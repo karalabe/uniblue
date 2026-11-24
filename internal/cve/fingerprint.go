@@ -171,7 +171,9 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 		}
 	}
 
-	// 2. Apply declarative fingerprint rules to every probed LAN host.
+	// 2. Apply declarative fingerprint rules to every probed LAN host, plus
+	// extract exact software versions directly from Nerva's Service discoveries
+	// (e.g., Grafana 13.3.1 from grafana:13.3.1-anon-access).
 	for _, hp := range profiles {
 		wan := wanExposedIPs[hp.Client.IP]
 		for _, rule := range f.rules {
@@ -194,6 +196,26 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 				VLAN:       hp.Client.NetworkName,
 				WANExposed: wan,
 			})
+		}
+
+		// Extract versioned products surfaced by Nerva service findings or CPEs
+		// (for example, Grafana 13.3.1 on :3000).
+		for _, svc := range hp.Services {
+			for _, sf := range svc.Findings {
+				if name, ver := parseNervaVersionedID(sf.ID); name == "grafana" && ver != "" {
+					add(Product{
+						Label:      "Grafana",
+						Vendors:    []string{"grafana"},
+						Products:   []string{"grafana"},
+						Version:    ver,
+						Source:     "nerva",
+						HostName:   hp.Client.DisplayName(),
+						HostIP:     hp.Client.IP,
+						VLAN:       hp.Client.NetworkName,
+						WANExposed: wan,
+					})
+				}
+			}
 		}
 	}
 
@@ -310,6 +332,21 @@ func expandProductPatterns(patterns []string, model string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// parseNervaVersionedID extracts (product, version) from Nerva finding IDs
+// formatted like "grafana:13.3.1-anon-access".
+func parseNervaVersionedID(id string) (string, string) {
+	prefix, rest, ok := strings.Cut(strings.ToLower(strings.TrimSpace(id)), ":")
+	if !ok || prefix == "" {
+		return "", ""
+	}
+	ver, _, _ := strings.Cut(rest, "-")
+	ver = strings.TrimSpace(ver)
+	if ver == "" || ver[0] < '0' || ver[0] > '9' {
+		return prefix, ""
+	}
+	return prefix, ver
 }
 
 // captureGroup safely extracts group idx from a regex submatch slice.

@@ -22,6 +22,21 @@
   vendors: ["home-assistant"]
   products: ["home-assistant"]
 
+- name: Grafana
+  http_title_regex: "(?i)^grafana$"
+  vendors: ["grafana"]
+  products: ["grafana"]
+
+- name: Pi-hole
+  http_title_regex: "(?i)pi-hole"
+  vendors: ["pi-hole"]
+  products: ["pi-hole", "adminlte"]
+
+- name: llama.cpp Server
+  http_server_regex: "(?i)^llama\\.cpp"
+  vendors: ["ggerganov", "llama.cpp"]
+  products: ["llama.cpp"]
+
 - name: HP LaserJet
   hostname_regex: "(?i)laserjet[^a-z0-9]*([a-z][0-9]{3,4})?"
   http_title_regex: "(?i)hp\\s+laserjet[^a-z0-9]*([a-z][0-9]{3,4})?"

@@ -397,6 +397,11 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
 	rawFindings := runner.RunAll(ctx, profiles)
 
+	// Merge noise-filtered Nerva protocol findings (e.g., SMBv1, anonymous
+	// Grafana, expired TLS certs) so they receive UniFi blast-radius scoring,
+	// state diffing, and watch alerting alongside UniBlue's own YAML checks.
+	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
+
 	report := risk.Evaluate(snap, rawFindings, cfg.Network)
 	return snap, profiles, report, nil
 }

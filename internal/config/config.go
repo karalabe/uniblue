@@ -13,10 +13,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultPorts lists the curated set of high-signal service and IoT ports
-// checked when no custom port list is supplied in configuration. Keeping the
-// default list small avoids overwhelming fragile embedded devices.
-var DefaultPorts = []int{22, 23, 80, 443, 502, 554, 1883, 5900, 8080, 8123, 8443, 47808}
+// DefaultPorts lists the curated set of high-signal service, database,
+// homelab, and IoT ports checked when no custom port list is supplied. Keeping
+// the list focused avoids overwhelming fragile embedded devices while giving
+// Nerva broad Shodan-style protocol coverage across the LAN.
+var DefaultPorts = []int{
+	21, 22, 23, 53, 80, 111, 443, 445,
+	502, 554, 623, 631, 1883, 2049, 2375, 3000,
+	3306, 3389, 5000, 5052, 5432, 5900, 6379, 8006,
+	8080, 8123, 8443, 8545, 9100, 27017,
+}
 
 // Config is the top-level UniBlue configuration structure.
 type Config struct {

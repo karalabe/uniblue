@@ -13,6 +13,7 @@ It combines your UniFi gateway's live network topology (clients, VLANs, firmware
 ## Why UniBlue?
 
 - **UniFi blast-radius awareness:** A vulnerable ventilation controller or unauthenticated camera is scored differently depending on whether it sits on an isolated IoT VLAN, your trusted LAN, or behind an active WAN port forward.
+- **Built-in 170+ protocol discovery:** Embeds Praetorian's `nerva` (in IoT-safe `FastMode`) to fingerprint SMBv1, SSH, NFS, RPC, databases, Grafana, Pi-hole, and expired TLS certs alongside UniBlue's own deep read-only verification checks.
 - **Informal IoT/LAN bug registry:** Many nasty bugs in local hardware (HVAC systems, inverters, cameras, smart relays) never get a formal CVE. UniBlue lets anyone drop a safe, read-only YAML check into `checks/` and run it locally.
 - **Gentle by design:** Fingerprinting uses a bounded worker pool, sequential per-host port checks with pacing, strict read-only verification probes, and target-IP-only sandboxing.
 - **Low-noise alerting:** `uniblue watch` tracks baseline state in a local JSON file and only notifies you when something new appears, a finding escalates, an unknown device joins a trusted VLAN, or a new WAN port forward is enabled.

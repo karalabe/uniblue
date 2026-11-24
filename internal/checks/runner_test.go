@@ -303,6 +303,47 @@ func TestProtocolProbes(t *testing.T) {
 	})
 }
 
+func TestFindingsFromProfilesDeduplicationAndNormalization(t *testing.T) {
+	profiles := []probe.HostProfile{
+		{
+			Client: unifi.Client{IP: "10.0.255.0", MAC: "aa:01", Name: "Home Assistant", NetworkName: "Default"},
+			Services: []probe.Service{
+				{
+					Port:            3000,
+					Protocol:        "http",
+					AnonymousAccess: true,
+					Findings: []probe.ServiceFinding{
+						{ID: "grafana:13.3.1-anon-access", Severity: "medium", Evidence: "unauth query succeeded"},
+					},
+				},
+				{
+					Port:     5900,
+					Protocol: "vnc",
+					Findings: []probe.ServiceFinding{
+						{ID: "vnc-none", Severity: "high", Evidence: "duplicate on port 5900"},
+					},
+				},
+			},
+		},
+	}
+
+	// Simulate UB-0005 already covering port 5900 on 10.0.255.0.
+	existing := []Finding{
+		{CheckID: "UB-0005", Client: profiles[0].Client, Port: 5900},
+	}
+
+	got := FindingsFromProfiles(profiles, existing)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 non-duplicate Nerva finding, got %d: %+v", len(got), got)
+	}
+	if got[0].CheckID != "NERVA-GRAFANA-ANON-ACCESS" {
+		t.Fatalf("expected version-stripped check ID NERVA-GRAFANA-ANON-ACCESS, got %q", got[0].CheckID)
+	}
+	if got[0].BaseSeverity != SeverityMedium {
+		t.Fatalf("expected medium severity, got %v", got[0].BaseSeverity)
+	}
+}
+
 // startMockTCP starts a localhost TCP server that handles connections with fn
 // and returns its listening port plus a cleanup function.
 func startMockTCP(t *testing.T, fn func(net.Conn)) (int, func()) {

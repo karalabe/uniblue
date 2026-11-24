@@ -28,7 +28,11 @@ const (
 	// perPortPause inserts a brief breather between consecutive port dials on
 	// the same host so fragile embedded TCP stacks (HVAC controllers, inverters,
 	// older cameras) are never hit with a rapid burst of SYNs.
-	perPortPause = 25 * time.Millisecond
+	perPortPause = 15 * time.Millisecond
+
+	// maxPortDialTimeout caps the initial TCP connect check on a local LAN so
+	// sleeping or firewalled hosts never stall a scan across 30+ ports.
+	maxPortDialTimeout = 600 * time.Millisecond
 )
 
 // titleRegex extracts the text inside an HTML <title>...</title> tag.
@@ -63,6 +67,59 @@ type HTTPBanner struct {
 	TLSSubjectOrg string `json:"tls_subject_org,omitempty"`
 }
 
+// Service summarizes one application-layer service identified on an open port
+// by UniBlue's embedded Nerva fingerprinter (covering 170+ TCP/UDP protocols).
+type Service struct {
+	// Port is the open TCP port where the service responded.
+	Port int `json:"port"`
+
+	// Protocol is the canonical protocol name detected by Nerva (e.g., "ssh",
+	// "smb", "http", "https", "nfs", "dns", "vnc").
+	Protocol string `json:"protocol"`
+
+	// TLS reports whether the service spoke TLS on this port.
+	TLS bool `json:"tls,omitempty"`
+
+	// Version is the software version string extracted from the protocol banner
+	// or handshake, when advertised (e.g., "nginx/1.26.3", "llama.cpp").
+	Version string `json:"version,omitempty"`
+
+	// Title holds an extracted web page title when Protocol is HTTP/HTTPS.
+	Title string `json:"title,omitempty"`
+
+	// Banner holds raw service identification text (such as an SSH greeting).
+	Banner string `json:"banner,omitempty"`
+
+	// AnonymousAccess indicates Nerva confirmed unauthenticated access to the service.
+	AnonymousAccess bool `json:"anonymous_access,omitempty"`
+
+	// CPEs lists any normalized CPE 2.3 identifiers reported by the service plugin.
+	CPEs []string `json:"cpes,omitempty"`
+
+	// Findings holds high-signal misconfigurations detected by Nerva after
+	// filtering out noisy LAN HTTP header lint warnings.
+	Findings []ServiceFinding `json:"findings,omitempty"`
+}
+
+// ServiceFinding represents one high-signal protocol misconfiguration surfaced
+// by Nerva (such as SMBv1 enabled, anonymous Grafana, or an expired TLS cert).
+type ServiceFinding struct {
+	// ID is Nerva's canonical finding identifier (e.g., "smb-v1-enabled").
+	ID string `json:"id"`
+
+	// Severity is the normalized lowercase severity string ("low", "medium", "high", "critical").
+	Severity string `json:"severity"`
+
+	// Title is an optional short summary provided by the plugin.
+	Title string `json:"title,omitempty"`
+
+	// Description explains the misconfiguration when provided by the plugin.
+	Description string `json:"description,omitempty"`
+
+	// Evidence records observable protocol-level proof without leaking secrets.
+	Evidence string `json:"evidence,omitempty"`
+}
+
 // HostProfile holds everything learned about a single LAN host during the
 // lightweight fingerprinting pass.
 type HostProfile struct {
@@ -78,6 +135,10 @@ type HostProfile struct {
 	// SSHBanner stores the passive greeting line advertised on port 22 (e.g.,
 	// "SSH-2.0-OpenSSH_9.6p1"), read without attempting authentication.
 	SSHBanner string `json:"ssh_banner,omitempty"`
+
+	// Services holds structured application-layer services identified on open
+	// ports by Nerva's embedded protocol fingerprinters.
+	Services []Service `json:"services,omitempty"`
 
 	// ScannedAt records when fingerprinting finished for this host.
 	ScannedAt time.Time `json:"scanned_at"`
@@ -218,6 +279,10 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 	sort.Slice(profiles, func(i, j int) bool {
 		return profiles[i].Client.IP < profiles[j].Client.IP
 	})
+
+	// Enrich every discovered open port using Nerva's FastMode protocol
+	// fingerprinters (170+ protocols, MaxHostConn=1 for IoT safety).
+	f.enrichWithNerva(ctx, profiles)
 	return profiles
 }
 
@@ -230,7 +295,11 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		ScannedAt: time.Now().UTC(),
 	}
 
-	dialer := net.Dialer{Timeout: f.timeout}
+	dialTimeout := f.timeout
+	if dialTimeout > maxPortDialTimeout {
+		dialTimeout = maxPortDialTimeout
+	}
+	dialer := net.Dialer{Timeout: dialTimeout}
 
 	for i, port := range f.ports {
 		if ctx.Err() != nil {

@@ -46,8 +46,10 @@ scan:
   concurrency: 8
   # Timeout per individual port or HTTP probe.
   timeout: 3s
-  # Curated high-signal ports checked during host fingerprinting.
-  ports: [22, 23, 80, 443, 502, 554, 1883, 5900, 8080, 8123, 8443, 47808]
+  # Optional override for the TCP ports checked during fingerprinting.
+  # Leave commented/empty to use UniBlue's curated DefaultPorts (30 homelab,
+  # database, and IoT ports) plus any specialty ports required by loaded checks.
+  # ports: [21, 22, 23, 53, 80, 443, 445, 502, 554, 1883, 3000, 5900, 8080, 8123, 8443, 8545]
   # Optional directory of extra local or community YAML checks loaded in addition
   # to the built-in checks.
   checks_dir: ""
