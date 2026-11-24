@@ -6,8 +6,6 @@ It combines your UniFi gateway's live network topology (clients, VLANs, firmware
 
 ![How UniBlue Protects Your UniFi Network](docs/how-it-works.png)
 
-*(Editable source: [docs/how-it-works.drawio](docs/how-it-works.drawio))*
-
 ## Why UniBlue?
 
 - **UniFi blast-radius awareness:** A vulnerable ventilation controller or unauthenticated camera is scored differently depending on whether it sits on an isolated IoT VLAN, your trusted LAN, or behind an active WAN port forward.
