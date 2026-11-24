@@ -10,41 +10,44 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>UniBlue — UniFi Security Console</title>
+<title>UniBlue — Home Network Security Checkup</title>
 <style>
-  /* ==========================================================================
-     COLOUR LAW: Warm hues (red/amber) encode ONLY evidenced violations/reviews.
-     Location, VLAN, role, and healthy state use neutral cool tones, shape,
-     containment, and texture — never a wall of green or red.
-     ========================================================================== */
   :root {
-    --bg: #f4f6f9;
+    --bg: #f5f7fa;
     --surface: #ffffff;
     --surface-2: #f8fafc;
-    --surface-3: #edf2f7;
-    --border: #e2e8f0;
-    --border-strong: #cbd5e1;
+    --surface-3: #eef2f6;
+    --border: #e5eaf1;
+    --border-strong: #cdd6e2;
     --text: #0f172a;
     --text-2: #334155;
     --muted: #64748b;
-    --accent: #1d4ed8;
-    --accent-bg: #eff6ff;
-    --accent-bd: #bfdbfe;
 
-    /* Verdict palette (warm ONLY for evidenced issues) */
-    --exp: #b91c1c;
-    --exp-bg: #fef2f2;
-    --exp-bd: #f87171;
-    --exp-solid: #dc2626;
-    --rev: #b45309;
-    --rev-bg: #fffbeb;
-    --rev-bd: #fbbf24;
-    --rev-solid: #d97706;
-    --unk: #475569;
-    --unk-bg: #f1f5f9;
-    --unk-bd: #94a3b8;
+    --blue: #2563eb;
+    --blue-bg: #eff6ff;
+    --blue-bd: #bfdbfe;
 
-    /* Physical port neutral link states */
+    /* Calm colour law: warm accents ONLY for real issues */
+    --crit: #b91c1c;
+    --crit-bg: #fef2f2;
+    --crit-bd: #fecaca;
+    --crit-solid: #dc2626;
+
+    --warn: #b45309;
+    --warn-bg: #fffbeb;
+    --warn-bd: #fde68a;
+    --warn-solid: #d97706;
+
+    --info: #0369a1;
+    --info-bg: #f0f9ff;
+    --info-bd: #bae6fd;
+
+    --ok: #047857;
+    --ok-bg: #ecfdf5;
+    --ok-bd: #a7f3d0;
+    --ok-solid: #10b981;
+
+    /* Calm hardware socket palette */
     --port-up-bg: #e2e8f0;
     --port-up-bd: #94a3b8;
     --port-up-fg: #1e293b;
@@ -52,520 +55,983 @@
     --port-open-bd: #cbd5e1;
     --port-off-bg: #f1f5f9;
 
-    /* Cool VLAN accents (subtle underbars only) */
+    /* Subtle zone accents */
     --vlan-0: #3b82f6;
     --vlan-1: #6366f1;
     --vlan-2: #0d9488;
     --vlan-3: #0284c7;
     --vlan-4: #64748b;
 
-    --shadow: 0 1px 2px rgba(15, 23, 42, .05), 0 1px 3px rgba(15, 23, 42, .03);
-    --radius: 10px;
+    --shadow-sm: 0 1px 2px rgba(15, 23, 42, .04);
+    --shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 6px 20px rgba(15, 23, 42, .03);
+    --shadow-lg: 0 20px 50px rgba(15, 23, 42, .18);
+    --radius: 16px;
+    --radius-sm: 10px;
   }
+
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #080e1a;
-      --surface: #0f172a;
-      --surface-2: #151f33;
+      --bg: #0b101b;
+      --surface: #111827;
+      --surface-2: #162033;
       --surface-3: #1e293b;
-      --border: #1e293b;
+      --border: #1f2a3d;
       --border-strong: #334155;
       --text: #f1f5f9;
       --text-2: #cbd5e1;
       --muted: #94a3b8;
-      --accent: #60a5fa;
-      --accent-bg: rgba(59, 130, 246, .14);
-      --accent-bd: rgba(96, 165, 250, .35);
 
-      --exp: #fca5a5;
-      --exp-bg: rgba(185, 28, 28, .26);
-      --exp-bd: rgba(248, 113, 113, .55);
-      --exp-solid: #ef4444;
-      --rev: #fcd34d;
-      --rev-bg: rgba(180, 83, 9, .26);
-      --rev-bd: rgba(251, 191, 36, .48);
-      --rev-solid: #f59e0b;
-      --unk: #94a3b8;
-      --unk-bg: rgba(148, 163, 184, .12);
-      --unk-bd: #475569;
+      --blue: #60a5fa;
+      --blue-bg: rgba(59, 130, 246, .15);
+      --blue-bd: rgba(96, 165, 250, .35);
+
+      --crit: #fca5a5;
+      --crit-bg: rgba(153, 27, 27, .28);
+      --crit-bd: rgba(248, 113, 113, .45);
+      --crit-solid: #ef4444;
+
+      --warn: #fcd34d;
+      --warn-bg: rgba(146, 64, 14, .26);
+      --warn-bd: rgba(251, 191, 36, .40);
+      --warn-solid: #f59e0b;
+
+      --info: #7dd3fc;
+      --info-bg: rgba(7, 89, 133, .28);
+      --info-bd: rgba(56, 189, 248, .38);
+
+      --ok: #6ee7b7;
+      --ok-bg: rgba(6, 95, 70, .25);
+      --ok-bd: rgba(52, 211, 153, .36);
+      --ok-solid: #10b981;
 
       --port-up-bg: #1e293b;
       --port-up-bd: #475569;
       --port-up-fg: #e2e8f0;
       --port-open-bg: #0f172a;
       --port-open-bd: #334155;
-      --port-off-bg: #0b1220;
+      --port-off-bg: #0c1220;
 
-      --shadow: 0 1px 2px rgba(0, 0, 0, .35);
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
+      --shadow: 0 2px 10px rgba(0, 0, 0, .3);
+      --shadow-lg: 0 20px 56px rgba(0, 0, 0, .6);
     }
   }
 
   * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
   body {
     margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
     background: var(--bg);
     color: var(--text);
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: 14px;
+    line-height: 1.55;
     min-height: 100vh;
     display: flex;
     flex-direction: column;
+    font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
   }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
   .muted { color: var(--muted); }
-  .sub { font-size: 11.5px; color: var(--muted); }
+  .small { font-size: 12.5px; color: var(--muted); }
+  .icon { width: 17px; height: 17px; flex-shrink: 0; display: inline-block; vertical-align: middle; }
+  .icon-lg { width: 22px; height: 22px; flex-shrink: 0; }
 
-  /* Header */
+  /* ==========================================================================
+     HEADER — Clean, airy, focused navigation
+     ========================================================================== */
   header {
-    display: flex; align-items: center; justify-content: space-between; gap: 14px;
-    padding: 0 20px; min-height: 54px;
-    background: var(--surface); border-bottom: 1px solid var(--border);
-    position: sticky; top: 0; z-index: 30; flex-wrap: wrap;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 30;
   }
-  .hdr-l { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .hdr-inner {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 24px;
+    min-height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; cursor: pointer; }
   .brand img { height: 28px; display: block; }
-  .nav { display: flex; gap: 2px; }
+
+  .nav-pills {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
   .nav-btn {
-    appearance: none; background: none; border: 0; border-bottom: 2.5px solid transparent;
-    padding: 16px 12px 14px; font-size: 13px; font-weight: 600; color: var(--muted);
-    cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    padding: 7px 14px;
+    border-radius: 9px;
+    font-size: 13.5px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    transition: background .15s, color .15s, box-shadow .15s;
   }
   .nav-btn:hover { color: var(--text); }
-  .nav-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
-  .hdr-r { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0; }
+  .nav-btn.active {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow-sm);
+  }
+  .nav-cnt {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    color: var(--text-2);
+  }
+  .nav-cnt.crit { background: var(--crit-bg); color: var(--crit); }
+  .nav-cnt.warn { background: var(--warn-bg); color: var(--warn); }
+  .nav-cnt.blue { background: var(--blue-bg); color: var(--blue); }
 
-  .pill {
-    display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px;
-    border-radius: 999px; font-size: 11.5px; font-weight: 600;
-    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
-  }
-  .pill.scanning { color: var(--accent); background: var(--accent-bg); border-color: var(--accent-bd); }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-  .pill.scanning .dot { animation: pulse 1.1s infinite; }
-
-  .btn {
-    appearance: none; border: 1px solid var(--border-strong); background: var(--surface);
-    color: var(--text); padding: 5px 11px; border-radius: 7px; font-size: 12px;
-    font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 5px;
-  }
-  .btn:hover { border-color: var(--accent); color: var(--accent); }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .btn.primary:hover { opacity: .92; color: #fff; }
-  .btn.sm { padding: 3px 8px; font-size: 11.5px; border-radius: 6px; }
-
-  /* Verdict Badges (ONLY warm for exposed/review; neutral for ok/unknown) */
-  .vbadge {
-    display: inline-flex; align-items: center; gap: 4px;
-    padding: 2px 7px; border-radius: 5px; font-size: 10.5px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: .3px; white-space: nowrap;
-    border: 1px solid var(--border); background: var(--surface-2); color: var(--muted);
-  }
-  .vbadge.v-exposed { color: var(--exp); background: var(--exp-bg); border-color: var(--exp-bd); }
-  .vbadge.v-review { color: var(--rev); background: var(--rev-bg); border-color: var(--rev-bd); }
-  .vbadge.v-unknown { color: var(--unk); background: var(--unk-bg); border-color: var(--unk-bd); border-style: dashed; }
-  .vbadge.v-ok { color: var(--text-2); background: var(--surface-2); border-color: var(--border); }
-
-  /* Numbered Pin Circle */
-  .pin {
-    display: inline-flex; align-items: center; justify-content: center;
-    min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
-    font-size: 10.5px; font-weight: 800; line-height: 1; flex-shrink: 0;
-    background: var(--exp-solid); color: #fff;
-  }
-  .pin.p-high { background: var(--rev-solid); }
-  .pin.p-med { background: var(--accent); }
-
-  /* OOB BMC Hexagon Badge */
-  .oob-hex {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 10px; font-weight: 800; letter-spacing: .4px; padding: 2px 7px;
-    clip-path: polygon(6px 0, calc(100% - 6px) 0, 100% 50%, calc(100% - 6px) 100%, 6px 100%, 0 50%);
-    background: var(--surface-3); color: var(--text);
-  }
-  .oob-hex.v-exposed { background: var(--exp-solid); color: #fff; }
-  .oob-hex.v-review { background: var(--rev-solid); color: #fff; }
-
-  /* Headline & Census Strip */
-  .headline-bar {
-    background: var(--surface); border-bottom: 1px solid var(--border);
-    padding: 12px 20px; display: flex; flex-direction: column; gap: 8px;
-  }
-  .headline-top {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-  }
-  .headline-text {
-    font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 9px; flex: 1; min-width: 240px;
-  }
-  .stepper { display: inline-flex; align-items: center; gap: 4px; }
-  .census-bar { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
-  .cfilter {
-    appearance: none; background: var(--surface-2); border: 1px solid var(--border);
-    color: var(--text-2); padding: 3px 9px; border-radius: 999px; font-size: 11.5px;
-    font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
-  }
-  .cfilter:hover { border-color: var(--accent); }
-  .cfilter.active { background: var(--accent-bg); border-color: var(--accent-bd); color: var(--accent); }
-  .cfilter.has-warn { border-color: var(--exp-bd); color: var(--exp); background: var(--exp-bg); }
-  .cfilter.has-warn.active { outline: 2px solid var(--exp-solid); outline-offset: 1px; }
-  .cfilter.has-rev { border-color: var(--rev-bd); color: var(--rev); background: var(--rev-bg); }
-
-  /* Main Workspace + Docked Non-Modal Rail */
-  .shell {
-    flex: 1; width: 100%; max-width: 1840px; margin: 0 auto; padding: 16px 20px 32px;
-  }
-  .view { display: none; }
-  .view.active { display: block; }
-
-  .map-workspace {
-    display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start;
-  }
-  @media (max-width: 1080px) {
-    .map-workspace { grid-template-columns: 1fr; }
-  }
-
-  /* Gateway Hinge (top of Map) */
-  .gw-hinge {
-    background: var(--surface); border: 1.5px solid var(--border-strong); border-radius: var(--radius);
-    padding: 12px 15px; margin-bottom: 14px; box-shadow: var(--shadow);
-    display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
-    cursor: pointer; transition: border-color .12s;
-  }
-  .gw-hinge:hover, .gw-hinge.sel { border-color: var(--accent); }
-  .gw-hinge.sel { box-shadow: 0 0 0 2px var(--accent-bg); }
-  .gw-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-  .ctrl-chip {
-    font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px;
-    border: 1px solid var(--border); background: var(--surface-2); color: var(--text-2);
-    display: inline-flex; align-items: center; gap: 5px;
-  }
-  .ctrl-chip.v-exposed { border-color: var(--exp-bd); background: var(--exp-bg); color: var(--exp); }
-  .ctrl-chip.v-review { border-color: var(--rev-bd); background: var(--rev-bg); color: var(--rev); }
-
-  /* Two Synchronized Lenses (Side-by-side >= 1180px, stacked below) */
-  .lenses {
-    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 14px; align-items: start;
-  }
-  @media (max-width: 1280px) {
-    .lenses { grid-template-columns: 1fr; }
-  }
-  .lens-col {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    box-shadow: var(--shadow); overflow: hidden;
-  }
-  .lens-hd {
-    display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    padding: 10px 14px; background: var(--surface-2); border-bottom: 1px solid var(--border);
-    font-weight: 800; font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-2);
-  }
-  .lens-body { padding: 12px 14px; }
-
-  /* ==========================================================================
-     LOGICAL ZONES LENS (Left)
-     ========================================================================== */
-  .wan-strip {
-    border: 1px solid var(--border-strong); border-radius: 8px; padding: 9px 11px;
-    margin-bottom: 12px; background: var(--surface-2);
-  }
-  .wan-flows { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-  .flow-chip {
-    display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 6px;
-    font-size: 11.5px; font-weight: 600; cursor: pointer;
-    border: 1px solid var(--border); background: var(--surface); color: var(--text-2);
-  }
-  .flow-chip:hover { border-color: var(--accent); }
-  .flow-chip.v-exposed { border-color: var(--exp-bd); background: var(--exp-bg); color: var(--exp); }
-  .flow-chip.v-review { border-color: var(--rev-bd); background: var(--rev-bg); color: var(--rev); }
-  .flow-chip.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-  .vlan-lane {
-    border: 1px solid var(--border); border-radius: 9px; margin-bottom: 10px;
-    overflow: hidden; background: var(--surface);
-  }
-  .vlan-lane.empty-iso { border-style: dashed; background: var(--surface-2); }
-  .lane-hd {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    padding: 8px 12px; background: var(--surface-2); border-bottom: 1px solid var(--border);
-    border-left: 4px solid var(--vlan-0); flex-wrap: wrap;
-  }
-  .lane-body { padding: 9px 12px; display: flex; flex-direction: column; gap: 8px; }
-
-  .oob-row {
-    padding: 7px 9px; border-radius: 7px; border: 1px solid var(--border-strong);
-    background: var(--surface-2); display: flex; flex-direction: column; gap: 6px;
-  }
-  .oob-row-lbl { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
-
-  .host-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .hchip {
-    display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 7px;
-    border: 1px solid var(--border); background: var(--surface); color: var(--text);
-    cursor: pointer; font-size: 12px; transition: all .12s; max-width: 100%;
-  }
-  .hchip:hover { border-color: var(--accent); }
-  .hchip.v-exposed { border-color: var(--exp-bd); background: var(--exp-bg); }
-  .hchip.v-review { border-color: var(--rev-bd); background: var(--rev-bg); }
-  .hchip.v-unknown { border-style: dashed; border-color: var(--unk-bd); background: var(--unk-bg); color: var(--muted); }
-  .hchip.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .hchip.dim { opacity: .24; }
-  .hchip-meta { font-size: 10.5px; color: var(--muted); }
-  .wall-notch { font-size: 10px; padding: 1px 4px; border-radius: 3px; background: var(--surface-3); color: var(--text-2); font-weight: 700; }
-
-  /* Quiet Dot Grid for Issue-Free Assessed Hosts */
-  .dot-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-top: 2px; }
-  .dot-grid { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-  .hdot {
-    width: 11px; height: 11px; border-radius: 3px; cursor: pointer;
-    background: var(--port-up-bg); border: 1px solid var(--port-up-bd);
-    transition: transform .1s, border-color .1s;
-  }
-  .hdot.unk { background: transparent; border-style: dashed; border-color: var(--unk-bd); }
-  .hdot:hover { transform: scale(1.25); border-color: var(--accent); }
-  .hdot.sel { background: var(--accent); border-color: var(--accent); transform: scale(1.25); }
-  .hdot.dim { opacity: .2; }
-
-  /* ==========================================================================
-     PHYSICAL BLUEPRINT LENS (Right)
-     ========================================================================== */
-  .bldg-zone {
-    border: 1px solid var(--border-strong); border-radius: 9px; padding: 10px 12px;
+  .hdr-r { display: flex; align-items: center; gap: 10px; }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 12px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 600;
     background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
   }
-  .bldg-zone.outside {
-    border-style: dashed; background: var(--surface);
-  }
-  .bldg-lbl {
-    font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .55px;
-    color: var(--muted); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;
-  }
+  .status-pill.live { color: var(--text-2); }
+  .status-pill.scanning { background: var(--blue-bg); border-color: var(--blue-bd); color: var(--blue); }
+  .sdot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .status-pill.live .sdot { background: var(--ok-solid); }
+  @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.85); } }
+  .status-pill.scanning .sdot { animation: pulse 1.2s infinite; }
 
-  /* Hatched Perimeter Wall + Wall Gates */
-  .wall-band {
-    margin: 12px 0; padding: 9px 11px; border-radius: 8px;
-    border-top: 2px solid var(--border-strong); border-bottom: 2px solid var(--border-strong);
-    background: repeating-linear-gradient(
-      -45deg,
-      var(--surface-2),
-      var(--surface-2) 6px,
-      var(--surface-3) 6px,
-      var(--surface-3) 12px
-    );
-  }
-  .wall-hdr {
-    font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .6px;
-    color: var(--text-2); margin-bottom: 7px; display: flex; justify-content: space-between; align-items: center;
-  }
-  .gates-row { display: flex; flex-wrap: wrap; gap: 6px; }
-  .gate {
-    display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 6px;
-    background: var(--surface); border: 1.5px solid var(--border-strong); color: var(--text);
-    font-size: 11.5px; font-weight: 600; cursor: pointer;
-  }
-  .gate.inferred { border-style: dashed; }
-  .gate.v-exposed { border-color: var(--exp-bd); background: var(--exp-bg); color: var(--exp); }
-  .gate.v-review { border-color: var(--rev-bd); background: var(--rev-bg); color: var(--rev); }
-  .gate.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .gate.dim { opacity: .24; }
-
-  /* LLDP Rack Rows & True Alternating 2-Row Switch Faceplates */
-  .rack-row {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-    margin-bottom: 9px; overflow: hidden;
-  }
-  .rack-row:last-child { margin-bottom: 0; }
-  .rack-row.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-bg); }
-  .rack-row.depth-1 { margin-left: 14px; }
-  .rack-row.depth-2 { margin-left: 28px; }
-  .rack-hd {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    padding: 7px 10px; background: var(--surface-2); border-bottom: 1px solid var(--border);
-    cursor: pointer; flex-wrap: wrap;
-  }
-  .rack-hd:hover { background: var(--surface-3); }
-  .rack-title { font-weight: 700; font-size: 12.5px; display: flex; align-items: center; gap: 6px; }
-  .trunk-tag {
-    font-size: 10.5px; padding: 1px 6px; border-radius: 4px;
-    background: var(--surface); border: 1px solid var(--border); color: var(--muted);
+  /* Buttons */
+  .btn {
+    appearance: none;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    padding: 7px 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
     cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: border-color .15s, background .15s, color .15s;
   }
-  .trunk-tag:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:hover { border-color: var(--blue); color: var(--blue); }
+  .btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .btn.primary:hover { opacity: .92; color: #fff; }
+  .btn.sm { padding: 5px 10px; font-size: 12px; border-radius: 8px; }
+  .btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+  .btn.ghost:hover { background: var(--surface-2); color: var(--text); }
 
-  /* True Switch Faceplate: Fixed alternating odd (top) / even (bottom) sockets + SFP gap */
-  .faceplate-wrap {
-    padding: 9px 10px; display: flex; align-items: center; gap: 10px; overflow-x: auto;
+  /* Main canvas */
+  main {
+    flex: 1;
+    width: 100%;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 28px 24px 64px;
   }
-  .fp-bank {
-    display: grid; grid-auto-flow: column; grid-template-rows: repeat(2, 26px); gap: 4px;
+  .view { display: none; animation: fadeIn .16s ease-out; }
+  .view.active { display: block; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* Friendly Badges & Tags */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text-2);
   }
-  .fp-bank.single-row { grid-template-rows: 26px; }
-  .fp-sfp-sep { width: 2px; height: 48px; background: var(--border-strong); border-radius: 2px; flex-shrink: 0; }
+  .tag.crit { background: var(--crit-bg); border-color: var(--crit-bd); color: var(--crit); }
+  .tag.warn { background: var(--warn-bg); border-color: var(--warn-bd); color: var(--warn); }
+  .tag.info { background: var(--info-bg); border-color: var(--info-bd); color: var(--info); }
+  .tag.blue { background: var(--blue-bg); border-color: var(--blue-bd); color: var(--blue); }
+  .tag.ok { background: var(--ok-bg); border-color: var(--ok-bd); color: var(--ok); }
+  .tag.unk { background: var(--blue-bg); border: 1px dashed var(--blue-bd); color: var(--blue); }
+  .tag.neutral { background: var(--surface-2); border-color: var(--border); color: var(--muted); }
+  .tag.click { cursor: pointer; transition: border-color .12s, transform .1s; }
+  .tag.click:hover { border-color: var(--blue); color: var(--blue); }
+
+  /* Cards */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  .card-hd {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 22px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .card-title { font-size: 15.5px; font-weight: 700; letter-spacing: -.01em; display: flex; align-items: center; gap: 9px; }
+  .card-body { padding: 20px 22px; }
+
+  /* ==========================================================================
+     TAB 1: CHECKUP HERO & GUIDED STORY CARDS
+     ========================================================================== */
+  .hero {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+    padding: 26px 28px;
+    margin-bottom: 24px;
+  }
+  .hero-top {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .ring-wrap {
+    width: 84px;
+    height: 84px;
+    position: relative;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .ring-svg { width: 84px; height: 84px; transform: rotate(-90deg); }
+  .ring-bg { fill: none; stroke: var(--surface-3); stroke-width: 7; }
+  .ring-fg { fill: none; stroke-width: 7; stroke-linecap: round; transition: stroke-dashoffset .4s ease; }
+  .ring-fg.spin { animation: spin 1.8s linear infinite; transform-origin: 42px 42px; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .ring-center {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    font-size: 20px;
+    letter-spacing: -.02em;
+  }
+  .hero-copy { flex: 1; min-width: 240px; }
+  .hero-title { font-size: 23px; font-weight: 800; letter-spacing: -.025em; margin: 0 0 5px; line-height: 1.25; }
+  .hero-sub { font-size: 14.5px; color: var(--text-2); margin: 0; max-width: 680px; }
+
+  .hero-pillars {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 22px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+  }
+  @media (max-width: 760px) { .hero-pillars { grid-template-columns: 1fr; } }
+  .pillar {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    padding: 13px 15px;
+    border-radius: 13px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: border-color .15s, background .15s, transform .12s;
+  }
+  .pillar:hover { border-color: var(--blue); background: var(--surface); transform: translateY(-1px); }
+  .pillar-ico {
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    background: var(--surface-3);
+    color: var(--text-2);
+  }
+  .pillar-ico.crit { background: var(--crit-bg); color: var(--crit); }
+  .pillar-ico.warn { background: var(--warn-bg); color: var(--warn); }
+  .pillar-ico.ok { background: var(--ok-bg); color: var(--ok); }
+  .pillar-ico.blue { background: var(--blue-bg); color: var(--blue); }
+  .pillar-lbl { font-size: 12px; font-weight: 600; color: var(--muted); }
+  .pillar-val { font-size: 14.5px; font-weight: 700; color: var(--text); margin-top: 1px; }
+
+  /* Two-column Checkup Body */
+  .checkup-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.65fr) minmax(290px, 1fr);
+    gap: 22px;
+    align-items: start;
+  }
+  @media (max-width: 960px) { .checkup-grid { grid-template-columns: 1fr; } }
+
+  .section-kicker {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--muted);
+    margin: 0 0 12px 4px;
+  }
+
+  /* Story Action Group Card */
+  .story {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 18px;
+    overflow: hidden;
+  }
+  .story-hd {
+    padding: 18px 22px 15px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+  }
+  .story-hd-l { display: flex; gap: 13px; align-items: flex-start; }
+  .story-ico {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .story-ico.crit { background: var(--crit-bg); color: var(--crit); }
+  .story-ico.warn { background: var(--warn-bg); color: var(--warn); }
+  .story-ico.blue { background: var(--blue-bg); color: var(--blue); }
+  .story-title { font-size: 15.5px; font-weight: 700; letter-spacing: -.01em; }
+  .story-why { font-size: 13px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
+
+  .story-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 22px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background .12s;
+  }
+  .story-item:last-child { border-bottom: 0; }
+  .story-item:hover { background: var(--surface-2); }
+  .story-item-l { min-width: 0; flex: 1; }
+  .story-item-name { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .story-item-sub { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+  .story-item-r { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .go-arrow { color: var(--muted); font-weight: 600; font-size: 13px; white-space: nowrap; }
+  .story-item:hover .go-arrow { color: var(--blue); }
+
+  /* Router Safety Checklist */
+  .checklist { padding: 6px 0; }
+  .chk-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 11px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .chk-row:last-child { border-bottom: 0; }
+  .chk-l { display: flex; align-items: center; gap: 11px; min-width: 0; }
+  .chk-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; background: var(--border-strong); }
+  .chk-dot.ok { background: var(--ok-solid); }
+  .chk-dot.warn { background: var(--warn-solid); }
+  .chk-dot.crit { background: var(--crit-solid); }
+  .chk-name { font-weight: 600; font-size: 13.5px; }
+  .chk-hint { font-size: 11.5px; color: var(--muted); }
+  .chk-val { font-size: 12.5px; font-weight: 600; text-align: right; white-space: nowrap; }
+  .chk-val.ok { color: var(--ok); }
+  .chk-val.warn { color: var(--warn); }
+  .chk-val.crit { color: var(--crit); }
+
+  /* ==========================================================================
+     TAB 2: HOUSE & CABLES (Architectural Cutaway)
+     ========================================================================== */
+  .bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+  }
+  .seg {
+    display: inline-flex;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 3px;
+    gap: 3px;
+    box-shadow: var(--shadow-sm);
+  }
+  .seg-b {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    padding: 6px 13px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .12s, color .12s;
+  }
+  .seg-b:hover { color: var(--text); }
+  .seg-b.active { background: var(--blue-bg); color: var(--blue); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 12.5px; color: var(--muted); }
+  .leg { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 14px; height: 14px; border-radius: 4px; border: 1.5px solid var(--border-strong); display: inline-block; }
+  .sw.up { background: var(--port-up-bg); border-color: var(--port-up-bd); }
+  .sw.open { background: var(--port-open-bg); border-style: dashed; }
+  .sw.off { background: var(--port-off-bg); opacity: .5; }
+  .sw.crit { background: var(--crit-bg); border-color: var(--crit-bd); }
+  .sw.warn { background: var(--warn-bg); border-color: var(--warn-bd); }
+  .sw.hatch { background: repeating-linear-gradient(-45deg, var(--surface), var(--surface) 3px, var(--surface-3) 3px, var(--surface-3) 6px); }
+
+  .house-zone {
+    border: 1.5px solid var(--border-strong);
+    border-radius: 20px;
+    padding: 22px 24px;
+    background: var(--surface-2);
+    margin-bottom: 18px;
+  }
+  .house-zone.outside {
+    border-style: dashed;
+    background: var(--surface);
+  }
+  .house-hd {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .house-title { font-size: 16px; font-weight: 800; letter-spacing: -.015em; display: flex; align-items: center; gap: 9px; }
+  .house-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
+
+  /* Architectural Wall Boundary */
+  .wall-band {
+    margin: 22px 0;
+    padding: 18px 22px;
+    border-radius: 16px;
+    border: 1.5px solid var(--border-strong);
+    background: repeating-linear-gradient(-45deg, var(--surface-2), var(--surface-2) 10px, var(--surface-3) 10px, var(--surface-3) 20px);
+  }
+  .wall-title { font-size: 13.5px; font-weight: 800; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .wall-cables { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  .cable-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1.5px solid var(--border-strong);
+    cursor: pointer;
+    box-shadow: var(--shadow-sm);
+    transition: border-color .15s, transform .1s;
+  }
+  .cable-pill:hover { border-color: var(--blue); transform: translateY(-1px); }
+  .cable-pill.crit { border-color: var(--crit-bd); background: var(--crit-bg); }
+  .cable-pill.warn { border-color: var(--warn-bd); background: var(--warn-bg); }
+  .cable-pill.inferred { border-style: dashed; }
+
+  .hw-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .hw-card:last-child { margin-bottom: 0; }
+  .hw-card.d1 { margin-left: 24px; }
+  .hw-card.d2 { margin-left: 48px; }
+  @media (max-width: 720px) { .hw-card.d1, .hw-card.d2 { margin-left: 0; } }
+  .hw-hd {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    flex-wrap: wrap;
+    transition: background .12s;
+  }
+  .hw-hd:hover { background: var(--surface-2); }
+
+  /* Roomy Physical Switch Sockets */
+  .fp-wrap { padding: 16px 18px; display: flex; align-items: center; gap: 16px; overflow-x: auto; }
+  .fp-bank { display: grid; grid-auto-flow: column; grid-template-rows: repeat(2, 46px); gap: 7px; }
+  .fp-bank.single { grid-template-rows: 46px; }
+  .fp-sep { width: 2px; height: 84px; background: var(--border-strong); border-radius: 2px; flex-shrink: 0; }
   .sock {
-    width: 32px; height: 26px; border-radius: 4px; position: relative;
-    border: 1.5px solid var(--port-open-bd); background: var(--port-open-bg);
-    color: var(--muted); font-size: 10.5px; font-weight: 700;
-    display: flex; align-items: center; justify-content: center;
-    cursor: pointer; user-select: none; transition: transform .08s;
+    width: 50px;
+    height: 46px;
+    border-radius: 9px;
+    position: relative;
+    border: 1.5px solid var(--port-open-bd);
+    background: var(--port-open-bg);
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    user-select: none;
+    transition: transform .12s, border-color .12s, box-shadow .12s;
   }
-  .sock:hover { transform: translateY(-1px); border-color: var(--accent); z-index: 2; }
+  .sock:hover { transform: translateY(-2px); border-color: var(--blue); box-shadow: 0 4px 10px rgba(37, 99, 235, .14); z-index: 2; }
   .sock.up { background: var(--port-up-bg); border-color: var(--port-up-bd); color: var(--port-up-fg); }
   .sock.open { border-style: dashed; }
-  .sock.off { background: var(--port-off-bg); border-color: var(--border); opacity: .4; }
+  .sock.off { background: var(--port-off-bg); border-color: var(--border); opacity: .45; }
   .sock.trunk {
-    background-image: repeating-linear-gradient(
-      -45deg, transparent, transparent 3px, rgba(100, 116, 139, .18) 3px, rgba(100, 116, 139, .18) 6px
-    );
+    background-image: repeating-linear-gradient(-45deg, transparent, transparent 4px, rgba(100, 116, 139, .14) 4px, rgba(100, 116, 139, .14) 8px);
   }
-  .sock.v-exposed {
-    background-color: var(--exp-bg); border-color: var(--exp-bd); color: var(--exp); opacity: 1;
-  }
-  .sock.v-review {
-    background-color: var(--rev-bg); border-color: var(--rev-bd); color: var(--rev); opacity: 1;
-  }
-  .sock.sel { outline: 2px solid var(--accent); outline-offset: 1px; z-index: 4; }
+  .sock.crit { background-color: var(--crit-bg); border-color: var(--crit-bd); color: var(--crit); opacity: 1; }
+  .sock.warn { background-color: var(--warn-bg); border-color: var(--warn-bd); color: var(--warn); opacity: 1; }
+  .sock.sel { outline: 2.5px solid var(--blue); outline-offset: 2px; z-index: 4; }
   .sock.dim { opacity: .2 !important; }
-  .sock .ubar {
-    position: absolute; left: 2px; right: 2px; bottom: 1px; height: 2.5px; border-radius: 1px;
+  .sock .sn { font-size: 12.5px; font-weight: 800; line-height: 1.1; }
+  .sock .sm { font-size: 10px; opacity: .82; line-height: 1.1; margin-top: 2px; }
+  .sock .ubar { position: absolute; left: 5px; right: 5px; bottom: 3px; height: 3px; border-radius: 2px; }
+
+  .hw-foot {
+    padding: 11px 18px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-2);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
   }
-  .sock .poe-dot {
-    position: absolute; top: 1px; right: 2px; font-size: 8px; line-height: 1; opacity: .85;
-  }
-  .sock .spin {
-    position: absolute; top: -6px; left: -5px; min-width: 14px; height: 14px; padding: 0 3px;
-    border-radius: 999px; background: var(--exp-solid); color: #fff; font-size: 9px; font-weight: 800;
-    display: flex; align-items: center; justify-content: center; line-height: 1;
-  }
-  .sock.v-review .spin { background: var(--rev-solid); }
 
   /* ==========================================================================
-     DOCKED NON-MODAL RIGHT RAIL (Queue <-> Inspector Stack)
+     TAB 3: DEVICES & WI-FI (Zones as Rooms)
      ========================================================================== */
-  .rail {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    box-shadow: var(--shadow); position: sticky; top: 68px; max-height: calc(100vh - 86px);
-    display: flex; flex-direction: column; overflow: hidden;
+  .search-box {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 11px;
+    padding: 0 13px;
+    width: 300px;
+    max-width: 100%;
+    box-shadow: var(--shadow-sm);
   }
-  .rail-hd {
-    padding: 11px 14px; background: var(--surface-2); border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0;
+  .search-box:focus-within { border-color: var(--blue); }
+  .search-box input {
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    padding: 8px 0;
+    font-size: 13.5px;
+    width: 100%;
+    outline: none;
   }
-  .rail-body { padding: 12px 14px; overflow-y: auto; flex: 1; }
-  .q-item {
-    display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px;
-    border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px;
-    cursor: pointer; background: var(--surface); transition: border-color .1s, background .1s;
-  }
-  .q-item:hover { border-color: var(--accent); background: var(--surface-2); }
-  .q-item.sel { border-color: var(--accent); background: var(--accent-bg); }
-  .q-text { font-size: 12.5px; font-weight: 600; line-height: 1.35; }
-  .q-cat { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; margin-top: 2px; }
 
-  .ins-sec { margin-bottom: 15px; }
-  .ins-sec-t {
-    font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .5px;
-    color: var(--muted); margin-bottom: 7px;
+  .zone-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 20px;
+    overflow: hidden;
   }
-  .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-  .kv { padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
-  .kv .k { font-size: 10px; color: var(--muted); font-weight: 700; text-transform: uppercase; }
-  .kv .v { font-size: 12px; font-weight: 600; margin-top: 2px; word-break: break-word; }
+  .zone-hd {
+    padding: 16px 22px;
+    border-bottom: 1px solid var(--border);
+    border-left: 5px solid var(--vlan-0);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .zone-title { font-size: 16.5px; font-weight: 800; letter-spacing: -.015em; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .zone-desc { font-size: 13px; color: var(--muted); margin-top: 3px; }
+  .zone-tip {
+    padding: 11px 22px;
+    background: var(--blue-bg);
+    color: var(--blue);
+    border-bottom: 1px solid var(--blue-bd);
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .bmc-band {
+    padding: 10px 22px;
+    background: var(--warn-bg);
+    border-bottom: 1px solid var(--warn-bd);
+    color: var(--warn);
+    font-size: 12.5px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
 
-  .reason-card {
-    border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; margin-bottom: 8px;
+  .dev-row {
+    display: grid;
+    grid-template-columns: minmax(220px, 1.5fr) minmax(150px, 1fr) minmax(200px, 1.4fr) auto;
+    gap: 14px;
+    align-items: center;
+    padding: 13px 22px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background .12s;
+  }
+  .dev-row:last-child { border-bottom: 0; }
+  .dev-row:hover { background: var(--surface-2); }
+  @media (max-width: 860px) { .dev-row { grid-template-columns: 1fr; gap: 8px; } }
+  .dev-id { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .dev-ico {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .dev-ico .sbadge {
+    position: absolute;
+    right: -3px;
+    bottom: -3px;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 2px solid var(--surface);
+    background: var(--border-strong);
+  }
+  .dev-ico .sbadge.crit { background: var(--crit-solid); }
+  .dev-ico .sbadge.warn { background: var(--warn-solid); }
+  .dev-ico .sbadge.ok { background: var(--ok-solid); }
+  .dev-ico .sbadge.unk { background: var(--blue); animation: pulse 1.2s infinite; }
+  .dev-name { font-weight: 700; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dev-meta { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+  .wifi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; padding: 18px 22px; }
+  .wifi-card {
+    padding: 15px 16px;
+    border: 1px solid var(--border);
+    border-radius: 13px;
     background: var(--surface-2);
   }
-  .reason-card.v-exposed { border-color: var(--exp-bd); background: var(--exp-bg); }
-  .reason-card.v-review { border-color: var(--rev-bd); background: var(--rev-bg); }
-  .ea-pair {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px;
-    padding: 6px 8px; border-radius: 6px; background: var(--surface); border: 1px solid var(--border);
-    font-size: 11px;
-  }
-  .ea-pair b { display: block; font-size: 9.5px; text-transform: uppercase; color: var(--muted); }
 
-  /* Inventory & Activity Tables */
-  .toolbar {
-    display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
-    padding: 10px 14px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); margin-bottom: 12px;
+  /* ==========================================================================
+     TAB 4: ACTIVITY FEED
+     ========================================================================== */
+  .act-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 13px 22px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
   }
-  .search {
-    padding: 5px 10px; border: 1px solid var(--border-strong); border-radius: 7px;
-    background: var(--surface-2); color: var(--text); font-size: 12.5px; width: 260px; max-width: 100%;
+  .act-row:last-child { border-bottom: 0; }
+  .act-row.clickable { cursor: pointer; transition: background .12s; }
+  .act-row.clickable:hover { background: var(--surface-2); }
+  .act-l { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 240px; }
+  .act-time { font-size: 12px; color: var(--muted); width: 72px; flex-shrink: 0; }
+
+  .empty { padding: 28px 22px; text-align: center; color: var(--muted); font-size: 14px; }
+
+  /* ==========================================================================
+     SLIDE-OVER INSPECTOR DRAWER (Human First + Collapsible Technical Details)
+     ========================================================================== */
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, .34);
+    backdrop-filter: blur(2px);
+    z-index: 45;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .18s;
   }
-  .tbl-card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    overflow-x: auto; box-shadow: var(--shadow);
+  .backdrop.open { opacity: 1; pointer-events: auto; }
+  .drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 500px;
+    max-width: 100vw;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    box-shadow: var(--shadow-lg);
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    transform: translateX(100%);
+    transition: transform .22s cubic-bezier(.16, 1, .3, 1);
   }
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  th {
-    text-align: left; padding: 8px 12px; font-size: 10.5px; text-transform: uppercase;
-    letter-spacing: .4px; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface-2);
+  .drawer.open { transform: translateX(0); }
+  .drawer-hd {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
   }
-  td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-  tr:last-child td { border-bottom: 0; }
-  tr.clickable { cursor: pointer; }
-  tr.clickable:hover td { background: var(--surface-2); }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 20px 24px 40px; }
+
+  .summary-box {
+    padding: 15px 17px;
+    border-radius: 13px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    margin-bottom: 20px;
+    font-size: 13.5px;
+    color: var(--text-2);
+    line-height: 1.55;
+  }
+  .summary-box.crit { background: var(--crit-bg); border-color: var(--crit-bd); color: var(--text); }
+  .summary-box.warn { background: var(--warn-bg); border-color: var(--warn-bd); color: var(--text); }
+  .summary-box.ok { background: var(--ok-bg); border-color: var(--ok-bd); color: var(--text); }
+  .summary-box.blue { background: var(--blue-bg); border-color: var(--blue-bd); color: var(--text); }
+
+  .dsec { margin-bottom: 22px; }
+  .dsec-t { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 10px; }
+
+  .fix-card {
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    padding: 15px 16px;
+    margin-bottom: 12px;
+    background: var(--surface);
+  }
+  .fix-card.crit { border-color: var(--crit-bd); background: var(--crit-bg); }
+  .fix-card.warn { border-color: var(--warn-bd); background: var(--warn-bg); }
+  .fix-step {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 9px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text);
+  }
+
+  .link-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    cursor: pointer;
+    margin-bottom: 8px;
+    transition: border-color .12s, background .12s;
+  }
+  .link-card:hover { border-color: var(--blue); background: var(--surface); }
+
+  /* Collapsible Technical Details (Power Users!) */
+  details.tech {
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    background: var(--surface-2);
+    overflow: hidden;
+    margin-top: 16px;
+  }
+  details.tech summary {
+    padding: 13px 16px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-2);
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    user-select: none;
+  }
+  details.tech summary::-webkit-details-marker { display: none; }
+  details.tech summary::after { content: "▸"; color: var(--muted); transition: transform .15s; }
+  details.tech[open] summary::after { transform: rotate(90deg); }
+  details.tech[open] summary { border-bottom: 1px solid var(--border); }
+  .tech-body { padding: 14px 16px; }
+  .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+  .kv { padding: 9px 11px; border-radius: 9px; background: var(--surface); border: 1px solid var(--border); }
+  .kv .k { font-size: 10.5px; font-weight: 700; text-transform: uppercase; color: var(--muted); }
+  .kv .v { font-size: 12.5px; font-weight: 600; margin-top: 2px; word-break: break-word; }
 
   /* Footer */
   footer {
-    margin-top: auto; padding: 12px 20px; border-top: 1px solid var(--border);
-    background: var(--surface); color: var(--muted); font-size: 11.5px;
-    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    margin-top: auto;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .ft-inner {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 15px 24px;
+    color: var(--muted);
+    font-size: 12.5px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
   }
   footer a { color: var(--text-2); text-decoration: none; font-weight: 600; }
-  footer a:hover { color: var(--accent); text-decoration: underline; }
+  footer a:hover { color: var(--blue); text-decoration: underline; }
 </style>
 </head>
 <body>
 
 <header>
-  <div class="hdr-l">
-    <div class="brand">
+  <div class="hdr-inner">
+    <div class="brand" onclick="switchTab('checkup')" title="Back to Network Checkup">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="/assets/logo-dark.svg">
         <img src="/assets/logo-light.svg" alt="UniBlue">
       </picture>
     </div>
-    <nav class="nav" role="tablist">
-      <button class="nav-btn active" data-tab="map">Map</button>
-      <button class="nav-btn" data-tab="inventory">Inventory</button>
-      <button class="nav-btn" data-tab="activity">Activity</button>
+
+    <nav class="nav-pills" role="tablist">
+      <button class="nav-btn active" data-tab="checkup">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        Checkup <span id="nb-ck" class="nav-cnt">0</span>
+      </button>
+      <button class="nav-btn" data-tab="house">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        House &amp; Cables <span id="nb-hs" class="nav-cnt">0</span>
+      </button>
+      <button class="nav-btn" data-tab="devices">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        Devices &amp; Wi-Fi <span id="nb-dv" class="nav-cnt">0</span>
+      </button>
+      <button class="nav-btn" data-tab="activity">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Activity <span id="nb-ac" class="nav-cnt">0</span>
+      </button>
     </nav>
-  </div>
-  <div class="hdr-r">
-    <span id="live-pill" class="pill"><span class="dot"></span><span id="mode-lbl">Loading…</span></span>
-    <span id="site-pill" class="pill">Site: -</span>
-    <span id="updated-pill" class="pill">Updated: -</span>
-    <button id="rescan-btn" class="btn primary" onclick="triggerRescan()">Rescan</button>
+
+    <div class="hdr-r">
+      <span id="status-pill" class="status-pill"><span class="sdot"></span><span id="status-lbl">Loading…</span></span>
+      <button id="rescan-btn" class="btn sm" onclick="triggerRescan()" title="Check all devices again">
+        <svg class="icon" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+        Scan
+      </button>
+    </div>
   </div>
 </header>
 
-<div id="headline-bar" class="headline-bar"></div>
-
-<div class="shell">
-  <section id="view-map" class="view active"></section>
-  <section id="view-inventory" class="view"></section>
+<main>
+  <section id="view-checkup" class="view active"></section>
+  <section id="view-house" class="view"></section>
+  <section id="view-devices" class="view"></section>
   <section id="view-activity" class="view"></section>
-</div>
+</main>
 
-<footer id="app-footer">
-  <span><strong>UniBlue</strong> · Blue-team security engine for UniFi networks</span>
-  <span>© 2026 Péter Szilágyi · <a href="https://github.com/karalabe/uniblue/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">BSD-3-Clause</a> · <a href="https://github.com/karalabe/uniblue" target="_blank" rel="noopener noreferrer">github.com/karalabe/uniblue</a></span>
+<div id="backdrop" class="backdrop" onclick="closeDrawer()"></div>
+<aside id="drawer" class="drawer" aria-hidden="true">
+  <div class="drawer-hd">
+    <div id="drawer-hd-content" style="flex:1;min-width:0"></div>
+    <button class="btn sm ghost" onclick="closeDrawer()" title="Close (Esc)">✕</button>
+  </div>
+  <div id="drawer-body" class="drawer-body"></div>
+</aside>
+
+<footer>
+  <div class="ft-inner" id="app-footer">
+    <span><strong>UniBlue</strong> · Home &amp; UniFi network security checkup</span>
+    <span>© 2026 Péter Szilágyi · <a href="https://github.com/karalabe/uniblue/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">BSD-3-Clause</a> · <a href="https://github.com/karalabe/uniblue" target="_blank" rel="noopener noreferrer">github.com/karalabe/uniblue</a></span>
+  </div>
 </footer>
 
 <script>
 let state = null;
 let isStaticMode = false;
-let activeTab = "map";
-let activeFilter = "all"; // "all"|"exposed"|"bmc"|"cve"|"wall"|"unassessed"|"review"|"outside"|"devices"
-let invSearch = "";
-let actFilter = "all";
-let queueIdx = 0;
-let railStack = []; // stack of entity IDs; empty = Fix-Next queue
-let hoverIDs = new Set();
+let activeTab = "checkup";
+let portFilter = "all";       // "all" | "risk" | "external"
+let deviceFilter = "all";     // "all" | "issues" | "bmc" | "cve" | "wan" | "checking"
+let deviceSearch = "";
+let activityFilter = "all";
+let drawerStack = [];
 
+/* ============================================================================
+   CRISP INLINE SVG ICONS (No external dependencies, works offline)
+   ============================================================================ */
+const ICONS = {
+  shieldOk: `<svg class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>`,
+  alert: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
+  lock: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`,
+  unlock: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>`,
+  house: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>`,
+  tree: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 7 10h3l-4 7h12l-4-7h3Z"/><line x1="12" y1="17" x2="12" y2="22"/></svg>`,
+  globe: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`,
+  cpu: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>`,
+  server: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>`,
+  camera: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>`,
+  printer: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>`,
+  tv: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>`,
+  smart: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>`,
+  laptop: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><line x1="2" y1="20" x2="22" y2="20"/></svg>`,
+  wifi: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>`,
+  plug: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>`,
+  sliders: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>`,
+  search: `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
+};
+
+/* ============================================================================
+   PLAIN-ENGLISH TRANSLATOR (Friendly for non-network-gurus!)
+   ============================================================================ */
 const vlanColorCache = {};
 const vlanPalette = ["var(--vlan-0)", "var(--vlan-1)", "var(--vlan-2)", "var(--vlan-3)", "var(--vlan-4)"];
 function vlanColor(name) {
@@ -585,7 +1051,7 @@ function esc(s) {
 
 function fmtTime(iso) {
   if (!iso || String(iso).startsWith("0001-")) return "-";
-  return new Date(iso).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+  return new Date(iso).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 }
 
 function fmtSpeed(sp) {
@@ -593,72 +1059,259 @@ function fmtSpeed(sp) {
   return sp >= 1000 ? (sp / 1000) + "G" : sp + "M";
 }
 
-function pinClass(sev) {
-  const s = (sev || "").toLowerCase();
-  if (s === "critical") return "";
-  if (s === "high") return "p-high";
-  return "p-med";
+function roleIcon(role, isBMC) {
+  if (isBMC || role === "bmc") return ICONS.cpu;
+  switch ((role || "").toLowerCase()) {
+    case "server": case "nas": return ICONS.server;
+    case "camera": return ICONS.camera;
+    case "printer": return ICONS.printer;
+    case "media": return ICONS.tv;
+    case "iot": return ICONS.smart;
+    case "gateway": case "switch": return ICONS.server;
+    case "ap": return ICONS.wifi;
+    default: return ICONS.laptop;
+  }
 }
 
-function vBadge(st, label) {
-  const s = (st || "ok").toLowerCase();
-  return `<span class="vbadge v-${esc(s)}">${esc(label || s)}</span>`;
+function humanRole(role, isBMC) {
+  if (isBMC || role === "bmc") return "Hardware Remote Control";
+  switch ((role || "").toLowerCase()) {
+    case "server": return "Server";
+    case "nas": return "Network Storage";
+    case "camera": return "Security Camera";
+    case "printer": return "Printer";
+    case "media": return "TV / Media Player";
+    case "iot": return "Smart Home Device";
+    case "personal": return "Phone or Computer";
+    case "network": return "Network Gear";
+    case "gateway": return "Main Router";
+    case "switch": return "Network Switch";
+    case "ap": return "Wi-Fi Access Point";
+    default: return "Network Device";
+  }
 }
 
-function currentSelectedID() {
-  return railStack.length ? railStack[railStack.length - 1] : null;
+function humanStateTone(entOrSev) {
+  if (!entOrSev) return "neutral";
+  if (typeof entOrSev === "string") {
+    const l = entOrSev.toLowerCase();
+    if (l === "critical") return "crit";
+    if (l === "high" || l === "medium" || l === "review") return "warn";
+    if (l === "unknown" || l === "unk") return "unk";
+    if (l === "ok" || l === "clean") return "ok";
+    return "neutral";
+  }
+  if (entOrSev.state === "unknown") return "unk";
+  if (entOrSev.state === "ok") return "ok";
+  if (entOrSev.max_severity === "critical") return "crit";
+  return "warn";
 }
 
-function switchTab(tab, pushHash = true) {
+function humanStateLabel(ent) {
+  if (!ent) return "";
+  if (ent.state === "unknown") return "Checking…";
+  if (ent.state === "ok") return "Looks good";
+  if (ent.state === "review") return "Worth checking";
+  if (ent.exact_cve_count && ent.reasons?.every(r => r.kind === "cve" || r.kind === "placement")) {
+    return `${ent.exact_cve_count} security update${ent.exact_cve_count === 1 ? "" : "s"}`;
+  }
+  if (ent.max_severity === "critical") return "Needs fixing";
+  return "Needs attention";
+}
+
+function humanServiceChip(svc) {
+  const lbl = (svc.label || "").toLowerCase();
+  if (lbl.includes("ipmi")) return "Hardware control (IPMI)";
+  if (lbl.includes("redfish")) return "Server admin API";
+  if (lbl.includes("bmc web")) return "Hardware web panel";
+  if (lbl.includes("idrac") || lbl.includes("ilo")) return "Server remote console";
+  if (lbl.includes("ikvm")) return "Remote screen & keyboard";
+  if (lbl.includes("tls 1.0")) return "Old encryption (TLS 1.0)";
+  if (lbl.includes("vnc")) return "Remote screen (VNC)";
+  if (lbl.includes("snmp")) return "Open device info (SNMP)";
+  if (lbl.includes("telnet")) return "Unencrypted login (Telnet)";
+  if (lbl.includes("cast")) return "Open Cast control";
+  if (lbl.includes("smbv1")) return "Old file sharing (SMBv1)";
+  if (lbl.includes("expired cert")) return "Expired security certificate";
+  return svc.label || ("Port " + svc.port);
+}
+
+function humanReason(r) {
+  const ref = r.ref || "";
+  const map = {
+    "UB-0030": {
+      title: "Hardware remote-control port (IPMI) is reachable",
+      why: "IPMI lets someone turn this server on or off and control its hardware directly. Even with a password, its older protocol has known weaknesses.",
+      fix: r.remediation || "Move this management cable to a separate private admin network that everyday devices can't reach, or disable IPMI-over-LAN in the server BIOS."
+    },
+    "UB-2026-0061": {
+      title: "Server hardware API (Redfish) is exposed",
+      why: "This API controls server power, firmware, and virtual disks — it should only be reachable by you, not every device on the network.",
+      fix: r.remediation || "Put server management panels on their own isolated admin network in UniFi."
+    },
+    "UB-2026-0062": {
+      title: "Server hardware web panel is reachable on this network",
+      why: "Anyone on the same network can see the server's built-in hardware login page (which controls power, BIOS, and screen).",
+      fix: r.remediation || "Move this management port onto a dedicated private admin network and restrict access with a UniFi firewall rule."
+    },
+    "UB-2026-0063": {
+      title: "Server hardware console (iDRAC / iLO) is reachable",
+      why: "This hardware console controls server power, BIOS, and virtual disks — keep it isolated from everyday devices.",
+      fix: r.remediation || "Move this server management port onto a private admin network in UniFi."
+    },
+    "UB-2026-0064": {
+      title: "Intel remote hardware management (AMT) is enabled",
+      why: "Intel AMT runs below the operating system and allows remote control even when the machine is asleep.",
+      fix: r.remediation || "Disable Intel AMT in BIOS/MEBx if unused, or isolate it on a private admin network."
+    },
+    "UB-2026-0065": {
+      title: "Remote BIOS keyboard & screen (iKVM) is exposed",
+      why: "Anyone who reaches this port can view the server's screen or mount virtual boot media.",
+      fix: r.remediation || "Restrict iKVM to a private admin network and turn off unencrypted legacy ports."
+    },
+    "UB-UNIFI-PORT-EXT-MULTI-MAC": {
+      title: "More than one device detected on an outdoor cable",
+      why: "An exterior drop meant for a single camera or sensor is seeing multiple hardware addresses — check whether an unauthorized switch or device was plugged in.",
+      fix: r.remediation || "Verify what is physically plugged into this outdoor cable and enable MAC Address Restriction in UniFi."
+    },
+    "UB-UNIFI-BMC-SHARED-VLAN": {
+      title: "Hardware control panel shares a network with regular devices",
+      why: "If any other computer or gadget on this network gets compromised, it could directly attack your server's hardware control board.",
+      fix: r.remediation || "In UniFi → Settings → Networks, create an isolated Admin/Management network and assign this switch port to it."
+    },
+    "UB-0020": {
+      title: "Uses outdated encryption (TLS 1.0 / 1.1)",
+      why: "This device still accepts very old encryption standards from the 2000s that modern browsers no longer trust.",
+      fix: r.remediation || "Update the device's firmware, or disable TLS 1.0/1.1 in its security settings (or isolate it from everyday devices)."
+    },
+    "UB-0005": {
+      title: "Remote screen sharing (VNC) is open",
+      why: "Screen sharing lets someone view or control this computer's desktop over the network.",
+      fix: r.remediation || "Turn off VNC if you don't need it, or require a strong password and restrict it to trusted devices."
+    },
+    "UB-0021": {
+      title: "Uses default 'public' status password (SNMP)",
+      why: "Other devices on the network can read detailed system info using the factory-default community password.",
+      fix: r.remediation || "Turn off SNMP in the device settings, or switch to SNMPv3 with a private password."
+    },
+    "UB-UNIFI-PORT-EXT-UPLINK": {
+      title: "Outdoor cable carries all of your home networks",
+      why: "Because this cable runs outside your house, someone could unplug it and connect a laptop to reach your main home network and servers.",
+      fix: r.remediation || "In UniFi → Ports, select this port and change Tagged VLAN Management from 'Allow All' to only the specific network needed outside (like Cameras or Smart Home)."
+    },
+    "UB-UNIFI-PORT-EXT-UNUSED-OPEN": {
+      title: "Empty sockets on an outdoor switch are still active",
+      why: "Anyone who walks up to this outdoor switch could plug an Ethernet cable straight into an empty socket and join your network.",
+      fix: r.remediation || "In UniFi → Ports, select each unused socket on this outdoor switch and turn its Operation to 'Disabled'."
+    },
+    "UB-UNIFI-PORT-EXT-OPEN": {
+      title: "Outdoor cable socket isn't locked to one device",
+      why: "If someone unplugs this outdoor device and plugs in their own laptop, the socket will let them onto your network.",
+      fix: r.remediation || "In UniFi → Ports, put this socket on an isolated network, block extra tagged networks, and enable MAC Address Restriction."
+    },
+    "PORT-TRUNK-ACCESS": {
+      title: "Single-device socket carries extra hidden networks",
+      why: "This socket only plugs into one regular device, so it doesn't need to carry your other networks.",
+      fix: "In UniFi → Ports, change Tagged VLAN Management to 'Block All' on this port."
+    },
+    "UB-UNIFI-SSH-PASSWORD": {
+      title: "Router allows password login over SSH",
+      why: "Using SSH keys instead of passwords makes it much harder for someone on your network to guess your router's admin login.",
+      fix: r.remediation || "In UniFi → Settings → System → Advanced, turn off Device SSH Authentication or switch to SSH keys only."
+    },
+    "UB-UNIFI-UPNP": {
+      title: "Automatic port opening (UPnP) is turned on",
+      why: "UPnP lets any gadget or infected app quietly open a door from the internet into your home network without asking you.",
+      fix: r.remediation || "In UniFi → Settings → Internet, turn off UPnP and add manual port forwards only for apps you intentionally expose."
+    },
+    "VLAN-PLACEMENT": {
+      title: "Smart-home or media device is on your main home network",
+      why: "Keeping cameras, TVs, and smart gadgets on a separate isolated network protects your personal computers and files if a gadget gets hacked.",
+      fix: r.remediation || "Move this device to your isolated Smart Home / IoT Wi-Fi or network."
+    }
+  };
+  if (map[ref]) return map[ref];
+  return {
+    title: r.title || ref,
+    why: r.evidence || "",
+    fix: r.remediation || ""
+  };
+}
+
+function humanEventType(t) {
+  const l = (t || "").toLowerCase();
+  if (l.includes("threat")) return { label: "Blocked threat", tone: "crit" };
+  if (l.includes("honeypot")) return { label: "Intruder trap", tone: "crit" };
+  if (l.includes("evil")) return { label: "Fake Wi-Fi", tone: "crit" };
+  if (l.includes("tamper")) return { label: "Cable swapped", tone: "crit" };
+  if (l.includes("port_down")) return { label: "Cable unplugged", tone: "warn" };
+  if (l.includes("port_up")) return { label: "Cable plugged in", tone: "blue" };
+  if (l.startsWith("port_")) return { label: "Cable change", tone: "neutral" };
+  if (l.includes("admin")) return { label: "Admin login", tone: "blue" };
+  if (l.includes("client_joined")) return { label: "Device joined", tone: "ok" };
+  if (l.includes("client_left")) return { label: "Device left", tone: "neutral" };
+  if (l.includes("host_scanned")) return { label: "Device checked", tone: "neutral" };
+  if (l.includes("vpn")) return { label: "Remote VPN", tone: "blue" };
+  if (l.includes("finding")) return { label: "New alert", tone: "warn" };
+  return { label: t.replace(/_/g, " "), tone: "neutral" };
+}
+
+function peerNamesForPort(vm, pe) {
+  if (!pe?.peer_ids?.length) return [];
+  return pe.peer_ids.map(id => vm.entities[id]?.label).filter(Boolean);
+}
+
+/* ============================================================================
+   NAVIGATION & DRAWER STATE
+   ============================================================================ */
+function currentDrawerID() {
+  return drawerStack.length ? drawerStack[drawerStack.length - 1] : null;
+}
+
+function switchTab(tab, updateHash = true) {
+  const mapOld = { overview: "checkup", physical: "house", logical: "devices" };
+  tab = mapOld[tab] || tab;
+  if (!["checkup", "house", "devices", "activity"].includes(tab)) tab = "checkup";
   activeTab = tab;
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
-  if (pushHash) syncHash();
-  renderAll();
+  if (updateHash) syncHash();
+  renderActiveTab();
+  window.scrollTo({ top: 0, behavior: "instant" });
 }
 
-function setFilter(f) {
-  activeFilter = (activeFilter === f) ? "all" : f;
-  renderAll();
-}
-
-function selectEntity(id, switchToMap = false) {
+function openEntity(id) {
   if (!id || !state?.view?.entities?.[id]) return;
-  if (switchToMap && activeTab !== "map") {
-    activeTab = "map";
-    document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === "map"));
-    document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-map"));
-  }
-  if (currentSelectedID() !== id) {
-    railStack.push(id);
-  }
+  if (currentDrawerID() !== id) drawerStack.push(id);
   syncHash();
-  renderAll();
+  renderDrawer();
+  document.getElementById("drawer").classList.add("open");
+  document.getElementById("drawer").setAttribute("aria-hidden", "false");
+  document.getElementById("backdrop").classList.add("open");
+  if (activeTab === "house") renderHouse();
 }
 
-function popInspector() {
-  if (railStack.length) {
-    railStack.pop();
-    syncHash();
-    renderAll();
+function popDrawer() {
+  drawerStack.pop();
+  syncHash();
+  if (!drawerStack.length) closeDrawer();
+  else {
+    renderDrawer();
+    if (activeTab === "house") renderHouse();
   }
 }
 
-function clearInspector() {
-  railStack = [];
+function closeDrawer() {
+  drawerStack = [];
   syncHash();
-  renderAll();
-}
-
-function stepQueue(delta) {
-  const q = state?.view?.queue || [];
-  if (!q.length) return;
-  queueIdx = (queueIdx + delta + q.length) % q.length;
-  selectEntity(q[queueIdx].subject_id, true);
+  document.getElementById("drawer").classList.remove("open");
+  document.getElementById("drawer").setAttribute("aria-hidden", "true");
+  document.getElementById("backdrop").classList.remove("open");
+  if (activeTab === "house") renderHouse();
 }
 
 function syncHash() {
-  const sel = currentSelectedID();
+  const sel = currentDrawerID();
   const next = sel ? ("#/" + activeTab + "/" + encodeURIComponent(sel)) : ("#/" + activeTab);
   if (location.hash !== next) history.replaceState(null, "", next);
 }
@@ -667,624 +1320,799 @@ function applyHash() {
   const h = (location.hash || "").replace(/^#\/?/, "");
   if (!h) return;
   const slash = h.indexOf("/");
-  const tab = slash === -1 ? h : h.slice(0, slash);
+  let tab = slash === -1 ? h : h.slice(0, slash);
+  const mapOld = { overview: "checkup", physical: "house", logical: "devices" };
+  tab = mapOld[tab] || tab;
   const ent = slash === -1 ? "" : decodeURIComponent(h.slice(slash + 1));
-  if (tab === "map" || tab === "inventory" || tab === "activity") {
+  if (["checkup", "house", "devices", "activity"].includes(tab)) {
     activeTab = tab;
     document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
     document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
   }
   if (ent && state?.view?.entities?.[ent]) {
-    railStack = [ent];
+    drawerStack = [ent];
+    renderDrawer();
+    document.getElementById("drawer").classList.add("open");
+    document.getElementById("backdrop").classList.add("open");
   }
 }
 
-window.addEventListener("hashchange", () => { applyHash(); renderAll(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape" && railStack.length) popInspector(); });
 document.querySelectorAll(".nav-btn").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
-
-function matchesFilter(ent) {
-  if (!ent || activeFilter === "all") return true;
-  if (activeFilter === "exposed") return ent.state === "exposed";
-  if (activeFilter === "review") return ent.state === "review";
-  if (activeFilter === "bmc") return !!ent.is_bmc;
-  if (activeFilter === "cve") return (ent.exact_cve_count || 0) > 0;
-  if (activeFilter === "unassessed") return ent.state === "unknown";
-  if (activeFilter === "outside") return ent.side === "outside" || ent.port_zone === "external" || ent.port_zone === "external_uplink";
-  if (activeFilter === "wall") return ent.port_zone === "external" || ent.port_zone === "external_uplink";
-  if (activeFilter === "devices") return ent.kind === "device";
-  return true;
-}
-
-function isHighlighted(id) {
-  if (!id) return false;
-  if (currentSelectedID() === id) return true;
-  if (hoverIDs.has(id)) return true;
-  // Cross-lens highlight: if selected is a host, highlight its port; if port, highlight its peers!
-  const sel = currentSelectedID();
-  const selEnt = sel ? state?.view?.entities?.[sel] : null;
-  if (selEnt) {
-    if (selEnt.port_id === id || selEnt.device_id === id || selEnt.network_id === id) return true;
-    if ((selEnt.peer_ids || []).includes(id)) return true;
-  }
-  return false;
-}
+document.addEventListener("keydown", e => { if (e.key === "Escape" && drawerStack.length) closeDrawer(); });
+window.addEventListener("hashchange", () => { applyHash(); renderActiveTab(); });
 
 /* ============================================================================
-   RENDER TOP HEADER & HEADLINE / CENSUS BAR
+   HEADER & NAV COUNTS
    ============================================================================ */
-function renderHeaderAndBar() {
-  const vm = state.view || { census: {}, entities: {}, queue: [] };
+function renderHeader() {
+  const vm = state.view || { census: {}, queue: [], entities: {} };
   const c = vm.census || {};
-  const scanning = !!state.scanning;
+  const hosts = Object.values(vm.entities || {}).filter(e => e.kind === "host");
+  const unassessed = c.unassessed_count || 0;
+  const checking = Boolean(state.scanning || unassessed > 0);
 
-  const livePill = document.getElementById("live-pill");
+  const pill = document.getElementById("status-pill");
+  const lbl = document.getElementById("status-lbl");
   if (isStaticMode) {
-    livePill.className = "pill";
-    document.getElementById("mode-lbl").textContent = "Offline Snapshot";
+    pill.className = "status-pill";
+    lbl.textContent = "Saved Snapshot · " + fmtTime(state.updated_at);
     document.getElementById("rescan-btn").style.display = "none";
-  } else if (scanning || (c.unassessed_count || 0) > 0) {
-    livePill.className = "pill scanning";
-    document.getElementById("mode-lbl").textContent = scanning
-      ? "Scanning LAN… " + (c.unassessed_count ? c.unassessed_count + " unassessed" : "")
-      : (c.unassessed_count + " host(s) unassessed · " + (state.event_mode || "poll"));
+  } else if (checking) {
+    pill.className = "status-pill scanning";
+    const done = Math.max(0, hosts.length - unassessed);
+    lbl.textContent = unassessed > 0 ? `Checking ${done}/${hosts.length}…` : "Checking network…";
   } else {
-    livePill.className = "pill";
-    document.getElementById("mode-lbl").textContent = "LIVE · " + (state.event_mode || "poll");
+    pill.className = "status-pill live";
+    lbl.textContent = "Live · " + fmtTime(state.updated_at);
   }
-  document.getElementById("site-pill").textContent = "Site: " + (state.site || "-");
-  document.getElementById("updated-pill").textContent = "Updated: " + fmtTime(state.updated_at);
 
-  // Headline + Stepper + Clickable Census Strip
   const q = vm.queue || [];
-  const headline = (scanning && (c.unassessed_count || 0) > 0 && q.length === 0)
-    ? `Initial LAN baseline scan in progress — ${c.unassessed_count} host(s) still unassessed.`
-    : (vm.headline || "Evaluating network posture…");
+  const ckB = document.getElementById("nb-ck");
+  ckB.textContent = checking && !q.length ? "…" : q.length;
+  ckB.className = "nav-cnt" + (q.some(x => x.severity === "critical") ? " crit" : q.length ? " warn" : checking ? " blue" : "");
 
-  const topSevBadge = q.length > 0
-    ? vBadge(q[0].state, q[0].severity)
-    : ((c.unassessed_count || 0) > 0 ? vBadge("unknown", "Scanning") : vBadge("ok", "Matches policy"));
+  const openGates = c.open_wall_gates || 0;
+  const hsB = document.getElementById("nb-hs");
+  hsB.textContent = openGates;
+  hsB.style.display = openGates ? "" : "none";
+  hsB.className = "nav-cnt crit";
 
-  const cf = (key, label, count, cls) =>
-    `<button class="cfilter ${count > 0 ? cls : ""} ${activeFilter === key ? "active" : ""}" onclick="setFilter('${key}')">${label}: <strong>${count}</strong></button>`;
+  const expHosts = hosts.filter(e => e.state === "exposed").length;
+  const dvB = document.getElementById("nb-dv");
+  dvB.textContent = expHosts || hosts.length;
+  dvB.className = "nav-cnt" + (hosts.some(e => e.state === "exposed" && e.max_severity === "critical") ? " crit" : expHosts ? " warn" : "");
 
-  document.getElementById("headline-bar").innerHTML = `
-    <div class="headline-top">
-      <div class="headline-text">${topSevBadge} <span>${esc(headline)}</span></div>
-      ${q.length > 0 ? `<div class="stepper">
-        <button class="btn sm" onclick="stepQueue(-1)">‹</button>
-        <span class="sub mono">${Math.min(queueIdx + 1, q.length)}/${q.length}</span>
-        <button class="btn sm" onclick="stepQueue(1)">›</button>
-      </div>` : ""}
-    </div>
-    <div class="census-bar">
-      ${cf("exposed", "Exposed", c.exposed_count || 0, "has-warn")}
-      ${cf("wall", "Wall gates open", (c.open_wall_gates || 0) + "/" + (c.total_wall_gates || 0), (c.open_wall_gates || 0) > 0 ? "has-warn" : "")}
-      ${cf("bmc", "⬡ BMCs (OOB)", c.bmc_count || 0, (c.bmc_count || 0) > 0 ? "has-rev" : "")}
-      ${cf("cve", "Exact-CVE hosts", c.exact_cve_hosts || 0, "has-warn")}
-      ${cf("unassessed", "Unassessed", c.unassessed_count || 0, "")}
-      ${cf("review", "Review", c.review_count || 0, "has-rev")}
-      ${activeFilter !== "all" ? `<button class="btn sm" onclick="setFilter('all')">Clear filter</button>` : ""}
-    </div>`;
+  const actCount = (state.events || []).length + (state.report?.unifi_posture?.recent_logs || []).length;
+  document.getElementById("nb-ac").textContent = actCount;
 
-  // Footer from single Go source
-  const foot = document.getElementById("app-footer");
   if (vm.copyright) {
-    foot.innerHTML = `
-      <span><strong>UniBlue</strong> · Blue-team security engine for UniFi networks</span>
+    document.getElementById("app-footer").innerHTML = `
+      <span><strong>UniBlue</strong> · Home &amp; UniFi network security checkup · Site: <strong>${esc(state.site || "default")}</strong></span>
       <span>${esc(vm.copyright)} · <a href="${esc(vm.repo_url)}/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">${esc(vm.license)}</a> · <a href="${esc(vm.repo_url)}" target="_blank" rel="noopener noreferrer">github.com/karalabe/uniblue</a></span>`;
   }
 }
 
 /* ============================================================================
-   TAB 1: MAP (GATEWAY HINGE + TWO SYNCHRONIZED LENSES + DOCKED RAIL)
-   ============================================================================ */
-function renderMap() {
+   TAB 1: CHECKUP (Plain-English Security Checkup Hero + Guided Story Cards)
+   ========================================================================== */
+function renderCheckup() {
   const vm = state.view;
-  if (!vm) {
-    document.getElementById("view-map").innerHTML = `<div class="tbl-card" style="padding:24px;text-align:center" class="muted">Loading presentation model…</div>`;
-    return;
+  if (!vm) return;
+  const c = vm.census || {};
+  const ents = Object.values(vm.entities || {});
+  const hosts = ents.filter(e => e.kind === "host");
+  const unassessed = c.unassessed_count || 0;
+  const checking = Boolean(state.scanning || unassessed > 0);
+  const assessedCount = Math.max(0, hosts.length - unassessed);
+
+  const bmcHosts = hosts.filter(e => e.is_bmc);
+  const exposedBMCs = bmcHosts.filter(e => e.state === "exposed");
+  const exposedHosts = hosts.filter(e => e.state === "exposed" && !e.is_bmc);
+  const wanAlerts = (vm.wan_flows || []).filter(f => !f.expected);
+  const perimItems = (vm.queue || []).filter(x => x.category === "perimeter");
+  const ctrlItems = (vm.queue || []).filter(x => x.category === "controller");
+  const totalIssues = (vm.queue || []).length;
+  const hasCrit = (vm.queue || []).some(x => x.severity === "critical");
+
+  // Compute SVG Progress Ring (r=36, circumference=226.2)
+  const C = 226.2;
+  let ringColor = "var(--ok-solid)";
+  let ringOffset = 0;
+  let ringSpin = "";
+  let ringLabel = "✓";
+  let heroTitle = "Your home network looks great";
+  let heroSub = `All ${hosts.length} devices and ${(vm.physical || []).length} network boxes checked out cleanly.`;
+
+  if (checking && totalIssues === 0) {
+    const pct = hosts.length ? (assessedCount / hosts.length) : 0.25;
+    ringColor = "var(--blue)";
+    ringOffset = C * (1 - Math.max(0.18, pct));
+    ringSpin = unassessed === hosts.length ? " spin" : "";
+    ringLabel = hosts.length ? `${Math.round(pct * 100)}%` : "…";
+    heroTitle = "Checking your home network…";
+    heroSub = `Checked ${assessedCount} of ${hosts.length} devices so far. Results appear automatically as each device finishes — nothing is marked safe until checked.`;
+  } else if (totalIssues > 0) {
+    ringColor = hasCrit ? "var(--crit-solid)" : "var(--warn-solid)";
+    ringOffset = C * 0.22;
+    ringLabel = String(totalIssues);
+    heroTitle = totalIssues === 1
+      ? "1 thing worth tightening up"
+      : `${totalIssues} things worth tightening up`;
+    const parts = [];
+    if (exposedBMCs.length) parts.push(`${exposedBMCs.length} server hardware control panel${exposedBMCs.length === 1 ? "" : "s"}`);
+    if (perimItems.length) parts.push(`${perimItems.length} outdoor cable alert${perimItems.length === 1 ? "" : "s"}`);
+    if (wanAlerts.length) parts.push(`${wanAlerts.length} open internet door${wanAlerts.length === 1 ? "" : "s"}`);
+    if (exposedHosts.length) parts.push(`${exposedHosts.length} device${exposedHosts.length === 1 ? "" : "s"} needing updates or fixes`);
+    if (ctrlItems.length) parts.push(`${ctrlItems.length} router setting${ctrlItems.length === 1 ? "" : "s"}`);
+    heroSub = (checking ? `Still checking ${unassessed} device${unassessed === 1 ? "" : "s"} · Found so far: ` : "We found ")
+      + parts.join(", ") + ". Click any item below for plain-English steps to fix it.";
   }
 
-  const gw = vm.gateway_id ? vm.entities[vm.gateway_id] : null;
+  // 3 Clean Pillar Cards inside Hero
+  const cableTone = perimItems.some(x => x.severity === "critical") ? "crit" : (perimItems.length ? "warn" : "ok");
+  const devTone = exposedHosts.some(x => x.max_severity === "critical") || exposedBMCs.some(x => x.max_severity === "critical")
+    ? "crit"
+    : ((exposedHosts.length + exposedBMCs.length) ? "warn" : (checking ? "blue" : "ok"));
+  const wanTone = wanAlerts.some(x => x.severity === "critical") ? "crit" : ((wanAlerts.length + ctrlItems.length) ? "warn" : "ok");
+
+  let html = `
+  <div class="hero">
+    <div class="hero-top">
+      <div class="ring-wrap">
+        <svg class="ring-svg" viewBox="0 0 84 84">
+          <circle class="ring-bg" cx="42" cy="42" r="36"></circle>
+          <circle class="ring-fg${ringSpin}" cx="42" cy="42" r="36" stroke="${ringColor}" stroke-dasharray="${C}" stroke-dashoffset="${ringOffset.toFixed(1)}"></circle>
+        </svg>
+        <div class="ring-center" style="color:${ringColor}">${esc(ringLabel)}</div>
+      </div>
+      <div class="hero-copy">
+        <h1 class="hero-title">${esc(heroTitle)}</h1>
+        <p class="hero-sub">${esc(heroSub)}</p>
+      </div>
+    </div>
+
+    <div class="hero-pillars">
+      <div class="pillar" onclick="switchTab('house')">
+        <div class="pillar-ico ${cableTone}">${perimItems.length ? ICONS.unlock : ICONS.lock}</div>
+        <div>
+          <div class="pillar-lbl">House &amp; Outdoor Cables</div>
+          <div class="pillar-val">${perimItems.length ? `${c.open_wall_gates || perimItems.length} need locking` : "All outdoor cables locked"}</div>
+        </div>
+      </div>
+      <div class="pillar" onclick="deviceFilter='${(exposedHosts.length + exposedBMCs.length) ? "issues" : "all"}'; switchTab('devices')">
+        <div class="pillar-ico ${devTone}">${ICONS.laptop}</div>
+        <div>
+          <div class="pillar-lbl">Devices &amp; Updates</div>
+          <div class="pillar-val">${(exposedHosts.length + exposedBMCs.length)
+            ? `${exposedHosts.length + exposedBMCs.length} need attention`
+            : (checking ? `Checking ${assessedCount}/${hosts.length}…` : `All ${hosts.length} look good`)}</div>
+        </div>
+      </div>
+      <div class="pillar" onclick="deviceFilter='wan'; switchTab('devices')">
+        <div class="pillar-ico ${wanTone}">${ICONS.globe}</div>
+        <div>
+          <div class="pillar-lbl">Internet Front Door</div>
+          <div class="pillar-val">${wanAlerts.length ? `${wanAlerts.length} open door${wanAlerts.length === 1 ? "" : "s"} to review` : "Front door locked"}</div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  html += `<div class="checkup-grid"><div>`;
+  html += `<div class="section-kicker">Action Guide</div>`;
+
+  // 1. Hardware Remote Controls (BMCs)
+  if (bmcHosts.length) {
+    const tone = exposedBMCs.some(x => x.max_severity === "critical") ? "crit" : (exposedBMCs.length ? "warn" : "blue");
+    html += `<div class="story">
+      <div class="story-hd">
+        <div class="story-hd-l">
+          <div class="story-ico ${tone}">${ICONS.cpu}</div>
+          <div>
+            <div class="story-title">Server Hardware Remote Controls (${bmcHosts.length})</div>
+            <div class="story-why">These built-in control boards act like a physical power button, BIOS screen, and keyboard for your servers. Keeping them on a private network prevents other devices from touching them.</div>
+          </div>
+        </div>
+      </div>`;
+    for (const bmc of bmcHosts) {
+      const portEnt = bmc.port_id ? vm.entities[bmc.port_id] : null;
+      const chips = (bmc.services || []).filter(s => s.exposed).slice(0, 3).map(s => `<span class="tag ${humanStateTone(s.severity)}">${esc(humanServiceChip(s))}</span>`).join("");
+      html += `<div class="story-item" onclick="openEntity('${esc(bmc.id)}')">
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(bmc.label)} <span class="tag ${humanStateTone(bmc)}">${esc(humanStateLabel(bmc))}</span></div>
+          <div class="story-item-sub">On <strong>${esc(bmc.network_name || "main")}</strong> network${portEnt ? ` · Plugged into <strong>${esc(portEnt.label)}</strong>` : ""} · <span class="mono">${esc(bmc.ip)}</span></div>
+        </div>
+        <div class="story-item-r">${chips}<span class="go-arrow">Fix →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // 2. Outdoor Cables & Switches
+  if (perimItems.length) {
+    const tone = perimItems.some(x => x.severity === "critical") ? "crit" : "warn";
+    html += `<div class="story">
+      <div class="story-hd">
+        <div class="story-hd-l">
+          <div class="story-ico ${tone}">${ICONS.unlock}</div>
+          <div>
+            <div class="story-title">Cables Going Outside Your House (${perimItems.length})</div>
+            <div class="story-why">If someone unplugs an outdoor camera or switch cable, locking these ports stops them from plugging in a laptop and reaching your home network.</div>
+          </div>
+        </div>
+        <button class="btn sm" onclick="switchTab('house')">View House Map</button>
+      </div>`;
+    for (const item of perimItems) {
+      const ent = vm.entities[item.subject_id];
+      const peers = ent ? peerNamesForPort(vm, ent) : [];
+      const headline = ent?.kind === "port" && peers.length
+        ? `${ent.label} → ${peers[0]}`
+        : (ent ? ent.label : item.sentence);
+      const topReason = ent?.reasons?.[0] ? humanReason(ent.reasons[0]).title : item.sentence;
+      html += `<div class="story-item" onclick="openEntity('${esc(item.subject_id)}')">
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(headline)} <span class="tag ${humanStateTone(item.severity)}">${item.severity === "critical" ? "Urgent" : "Review"}</span></div>
+          <div class="story-item-sub">${esc(topReason)}</div>
+        </div>
+        <div class="story-item-r"><span class="go-arrow">How to lock →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // 3. Open Doors to the Internet (WAN)
+  if (wanAlerts.length) {
+    const tone = wanAlerts.some(x => x.severity === "critical") ? "crit" : "warn";
+    html += `<div class="story">
+      <div class="story-hd">
+        <div class="story-hd-l">
+          <div class="story-ico ${tone}">${ICONS.globe}</div>
+          <div>
+            <div class="story-title">Open Doors to the Internet (${wanAlerts.length})</div>
+            <div class="story-why">Your router lets traffic from the public internet reach these devices directly. Double-check that each one is intentional and kept up to date.</div>
+          </div>
+        </div>
+      </div>`;
+    for (const f of wanAlerts) {
+      const target = f.kind === "firewall" ? f.id : (f.target_id || vm.gateway_id);
+      html += `<div class="story-item" onclick="openEntity('${esc(target)}')">
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(f.rule_name)} <span class="tag ${humanStateTone(f.severity)}">${esc(f.severity)}</span></div>
+          <div class="story-item-sub">Points to <strong>${esc(f.target_name || f.target_ip || "Router")}</strong> · <span class="mono">${esc(f.label)}</span></div>
+        </div>
+        <div class="story-item-r"><span class="go-arrow">Inspect →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // 4. Devices Needing Updates or Fixes
+  if (exposedHosts.length) {
+    const tone = exposedHosts.some(x => x.max_severity === "critical") ? "crit" : "warn";
+    html += `<div class="story">
+      <div class="story-hd">
+        <div class="story-hd-l">
+          <div class="story-ico ${tone}">${ICONS.alert}</div>
+          <div>
+            <div class="story-title">Devices Needing Updates or Fixes (${exposedHosts.length})</div>
+            <div class="story-why">Devices running software with known security bugs, or exposing older unprotected logins on your home network.</div>
+          </div>
+        </div>
+        <button class="btn sm" onclick="deviceFilter='issues'; switchTab('devices')">See All Devices</button>
+      </div>`;
+    const sorted = [...exposedHosts].sort((a, b) => (b.exact_cve_count || 0) - (a.exact_cve_count || 0));
+    for (const h of sorted) {
+      const portEnt = h.port_id ? vm.entities[h.port_id] : null;
+      const tags = [];
+      if (h.exact_cve_count) {
+        tags.push(`<span class="tag ${humanStateTone(h)}">${h.exact_cve_count} security bug${h.exact_cve_count === 1 ? "" : "s"}</span>`);
+      }
+      for (const s of (h.services || []).filter(x => x.exposed).slice(0, 2)) {
+        tags.push(`<span class="tag ${humanStateTone(s.severity)}">${esc(humanServiceChip(s))}</span>`);
+      }
+      html += `<div class="story-item" onclick="openEntity('${esc(h.id)}')">
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(h.label)}</div>
+          <div class="story-item-sub">${esc(humanRole(h.role, false))} · On <strong>${esc(h.network_name || "main")}</strong>${portEnt ? ` · ${esc(portEnt.label)}` : (h.essid ? ` · Wi-Fi: ${esc(h.essid)}` : "")}</div>
+        </div>
+        <div class="story-item-r">${tags.join("")}<span class="go-arrow">Details →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // 5. Router & Wi-Fi Quick Settings
+  if (ctrlItems.length) {
+    html += `<div class="story">
+      <div class="story-hd">
+        <div class="story-hd-l">
+          <div class="story-ico warn">${ICONS.sliders}</div>
+          <div>
+            <div class="story-title">Quick Router &amp; Wi-Fi Settings (${ctrlItems.length})</div>
+            <div class="story-why">Simple switches you can flip in your UniFi settings to close easy loopholes.</div>
+          </div>
+        </div>
+      </div>`;
+    for (const item of ctrlItems) {
+      const gw = vm.entities[item.subject_id];
+      const matchR = gw?.reasons?.find(r => r.ref === item.reason_ref);
+      const hr = matchR ? humanReason(matchR) : { title: item.sentence, why: "" };
+      html += `<div class="story-item" onclick="openEntity('${esc(item.subject_id)}')">
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(hr.title)}</div>
+          ${hr.why ? `<div class="story-item-sub">${esc(hr.why)}</div>` : ""}
+        </div>
+        <div class="story-item-r"><span class="go-arrow">How to fix →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  if (!totalIssues && !checking) {
+    html += `<div class="card"><div class="card-body" style="display:flex;align-items:center;gap:14px">
+      <div class="pillar-ico ok">${ICONS.shieldOk}</div>
+      <div>
+        <div style="font-weight:700;font-size:15px">Nothing needs fixing right now</div>
+        <div class="small">UniBlue keeps watching in the background and will alert you if a new device joins, a cable is swapped, or a vulnerability appears.</div>
+      </div>
+    </div></div>`;
+  }
+
+  // Right Column: Plain-English Router Safety Checklist
+  html += `</div><div>`;
+  html += `<div class="section-kicker">Router Protection</div>`;
   const s = state.report?.unifi_posture?.settings || {};
   const h = state.report?.unifi_posture?.health || {};
   const posture = state.report?.unifi_posture || {};
 
-  const ctrlChip = (lbl, val, st) => `<span class="ctrl-chip ${st ? "v-" + st : ""}">${esc(lbl)}: <strong>${esc(val)}</strong></span>`;
-  const gwChips = [
-    ctrlChip("SSH", s.ssh_enabled ? (s.ssh_password_auth ? "Password" : "Key-only") : "Off", s.ssh_enabled && s.ssh_password_auth ? "exposed" : (s.ssh_enabled ? "review" : "")),
-    ctrlChip("UPnP", s.upnp_enabled ? "Enabled" : "Off", s.upnp_enabled ? "exposed" : ""),
-    ctrlChip("IDS/IPS", s.ips_mode ? s.ips_mode.toUpperCase() : "-", (s.ips_mode === "disabled" || s.ips_mode === "off") ? "review" : ""),
-    ctrlChip("Honeypot", s.honeypot_enabled ? "On (" + (s.honeypot_ips || []).length + ")" : "Off", s.honeypot_enabled ? "" : "review"),
-    ctrlChip("DoH", (s.doh_state && s.doh_state !== "off") ? s.doh_state : "Off", ""),
-    ctrlChip("Airspace", posture.evil_twin_count ? posture.evil_twin_count + " Evil-Twin" : (posture.neighbor_aps || 0) + " neighbors", posture.evil_twin_count ? "exposed" : ""),
-    ctrlChip("VPN", (h.active_vpn_users || 0) + " active", ""),
-  ].join("");
-
-  const gwSel = gw && isHighlighted(gw.id) ? " sel" : "";
-  const gwHTML = gw ? `
-    <div class="gw-hinge${gwSel}" onclick="selectEntity('${esc(gw.id)}')">
-      <div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          ${gw.pin_number ? `<span class="pin ${pinClass(gw.max_severity)}">${gw.pin_number}</span>` : ""}
-          <strong style="font-size:14px">${esc(gw.label)}</strong>
-          <span class="sub">${esc(gw.model)}</span>
-          ${h.wan_ip ? `<span class="pill mono">WAN ${esc(h.wan_ip)}</span>` : ""}
-          ${vBadge(gw.state, gw.state_label)}
-        </div>
-        <div class="sub" style="margin-top:2px">Gateway Hinge · Logical Zones (left) ↔ Physical Blueprint (right)</div>
-      </div>
-      <div class="gw-chips">${gwChips}</div>
-    </div>` : "";
-
-  document.getElementById("view-map").innerHTML = `
-    <div class="map-workspace">
-      <div>
-        ${gwHTML}
-        <div class="lenses">
-          <div class="lens-col">
-            <div class="lens-hd"><span>Logical Zones &amp; Services</span><span class="sub">${(vm.logical || []).length} VLANs</span></div>
-            <div class="lens-body">${renderLogicalLens(vm)}</div>
-          </div>
-          <div class="lens-col">
-            <div class="lens-hd"><span>Physical Blueprint &amp; Perimeter</span><span class="sub">${(vm.physical || []).length} UniFi gear</span></div>
-            <div class="lens-body">${renderPhysicalLens(vm)}</div>
-          </div>
-        </div>
-      </div>
-      <aside class="rail">${renderRail(vm)}</aside>
-    </div>`;
-}
-
-function renderLogicalLens(vm) {
-  let html = "";
-
-  // WAN Ingress Strip
-  const flows = vm.wan_flows || [];
-  const reviewFlows = flows.filter(f => !f.expected);
-  const expP2P = flows.filter(f => f.expected);
-  html += `<div class="wan-strip">
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-      <span class="sub" style="font-weight:800;text-transform:uppercase;letter-spacing:.4px">WAN Ingress</span>
-      <span class="sub">${reviewFlows.length} active rule/forward(s)${expP2P.length ? " · " + expP2P.length + " expected P2P" : ""}</span>
-    </div>
-    <div class="wan-flows">
-      ${reviewFlows.length ? reviewFlows.map(f => {
-        const target = f.kind === "firewall" ? f.id : (f.target_id || vm.gateway_id);
-        const sel = isHighlighted(target) ? " sel" : "";
-        return `<span class="flow-chip v-${esc(f.state)}${sel}" onclick="selectEntity('${esc(target)}')">
-          ${f.pin_number ? `<span class="pin ${pinClass(f.severity)}">${f.pin_number}</span>` : ""}
-          <strong>${esc(f.rule_name)}</strong> <span class="mono">${esc(f.label)}</span>
-        </span>`;
-      }).join("") : '<span class="sub">No unexpected inbound WAN exposures.</span>'}
-      ${expP2P.map(f => `<span class="flow-chip" title="Expected P2P forward" onclick="selectEntity('${esc(f.target_id || "")}')">${esc(f.rule_name)} <span class="mono">${esc(f.label)}</span></span>`).join("")}
-    </div>
-  </div>`;
-
-  // VLAN Lanes
-  for (const lane of (vm.logical || [])) {
-    const isEmptyIso = lane.isolated && lane.total_hosts === 0;
-    html += `<div class="vlan-lane ${isEmptyIso ? "empty-iso" : ""}">
-      <div class="lane-hd" style="border-left-color:${vlanColor(lane.name)}">
-        <div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">
-          <strong>${esc(lane.name)}</strong>
-          ${lane.vlan ? `<span class="sub mono">VLAN ${esc(lane.vlan)}</span>` : ""}
-          ${lane.subnet ? `<span class="sub mono">${esc(lane.subnet)}</span>` : ""}
-        </div>
-        <div style="display:flex;align-items:center;gap:6px">
-          <span class="vbadge v-ok">${lane.isolated ? "✓ Isolated" : esc(lane.zone_name)}</span>
-          <span class="sub">${lane.total_hosts}</span>
-        </div>
-      </div>
-      <div class="lane-body">`;
-
-    if (lane.total_hosts === 0) {
-      html += `<div class="sub">${lane.migration_hint ? "↳ " + esc(lane.migration_hint) : "0 active hosts"}</div>`;
-    } else {
-      // Dedicated Out-of-Band Management (BMC) row inside its ACTUAL VLAN!
-      if (lane.bmc_ids && lane.bmc_ids.length) {
-        html += `<div class="oob-row">
-          <div class="oob-row-lbl">Out-of-Band Server Management (BMCs on ${esc(lane.name)})</div>
-          <div class="host-chips">${lane.bmc_ids.map(id => renderHostChip(vm.entities[id])).join("")}</div>
-        </div>`;
-      }
-      // Pinned Exposed / Review Hosts
-      if (lane.pinned_host_ids && lane.pinned_host_ids.length) {
-        html += `<div class="host-chips">${lane.pinned_host_ids.map(id => renderHostChip(vm.entities[id])).join("")}</div>`;
-      }
-      // Quiet Dot Grid for Issue-Free Assessed Hosts
-      if (lane.clean_host_ids && lane.clean_host_ids.length) {
-        html += `<div class="dot-group">
-          <div class="dot-grid">${lane.clean_host_ids.map(id => renderHostDot(vm.entities[id], false)).join("")}</div>
-          <span class="sub">${lane.clean_host_ids.length} assessed · no findings</span>
-        </div>`;
-      }
-      // Hollow Dot Grid for Unassessed (Startup / Unscanned) Hosts — NEVER green!
-      if (lane.unknown_host_ids && lane.unknown_host_ids.length) {
-        html += `<div class="dot-group">
-          <div class="dot-grid">${lane.unknown_host_ids.map(id => renderHostDot(vm.entities[id], true)).join("")}</div>
-          <span class="sub">${lane.unknown_host_ids.length} unassessed</span>
-        </div>`;
-      }
+  const checks = [
+    {
+      name: "Intrusion Shield",
+      hint: "Blocks attacks automatically",
+      tone: (s.ips_mode === "ips" || s.ips_mode === "ids") ? "ok" : "warn",
+      val: s.ips_mode === "ips" ? "Blocking threats" : (s.ips_mode === "ids" ? "Alerting only" : "Turned off")
+    },
+    {
+      name: "Auto Port Opening",
+      hint: "UPnP for apps & gadgets",
+      tone: s.upnp_enabled ? "warn" : "ok",
+      val: s.upnp_enabled ? "On (risky)" : "Off (safer)"
+    },
+    {
+      name: "Fake Wi-Fi Watch",
+      hint: "Checks for copycat networks",
+      tone: posture.evil_twin_count ? "crit" : "ok",
+      val: posture.evil_twin_count ? `${posture.evil_twin_count} suspicious!` : `All clear (${posture.neighbor_aps || 0} nearby)`
+    },
+    {
+      name: "Router Admin Login",
+      hint: "SSH password protection",
+      tone: (s.ssh_enabled && s.ssh_password_auth) ? "warn" : "ok",
+      val: s.ssh_enabled ? (s.ssh_password_auth ? "Password on" : "Key-only") : "Turned off"
+    },
+    {
+      name: "Encrypted DNS",
+      hint: "Hides web lookups from ISP",
+      tone: (s.doh_state && s.doh_state !== "off") ? "ok" : "neutral",
+      val: (s.doh_state && s.doh_state !== "off") ? "On" : "Standard"
+    },
+    {
+      name: "Intruder Trap",
+      hint: "Decoy address catches scans",
+      tone: s.honeypot_enabled ? "ok" : "neutral",
+      val: s.honeypot_enabled ? `Active (${(s.honeypot_ips || []).length})` : "Off"
+    },
+    {
+      name: "Internet Line",
+      hint: h.wan_ip || "WAN status",
+      tone: h.wan_status === "ok" ? "ok" : "neutral",
+      val: h.wan_status === "ok" ? "Online" : (h.wan_status || "Unknown")
+    },
+    {
+      name: "Remote VPN",
+      hint: "People signed in remotely",
+      tone: "neutral",
+      val: `${h.active_vpn_users || 0} connected`
     }
-    html += `</div></div>`;
-  }
+  ];
 
-  // Compact Wi-Fi SSIDs list
-  const wlans = state.report?.unifi_posture?.wlans || [];
-  if (wlans.length) {
-    html += `<div class="wan-strip" style="margin-top:4px;margin-bottom:0">
-      <div class="sub" style="font-weight:800;text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px">Wi-Fi Broadcasts (${wlans.length})</div>
-      <div class="wan-flows">
-        ${wlans.map(w => `<span class="ctrl-chip">${esc(w.name)} → <strong>${esc(w.network_name || "-")}</strong> · <span class="mono">${esc((w.wpa3_support ? "WPA3" : (w.wpa_mode || w.security || "-")).toUpperCase())}</span>${w.l2_isolation ? " · L2-iso" : ""}</span>`).join("")}
-      </div>
-    </div>`;
-  }
-
-  return html;
-}
-
-function renderHostChip(ent) {
-  if (!ent) return "";
-  const sel = isHighlighted(ent.id) ? " sel" : "";
-  const dim = !matchesFilter(ent) ? " dim" : "";
-  const svcChips = (ent.services || []).filter(s => s.exposed || s.reachable === "wan").slice(0, 3)
-    .map(s => `<span class="hchip-meta mono">${esc(s.label || (":" + s.port))}</span>`).join(" · ");
-  const cveTxt = ent.exact_cve_count ? `<span class="hchip-meta mono">${ent.exact_cve_count} exact CVE</span>` : "";
-  const meta = [svcChips, cveTxt].filter(Boolean).join(" · ");
-  return `<div class="hchip v-${esc(ent.state)}${sel}${dim}" onclick="selectEntity('${esc(ent.id)}')">
-    ${ent.pin_number ? `<span class="pin ${pinClass(ent.max_severity)}">${ent.pin_number}</span>` : ""}
-    ${ent.is_bmc ? `<span class="oob-hex v-${esc(ent.state)}">OOB</span>` : ""}
-    <strong>${esc(ent.label)}</strong>
-    ${ent.side === "outside" ? `<span class="wall-notch" title="Physically outside building">OUT</span>` : ""}
-    ${meta ? `<span class="hchip-meta">${meta}</span>` : ""}
+  html += `<div class="card">
+    <div class="card-hd">
+      <div class="card-title">Safety Features</div>
+      ${vm.gateway_id ? `<button class="btn sm ghost" onclick="openEntity('${esc(vm.gateway_id)}')">Inspect Router →</button>` : ""}
+    </div>
+    <div class="checklist">
+      ${checks.map(ck => `<div class="chk-row">
+        <div class="chk-l">
+          <span class="chk-dot ${ck.tone}"></span>
+          <div>
+            <div class="chk-name">${esc(ck.name)}</div>
+            <div class="chk-hint">${esc(ck.hint)}</div>
+          </div>
+        </div>
+        <div class="chk-val ${ck.tone}">${esc(ck.val)}</div>
+      </div>`).join("")}
+    </div>
   </div>`;
+
+  const notes = state.report?.posture_notes || [];
+  if (notes.length) {
+    html += `<details class="tech" style="margin-top:0">
+      <summary>Good to know (${notes.length} note${notes.length === 1 ? "" : "s"})</summary>
+      <div class="tech-body">
+        ${notes.slice(0, 6).map(n => `<div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
+          <div style="font-weight:700;font-size:13px">${esc(n.title)}</div>
+          <div class="small" style="margin-top:2px">${esc(n.detail)}</div>
+        </div>`).join("")}
+      </div>
+    </details>`;
+  }
+
+  html += `</div></div>`;
+  document.getElementById("view-checkup").innerHTML = html;
 }
 
-function renderHostDot(ent, isUnknown) {
-  if (!ent) return "";
-  const sel = isHighlighted(ent.id) ? " sel" : "";
-  const dim = !matchesFilter(ent) ? " dim" : "";
-  const tip = `${ent.label} (${ent.ip}) · ${ent.state_label}`;
-  return `<span class="hdot ${isUnknown ? "unk" : ""}${sel}${dim}" title="${esc(tip)}" onclick="selectEntity('${esc(ent.id)}')"></span>`;
-}
-
-function renderPhysicalLens(vm) {
+/* ============================================================================
+   TAB 2: HOUSE & CABLES (Architectural Inside vs Outside Cutaway)
+   ========================================================================== */
+function renderHouse() {
+  const vm = state.view;
+  if (!vm) return;
   const rows = vm.physical || [];
   const inside = rows.filter(r => r.side !== "outside" && !r.uplink_unknown);
   const unknownRows = rows.filter(r => r.side !== "outside" && r.uplink_unknown);
   const outside = rows.filter(r => r.side === "outside");
   const gates = vm.wall_gates || [];
 
-  let html = `<div class="bldg-zone">
-    <div class="bldg-lbl"><span>Inside Secured Building</span><span class="sub">Odd ports top · Even bottom · Hatch = Trunk All</span></div>
-    ${inside.map(r => renderPhysicalRow(vm, r)).join("")}
-    ${unknownRows.length ? `<div class="bldg-lbl" style="margin-top:10px"><span>Uplink Unknown</span></div>${unknownRows.map(r => renderPhysicalRow(vm, r)).join("")}` : ""}
+  let html = `
+  <div class="bar">
+    <div class="seg">
+      <button class="seg-b ${portFilter === "all" ? "active" : ""}" onclick="portFilter='all'; renderHouse()">All Sockets</button>
+      <button class="seg-b ${portFilter === "risk" ? "active" : ""}" onclick="portFilter='risk'; renderHouse()">Highlight Issues</button>
+      <button class="seg-b ${portFilter === "external" ? "active" : ""}" onclick="portFilter='external'; renderHouse()">Outdoor Cables</button>
+    </div>
+    <div class="legend">
+      <span class="leg"><span class="sw up"></span>Plugged in</span>
+      <span class="leg"><span class="sw open"></span>Empty</span>
+      <span class="leg"><span class="sw off"></span>Turned off</span>
+      <span class="leg"><span class="sw crit"></span>Needs fix</span>
+      <span class="leg"><span class="sw hatch"></span>Carries all networks</span>
+      <span class="leg">⚡ Powered</span>
+    </div>
   </div>`;
 
-  // Hatched Perimeter Wall Band with explicit Wall Gates
+  // Inside Your House
+  html += `<div class="house-zone">
+    <div class="house-hd">
+      <div>
+        <div class="house-title">${ICONS.house} Inside Your House (${inside.length} device${inside.length === 1 ? "" : "s"})</div>
+        <div class="house-sub">Click any socket to see what's plugged in and whether it's safely configured.</div>
+      </div>
+    </div>
+    ${inside.map(r => renderHWCard(vm, r)).join("")}
+    ${unknownRows.length ? `<div class="house-hd" style="margin-top:20px"><div class="house-title">Other Network Boxes (${unknownRows.length})</div></div>${unknownRows.map(r => renderHWCard(vm, r)).join("")}` : ""}
+  </div>`;
+
+  // Architectural Exterior Wall Divider
   if (gates.length || outside.length) {
     const openN = gates.filter(g => g.state === "exposed" || g.state === "review").length;
     html += `<div class="wall-band">
-      <div class="wall-hdr">
-        <span>Building Perimeter Wall · ${gates.length} Gate${gates.length === 1 ? "" : "s"} (${openN} Open)</span>
-        <span class="sub">Dashed = inferred by name</span>
+      <div class="wall-title">
+        ${openN ? ICONS.unlock : ICONS.lock}
+        Cables Passing Through Your Outside Wall (${gates.length} cable${gates.length === 1 ? "" : "s"}${openN ? ` · ${openN} unlocked` : " · all locked"})
       </div>
-      <div class="gates-row">
+      <div class="small">These cables leave the inside of your house. Click any cable to see how to lock it down.</div>
+      <div class="wall-cables">
         ${gates.map(g => {
           const pe = vm.entities[g.port_id];
-          const sel = isHighlighted(g.port_id) ? " sel" : "";
-          const dim = pe && !matchesFilter(pe) ? " dim" : "";
-          return `<span class="gate v-${esc(g.state)} ${g.inferred ? "inferred" : ""}${sel}${dim}" onclick="selectEntity('${esc(g.port_id)}')">
-            ${g.pin_number ? `<span class="pin ${pinClass(pe?.max_severity)}">${g.pin_number}</span>` : ""}
-            <strong>${esc(g.switch_name)} #${g.port_idx}</strong> → ${esc(g.target_name)}
-            <span class="sub mono">(${esc(g.inline_fact)})</span>
-          </span>`;
+          const isRisk = g.state === "exposed" || g.state === "review";
+          const tone = g.state === "exposed" ? humanStateTone(pe) : (g.state === "review" ? "warn" : "");
+          const plainFact = pe?.tagged_policy === "all"
+            ? "Carries all home networks"
+            : (pe?.port_security ? `Locked to ${pe.native_vlan || "1 network"}` : `${pe?.native_vlan || "Network"} · no device lock`);
+          return `<div class="cable-pill ${tone} ${g.inferred ? "inferred" : ""}" onclick="openEntity('${esc(g.port_id)}')">
+            <span style="color:${isRisk ? "var(--" + (tone === "crit" ? "crit" : "warn") + ")" : "var(--ok)"}">${isRisk ? ICONS.unlock : ICONS.lock}</span>
+            <div>
+              <div style="font-weight:700;font-size:13.5px">${esc(g.switch_name)} #${g.port_idx} → ${esc(g.target_name)}</div>
+              <div class="small">${esc(plainFact)}</div>
+            </div>
+          </div>`;
         }).join("")}
       </div>
     </div>`;
 
-    // Outside Perimeter Container (neutral dashed frame — NEVER red unless failing!)
-    html += `<div class="bldg-zone outside">
-      <div class="bldg-lbl"><span>Outside Building Perimeter</span><span class="sub">${outside.length} switch/AP · ${gates.filter(g => g.kind === "drop").length} exterior drop(s)</span></div>
-      ${outside.map(r => renderPhysicalRow(vm, r)).join("")}
+    // Outside Your House
+    html += `<div class="house-zone outside">
+      <div class="house-hd">
+        <div>
+          <div class="house-title">${ICONS.tree} Outside Your House (${outside.length} switch / AP)</div>
+          <div class="house-sub">Hardware in a garage, shed, or exterior wall can be touched physically — turning off empty sockets stops strangers from plugging in.</div>
+        </div>
+      </div>
+      ${outside.map(r => renderHWCard(vm, r)).join("")}
     </div>`;
   }
 
-  return html;
+  document.getElementById("view-house").innerHTML = html;
 }
 
-function renderPhysicalRow(vm, row) {
-  const devEnt = vm.entities[row.device_id];
-  const sel = isHighlighted(row.device_id) ? " sel" : "";
-  const depthCls = row.depth === 1 ? " depth-1" : (row.depth >= 2 ? " depth-2" : "");
-
+function renderHWCard(vm, row) {
+  const depthCls = row.depth === 1 ? " d1" : (row.depth >= 2 ? " d2" : "");
   const portIDs = row.port_ids || [];
-  let faceplateHTML = "";
+  const rjPorts = [];
+  const sfpPorts = [];
+  const riskPorts = [];
+
+  for (const pid of portIDs) {
+    const pe = vm.entities[pid];
+    if (!pe) continue;
+    if (pe.state === "exposed" || pe.state === "review") riskPorts.push(pe);
+    if (row.sfp_start_idx && pe.port_idx >= row.sfp_start_idx) sfpPorts.push(pe);
+    else rjPorts.push(pe);
+  }
+
+  const sockMatches = (pe) => {
+    if (portFilter === "all") return true;
+    if (portFilter === "risk") return pe.state === "exposed" || pe.state === "review";
+    if (portFilter === "external") return pe.port_zone === "external" || pe.port_zone === "external_uplink" || row.side === "outside";
+    return true;
+  };
+
+  const renderSock = (pe) => {
+    const linkCls = pe.port_state === "active" ? "up" : (pe.port_state === "disabled" ? "off" : "open");
+    const trunkCls = pe.tagged_policy === "all" && pe.port_state !== "disabled" ? " trunk" : "";
+    const vCls = pe.state === "exposed" ? (" " + humanStateTone(pe)) : (pe.state === "review" ? " warn" : "");
+    const sel = currentDrawerID() === pe.id ? " sel" : "";
+    const dim = !sockMatches(pe) ? " dim" : "";
+    const meta = pe.port_state === "active"
+      ? (pe.poe_enabled && pe.poe_power ? "⚡" + pe.poe_power + "W" : fmtSpeed(pe.speed))
+      : (pe.port_state === "disabled" ? "off" : "—");
+    const peers = peerNamesForPort(vm, pe);
+    const who = peers.length ? peers.join(", ") : (pe.port_state === "disabled" ? "Turned off" : "Empty socket");
+    const tip = `Socket #${pe.port_idx} · ${who}${pe.native_vlan ? " · Network: " + pe.native_vlan : ""}${pe.state !== "ok" ? " · Needs attention" : ""}`;
+    return `<div class="sock ${linkCls}${trunkCls}${vCls}${sel}${dim}" title="${esc(tip)}" onclick="event.stopPropagation(); openEntity('${esc(pe.id)}')">
+      <span class="sn">#${pe.port_idx}</span>
+      <span class="sm">${esc(meta)}</span>
+      ${pe.native_vlan ? `<span class="ubar" style="background:${vlanColor(pe.native_vlan)}"></span>` : ""}
+    </div>`;
+  };
+
+  let fpHTML = "";
   if (portIDs.length) {
-    const rjPorts = [];
-    const sfpPorts = [];
-    for (const pid of portIDs) {
-      const pe = vm.entities[pid];
-      if (!pe) continue;
-      if (row.sfp_start_idx && pe.port_idx >= row.sfp_start_idx) sfpPorts.push(pe);
-      else rjPorts.push(pe);
-    }
-    const singleRow = rjPorts.length <= 8;
-    faceplateHTML = `<div class="faceplate-wrap">
-      <div class="fp-bank ${singleRow ? "single-row" : ""}">${rjPorts.map(renderSocket).join("")}</div>
-      ${sfpPorts.length ? `<div class="fp-sfp-sep" title="SFP/SFP+ bank"></div><div class="fp-bank ${sfpPorts.length <= 2 ? "single-row" : ""}">${sfpPorts.map(renderSocket).join("")}</div>` : ""}
+    fpHTML = `<div class="fp-wrap">
+      <div class="fp-bank ${rjPorts.length <= 8 ? "single" : ""}">${rjPorts.map(renderSock).join("")}</div>
+      ${sfpPorts.length ? `<div class="fp-sep" title="Fiber (SFP) sockets"></div><div class="fp-bank ${sfpPorts.length <= 2 ? "single" : ""}">${sfpPorts.map(renderSock).join("")}</div>` : ""}
     </div>`;
   } else {
-    faceplateHTML = `<div class="faceplate-wrap"><span class="sub">${row.client_count || 0} Wi-Fi client(s)${(row.ssids && row.ssids.length) ? " · " + esc(row.ssids.join(", ")) : ""}</span></div>`;
+    fpHTML = `<div class="fp-wrap" style="color:var(--muted);font-size:13px">${ICONS.wifi} <span>${row.client_count || 0} wireless device${row.client_count === 1 ? "" : "s"} connected${(row.ssids && row.ssids.length) ? " · Wi-Fi: " + esc(row.ssids.join(", ")) : ""}</span></div>`;
   }
 
-  return `<div class="rack-row${depthCls}${sel}">
-    <div class="rack-hd" onclick="selectEntity('${esc(row.device_id)}')">
-      <div class="rack-title">
-        ${devEnt?.pin_number ? `<span class="pin ${pinClass(devEnt.max_severity)}">${devEnt.pin_number}</span>` : ""}
-        <span>${esc(row.name)}</span>
-        <span class="sub">${esc(row.model)}</span>
-        ${row.upgradable ? `<span class="vbadge v-review">FW update</span>` : ""}
+  return `<div class="hw-card${depthCls}">
+    <div class="hw-hd" onclick="openEntity('${esc(row.device_id)}')">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <strong style="font-size:15px">${esc(row.name)}</strong>
+        <span class="small">${esc(row.model)}</span>
+        ${row.upgradable ? `<span class="tag warn">Update available</span>` : ""}
+        ${riskPorts.length
+          ? `<span class="tag ${riskPorts.some(p => p.max_severity === "critical") ? "crit" : "warn"}">${riskPorts.length} socket${riskPorts.length === 1 ? "" : "s"} to check</span>`
+          : (portIDs.length ? `<span class="tag neutral">Sockets OK</span>` : "")}
       </div>
-      <div style="display:flex;align-items:center;gap:6px">
-        ${row.parent_label ? `<span class="trunk-tag" onclick="event.stopPropagation(); selectEntity('${esc(row.parent_port_id || row.parent_id)}')">↑ ${esc(row.parent_label)}</span>` : ""}
-        <span class="sub mono">${esc(row.ip)}</span>
+      <div>
+        ${row.parent_label
+          ? `<span class="tag click" onclick="event.stopPropagation(); openEntity('${esc(row.parent_port_id || row.parent_id)}')">↳ Plugged into ${esc(row.parent_label)}</span>`
+          : `<span class="tag neutral">Main Router</span>`}
       </div>
     </div>
-    ${faceplateHTML}
-  </div>`;
-}
-
-function renderSocket(pe) {
-  if (!pe) return "";
-  const linkCls = pe.port_state === "active" ? "up" : (pe.port_state === "disabled" ? "off" : "open");
-  const trunkCls = pe.tagged_policy === "all" && pe.port_state !== "disabled" ? " trunk" : "";
-  const verdictCls = pe.state === "exposed" ? " v-exposed" : (pe.state === "review" ? " v-review" : "");
-  const sel = isHighlighted(pe.id) ? " sel" : "";
-  const dim = !matchesFilter(pe) ? " dim" : "";
-  const tip = `${pe.label} · ${pe.port_state} ${fmtSpeed(pe.speed)} · Zone: ${pe.port_zone} · VLAN: ${pe.native_vlan || "-"} (${pe.tagged_policy}) · ${pe.state_label}`;
-  return `<div class="sock ${linkCls}${trunkCls}${verdictCls}${sel}${dim}" title="${esc(tip)}" onclick="event.stopPropagation(); selectEntity('${esc(pe.id)}')">
-    ${pe.pin_number ? `<span class="spin">${pe.pin_number}</span>` : ""}
-    ${pe.poe_enabled ? `<span class="poe-dot">⚡</span>` : ""}
-    <span>${pe.port_idx}</span>
-    ${pe.native_vlan ? `<span class="ubar" style="background:${vlanColor(pe.native_vlan)}"></span>` : ""}
+    ${fpHTML}
+    ${riskPorts.length ? `<div class="hw-foot">
+      <span class="small" style="font-weight:700">Check these sockets:</span>
+      ${riskPorts.slice(0, 6).map(p => {
+        const peers = peerNamesForPort(vm, p);
+        const lbl = peers.length ? `#${p.port_idx} (${peers[0]})` : `#${p.port_idx} (empty)`;
+        return `<span class="tag click ${p.state === "exposed" ? humanStateTone(p) : "warn"}" onclick="openEntity('${esc(p.id)}')">${esc(lbl)}</span>`;
+      }).join("")}
+      ${riskPorts.length > 6 ? `<span class="small">+${riskPorts.length - 6} more</span>` : ""}
+    </div>` : ""}
   </div>`;
 }
 
 /* ============================================================================
-   DOCKED NON-MODAL RIGHT RAIL (FIX-NEXT QUEUE <-> STACK INSPECTOR)
-   ============================================================================ */
-function renderRail(vm) {
-  const selID = currentSelectedID();
-  if (!selID || !vm.entities[selID]) {
-    const q = vm.queue || [];
-    return `
-      <div class="rail-hd">
-        <strong>Fix Next (${q.length})</strong>
-        <span class="sub">Ranked by impact</span>
-      </div>
-      <div class="rail-body">
-        ${q.length ? q.map((item, i) => `
-          <div class="q-item" onclick="queueIdx=${i}; selectEntity('${esc(item.subject_id)}')">
-            <span class="pin ${pinClass(item.severity)}">${item.pin}</span>
-            <div style="flex:1;min-width:0">
-              <div class="q-text">${esc(item.sentence)}</div>
-              <div class="q-cat">${esc(item.category)} · ${esc(item.severity)}</div>
-            </div>
-          </div>`).join("") : `<div class="sub" style="text-align:center;padding:24px 8px">No prioritized issues in queue. Click any device, port, or host on the map to inspect.</div>`}
-      </div>`;
-  }
-
-  const ent = vm.entities[selID];
-  const backLbl = railStack.length > 1 ? "← Back" : "← Queue";
-  let body = "";
-
-  // Header summary
-  body += `<div class="ins-sec">
-    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px">
-      ${ent.pin_number ? `<span class="pin ${pinClass(ent.max_severity)}">${ent.pin_number}</span>` : ""}
-      ${ent.is_bmc ? `<span class="oob-hex v-${esc(ent.state)}">OOB BMC</span>` : ""}
-      ${vBadge(ent.state, ent.state_label + (ent.exact_cve_count ? " · " + ent.exact_cve_count + " exact CVE" : ""))}
-      ${ent.side === "outside" ? `<span class="vbadge v-ok">Outside (${esc(ent.zone_source || "auto")})</span>` : ""}
-    </div>
-    <div style="font-size:15px;font-weight:800">${esc(ent.label)}</div>
-    <div class="sub mono">${[ent.ip, ent.mac, ent.network_name].filter(Boolean).map(esc).join(" · ")}</div>
-  </div>`;
-
-  // Cross-links & telemetry grid
-  body += `<div class="ins-sec"><div class="ins-sec-t">Telemetry &amp; Cross-References</div><div class="kv-grid">`;
-  if (ent.kind === "port") {
-    body += `<div class="kv"><div class="k">Link</div><div class="v">${esc(ent.port_state)} ${fmtSpeed(ent.speed)}</div></div>
-      <div class="kv"><div class="k">Native VLAN</div><div class="v">${esc(ent.native_vlan || "-")}</div></div>
-      <div class="kv"><div class="k">Tagged Policy</div><div class="v mono">${esc(ent.tagged_policy || "-")}</div></div>
-      <div class="kv"><div class="k">MAC Security</div><div class="v">${ent.port_security ? "Enabled" : "Off"} (${ent.mac_table_count || 0} MACs)</div></div>
-      <div class="kv"><div class="k">PoE Power</div><div class="v mono">${ent.poe_enabled ? "⚡ " + esc(ent.poe_power || "ON") + "W" : "Off"}</div></div>
-      <div class="kv"><div class="k">STP State</div><div class="v mono">${esc(ent.stp_state || "-")}</div></div>`;
-  } else if (ent.kind === "host") {
-    const portEnt = ent.port_id ? vm.entities[ent.port_id] : null;
-    const apEnt = ent.ap_id ? vm.entities[ent.ap_id] : null;
-    body += `<div class="kv"><div class="k">Role / Vendor</div><div class="v">${esc(ent.role || "unknown")}${ent.vendor ? " · " + esc(ent.vendor) : ""}</div></div>
-      <div class="kv"><div class="k">Coverage</div><div class="v">${ent.scanned_at ? "Scanned " + fmtTime(ent.scanned_at) : "Unassessed"}</div></div>
-      <div class="kv"><div class="k">VLAN</div><div class="v">${esc(ent.network_name || "-")}</div></div>
-      <div class="kv"><div class="k">Physical Link</div><div class="v">${portEnt
-        ? `<button class="btn sm" onclick="selectEntity('${esc(portEnt.id)}')">${esc(portEnt.label)} →</button>`
-        : (apEnt ? `<button class="btn sm" onclick="selectEntity('${esc(apEnt.id)}')">${esc(apEnt.label)} (${esc(ent.essid || "Wi-Fi")})</button>` : (ent.essid ? "Wi-Fi: " + esc(ent.essid) : "-"))}</div></div>`;
-  } else if (ent.kind === "device") {
-    body += `<div class="kv"><div class="k">Model</div><div class="v">${esc(ent.model || "-")}</div></div>
-      <div class="kv"><div class="k">Firmware</div><div class="v mono">${esc(ent.firmware || "-")}</div></div>
-      <div class="kv"><div class="k">Perimeter</div><div class="v">${esc(ent.side || "inside")}</div></div>
-      <div class="kv"><div class="k">Role</div><div class="v">${esc(ent.role || "-")}</div></div>`;
-  }
-  body += `</div></div>`;
-
-  // Connected Peers (for Port)
-  if (ent.kind === "port" && ent.peer_ids && ent.peer_ids.length) {
-    body += `<div class="ins-sec"><div class="ins-sec-t">Connected Peer(s)</div><div class="host-chips">`;
-    for (const pid of ent.peer_ids) {
-      const peer = vm.entities[pid];
-      if (peer) {
-        body += `<button class="btn sm" onclick="selectEntity('${esc(peer.id)}')">${esc(peer.label)} (${esc(peer.state_label)}) →</button>`;
-      }
-    }
-    body += `</div></div>`;
-  }
-
-  // Exact CVEs FIRST when present (so vulnerable hosts never appear clean)
-  if (ent.exact_cves && ent.exact_cves.length) {
-    body += `<div class="ins-sec"><div class="ins-sec-t">Exact-Version CVEs (${ent.exact_cve_count})</div>`;
-    for (const s of ent.exact_cves) {
-      body += `<div class="reason-card v-exposed">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
-          <strong>${esc(s.product.label)} ${esc(s.product.version || "")}</strong>
-          ${vBadge("exposed", s.max_severity)}
-        </div>
-        <div class="sub" style="margin-top:3px;color:var(--text)">${s.total_cves} CVE(s) · max CVSS ${Number(s.max_cvss).toFixed(1)}${s.kev_count ? " · " + s.kev_count + " KEV" : ""}${s.min_fixed_version ? " · Upgrade ≥ " + esc(s.min_fixed_version) : ""}</div>
-        <div class="sub mono" style="margin-top:3px">${esc((s.top_cves || []).join(", "))}</div>
-      </div>`;
-    }
-    body += `</div>`;
-  }
-
-  // Evidenced Reasons (Expected vs Observed + Proof + Action)
-  const nonCVEReasons = (ent.reasons || []).filter(r => r.kind !== "cve");
-  if (nonCVEReasons.length) {
-    body += `<div class="ins-sec"><div class="ins-sec-t">Assessments &amp; Findings (${nonCVEReasons.length})</div>`;
-    for (const r of nonCVEReasons) {
-      body += `<div class="reason-card v-${esc(r.state)}">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
-          <span class="mono sub">${esc(r.ref)}${r.port ? " :" + r.port : ""}</span>
-          ${vBadge(r.state, r.severity)}
-        </div>
-        <div style="font-weight:700;margin-top:3px">${esc(r.title)}</div>
-        ${(r.expected || r.observed) ? `<div class="ea-pair">
-          <div><b>Observed</b>${esc(r.observed || "-")}</div>
-          <div><b>Expected</b>${esc(r.expected || "-")}</div>
-        </div>` : ""}
-        ${r.evidence ? `<div class="sub" style="margin-top:5px;color:var(--text-2)">${esc(r.evidence)}</div>` : ""}
-        ${r.remediation ? `<div class="sub" style="margin-top:5px;padding-top:5px;border-top:1px solid var(--border)"><strong>Fix:</strong> ${esc(r.remediation)}</div>` : ""}
-        <div class="sub" style="margin-top:3px">Source: <span class="mono">${esc(r.source)}</span></div>
-      </div>`;
-    }
-    body += `</div>`;
-  } else if (!(ent.exact_cves && ent.exact_cves.length)) {
-    body += `<div class="ins-sec"><div class="reason-card">${vBadge(ent.state, ent.state_label)} <span class="sub" style="margin-left:6px">${ent.state === "unknown" ? "Host has not been actively probed yet." : "Zero active policy or service violations."}</span></div></div>`;
-  }
-
-  // Services with Computed Reachability
-  if (ent.services && ent.services.length) {
-    body += `<div class="ins-sec"><div class="ins-sec-t">Services &amp; Reachability (${ent.services.length})</div><div class="host-chips">`;
-    for (const svc of ent.services) {
-      const cls = svc.exposed ? "v-exposed" : (svc.reachable === "wan" ? "v-review" : "");
-      body += `<span class="ctrl-chip ${cls}"><span class="mono">${esc(svc.label || (svc.proto + ":" + svc.port))}</span> · ${esc(svc.reachable)}</span>`;
-    }
-    body += `</div></div>`;
-  }
-
-  // Potential CVEs (version-unknown -> Review)
-  if (ent.potential_cves && ent.potential_cves.length) {
-    body += `<div class="ins-sec"><div class="ins-sec-t">Patch Verification — Version Unknown (${ent.potential_cves.length})</div>`;
-    for (const s of ent.potential_cves) {
-      body += `<div class="reason-card v-review">
-        <strong>${esc(s.product.label)}</strong> · ${s.total_cves} CVE(s) (max CVSS ${Number(s.max_cvss).toFixed(1)})
-        <div class="sub mono" style="margin-top:2px">${esc((s.top_cves || []).join(", "))}</div>
-      </div>`;
-    }
-    body += `</div>`;
-  }
-
-  return `
-    <div class="rail-hd">
-      <button class="btn sm" onclick="popInspector()">${backLbl}</button>
-      <div style="display:flex;gap:6px">
-        ${!isStaticMode && ent.kind === "host" && ent.ip ? `<button class="btn sm" onclick="triggerRescan('${esc(ent.ip)}')">Rescan</button>` : ""}
-        ${railStack.length > 1 ? `<button class="btn sm" onclick="clearInspector()">Queue</button>` : ""}
-      </div>
-    </div>
-    <div class="rail-body">${body}</div>`;
-}
-
-/* ============================================================================
-   TAB 2: INVENTORY (SINGLE TABLE PROJECTION OVER GO ENTITIES)
-   ============================================================================ */
-function renderInventory() {
+   TAB 3: DEVICES & WI-FI (Network Zones Explained Like Rooms)
+   ========================================================================== */
+function renderDevices() {
   const vm = state.view;
   if (!vm) return;
+  const c = vm.census || {};
+  const wanIPSet = new Set((vm.wan_flows || []).map(f => f.target_ip).filter(Boolean));
+  const totalHosts = Object.values(vm.entities || {}).filter(e => e.kind === "host").length;
 
-  const list = Object.values(vm.entities || {}).filter(ent => {
-    if (ent.kind !== "host" && ent.kind !== "device" && !(ent.kind === "port" && ent.state !== "ok")) return false;
-    if (!matchesFilter(ent)) return false;
-    if (invSearch) {
-      const hay = [ent.label, ent.ip, ent.mac, ent.network_name, ent.role, ent.vendor, ent.model, ent.state_label, (ent.reasons || []).map(r => r.ref + " " + r.title).join(" ")].join(" ").toLowerCase();
-      if (!hay.includes(invSearch.toLowerCase())) return false;
+  const matchHost = (ent) => {
+    if (!ent) return false;
+    if (deviceFilter === "issues" && ent.state !== "exposed") return false;
+    if (deviceFilter === "bmc" && !ent.is_bmc) return false;
+    if (deviceFilter === "cve" && !(ent.exact_cve_count > 0)) return false;
+    if (deviceFilter === "wan" && !wanIPSet.has(ent.ip)) return false;
+    if (deviceFilter === "checking" && ent.state !== "unknown") return false;
+    if (deviceSearch) {
+      const hay = [ent.label, ent.ip, ent.mac, ent.network_name, ent.role, humanRole(ent.role, ent.is_bmc), ent.vendor, (ent.services || []).map(s => s.label + " " + s.port).join(" "), (ent.reasons || []).map(r => r.ref + " " + r.title).join(" ")].join(" ").toLowerCase();
+      if (!hay.includes(deviceSearch.toLowerCase())) return false;
     }
     return true;
-  }).sort((a, b) => {
-    const sr = { exposed: 3, review: 2, unknown: 1, ok: 0 };
-    if ((sr[b.state] || 0) !== (sr[a.state] || 0)) return (sr[b.state] || 0) - (sr[a.state] || 0);
-    if ((b.is_bmc ? 1 : 0) !== (a.is_bmc ? 1 : 0)) return (b.is_bmc ? 1 : 0) - (a.is_bmc ? 1 : 0);
-    return (a.label || "").localeCompare(b.label || "");
-  });
+  };
 
-  document.getElementById("view-inventory").innerHTML = `
-    <div class="toolbar">
-      <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
-        <input id="inv-search" class="search" type="search" value="${esc(invSearch)}" placeholder="Filter name, IP, MAC, VLAN, role, CVE…">
-        <span class="sub">${list.length} matching entities</span>
-      </div>
-      <div class="census-bar">
-        <button class="cfilter ${activeFilter === "all" ? "active" : ""}" onclick="setFilter('all')">All</button>
-        <button class="cfilter ${activeFilter === "bmc" ? "active" : ""}" onclick="setFilter('bmc')">⬡ BMCs</button>
-        <button class="cfilter ${activeFilter === "cve" ? "active" : ""}" onclick="setFilter('cve')">Exact CVEs</button>
-        <button class="cfilter ${activeFilter === "exposed" ? "active" : ""}" onclick="setFilter('exposed')">Exposed</button>
-        <button class="cfilter ${activeFilter === "unassessed" ? "active" : ""}" onclick="setFilter('unassessed')">Unassessed</button>
-        <button class="cfilter ${activeFilter === "outside" ? "active" : ""}" onclick="setFilter('outside')">Outside</button>
-        <button class="cfilter ${activeFilter === "devices" ? "active" : ""}" onclick="setFilter('devices')">UniFi Gear</button>
-      </div>
+  let html = `
+  <div class="bar">
+    <div class="seg" style="flex-wrap:wrap">
+      <button class="seg-b ${deviceFilter === "all" ? "active" : ""}" onclick="deviceFilter='all'; renderDevices()">All (${totalHosts})</button>
+      <button class="seg-b ${deviceFilter === "issues" ? "active" : ""}" onclick="deviceFilter='issues'; renderDevices()">Needs attention</button>
+      ${c.bmc_count ? `<button class="seg-b ${deviceFilter === "bmc" ? "active" : ""}" onclick="deviceFilter='bmc'; renderDevices()">Hardware controls (${c.bmc_count})</button>` : ""}
+      ${c.exact_cve_hosts ? `<button class="seg-b ${deviceFilter === "cve" ? "active" : ""}" onclick="deviceFilter='cve'; renderDevices()">Security updates (${c.exact_cve_hosts})</button>` : ""}
+      <button class="seg-b ${deviceFilter === "wan" ? "active" : ""}" onclick="deviceFilter='wan'; renderDevices()">Open to internet</button>
+      ${c.unassessed_count ? `<button class="seg-b ${deviceFilter === "checking" ? "active" : ""}" onclick="deviceFilter='checking'; renderDevices()">Checking (${c.unassessed_count})</button>` : ""}
     </div>
-    <div class="tbl-card">
-      <table>
-        <thead><tr><th>Verdict</th><th>Entity</th><th>Role</th><th>IP / Address</th><th>VLAN / Side</th><th>Evidence Summary</th></tr></thead>
-        <tbody>
-          ${list.length ? list.map(ent => {
-            const summary = ent.exact_cve_count
-              ? `${ent.exact_cve_count} exact CVE(s)` + ((ent.reasons || []).filter(r => r.kind !== "cve").length ? ` + ${(ent.reasons || []).filter(r => r.kind !== "cve").length} check(s)` : "")
-              : ((ent.reasons && ent.reasons.length) ? ent.reasons[0].title : (ent.state === "unknown" ? "Not yet scanned" : "No findings"));
-            return `<tr class="clickable" onclick="selectEntity('${esc(ent.id)}', true)">
-              <td>${vBadge(ent.state, ent.state_label)}</td>
-              <td>${ent.is_bmc ? `<span class="oob-hex v-${esc(ent.state)}">OOB</span> ` : ""}<strong>${esc(ent.label)}</strong><div class="sub mono">${esc(ent.mac || ent.id)}</div></td>
-              <td>${esc(ent.role || ent.kind)}${ent.vendor ? `<div class="sub">${esc(ent.vendor)}</div>` : ""}</td>
-              <td class="mono">${esc(ent.ip || "-")}</td>
-              <td>${esc(ent.network_name || "-")}${ent.side === "outside" ? ` <span class="wall-notch">OUT</span>` : ""}</td>
-              <td class="sub" style="color:var(--text-2)">${esc(summary)}</td>
-            </tr>`;
-          }).join("") : `<tr><td colspan="6" style="text-align:center;padding:24px" class="muted">No matching entities.</td></tr>`}
-        </tbody>
-      </table>
-    </div>`;
+    <div class="search-box">
+      <span class="muted">${ICONS.search}</span>
+      <input id="dev-search" type="search" value="${esc(deviceSearch)}" placeholder="Search device, network, or IP…">
+    </div>
+  </div>`;
 
-  const el = document.getElementById("inv-search");
-  if (el) {
-    el.addEventListener("input", e => {
+  let shown = 0;
+  for (const lane of (vm.logical || [])) {
+    const bmcs = (lane.bmc_ids || []).map(id => vm.entities[id]).filter(matchHost);
+    const otherIDs = [...(lane.pinned_host_ids || []), ...(lane.unknown_host_ids || []), ...(lane.clean_host_ids || [])];
+    const others = otherIDs.map(id => vm.entities[id]).filter(matchHost);
+    if ((deviceFilter !== "all" || deviceSearch) && !bmcs.length && !others.length) continue;
+    shown += bmcs.length + others.length;
+
+    const expN = [...(lane.bmc_ids || []), ...otherIDs].map(id => vm.entities[id]).filter(e => e?.state === "exposed").length;
+    const zoneExplain = lane.isolated
+      ? "Private isolated network — devices here can use the internet, but can't peek at your main home devices."
+      : "Shared home network — devices here can talk freely to each other.";
+
+    html += `<div class="zone-card">
+      <div class="zone-hd" style="border-left-color:${vlanColor(lane.name)}">
+        <div>
+          <div class="zone-title">
+            <span>${esc(lane.name)}</span>
+            ${lane.isolated
+              ? `<span class="tag ok">${ICONS.lock} Isolated</span>`
+              : `<span class="tag blue">${ICONS.house} Shared</span>`}
+            ${lane.vlan ? `<span class="small mono">VLAN ${esc(lane.vlan)}</span>` : ""}
+          </div>
+          <div class="zone-desc">${esc(zoneExplain)}</div>
+        </div>
+        <div class="small"><strong>${bmcs.length + others.length}</strong> device${(bmcs.length + others.length) === 1 ? "" : "s"}${expN ? ` · <strong style="color:var(--crit)">${expN} need attention</strong>` : ""}</div>
+      </div>`;
+
+    if (lane.migration_hint && deviceFilter === "all" && !deviceSearch) {
+      html += `<div class="zone-tip">💡 Tip: Moving smart-home gadgets with warnings from your main network into <strong>${esc(lane.name)}</strong> keeps them safely separated.</div>`;
+    }
+
+    if (bmcs.length) {
+      html += `<div class="bmc-band">${ICONS.cpu} Server hardware remote controls on ${esc(lane.name)} — best kept on their own private admin network</div>`;
+      html += bmcs.map(e => renderDeviceRow(vm, e)).join("");
+    }
+    if (others.length) {
+      html += others.map(e => renderDeviceRow(vm, e)).join("");
+    } else if (!bmcs.length) {
+      html += `<div class="empty">No devices currently connected to ${esc(lane.name)}.</div>`;
+    }
+    html += `</div>`;
+  }
+
+  if (!shown && (deviceFilter !== "all" || deviceSearch)) {
+    html += `<div class="card"><div class="empty">No devices match your current filter.</div></div>`;
+  }
+
+  // Wi-Fi Networks (Plain-English cards!)
+  const wlans = state.report?.unifi_posture?.wlans || [];
+  if (wlans.length && deviceFilter === "all" && !deviceSearch) {
+    html += `<div class="card">
+      <div class="card-hd">
+        <div class="card-title">${ICONS.wifi} Your Wi-Fi Networks (${wlans.length})</div>
+        <span class="small">${state.report?.unifi_posture?.neighbor_aps || 0} neighboring Wi-Fi routers nearby</span>
+      </div>
+      <div class="wifi-grid">
+        ${wlans.map(w => {
+          const enc = w.wpa3_support ? "Modern (WPA3)" : ((w.security || "").toLowerCase().includes("open") ? "Open (no password)" : "Standard (WPA2)");
+          const encTone = enc.includes("Open") ? "crit" : (w.wpa3_support ? "ok" : "neutral");
+          return `<div class="wifi-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
+              <strong style="font-size:15px">${esc(w.name)}</strong>
+              ${w.is_guest ? `<span class="tag blue">Guest</span>` : ""}
+            </div>
+            <div class="small" style="margin-bottom:10px">Connects to <strong>${esc(w.network_name || "Main")}</strong> network</div>
+            <div class="pills">
+              <span class="tag ${encTone}">${esc(enc)}</span>
+              <span class="tag ${w.l2_isolation ? "ok" : "neutral"}">${w.l2_isolation ? "Devices isolated" : "Devices can talk"}</span>
+            </div>
+          </div>`;
+        }).join("")}
+      </div>
+    </div>`;
+  }
+
+  // Internet Port Forwards (Plain-English!)
+  const wanFlows = (vm.wan_flows || []).filter(f => f.kind === "forward");
+  if (wanFlows.length && (deviceFilter === "all" || deviceFilter === "wan")) {
+    html += `<div class="card">
+      <div class="card-hd">
+        <div class="card-title">${ICONS.globe} Open Doors to the Internet (${wanFlows.length})</div>
+        <span class="small">Traffic from outside your home forwarded by your router</span>
+      </div>`;
+    for (const f of wanFlows) {
+      const target = f.target_id || vm.gateway_id || "";
+      html += `<div class="story-item" onclick="openEntity('${esc(target)}')">
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(f.rule_name)} <span class="tag ${f.expected ? "neutral" : humanStateTone(f.severity)}">${f.expected ? "Normal P2P" : "Review"}</span></div>
+          <div class="story-item-sub">Sends internet traffic to <strong>${esc(f.target_name || f.target_ip)}</strong> · <span class="mono">${esc(f.label)}</span></div>
+        </div>
+        <div class="story-item-r"><span class="go-arrow">Inspect →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  document.getElementById("view-devices").innerHTML = html;
+  const sEl = document.getElementById("dev-search");
+  if (sEl) {
+    sEl.addEventListener("input", e => {
       const pos = e.target.selectionStart;
-      invSearch = e.target.value;
-      renderInventory();
-      const again = document.getElementById("inv-search");
+      deviceSearch = e.target.value;
+      renderDevices();
+      const again = document.getElementById("dev-search");
       if (again) { again.focus(); again.setSelectionRange(pos, pos); }
     });
   }
 }
 
+function renderDeviceRow(vm, ent) {
+  const portEnt = ent.port_id ? vm.entities[ent.port_id] : null;
+  const connHTML = portEnt
+    ? `<span class="tag click ${portEnt.state === "exposed" ? humanStateTone(portEnt) : ""}" onclick="event.stopPropagation(); openEntity('${esc(portEnt.id)}')">${ICONS.plug} ${esc(portEnt.label)}</span>`
+    : (ent.essid
+      ? `<span class="tag neutral">${ICONS.wifi} ${esc(ent.essid)}</span>`
+      : `<span class="small">${ent.is_wired ? "Wired cable" : "Wi-Fi"}</span>`);
+
+  const pills = [];
+  if (ent.exact_cve_count) {
+    pills.push(`<span class="tag ${humanStateTone(ent)}">${ent.exact_cve_count} security bug${ent.exact_cve_count === 1 ? "" : "s"}</span>`);
+  }
+  for (const svc of (ent.services || [])) {
+    if (svc.exposed) pills.push(`<span class="tag ${humanStateTone(svc.severity)}">${esc(humanServiceChip(svc))}</span>`);
+    else if (svc.reachable === "wan") pills.push(`<span class="tag blue">Internet :${svc.port}</span>`);
+  }
+  if (!pills.length) {
+    pills.push(`<span class="tag ${humanStateTone(ent)}">${esc(humanStateLabel(ent))}</span>`);
+  }
+
+  return `<div class="dev-row" onclick="openEntity('${esc(ent.id)}')">
+    <div class="dev-id">
+      <div class="dev-ico">
+        ${roleIcon(ent.role, ent.is_bmc)}
+        <span class="sbadge ${humanStateTone(ent)}"></span>
+      </div>
+      <div style="min-width:0">
+        <div class="dev-name">${esc(ent.label)}</div>
+        <div class="dev-meta">${esc(humanRole(ent.role, ent.is_bmc))}${ent.vendor ? " · " + esc(ent.vendor) : ""} · <span class="mono">${esc(ent.ip || "")}</span></div>
+      </div>
+    </div>
+    <div>${connHTML}</div>
+    <div class="pills">${pills.join("")}</div>
+    <div class="go-arrow">Inspect →</div>
+  </div>`;
+}
+
 /* ============================================================================
-   TAB 3: ACTIVITY (UNIFIED LIVE SSE + 24H CONTROLLER LOGS WITH ENTITY LINKS)
-   ============================================================================ */
+   TAB 4: ACTIVITY (Friendly Chronological Timeline)
+   ========================================================================== */
 function renderActivity() {
   const vm = state.view || { entities: {} };
   const logs = [];
   const seen = new Set();
+
   for (const ev of (state.events || [])) {
-    logs.push({ time: ev.time, severity: ev.severity || "info", type: ev.type || "event", summary: ev.summary, subject: ev.subject_id || "", ip: ev.ip || "", src: "live" });
+    logs.push({ time: ev.time, severity: ev.severity || "info", type: ev.type || "event", summary: ev.summary, subject: ev.subject_id || "", ip: ev.ip || "" });
     seen.add(ev.summary);
   }
   for (const lg of (state.report?.unifi_posture?.recent_logs || [])) {
@@ -1293,61 +2121,254 @@ function renderActivity() {
     if (lg.category === "ADMIN") t = "admin_activity";
     else if ((lg.event || "").includes("HONEYPOT")) t = "honeypot_hit";
     else if (lg.category === "SECURITY" || (lg.event || "").includes("THREAT")) t = "ids_threat";
-    logs.push({ time: lg.timestamp, severity: lg.severity || "info", type: t, summary: lg.message || lg.event, subject: "", ip: lg.src_ip || "", src: "unifi-24h" });
+    logs.push({ time: lg.timestamp, severity: lg.severity || "info", type: t, summary: lg.message || lg.event, subject: "", ip: lg.src_ip || "" });
   }
   logs.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
 
   const filtered = logs.filter(ev => {
     const t = ev.type.toLowerCase();
-    if (actFilter === "threats") return t.includes("threat") || t.includes("honeypot") || t.includes("evil") || t.includes("tamper") || t.includes("surge") || t.includes("spike") || t.includes("finding");
-    if (actFilter === "ports") return t.startsWith("port_");
-    if (actFilter === "clients") return t.startsWith("client_") || t.startsWith("vpn_") || t.includes("host_scanned");
-    if (actFilter === "admin") return t.includes("admin") || t.includes("policy") || t.includes("config") || t.includes("wan_");
+    if (activityFilter === "threats") return t.includes("threat") || t.includes("honeypot") || t.includes("evil") || t.includes("tamper") || t.includes("surge") || t.includes("spike") || t.includes("finding");
+    if (activityFilter === "ports") return t.startsWith("port_");
+    if (activityFilter === "clients") return t.startsWith("client_") || t.startsWith("vpn_") || t.includes("host_scanned");
+    if (activityFilter === "admin") return t.includes("admin") || t.includes("policy") || t.includes("config") || t.includes("wan_");
     return true;
   });
 
-  // Resolve IP -> entity ID when subject_id absent so rows stay clickable!
   const entByIP = {};
   for (const e of Object.values(vm.entities || {})) {
     if (e.ip && (e.kind === "host" || e.kind === "device")) entByIP[e.ip] = e.id;
   }
 
   document.getElementById("view-activity").innerHTML = `
-    <div class="toolbar">
-      <div class="census-bar">
-        ${[["all", "All (" + logs.length + ")"], ["threats", "Threats & Tamper"], ["ports", "Physical Ports"], ["clients", "Clients & VPN"], ["admin", "Admin & Config"]].map(([k, lbl]) =>
-          `<button class="cfilter ${actFilter === k ? "active" : ""}" onclick="actFilter='${k}'; renderActivity()">${lbl}</button>`
+    <div class="bar">
+      <div class="seg" style="flex-wrap:wrap">
+        ${[["all", "Everything (" + logs.length + ")"], ["threats", "Security alerts"], ["ports", "Cables"], ["clients", "Devices & VPN"], ["admin", "Settings"]].map(([k, lbl]) =>
+          `<button class="seg-b ${activityFilter === k ? "active" : ""}" onclick="activityFilter='${k}'; renderActivity()">${lbl}</button>`
         ).join("")}
       </div>
-      <span class="sub">Click any linked row to locate on Map</span>
+      <span class="small">Live updates + past 24 hours from your router</span>
     </div>
-    <div class="tbl-card">
-      <table>
-        <thead><tr><th>Time</th><th>Severity</th><th>Type</th><th>Event</th><th>Source</th></tr></thead>
-        <tbody>
-          ${filtered.length ? filtered.map(ev => {
-            const target = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || "";
-            const click = target ? `class="clickable" onclick="selectEntity('${esc(target)}', true)"` : "";
-            const st = (ev.severity === "critical" || ev.severity === "high") ? "exposed" : (ev.severity === "medium" ? "review" : "ok");
-            return `<tr ${click}>
-              <td class="mono sub" style="white-space:nowrap">${fmtTime(ev.time)}</td>
-              <td>${vBadge(st, ev.severity)}</td>
-              <td class="mono">${esc(ev.type)}</td>
-              <td>${esc(ev.summary)}${target ? ` <span class="sub">→</span>` : ""}</td>
-              <td class="sub">${esc(ev.src)}</td>
-            </tr>`;
-          }).join("") : `<tr><td colspan="5" style="text-align:center;padding:24px" class="muted">No events in this category.</td></tr>`}
-        </tbody>
-      </table>
+    <div class="card">
+      ${filtered.length ? filtered.map(ev => {
+        const target = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || "";
+        const ht = humanEventType(ev.type);
+        const click = target ? `clickable" onclick="openEntity('${esc(target)}')"` : `"`;
+        return `<div class="act-row ${click}>
+          <div class="act-l">
+            <span class="act-time mono">${fmtTime(ev.time)}</span>
+            <span class="tag ${ht.tone}">${esc(ht.label)}</span>
+            <span style="font-weight:500">${esc(ev.summary)}</span>
+          </div>
+          ${target ? `<span class="go-arrow">Inspect →</span>` : ""}
+        </div>`;
+      }).join("") : `<div class="empty">No matching activity yet.</div>`}
     </div>`;
 }
 
-function renderAll() {
+/* ============================================================================
+   SLIDE-OVER INSPECTOR DRAWER (Human First + Collapsible Technical Details)
+   ========================================================================== */
+function plainSummaryForEntity(vm, ent) {
+  if (ent.kind === "port") {
+    const peers = peerNamesForPort(vm, ent);
+    const where = ent.port_zone === "external_uplink"
+      ? "This socket feeds a cable running outside your house."
+      : (ent.side === "outside" ? "This socket is on an outdoor switch." : "This is an indoor switch socket.");
+    const conn = peers.length
+      ? ` Connected to <strong>${esc(peers.join(", "))}</strong>.`
+      : (ent.port_state === "disabled" ? " Currently turned off." : " Nothing is plugged in right now.");
+    return where + conn;
+  }
+  if (ent.kind === "host") {
+    if (ent.state === "unknown") {
+      return `UniBlue hasn't finished checking <strong>${esc(ent.label)}</strong> yet. Once scanned, any open services or outdated software will appear right here.`;
+    }
+    if (ent.is_bmc) {
+      return `This is a server's built-in <strong>hardware remote control (BMC)</strong>. It gives direct power, BIOS, and virtual keyboard access even when the server is off — keep it isolated from everyday devices.`;
+    }
+    if (ent.state === "exposed") {
+      const bits = [];
+      if (ent.exact_cve_count) bits.push(`${ent.exact_cve_count} known security bug${ent.exact_cve_count === 1 ? "" : "s"} in its software`);
+      const nonCVE = (ent.reasons || []).filter(r => r.kind !== "cve").length;
+      if (nonCVE) bits.push(`${nonCVE} configuration or protocol warning${nonCVE === 1 ? "" : "s"}`);
+      return `<strong>${esc(ent.label)}</strong> has ${bits.join(" and ")}. Follow the steps below to resolve ${bits.length > 1 ? "them" : "it"}.`;
+    }
+    return `<strong>${esc(ent.label)}</strong> looks healthy — we checked its open services and software versions and found no active problems.`;
+  }
+  if (ent.kind === "device") {
+    const count = (ent.reasons || []).length;
+    return count
+      ? `<strong>${esc(ent.label)}</strong> (${esc(ent.model || "UniFi device")}) has ${count} item${count === 1 ? "" : "s"} worth reviewing below.`
+      : `<strong>${esc(ent.label)}</strong> (${esc(ent.model || "UniFi device")}) is operating cleanly.`;
+  }
+  return `Review this security rule below to make sure it matches what you want allowed on your network.`;
+}
+
+function renderDrawer() {
+  const vm = state?.view;
+  const id = currentDrawerID();
+  if (!vm || !id || !vm.entities[id]) return;
+  const ent = vm.entities[id];
+  const tone = humanStateTone(ent);
+
+  document.getElementById("drawer-hd-content").innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      ${drawerStack.length > 1 ? `<button class="btn sm" onclick="popDrawer()">← Back</button>` : ""}
+      <span class="tag ${tone}">${esc(humanStateLabel(ent))}</span>
+      ${ent.is_bmc ? `<span class="tag warn">Hardware Control</span>` : ""}
+      ${ent.side === "outside" ? `<span class="tag neutral">Outside House</span>` : ""}
+      ${!isStaticMode && ent.kind === "host" && ent.ip ? `<button class="btn sm" onclick="triggerRescan('${esc(ent.ip)}')">Recheck</button>` : ""}
+    </div>
+    <div style="font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.2">${esc(ent.label)}</div>
+    <div class="small" style="margin-top:3px">${esc(ent.kind === "host" ? humanRole(ent.role, ent.is_bmc) : (ent.subtitle || ent.model || ""))}${ent.network_name ? ` · ${esc(ent.network_name)} network` : ""}${ent.ip ? ` · <span class="mono">${esc(ent.ip)}</span>` : ""}</div>`;
+
+  let b = `<div class="summary-box ${tone === "unk" ? "blue" : tone}">${plainSummaryForEntity(vm, ent)}</div>`;
+
+  // 1. Known Software Security Bugs (Exact CVEs — ALWAYS prominently at the top!)
+  if (ent.exact_cves && ent.exact_cves.length) {
+    b += `<div class="dsec"><div class="dsec-t">Software Updates Needed (${ent.exact_cve_count} known bug${ent.exact_cve_count === 1 ? "" : "s"})</div>`;
+    for (const s of ent.exact_cves) {
+      const fixTxt = s.min_fixed_version
+        ? `Update ${s.product.label} to version ${s.min_fixed_version} or newer.`
+        : `Install the latest security updates for ${s.product.label} on this device.`;
+      b += `<div class="fix-card ${humanStateTone(s.max_severity)}">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <strong style="font-size:14.5px">${esc(s.product.label)} ${esc(s.product.version || "")}</strong>
+          <span class="tag ${humanStateTone(s.max_severity)}">${s.total_cves} CVE${s.total_cves === 1 ? "" : "s"} · CVSS ${Number(s.max_cvss).toFixed(1)}</span>
+        </div>
+        <div class="small" style="margin-top:5px;color:var(--text-2)">
+          This exact version has ${s.total_cves} publicly documented security flaw${s.total_cves === 1 ? "" : "s"}${s.kev_count ? ` (${s.kev_count} actively exploited in the wild)` : ""}.
+        </div>
+        <div class="fix-step"><strong>How to fix:</strong> ${esc(fixTxt)}</div>
+        <div class="small mono" style="margin-top:8px">${esc((s.top_cves || []).join(", "))}</div>
+      </div>`;
+    }
+    b += `</div>`;
+  }
+
+  // 2. Plain-English Findings & Fix Steps
+  const nonCVE = (ent.reasons || []).filter(r => r.kind !== "cve");
+  if (nonCVE.length) {
+    b += `<div class="dsec"><div class="dsec-t">What Needs Attention (${nonCVE.length})</div>`;
+    for (const r of nonCVE) {
+      const hr = humanReason(r);
+      const rTone = r.state === "exposed" ? humanStateTone(r.severity) : "warn";
+      b += `<div class="fix-card ${rTone}">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+          <strong style="font-size:14.5px">${esc(hr.title)}</strong>
+          <span class="tag ${rTone}">${r.severity === "critical" ? "Urgent" : (r.state === "review" ? "Review" : "Fix")}</span>
+        </div>
+        ${hr.why ? `<div class="small" style="margin-top:6px;color:var(--text-2)">${esc(hr.why)}</div>` : ""}
+        ${hr.fix ? `<div class="fix-step"><strong>How to fix:</strong> ${esc(hr.fix)}</div>` : ""}
+      </div>`;
+    }
+    b += `</div>`;
+  }
+
+  // 3. Connected To (Clickable cross-links with Back stack!)
+  const links = [];
+  if (ent.kind === "host") {
+    if (ent.port_id && vm.entities[ent.port_id]) {
+      const pe = vm.entities[ent.port_id];
+      links.push({ id: pe.id, icon: ICONS.plug, title: `Plugged into ${pe.label}`, sub: `${pe.native_vlan || "Main"} network${pe.poe_enabled && pe.poe_power ? " · Powered (" + pe.poe_power + "W)" : ""}` });
+    } else if (ent.ap_id && vm.entities[ent.ap_id]) {
+      const ap = vm.entities[ent.ap_id];
+      links.push({ id: ap.id, icon: ICONS.wifi, title: `Connected to ${ap.label}`, sub: ent.essid ? `Wi-Fi: ${ent.essid}` : "Wireless connection" });
+    }
+  } else if (ent.kind === "port") {
+    if (ent.device_id && vm.entities[ent.device_id]) {
+      const sw = vm.entities[ent.device_id];
+      links.push({ id: sw.id, icon: ICONS.server, title: `On switch ${sw.label}`, sub: sw.model || "UniFi Switch" });
+    }
+    for (const pid of (ent.peer_ids || [])) {
+      const peer = vm.entities[pid];
+      if (peer) links.push({ id: peer.id, icon: roleIcon(peer.role, peer.is_bmc), title: peer.label, sub: `Connected device · ${humanStateLabel(peer)}` });
+    }
+  }
+  if (links.length) {
+    b += `<div class="dsec"><div class="dsec-t">Connections</div>`;
+    for (const lk of links) {
+      b += `<div class="link-card" onclick="openEntity('${esc(lk.id)}')">
+        <div style="display:flex;align-items:center;gap:11px;min-width:0">
+          <span class="muted">${lk.icon}</span>
+          <div style="min-width:0">
+            <div style="font-weight:700;font-size:13.5px">${esc(lk.title)}</div>
+            <div class="small">${esc(lk.sub)}</div>
+          </div>
+        </div>
+        <span class="go-arrow">Open →</span>
+      </div>`;
+    }
+    b += `</div>`;
+  }
+
+  // 4. Collapsible Technical Details (Full Fidelity for Power Users!)
+  b += `<details class="tech">
+    <summary>Technical details (IP, MAC, ports &amp; raw checks)</summary>
+    <div class="tech-body">
+      <div class="kv-grid">`;
+  if (ent.kind === "port") {
+    b += `<div class="kv"><div class="k">Link State</div><div class="v">${esc(ent.port_state)} ${fmtSpeed(ent.speed)}</div></div>
+      <div class="kv"><div class="k">Native VLAN</div><div class="v">${esc(ent.native_vlan || "-")}</div></div>
+      <div class="kv"><div class="k">Tagged VLANs</div><div class="v mono">${esc(ent.tagged_policy || "-")}</div></div>
+      <div class="kv"><div class="k">MAC Security</div><div class="v">${ent.port_security ? "Enabled" : "Off"} (${ent.mac_table_count || 0} MACs)</div></div>
+      <div class="kv"><div class="k">PoE Power</div><div class="v mono">${ent.poe_enabled ? "⚡ " + esc(ent.poe_power || "ON") + "W" : "Off"}</div></div>
+      <div class="kv"><div class="k">STP State</div><div class="v mono">${esc(ent.stp_state || "-")}</div></div>`;
+  } else {
+    b += `<div class="kv"><div class="k">IP Address</div><div class="v mono">${esc(ent.ip || "-")}</div></div>
+      <div class="kv"><div class="k">MAC Address</div><div class="v mono">${esc(ent.mac || "-")}</div></div>
+      <div class="kv"><div class="k">Network / VLAN</div><div class="v">${esc(ent.network_name || "-")}</div></div>
+      <div class="kv"><div class="k">${ent.kind === "device" ? "Firmware" : "Last Checked"}</div><div class="v mono">${esc(ent.kind === "device" ? (ent.firmware || "-") : (ent.scanned_at ? fmtTime(ent.scanned_at) : "Not yet scanned"))}</div></div>`;
+  }
+  b += `</div>`;
+
+  if (ent.services && ent.services.length) {
+    const reachMap = { wan: "Internet", lan: "Whole Home", "vlan-only": "This Network Only" };
+    b += `<div class="dsec-t" style="margin-top:8px">Open Network Ports (${ent.services.length})</div>
+      <div class="pills" style="margin-bottom:12px">
+        ${ent.services.map(svc => `<span class="tag ${svc.exposed ? humanStateTone(svc.severity) : (svc.reachable === "wan" ? "blue" : "neutral")}">
+          <span class="mono">${esc(svc.label || (svc.proto + ":" + svc.port))}</span> · ${esc(reachMap[svc.reachable] || svc.reachable)}
+        </span>`).join("")}
+      </div>`;
+  }
+
+  if (nonCVE.length) {
+    b += `<div class="dsec-t" style="margin-top:8px">Raw Check Evidence</div>`;
+    for (const r of nonCVE) {
+      b += `<div style="padding:9px 11px;border-radius:9px;background:var(--surface);border:1px solid var(--border);margin-bottom:8px;font-size:12px">
+        <div class="mono" style="font-weight:700">${esc(r.ref)}${r.port ? " :" + r.port : ""} · ${esc(r.severity)}</div>
+        ${r.observed ? `<div class="small" style="margin-top:3px"><strong>Observed:</strong> ${esc(r.observed)}</div>` : ""}
+        ${r.expected ? `<div class="small"><strong>Expected:</strong> ${esc(r.expected)}</div>` : ""}
+        ${r.evidence ? `<div class="small" style="margin-top:3px">${esc(r.evidence)}</div>` : ""}
+      </div>`;
+    }
+  }
+
+  if (ent.potential_cves && ent.potential_cves.length) {
+    b += `<div class="dsec-t" style="margin-top:8px">Unverified Patch Advisories (${ent.potential_cves.length})</div>`;
+    for (const s of ent.potential_cves) {
+      b += `<div style="padding:9px 11px;border-radius:9px;background:var(--surface);border:1px solid var(--border);margin-bottom:8px;font-size:12px">
+        <strong>${esc(s.product.label)}</strong> · ${s.total_cves} possible CVE(s) (version hidden)
+        <div class="small mono" style="margin-top:2px">${esc((s.top_cves || []).join(", "))}</div>
+      </div>`;
+    }
+  }
+
+  b += `</div></details>`;
+  document.getElementById("drawer-body").innerHTML = b;
+}
+
+/* ============================================================================
+   LIVE LOOP & OFFLINE SNAPSHOT BOOTSTRAP
+   ============================================================================ */
+function renderActiveTab() {
   if (!state) return;
-  renderHeaderAndBar();
-  if (activeTab === "map") renderMap();
-  else if (activeTab === "inventory") renderInventory();
+  renderHeader();
+  if (activeTab === "checkup") renderCheckup();
+  else if (activeTab === "house") renderHouse();
+  else if (activeTab === "devices") renderDevices();
   else if (activeTab === "activity") renderActivity();
+  if (drawerStack.length) renderDrawer();
 }
 
 async function fetchState() {
@@ -1355,8 +2376,8 @@ async function fetchState() {
   const r = await fetch("/api/state", {cache: "no-store"});
   if (!r.ok) return;
   state = await r.json();
-  applyHash();
-  renderAll();
+  if (!drawerStack.length && location.hash) applyHash();
+  renderActiveTab();
 }
 
 async function triggerRescan(ip) {
@@ -1370,17 +2391,16 @@ function connectSSE() {
   if (isStaticMode) return;
   const es = new EventSource("/api/events");
   es.addEventListener("uniblue", () => fetchState());
-  es.onerror = () => { document.getElementById("mode-lbl").textContent = "Reconnecting…"; };
+  es.onerror = () => { document.getElementById("status-lbl").textContent = "Reconnecting…"; };
   es.onopen = () => fetchState();
 }
 
-// Boot: check for offline baked state (from `uniblue topology -out topology.html`) first!
 const staticEl = document.getElementById("uniblue-static-state");
 if (staticEl && staticEl.textContent.trim()) {
   isStaticMode = true;
   state = JSON.parse(staticEl.textContent);
   applyHash();
-  renderAll();
+  renderActiveTab();
 } else {
   fetchState();
   connectSSE();
