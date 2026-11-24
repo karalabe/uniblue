@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/karalabe/uniblue/internal/unifi"
+	"github.com/praetorian-inc/nerva/pkg/plugins"
 )
 
 func TestFingerprintHostAndExclusions(t *testing.T) {
@@ -52,5 +53,28 @@ func TestFingerprintHostAndExclusions(t *testing.T) {
 	}
 	if banner.StatusCode != 200 || banner.Server != "AirFlow-HTTP/1.0" || banner.Title != "AirFlow Pro Ventilation" {
 		t.Fatalf("unexpected banner: %+v", banner)
+	}
+}
+
+func TestShouldKeepNervaFindingFiltersSyntheticHTTPAnonAccess(t *testing.T) {
+	// Synthetic HTTP fingerprinter finding emitted on public /api/health or /login must be dropped.
+	synthetic := plugins.SecurityFinding{
+		ID:       "grafana:10.0.0-anon-access",
+		Severity: plugins.SeverityMedium,
+		Evidence: "Successfully queried endpoint without credentials",
+	}
+	if shouldKeepNervaFinding(synthetic) {
+		t.Fatal("expected synthetic HTTP *-anon-access finding to be filtered out")
+	}
+
+	// Real verified protocol findings must be retained.
+	for _, realFinding := range []plugins.SecurityFinding{
+		{ID: "smb-v1-enabled", Severity: plugins.SeverityMedium, Evidence: "SMBv1 negotiate response received"},
+		{ID: "ftp-anon-access", Severity: plugins.SeverityHigh, Evidence: "230 Anonymous login ok"},
+		{ID: "tls-certificate-expired", Severity: plugins.SeverityLow, Evidence: "expired=2023-01-01"},
+	} {
+		if !shouldKeepNervaFinding(realFinding) {
+			t.Fatalf("expected genuine finding %q to be kept", realFinding.ID)
+		}
 	}
 }

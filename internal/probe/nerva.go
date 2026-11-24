@@ -107,14 +107,13 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 		}
 
 		svc := Service{
-			Port:            rawSvc.Port,
-			Protocol:        proto,
-			TLS:             rawSvc.TLS,
-			Version:         strings.TrimSpace(rawSvc.Version),
-			Title:           strings.TrimSpace(meta.Title),
-			Banner:          strings.TrimSpace(meta.Banner),
-			AnonymousAccess: rawSvc.AnonymousAccess,
-			CPEs:            meta.CPEs,
+			Port:     rawSvc.Port,
+			Protocol: proto,
+			TLS:      rawSvc.TLS,
+			Version:  strings.TrimSpace(rawSvc.Version),
+			Title:    strings.TrimSpace(meta.Title),
+			Banner:   strings.TrimSpace(meta.Banner),
+			CPEs:     meta.CPEs,
 		}
 
 		for _, sf := range rawSvc.SecurityFindings {
@@ -123,6 +122,9 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 			}
 			if !shouldKeepNervaFinding(sf) {
 				continue
+			}
+			if strings.Contains(strings.ToLower(sf.ID), "anon") || strings.Contains(strings.ToLower(sf.ID), "no-auth") {
+				svc.AnonymousAccess = true
 			}
 			svc.Findings = append(svc.Findings, ServiceFinding{
 				ID:          sf.ID,
@@ -171,15 +173,24 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 	}
 }
 
-// shouldKeepNervaFinding drops noisy LAN web-header lint findings while
-// retaining genuine security exposures (anonymous access, SMBv1, weak signing,
-// expired TLS certificates, weak auth, etc.).
+// shouldKeepNervaFinding drops noisy LAN web-header lint findings and Nerva's
+// synthetic HTTP product-detection "*-anon-access" placeholders (which fire
+// on public /api/health or /login endpoints without verifying authentication),
+// while retaining genuine security exposures (SMBv1, weak signing, expired TLS
+// certificates, verified unauthenticated protocols, etc.).
 func shouldKeepNervaFinding(sf plugins.SecurityFinding) bool {
 	id := strings.ToLower(strings.TrimSpace(sf.ID))
 	if id == "" {
 		return false
 	}
 	if _, noisy := noisyNervaFindings[id]; noisy {
+		return false
+	}
+	// Nerva's HTTP plugin synthesizes "<tech>-anon-access" with this exact
+	// boilerplate evidence whenever an HTTP fingerprinter detects a product via
+	// a public health or login endpoint, even when authentication is enforced.
+	if strings.HasSuffix(id, "-anon-access") &&
+		strings.EqualFold(strings.TrimSpace(sf.Evidence), "Successfully queried endpoint without credentials") {
 		return false
 	}
 	return true

@@ -198,22 +198,25 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 			})
 		}
 
-		// Extract versioned products surfaced by Nerva service findings or CPEs.
+		// Extract exact-version products directly from any versioned CPE 2.3
+		// identifiers reported by Nerva's protocol fingerprinters.
 		for _, svc := range hp.Services {
-			for _, sf := range svc.Findings {
-				if name, ver := parseNervaVersionedID(sf.ID); name == "grafana" && ver != "" {
-					add(Product{
-						Label:      "Grafana",
-						Vendors:    []string{"grafana"},
-						Products:   []string{"grafana"},
-						Version:    ver,
-						Source:     "nerva",
-						HostName:   hp.Client.DisplayName(),
-						HostIP:     hp.Client.IP,
-						VLAN:       hp.Client.NetworkName,
-						WANExposed: wan,
-					})
+			for _, rawCPE := range svc.CPEs {
+				vendor, product, ver, ok := parseVersionedCPE23(rawCPE)
+				if !ok {
+					continue
 				}
+				add(Product{
+					Label:      formatProductLabel(product),
+					Vendors:    []string{vendor},
+					Products:   []string{product},
+					Version:    ver,
+					Source:     "nerva-cpe",
+					HostName:   hp.Client.DisplayName(),
+					HostIP:     hp.Client.IP,
+					VLAN:       hp.Client.NetworkName,
+					WANExposed: wan,
+				})
 			}
 		}
 	}
@@ -333,19 +336,35 @@ func expandProductPatterns(patterns []string, model string) []string {
 	return out
 }
 
-// parseNervaVersionedID extracts (product, version) from Nerva finding IDs
-// formatted like "<product>:<version>-<issue>".
-func parseNervaVersionedID(id string) (string, string) {
-	prefix, rest, ok := strings.Cut(strings.ToLower(strings.TrimSpace(id)), ":")
-	if !ok || prefix == "" {
-		return "", ""
+// parseVersionedCPE23 parses a CPE 2.3 URI ("cpe:2.3:a:vendor:product:version:...")
+// and returns (vendor, product, version, true) only when a concrete version
+// token (not "*", "-", or empty) is present.
+func parseVersionedCPE23(raw string) (vendor, product, version string, ok bool) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(raw)), ":")
+	if len(parts) < 6 || parts[0] != "cpe" || parts[1] != "2.3" {
+		return "", "", "", false
 	}
-	ver, _, _ := strings.Cut(rest, "-")
-	ver = strings.TrimSpace(ver)
-	if ver == "" || ver[0] < '0' || ver[0] > '9' {
-		return prefix, ""
+	vendor = parts[3]
+	product = parts[4]
+	version = parts[5]
+	if vendor == "" || vendor == "*" || vendor == "-" ||
+		product == "" || product == "*" || product == "-" ||
+		version == "" || version == "*" || version == "-" {
+		return "", "", "", false
 	}
-	return prefix, ver
+	return vendor, product, version, true
+}
+
+// formatProductLabel converts a CPE product token such as "grafana" or
+// "http_server" into a concise human-readable display label.
+func formatProductLabel(cpeProduct string) string {
+	words := strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(cpeProduct))
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // captureGroup safely extracts group idx from a regex submatch slice.
