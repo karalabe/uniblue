@@ -105,3 +105,60 @@ func TestStatePersistenceAndDiffing(t *testing.T) {
 		t.Fatal("expected diff to trigger high-severity alert")
 	}
 }
+
+func TestExposureClassificationAndPostureNotes(t *testing.T) {
+	netCfg := config.NetworkConfig{
+		TrustedVLANs:  []string{"Default"},
+		IsolatedVLANs: []string{"IoT"},
+	}
+
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Networks: []unifi.Network{
+			{ID: "n1", Name: "Default", VLAN: "1"},
+			{ID: "n2", Name: "IoT", VLAN: "30"},
+			{ID: "n3", Name: "Servers", VLAN: "2"},
+		},
+		Clients: []unifi.Client{
+			{IP: "10.0.1.50", MAC: "aa:01", Name: "Ventilation", NetworkName: "Default"},
+			{IP: "192.168.10.3", MAC: "aa:02", Name: "p2p-node", NetworkName: "Servers"},
+		},
+		PortForwards: []unifi.PortForward{
+			{Name: "Ethereum DevP2P", Enabled: true, Proto: "tcp_udp", DstPort: "30303", FwdIP: "192.168.10.3", FwdPort: "30303", Src: "any"},
+			{Name: "Accidental Eth RPC", Enabled: true, Proto: "tcp", DstPort: "8545", FwdIP: "192.168.10.3", FwdPort: "8545", Src: "any"},
+		},
+	}
+
+	raw := []checks.Finding{
+		{CheckID: "UB-2026-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[0], Port: 56747},
+	}
+
+	report := Evaluate(snap, raw, netCfg)
+
+	// Expect 2 WAN surface entries: DevP2P classified INFO (expected-p2p), RPC classified CRITICAL (dangerous-rpc).
+	if len(report.WANSurface) != 2 {
+		t.Fatalf("expected 2 WAN surface items, got %d", len(report.WANSurface))
+	}
+	if report.WANSurface[0].Class != "dangerous-rpc" || report.WANSurface[0].Severity != checks.SeverityCritical {
+		t.Fatalf("expected RPC forward to be CRITICAL dangerous-rpc, got %+v", report.WANSurface[0])
+	}
+	if report.WANSurface[1].Class != "expected-p2p" || report.WANSurface[1].Severity != checks.SeverityInfo {
+		t.Fatalf("expected DevP2P forward to be INFO expected-p2p, got %+v", report.WANSurface[1])
+	}
+
+	// Only the CRITICAL RPC forward (not expected DevP2P) should appear as a Finding.
+	portFwdFindings := 0
+	for _, f := range report.Findings {
+		if f.CheckID == "UB-UNIFI-PORTFWD" {
+			portFwdFindings++
+		}
+	}
+	if portFwdFindings != 1 {
+		t.Fatalf("expected exactly 1 actionable port-forward finding (RPC only), got %d", portFwdFindings)
+	}
+
+	// Unused "IoT" VLAN posture note should fire automatically.
+	if len(report.PostureNotes) == 0 {
+		t.Fatal("expected posture note flagging unused IoT VLAN")
+	}
+}

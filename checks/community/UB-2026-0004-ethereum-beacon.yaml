@@ -1,0 +1,38 @@
+id: UB-2026-0004
+title: Unauthenticated Ethereum Consensus Beacon REST API Exposed
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Ethereum
+  product: Consensus Client Beacon API (Lighthouse / Prysm / Teku / Nimbus / Lodestar)
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://ethereum.github.io/beacon-APIs/
+
+preconditions:
+  ports_any: [5052, 3500]
+
+probe:
+  type: http
+  method: GET
+  path: /eth/v1/node/version
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_any: ["version"]
+    headers_absent: ["WWW-Authenticate"]
+    redact_body: false
+
+remediation:
+  summary: >
+    Ethereum Consensus Beacon REST API is reachable without authentication.
+    Keep Beacon HTTP endpoints private to localhost or your validator host,
+    while only forwarding P2P ports (9000/9001) on WAN.
+  unifi_actions:
+    - bind_beacon_api_to_localhost
+    - block_wan_port_5052
+    - restrict_inter_vlan_access

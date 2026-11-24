@@ -83,14 +83,16 @@ Commands:
   cve         Sync, search, and match a local NVD + CISA KEV cache against your LAN`)
 }
 
-// runScan executes one complete UniFi sync, gentle host probe, check pass, and
-// blast-radius evaluation, printing the report to stdout.
+// runScan executes one complete UniFi sync, gentle host probe, check pass,
+// blast-radius evaluation, and (when a local CVE cache exists) rolled-up CVE
+// correlation, printing a unified executive summary to stdout.
 func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
 	jsonOut := fs.Bool("json", false, "output report as JSON")
 	saveState := fs.Bool("save-state", false, "persist scan baseline to configured state.path")
+	noCVE := fs.Bool("no-cve", false, "skip local CVE cache rollup even if synced")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -104,9 +106,17 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return err
 	}
 
-	snap, report, err := executeCycle(ctx, cfg, checkList)
+	snap, profiles, report, err := executeCycle(ctx, cfg, checkList)
 	if err != nil {
 		return err
+	}
+
+	// Opportunistically attach rolled-up CVE summaries whenever a local NVD+KEV
+	// cache has been synced, giving operators a single unified security picture.
+	var exactCVEs, potentialCVEs []cve.ProductSummary
+	cveLoaded := false
+	if !*noCVE {
+		exactCVEs, potentialCVEs, cveLoaded = correlateLocalCVEs(cfg, snap, profiles)
 	}
 
 	if *saveState {
@@ -117,9 +127,14 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 
 	if *jsonOut {
-		return writeJSON(stdout, report)
+		return writeJSON(stdout, map[string]any{
+			"report":         report,
+			"cve_correlated": cveLoaded,
+			"exact_cves":     exactCVEs,
+			"potential_cves": potentialCVEs,
+		})
 	}
-	printReport(stdout, snap, report)
+	printReport(stdout, snap, report, exactCVEs, potentialCVEs, cveLoaded)
 	return nil
 }
 
@@ -167,7 +182,7 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			return
 		}
 
-		snap, report, err := executeCycle(ctx, cfg, checkList)
+		snap, _, report, err := executeCycle(ctx, cfg, checkList)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -358,22 +373,22 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 // executeCycle runs one end-to-end UniFi snapshot, host fingerprinting pass,
 // declarative check sweep, and blast-radius risk evaluation.
-func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.Check) (*unifi.Snapshot, risk.Report, error) {
+func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.Check) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
 	ctrl, err := unifi.New(cfg.UniFi)
 	if err != nil {
-		return nil, risk.Report{}, err
+		return nil, nil, risk.Report{}, err
 	}
 	if err := ctrl.Login(ctx); err != nil {
-		return nil, risk.Report{}, err
+		return nil, nil, risk.Report{}, err
 	}
 	snap, err := ctrl.FetchSnapshot(ctx)
 	if err != nil {
-		return nil, risk.Report{}, err
+		return nil, nil, risk.Report{}, err
 	}
 
 	// Union configured default ports with any specialty ports required by loaded
-	// community checks (such as port 56747 for Zehnder ComfoConnect) so dropping
-	// a new YAML check into checks/ works without editing config.yaml.
+	// community checks (such as port 56747 for Zehnder ComfoConnect or 8545 for
+	// Ethereum RPC) so dropping a YAML check into checks/ works automatically.
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
 	fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
@@ -383,7 +398,37 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	rawFindings := runner.RunAll(ctx, profiles)
 
 	report := risk.Evaluate(snap, rawFindings, cfg.Network)
-	return snap, report, nil
+	return snap, profiles, report, nil
+}
+
+// correlateLocalCVEs checks whether the local NVD+KEV cache exists and, if so,
+// returns deterministic per-(host, product) rollups split into Exact version
+// matches and Potential (version-unknown) patch reminders.
+func correlateLocalCVEs(cfg *config.Config, snap *unifi.Snapshot, profiles []probe.HostProfile) (exact, potential []cve.ProductSummary, ok bool) {
+	cache := cve.NewCache(cfg.CVE.CacheDir)
+	if _, err := cache.Stats(); err != nil {
+		return nil, nil, false
+	}
+	identifier, err := cve.LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		return nil, nil, false
+	}
+	products := identifier.Identify(snap, profiles)
+	matches, err := cache.MatchProducts(products, cve.MatchOptions{
+		MinSeverity:          checks.SeverityHigh,
+		PotentialMaxAgeYears: 2,
+	})
+	if err != nil {
+		return nil, nil, false
+	}
+	for _, s := range cve.RollupMatches(matches) {
+		if s.Confidence == cve.ConfidenceExact {
+			exact = append(exact, s)
+		} else {
+			potential = append(potential, s)
+		}
+	}
+	return exact, potential, true
 }
 
 // mergePorts returns the deduplicated union of basePorts and every port
@@ -425,49 +470,126 @@ func loadAllChecks(extraDir string) ([]*checks.Check, error) {
 	return checks.Merge(builtins, custom)
 }
 
-// printReport renders a prioritized, operator-friendly summary to w.
-func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report) {
-	fmt.Fprintf(w, "UniBlue Scan Report | Site: %s (%s) | Clients: %d | Findings: %d\n\n",
-		snap.Site, snap.ControllerType, report.ClientCount, len(report.Findings))
+// printReport renders a unified, operator-ready security summary combining
+// confirmed live check findings, exact-version CVE rollups, classified WAN
+// exposure, version-unknown patch checks, and clean-posture statistics.
+func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVEs, potentialCVEs []cve.ProductSummary, cveLoaded bool) {
+	fmt.Fprintf(w, "UniBlue Security Summary | Site: %s (%s) | Clients: %d | UniFi Gear: %d | Networks: %d\n\n",
+		snap.Site, snap.ControllerType, report.ClientCount, report.UniFiDeviceCount, len(snap.Networks))
 
-	if len(report.Findings) == 0 {
-		fmt.Fprintln(w, "No findings detected.")
-		return
+	// 1. Confirmed Actionable LAN Findings (active checks + exact-version CVEs).
+	var activeChecks []checks.Finding
+	var firmwareFindings []checks.Finding
+	for _, f := range report.Findings {
+		switch f.CheckID {
+		case "UB-UNIFI-PORTFWD":
+			// Shown cleanly in the dedicated WAN Surface section below.
+		case "UB-UNIFI-FIRMWARE":
+			firmwareFindings = append(firmwareFindings, f)
+		default:
+			activeChecks = append(activeChecks, f)
+		}
 	}
 
-	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "SEVERITY\tCHECK\tHOST\tIP:PORT\tVLAN\tTITLE")
-	for _, f := range report.Findings {
-		ipPort := f.Client.IP
-		if f.Port > 0 {
-			ipPort = fmt.Sprintf("%s:%d", f.Client.IP, f.Port)
+	fmt.Fprintf(w, "1. Confirmed LAN Exposures (%d check(s), %d exact-version CVE rollup(s)):\n", len(activeChecks), len(exactCVEs))
+	if len(activeChecks) == 0 && len(exactCVEs) == 0 {
+		fmt.Fprintln(w, "  None detected.")
+	} else {
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "  SEVERITY\tSOURCE\tHOST\tIP:PORT\tVLAN\tVERIFIED FINDING")
+		for _, f := range activeChecks {
+			ipPort := f.Client.IP
+			if f.Port > 0 {
+				ipPort = fmt.Sprintf("%s:%d", f.Client.IP, f.Port)
+			}
+			vlan := f.Client.NetworkName
+			if vlan == "" {
+				vlan = "-"
+			}
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\n",
+				strings.ToUpper(f.EffectiveSeverity.String()), f.CheckID, f.Client.DisplayName(), ipPort, vlan, f.Title)
 		}
-		vlan := f.Client.NetworkName
-		if vlan == "" {
-			vlan = "-"
+		for _, s := range exactCVEs {
+			vlan := s.Product.VLAN
+			if vlan == "" {
+				vlan = "-"
+			}
+			fmt.Fprintf(tw, "  %s\tCVE-EXACT\t%s\t%s\t%s\t%s\n",
+				strings.ToUpper(s.MaxSeverity.String()), s.Product.HostName, s.Product.HostIP, vlan, s.Headline())
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			strings.ToUpper(f.EffectiveSeverity.String()),
-			f.CheckID,
-			f.Client.DisplayName(),
-			ipPort,
-			vlan,
-			f.Title,
-		)
-	}
-	_ = tw.Flush()
+		_ = tw.Flush()
 
-	fmt.Fprintln(w, "\nDetails:")
-	for _, f := range report.Findings {
-		fmt.Fprintf(w, "- [%s] %s on %s (%s)\n",
-			strings.ToUpper(f.EffectiveSeverity.String()), f.CheckID, f.Client.DisplayName(), f.Client.IP)
-		fmt.Fprintf(w, "  Evidence: %s\n", f.Evidence)
-		if len(f.RiskReasons) > 0 {
-			fmt.Fprintf(w, "  Blast Radius: %s\n", strings.Join(f.RiskReasons, "; "))
+		fmt.Fprintln(w, "\n  Verified Proof & Remediation:")
+		for _, f := range activeChecks {
+			fmt.Fprintf(w, "  - [%s] %s on %s (%s)\n",
+				strings.ToUpper(f.EffectiveSeverity.String()), f.CheckID, f.Client.DisplayName(), f.Client.IP)
+			fmt.Fprintf(w, "    Proof:       %s\n", f.Evidence)
+			if len(f.RiskReasons) > 0 {
+				fmt.Fprintf(w, "    BlastRadius: %s\n", strings.Join(f.RiskReasons, "; "))
+			}
+			if f.Remediation.Summary != "" {
+				fmt.Fprintf(w, "    Action:      %s\n", strings.TrimSpace(f.Remediation.Summary))
+			}
 		}
-		if f.Remediation.Summary != "" {
-			fmt.Fprintf(w, "  Remediation: %s\n", strings.TrimSpace(f.Remediation.Summary))
+		for _, s := range exactCVEs {
+			fmt.Fprintf(w, "  - [%s] %s on %s (%s): %s (top: %s)\n",
+				strings.ToUpper(s.MaxSeverity.String()), s.Product.Label, s.Product.HostName, s.Product.HostIP, s.Headline(), strings.Join(s.TopCVEs, ", "))
 		}
+	}
+
+	// 2. Classified WAN Surface (separating dangerous forwards from expected P2P/VPN).
+	fmt.Fprintf(w, "\n2. WAN Exposure Surface (%d enabled forward(s)):\n", len(report.WANSurface))
+	if len(report.WANSurface) == 0 {
+		fmt.Fprintln(w, "  No active WAN port forwards.")
+	} else {
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "  SEVERITY\tCLASS\tRULE\tWAN -> TARGET\tHOST\tASSESSMENT")
+		for _, a := range report.WANSurface {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%s:%s -> %s:%s\t%s\t%s\n",
+				strings.ToUpper(a.Severity.String()),
+				a.Class,
+				a.Forward.Name,
+				a.Forward.Proto, a.Forward.DstPort, a.Forward.FwdIP, a.Forward.FwdPort,
+				a.Client.DisplayName(),
+				a.RuleName,
+			)
+		}
+		_ = tw.Flush()
+	}
+
+	// 3. Rolled-up Patch Verification Reminders (version unknown).
+	if cveLoaded && len(potentialCVEs) > 0 {
+		fmt.Fprintf(w, "\n3. Patch Verification — Version Unknown (%d product(s)):\n", len(potentialCVEs))
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "  MAX SEV\tHOST\tVLAN\tSUMMARY\tTOP CVES")
+		for _, s := range potentialCVEs {
+			vlan := s.Product.VLAN
+			if vlan == "" {
+				vlan = "-"
+			}
+			fmt.Fprintf(tw, "  %s\t%s (%s)\t%s\t%s\t%s\n",
+				strings.ToUpper(s.MaxSeverity.String()),
+				s.Product.HostName, s.Product.HostIP,
+				vlan,
+				s.Headline(),
+				strings.Join(s.TopCVEs, ", "),
+			)
+		}
+		_ = tw.Flush()
+	}
+
+	// 4. Network Posture & Clean Summary.
+	fmt.Fprintln(w, "\n4. Posture & Clean Baseline:")
+	for _, n := range report.PostureNotes {
+		fmt.Fprintf(w, "  - [%s] %s\n    %s\n", strings.ToUpper(n.Severity.String()), n.Title, n.Detail)
+	}
+	for _, f := range firmwareFindings {
+		fmt.Fprintf(w, "  - [LOW] %s — %s\n", f.Title, f.Evidence)
+	}
+	fmt.Fprintf(w, "  - [OK] UniFi Infrastructure: %d/%d device(s) up to date\n", report.CleanUniFiDevices, report.UniFiDeviceCount)
+	fmt.Fprintf(w, "  - [OK] LAN Clients:          %d/%d active host(s) passed with zero unauthenticated services exposed\n", report.CleanClients, report.ClientCount)
+	if !cveLoaded {
+		fmt.Fprintln(w, "  - [TIP] Run `uniblue cve sync` once to include offline NVD+KEV correlation in `uniblue scan`.")
 	}
 }
 

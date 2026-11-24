@@ -1,0 +1,112 @@
+# Declarative WAN port-forward classification rules.
+# Evaluated top-to-bottom; the first matching rule classifies the forward's
+# baseline risk before VLAN trust adjustments are applied.
+
+- id: eth-rpc-exposed
+  name: Ethereum RPC / Engine / Keymanager API
+  class: dangerous-rpc
+  severity: critical
+  ports: [8545, 8546, 8551, 5052, 5062, 7500]
+  summary: >
+    Ethereum JSON-RPC, Engine API, Beacon REST, or Validator Keymanager port
+    is forwarded from WAN. Never expose node RPC or validator APIs to the
+    public internet; bind them to localhost or access over VPN.
+  actions:
+    - disable_wan_port_forward
+    - restrict_to_vpn_or_localhost
+
+- id: remote-desktop-exposed
+  name: Remote Desktop / Cleartext Shell
+  class: dangerous-remote
+  severity: critical
+  ports: [23, 3389, 5900, 5901, 5902, 5903, 5904, 5905]
+  summary: >
+    Remote desktop (RDP/VNC) or cleartext Telnet port is directly forwarded
+    from WAN. These ports are continuously targeted by automated credential
+    stuffing and takeover bots.
+  actions:
+    - disable_wan_port_forward
+    - use_wireguard_vpn
+
+- id: database-or-docker-exposed
+  name: Database / Container Daemon / SMB
+  class: dangerous-remote
+  severity: critical
+  ports: [445, 2375, 3306, 5432, 6379, 9200, 27017]
+  summary: >
+    Internal database, SMB file share, or unencrypted Docker daemon port is
+    forwarded from WAN.
+  actions:
+    - disable_wan_port_forward
+    - restrict_to_internal_vlan
+
+- id: iot-control-exposed
+  name: IoT / Industrial Control Protocol
+  class: dangerous-remote
+  severity: critical
+  ports: [502, 554, 623, 1883, 47808, 56747]
+  summary: >
+    IoT, IPMI, camera RTSP, or building-automation control port is forwarded
+    directly from WAN.
+  actions:
+    - disable_wan_port_forward
+    - move_to_iot_vlan
+
+- id: admin-panel-exposed
+  name: Direct Admin / SSH Entrypoint
+  class: remote-admin
+  severity: high
+  ports: [22, 5000, 5001, 8006, 8123]
+  name_regex: "(?i)(dashboard|admin|console|ipmi|proxmox|unraid|truenas|synology)"
+  summary: >
+    Direct SSH or management dashboard port is forwarded from WAN. Prefer
+    WireGuard/Teleport VPN access or restrict allowed WAN source IPs.
+  actions:
+    - restrict_wan_source_ip
+    - prefer_vpn_access
+
+- id: public-web-proxy
+  name: Public HTTP/HTTPS Web Entrypoint
+  class: web-entrypoint
+  severity: medium
+  ports: [80, 443]
+  summary: >
+    Public HTTP/HTTPS entrypoint open to WAN. Keep the reverse proxy patched
+    and verify internal management panels (Unraid, TrueNAS, IPMI) are not
+    proxied externally.
+  actions:
+    - keep_reverse_proxy_patched
+    - audit_proxied_upstreams
+
+- id: eth-p2p-expected
+  name: Ethereum P2P Peering (DevP2P / LibP2P)
+  class: expected-p2p
+  severity: info
+  ports: [30303, 30304, 9000, 9001, 12000, 13000]
+  name_regex: "(?i)(ethereum|devp2p|libp2p|beacon|consensus|execution|geth|reth|lighthouse|prysm|teku|nimbus)"
+  summary: >
+    Expected Ethereum peer-to-peer networking port required for healthy node
+    peering. Safe to expose on WAN as long as RPC/Engine ports (8545/8551/5052)
+    remain strictly private.
+  actions:
+    - verify_rpc_ports_not_forwarded
+
+- id: wireguard-vpn
+  name: WireGuard VPN Listener
+  class: vpn-entrypoint
+  severity: info
+  proto: udp
+  ports: [51820]
+  summary: >
+    WireGuard UDP listener designed for public WAN exposure (silently drops
+    unauthenticated packets).
+  actions: []
+
+- id: generic-p2p-expected
+  name: Peer-to-Peer Network Port (Bitcoin / IPFS)
+  class: expected-p2p
+  severity: info
+  ports: [4001, 8333, 9735]
+  summary: >
+    Standard peer-to-peer protocol port (Bitcoin, Lightning, or IPFS Swarm).
+  actions: []

@@ -188,4 +188,13 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 	if err != nil || len(found) != 1 {
 		t.Fatalf("Search(vendor=ixsystems, limit=1) = %+v, err=%v", found, err)
 	}
+
+	// Verify deterministic rollup and computed MinFixedVersion.
+	summaries := RollupMatches(matches)
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 rollup summaries, got %d", len(summaries))
+	}
+	if summaries[0].MinFixedVersion != "9.8p1" || summaries[0].KEVCount != 1 {
+		t.Fatalf("unexpected OpenSSH rollup summary: %+v", summaries[0])
+	}
 }

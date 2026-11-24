@@ -284,6 +284,23 @@ func TestProtocolProbes(t *testing.T) {
 			t.Fatalf("expected telnet login banner evidence, got ok=%v ev=%q", ok, ev)
 		}
 	})
+
+	t.Run("ethereum json-rpc exposed", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":"Geth/v1.15.0-stable/linux-amd64/go1.24.0"}`)
+		}))
+		defer srv.Close()
+
+		_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+
+		r := NewRunner(nil, 1)
+		ev, ok := r.probeEthereumRPC(context.Background(), "127.0.0.1", port)
+		if !ok || !strings.Contains(ev, "Geth/v1.15.0") {
+			t.Fatalf("expected eth-rpc probe match with Geth version, got ok=%v ev=%q", ok, ev)
+		}
+	})
 }
 
 // startMockTCP starts a localhost TCP server that handles connections with fn

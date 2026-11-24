@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -341,6 +342,8 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 		return probeDenonMarantzAVR(probeCtx, ip, port)
 	case "comfoconnect":
 		return probeComfoConnect(probeCtx, ip, port)
+	case "eth-rpc":
+		return r.probeEthereumRPC(probeCtx, ip, port)
 	default:
 		return "", false
 	}
@@ -850,6 +853,39 @@ func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 		return fmt.Sprintf("confirmed passwordless VNC session: desktop %q (%dx%d, RFB None)", desktopName, width, height), true
 	}
 	return fmt.Sprintf("confirmed passwordless VNC session (%dx%d, RFB None)", width, height), true
+}
+
+// probeEthereumRPC sends a strictly read-only JSON-RPC "web3_clientVersion"
+// query to confirm an unauthenticated Ethereum Execution RPC endpoint and
+// identify the exact client software (e.g., Geth, Reth, Nethermind, Besu).
+func (r *Runner) probeEthereumRPC(ctx context.Context, ip string, port int) (string, bool) {
+	targetURL := fmt.Sprintf("http://%s/", net.JoinHostPort(ip, strconv.Itoa(port)))
+	payload := `{"jsonrpc":"2.0","method":"web3_clientVersion","params":[],"id":1}`
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(payload))
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "UniBlue-Checker/0.1")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var rpcResp struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(bodyBytes, &rpcResp); err != nil || strings.TrimSpace(rpcResp.Result) == "" {
+		return "", false
+	}
+	return fmt.Sprintf("confirmed unauthenticated Ethereum JSON-RPC: web3_clientVersion -> %q", compactASCII(rpcResp.Result, 96)), true
 }
 
 // compactASCII strips control bytes, collapses whitespace, and caps length so

@@ -16,6 +16,7 @@ import (
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/unifi"
+	"github.com/karalabe/uniblue/rules"
 )
 
 // Report holds the complete risk-scored output of a single UniBlue scan.
@@ -29,9 +30,26 @@ type Report struct {
 	// ClientCount is the number of active LAN clients observed in UniFi.
 	ClientCount int `json:"client_count"`
 
-	// Findings holds all check and posture findings sorted from highest to lowest
-	// effective severity.
+	// CleanClients is the number of active clients with zero confirmed check findings.
+	CleanClients int `json:"clean_clients"`
+
+	// UniFiDeviceCount is the total number of UniFi infrastructure devices.
+	UniFiDeviceCount int `json:"unifi_device_count"`
+
+	// CleanUniFiDevices counts UniFi devices running up-to-date firmware.
+	CleanUniFiDevices int `json:"clean_unifi_devices"`
+
+	// Findings holds all actionable check and posture findings sorted from
+	// highest to lowest effective severity.
 	Findings []checks.Finding `json:"findings"`
+
+	// WANSurface classifies every enabled WAN port forward into expected P2P/VPN,
+	// public web entrypoints, or dangerous admin/RPC exposures.
+	WANSurface []ExposureAssessment `json:"wan_surface,omitempty"`
+
+	// PostureNotes captures network-wide architectural observations (such as an
+	// unused isolated IoT VLAN or unnamed WAN-exposed hosts).
+	PostureNotes []PostureNote `json:"posture_notes,omitempty"`
 }
 
 // State captures the minimal baseline persisted to disk between consecutive
@@ -112,14 +130,22 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		}
 	}
 
+	classifier, _ := LoadExposureClassifier(rules.BuiltinFS)
+
 	scored := make([]checks.Finding, 0, len(rawFindings)+len(snap.PortForwards))
+	affectedClientIPs := make(map[string]struct{})
 	for _, f := range rawFindings {
 		f = scoreFinding(f, forwardsByIP[f.Client.IP], trustedSet, isolatedSet)
 		scored = append(scored, f)
+		if f.Client.IP != "" {
+			affectedClientIPs[f.Client.IP] = struct{}{}
+		}
 	}
 
-	// Emit UniFi posture findings for enabled WAN port forwards so operators
-	// always see internet-facing exposure alongside internal check results.
+	// Classify every enabled WAN port forward using declarative exposure rules
+	// (distinguishing expected Ethereum P2P / WireGuard listeners from risky web
+	// proxies or critical RPC/RDP/database exposures).
+	var wanSurface []ExposureAssessment
 	for _, pf := range snap.PortForwards {
 		if !pf.Enabled {
 			continue
@@ -128,35 +154,54 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		if !known {
 			cl = unifi.Client{IP: pf.FwdIP, Name: pf.Name}
 		}
-		sev := checks.SeverityMedium
+
+		assessment := classifier.Classify(pf, cl)
 		var reasons []string
 		if pf.Src == "" || strings.EqualFold(pf.Src, "any") {
 			reasons = append(reasons, "open to any source IP on WAN")
 		}
-		if matchesVLAN(cl, trustedSet) {
-			sev = sev.Bump(1)
+		// Only escalate non-P2P/VPN forwards that punch directly into a trusted VLAN.
+		if assessment.Severity >= checks.SeverityMedium && matchesVLAN(cl, trustedSet) {
+			assessment.Severity = assessment.Severity.Bump(1)
 			reasons = append(reasons, fmt.Sprintf("forwards into trusted VLAN %q", vlanLabel(cl)))
 		}
+		wanSurface = append(wanSurface, assessment)
+
+		// Expected P2P/VPN listeners stay in WANSurface (INFO) without cluttering
+		// actionable Findings or waking up watch alerts.
+		if assessment.Severity < checks.SeverityMedium {
+			continue
+		}
+
 		scored = append(scored, checks.Finding{
 			CheckID:           "UB-UNIFI-PORTFWD",
-			Title:             fmt.Sprintf("WAN Port Forward Enabled (%s -> %s:%s)", pf.DstPort, pf.FwdIP, pf.FwdPort),
-			Category:          "wan-exposure",
-			BaseSeverity:      checks.SeverityMedium,
-			EffectiveSeverity: sev,
+			Title:             fmt.Sprintf("%s (%s -> %s:%s)", assessment.RuleName, pf.DstPort, pf.FwdIP, pf.FwdPort),
+			Category:          assessment.Class,
+			BaseSeverity:      assessment.Severity,
+			EffectiveSeverity: assessment.Severity,
 			RiskReasons:       reasons,
 			Client:            cl,
 			Evidence:          fmt.Sprintf("rule %q forwards %s WAN:%s to %s:%s (src=%s)", pf.Name, pf.Proto, pf.DstPort, pf.FwdIP, pf.FwdPort, fallbackAny(pf.Src)),
 			Remediation: checks.Remediation{
-				Summary:      "Verify this service truly needs public internet exposure. Prefer VPN/WireGuard access or restrict allowed source IPs where possible.",
-				UniFiActions: []string{"review_port_forward", "restrict_wan_source_ip"},
+				Summary:      assessment.Summary,
+				UniFiActions: assessment.Actions,
 			},
 		})
 	}
 
-	// Emit an informational/low posture finding for UniFi infrastructure gear
-	// running outdated firmware reported as upgradable by the controller.
+	sort.Slice(wanSurface, func(i, j int) bool {
+		if wanSurface[i].Severity != wanSurface[j].Severity {
+			return wanSurface[i].Severity > wanSurface[j].Severity
+		}
+		return wanSurface[i].Forward.Name < wanSurface[j].Forward.Name
+	})
+
+	// Emit a low-severity posture finding for UniFi infrastructure gear running
+	// outdated firmware reported as upgradable by the controller.
+	cleanUniFi := 0
 	for _, dev := range snap.Devices {
 		if !dev.Upgradable {
+			cleanUniFi++
 			continue
 		}
 		scored = append(scored, checks.Finding{
@@ -189,11 +234,25 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		return scored[i].CheckID < scored[j].CheckID
 	})
 
+	cleanClients := 0
+	for _, cl := range snap.Clients {
+		if _, bad := affectedClientIPs[cl.IP]; !bad {
+			cleanClients++
+		}
+	}
+
+	postureNotes := AnalyzePosture(snap, scored, netCfg)
+
 	return Report{
-		GeneratedAt: time.Now().UTC(),
-		Site:        snap.Site,
-		ClientCount: len(snap.Clients),
-		Findings:    scored,
+		GeneratedAt:       time.Now().UTC(),
+		Site:              snap.Site,
+		ClientCount:       len(snap.Clients),
+		CleanClients:      cleanClients,
+		UniFiDeviceCount:  len(snap.Devices),
+		CleanUniFiDevices: cleanUniFi,
+		Findings:          scored,
+		WANSurface:        wanSurface,
+		PostureNotes:      postureNotes,
 	}
 }
 

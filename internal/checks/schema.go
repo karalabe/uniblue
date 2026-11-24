@@ -207,7 +207,7 @@ type Preconditions struct {
 // satisfies a check's Preconditions.
 type ProbeSpec struct {
 	// Type selects the probe protocol: "tcp", "telnet", "http", "mqtt",
-	// "modbus", "rtsp", "vnc", "avr", or "comfoconnect".
+	// "modbus", "rtsp", "vnc", "avr", "comfoconnect", or "eth-rpc".
 	Type string `yaml:"type"`
 
 	// Port optionally pins the target port. When 0, the runner tests whichever
@@ -387,7 +387,7 @@ func (c *Check) Validate() error {
 	// mutate device state.
 	c.Probe.Type = strings.ToLower(strings.TrimSpace(c.Probe.Type))
 	switch c.Probe.Type {
-	case "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect":
+	case "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc":
 	case "http":
 		method := strings.ToUpper(strings.TrimSpace(c.Probe.Method))
 		if method == "" {
