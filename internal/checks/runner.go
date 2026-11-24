@@ -170,7 +170,10 @@ func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Fin
 		if all[i].Client.IP != all[j].Client.IP {
 			return all[i].Client.IP < all[j].Client.IP
 		}
-		return all[i].CheckID < all[j].CheckID
+		if all[i].CheckID != all[j].CheckID {
+			return all[i].CheckID < all[j].CheckID
+		}
+		return all[i].Port < all[j].Port
 	})
 	return all
 }

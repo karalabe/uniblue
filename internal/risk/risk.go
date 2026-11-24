@@ -230,7 +230,10 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		if scored[i].Client.IP != scored[j].Client.IP {
 			return scored[i].Client.IP < scored[j].Client.IP
 		}
-		return scored[i].CheckID < scored[j].CheckID
+		if scored[i].CheckID != scored[j].CheckID {
+			return scored[i].CheckID < scored[j].CheckID
+		}
+		return scored[i].Port < scored[j].Port
 	})
 
 	cleanClients := 0

@@ -33,6 +33,15 @@ const (
 	// maxPortDialTimeout caps the initial TCP connect check on a local LAN so
 	// sleeping or firewalled hosts never stall a scan across 30+ ports.
 	maxPortDialTimeout = 600 * time.Millisecond
+
+	// vncMaxDisplayPort caps the adaptive sequential VNC display walk (5900..5919)
+	// triggered only on hosts that already expose a VNC listener.
+	vncMaxDisplayPort = 5919
+
+	// vncWalkMaxConsecutiveMisses stops the adaptive VNC walk once this many
+	// consecutive display ports are closed, catching gaps from stopped VMs while
+	// keeping hypervisor probing fast.
+	vncWalkMaxConsecutiveMisses = 2
 )
 
 // titleRegex extracts the text inside an HTML <title>...</title> tag.
@@ -342,7 +351,61 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 	}
 
+	// Hypervisors (Unraid, Proxmox, QEMU/KVM) assign VNC displays sequentially
+	// starting at 5900 (:0, :1, :2...). When a host already exposes a VNC port,
+	// adaptively walk upward to discover additional VM displays without sending
+	// extra probes to non-VNC IoT devices.
+	if profile.HasPort(5900) || profile.HasPort(5901) {
+		f.walkVNCDisplays(ctx, dialer, cl.IP, &profile)
+	}
+
+	sort.Ints(profile.OpenPorts)
 	return profile
+}
+
+// walkVNCDisplays gently probes sequential RFB/VNC display ports (5901..5919)
+// on a host that already responded on a base VNC port, stopping once
+// vncWalkMaxConsecutiveMisses consecutive ports are closed.
+func (f *Fingerprinter) walkVNCDisplays(ctx context.Context, dialer net.Dialer, ip string, profile *HostProfile) {
+	probed := make(map[int]struct{}, len(f.ports))
+	for _, p := range f.ports {
+		probed[p] = struct{}{}
+	}
+
+	misses := 0
+	for port := 5901; port <= vncMaxDisplayPort; port++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, already := probed[port]; already {
+			if profile.HasPort(port) {
+				misses = 0
+			} else {
+				misses++
+			}
+			continue
+		}
+
+		timer := time.NewTimer(perPortPause)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+		if err != nil {
+			misses++
+			if misses >= vncWalkMaxConsecutiveMisses {
+				return
+			}
+			continue
+		}
+		_ = conn.Close()
+		profile.OpenPorts = append(profile.OpenPorts, port)
+		misses = 0
+	}
 }
 
 // readSSHBanner reads a single identification line (e.g., "SSH-2.0-OpenSSH_9.6p1")
