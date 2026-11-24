@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 296" width="1160" height="296" role="img" aria-label="How UniBlue works: Map Your Network, Probe LAN Safely, Weigh Real Impact, Act on What Changes">
+  <defs>
+    <style>
+      .font { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .step { font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; }
+      .title { font-size: 16.5px; font-weight: 700; fill: #0F172A; }
+      .sub { font-size: 11.5px; font-weight: 400; fill: #64748B; }
+      .pill { font-size: 11px; fill: #0F172A; }
+      .pill-b { font-weight: 700; }
+      .pill-m { fill: #64748B; }
+    </style>
+  </defs>
+
+  <!-- Card 1: UniFi Topology -->
+  <g transform="translate(8,8)">
+    <rect width="256" height="280" rx="14" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.25"/>
+    <rect x="18" y="18" width="42" height="5" rx="2.5" fill="#2563EB"/>
+    <text x="18" y="42" class="font step" fill="#2563EB">01 · UNIFI TOPOLOGY</text>
+    <text x="18" y="66" class="font title">Map Your Network</text>
+    <text x="18" y="86" class="font sub">UDM Pro · Cloud Key · Network App</text>
+
+    <rect x="18" y="110" width="220" height="42" rx="10" fill="#FFFFFF" stroke="#DBEAFE" stroke-width="1.2"/>
+    <text x="128" y="135" text-anchor="middle" class="font pill"><tspan class="pill-b">Active Clients</tspan><tspan class="pill-m" dx="4">·</tspan><tspan class="pill-m" dx="4">IPs &amp; MACs</tspan></text>
+
+    <rect x="18" y="162" width="220" height="42" rx="10" fill="#FFFFFF" stroke="#DBEAFE" stroke-width="1.2"/>
+    <text x="128" y="187" text-anchor="middle" class="font pill"><tspan class="pill-b">VLANs &amp; Subnets</tspan><tspan class="pill-m" dx="4">·</tspan><tspan class="pill-m" dx="4">Trust Tiers</tspan></text>
+
+    <rect x="18" y="214" width="220" height="42" rx="10" fill="#FFFFFF" stroke="#DBEAFE" stroke-width="1.2"/>
+    <text x="128" y="239" text-anchor="middle" class="font pill"><tspan class="pill-b">WAN Forwards</tspan><tspan class="pill-m" dx="4">·</tspan><tspan class="pill-m" dx="4">Firmware</tspan></text>
+  </g>
+
+  <!-- Arrow 1 -> 2 -->
+  <g stroke="#60A5FA" fill="#60A5FA">
+    <line x1="270" y1="148" x2="292" y2="148" stroke-width="2.25" stroke-linecap="round"/>
+    <polygon points="298,148 289,142.5 289,153.5"/>
+  </g>
+
+  <!-- Card 2: Community Checks -->
+  <g transform="translate(304,8)">
+    <rect width="256" height="280" rx="14" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.25"/>
+    <rect x="18" y="18" width="42" height="5" rx="2.5" fill="#7C3AED"/>
+    <text x="18" y="42" class="font step" fill="#7C3AED">02 · COMMUNITY CHECKS</text>
+    <text x="18" y="66" class="font title">Probe LAN Safely</text>
+    <text x="18" y="86" class="font sub">Declarative YAML · Read-Only</text>
+
+    <rect x="18" y="110" width="220" height="42" rx="10" fill="#FFFFFF" stroke="#E9D5FF" stroke-width="1.2"/>
+    <text x="128" y="135" text-anchor="middle" class="font pill"><tspan class="pill-b">Exposed Ports</tspan><tspan class="pill-m" dx="4">·</tspan><tspan class="pill-m" dx="4">VNC, Telnet, MQTT</tspan></text>
+
+    <rect x="18" y="162" width="220" height="42" rx="10" fill="#FFFFFF" stroke="#E9D5FF" stroke-width="1.2"/>
+    <text x="128" y="187" text-anchor="middle" class="font pill"><tspan class="pill-b">IoT &amp; HVAC</tspan><tspan class="pill-m" dx="4">·</tspan><tspan class="pill-m" dx="4">Community YAML</tspan></text>
+
+    <rect x="18" y="214" width="220" height="42" rx="10" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="1.2"/>
+    <text x="128" y="239" text-anchor="middle" class="font pill" fill="#5B21B6"><tspan class="pill-b" fill="#5B21B6">Sandboxed</tspan><tspan fill="#6D28D9" dx="4">·</tspan><tspan fill="#6D28D9" dx="4">Target-IP &amp; Gentle</tspan></text>
+  </g>
+
+  <!-- Arrow 2 -> 3 -->
+  <g stroke="#A78BFA" fill="#A78BFA">
+    <line x1="566" y1="148" x2="588" y2="148" stroke-width="2.25" stroke-linecap="round"/>
+    <polygon points="594,148 585,142.5 585,153.5"/>
+  </g>
+
+  <!-- Card 3: Blast Radius -->
+  <g transform="translate(600,8)">
+    <rect width="256" height="280" rx="14" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.25"/>
+    <rect x="18" y="18" width="42" height="5" rx="2.5" fill="#D97706"/>
+    <text x="18" y="42" class="font step" fill="#D97706">03 · BLAST RADIUS</text>
+    <text x="18" y="66" class="font title">Weigh Real Impact</text>
+    <text x="18" y="86" class="font sub">Finding × UniFi Placement</text>
+
+    <rect x="18" y="110" width="220" height="42" rx="10" fill="#FEF2F2" stroke="#FCA5A5" stroke-width="1.2"/>
+    <text x="128" y="135" text-anchor="middle" class="font pill" fill="#7F1D1D"><tspan class="pill-b" fill="#7F1D1D">WAN Forward</tspan><tspan fill="#991B1B" dx="5">→</tspan><tspan class="pill-b" fill="#DC2626" dx="5">CRITICAL</tspan></text>
+
+    <rect x="18" y="162" width="220" height="42" rx="10" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1.2"/>
+    <text x="128" y="187" text-anchor="middle" class="font pill" fill="#78350F"><tspan class="pill-b" fill="#78350F">Trusted VLAN</tspan><tspan fill="#92400E" dx="5">→</tspan><tspan class="pill-b" fill="#B45309" dx="5">Escalated +1</tspan></text>
+
+    <rect x="18" y="214" width="220" height="42" rx="10" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.2"/>
+    <text x="128" y="239" text-anchor="middle" class="font pill" fill="#14532D"><tspan class="pill-b" fill="#14532D">Isolated IoT</tspan><tspan fill="#166534" dx="5">→</tspan><tspan class="pill-b" fill="#15803D" dx="5">Contained -1</tspan></text>
+  </g>
+
+  <!-- Arrow 3 -> 4 -->
+  <g stroke="#F59E0B" fill="#F59E0B">
+    <line x1="862" y1="148" x2="884" y2="148" stroke-width="2.25" stroke-linecap="round"/>
+    <polygon points="890,148 881,142.5 881,153.5"/>
+  </g>
+
+  <!-- Card 4: Zero-Noise Alerts -->
+  <g transform="translate(896,8)">
+    <rect width="256" height="280" rx="14" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1.25"/>
+    <rect x="18" y="18" width="42" height="5" rx="2.5" fill="#059669"/>
+    <text x="18" y="42" class="font step" fill="#059669">04 · ZERO-NOISE ALERTS</text>
+    <text x="18" y="66" class="font title">Act on What Changes</text>
+    <text x="18" y="86" class="font sub">Diffed Against Baseline State</text>
+
+    <rect x="18" y="110" width="220" height="42" rx="10" fill="#FFFFFF" stroke="#A7F3D0" stroke-width="1.2"/>
+    <text x="128" y="135" text-anchor="middle" class="font pill"><tspan class="pill-b">New or Escalated Risks</tspan></text>
+
+    <rect x="18" y="162" width="220" height="42" rx="10" fill="#FFFFFF" stroke="#A7F3D0" stroke-width="1.2"/>
+    <text x="128" y="187" text-anchor="middle" class="font pill"><tspan class="pill-b">Rogue Devices &amp; Forwards</tspan></text>
+
+    <rect x="18" y="214" width="220" height="42" rx="10" fill="#ECFDF5" stroke="#6EE7B7" stroke-width="1.2"/>
+    <text x="128" y="239" text-anchor="middle" class="font pill" fill="#065F46"><tspan class="pill-b" fill="#065F46">CLI · ntfy · Discord · Slack · JSON</tspan></text>
+  </g>
+</svg>
