@@ -85,6 +85,11 @@ UniBlue can sync the full NVD JSON 2.0 database alongside CISA's Known Exploited
 # Search cached CVEs offline or inspect full affected CPE ranges
 ./uniblue cve search -vendor ui unifi
 ./uniblue cve show CVE-2026-9773
+
+# Sync the official IEEE MAC OUI registries (MA-L, MA-M, MA-S, IAB; ~550 KB)
+# for deterministic offline hardware vendor & device-category classification
+./uniblue oui sync
+./uniblue inventory -config config.yaml -probe
 ```
 
 ## Controller Compatibility

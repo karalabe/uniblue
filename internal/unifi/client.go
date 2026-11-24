@@ -281,6 +281,12 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	type policiesRes struct {
 		items []integrationFirewallPolicy
 	}
+	type legacyClientsRes struct {
+		items []rawClient
+	}
+	type legacyDevicesRes struct {
+		items []rawDevice
+	}
 
 	clientsCh := make(chan clientsRes, 1)
 	devicesCh := make(chan devicesRes, 1)
@@ -288,6 +294,8 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	forwardsCh := make(chan forwardsRes, 1)
 	zonesCh := make(chan zonesRes, 1)
 	policiesCh := make(chan policiesRes, 1)
+	legacyClientsCh := make(chan legacyClientsRes, 1)
+	legacyDevicesCh := make(chan legacyDevicesRes, 1)
 
 	siteBase := fmt.Sprintf("%s/sites/%s", integrationV1Prefix, c.siteID)
 
@@ -337,6 +345,25 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		}
 		policiesCh <- policiesRes{items: items}
 	}()
+	go func() {
+		// Opportunistically fetch legacy stat/sta to enrich Integration v1 clients
+		// with true DHCP hostnames, OUI strings, Wi-Fi SSIDs, and switch port links.
+		var env apiEnvelope[rawClient]
+		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/sta", c.site), &env); err == nil {
+			legacyClientsCh <- legacyClientsRes{items: env.Data}
+			return
+		}
+		legacyClientsCh <- legacyClientsRes{}
+	}()
+	go func() {
+		// Opportunistically fetch legacy stat/device to attach physical LLDP uplinks.
+		var env apiEnvelope[rawDevice]
+		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/device", c.site), &env); err == nil {
+			legacyDevicesCh <- legacyDevicesRes{items: env.Data}
+			return
+		}
+		legacyDevicesCh <- legacyDevicesRes{}
+	}()
 
 	cr := <-clientsCh
 	dr := <-devicesCh
@@ -344,6 +371,8 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	fr := <-forwardsCh
 	zr := <-zonesCh
 	pr := <-policiesCh
+	lcr := <-legacyClientsCh
+	ldr := <-legacyDevicesCh
 
 	if err := errors.Join(cr.err, dr.err, nr.err); err != nil {
 		return nil, fmt.Errorf("fetch unifi integration snapshot: %w", err)
@@ -415,14 +444,40 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 
 	policies := convertIntegrationPolicies(pr.items, zoneNameByID)
 
+	legacyClientByMAC := make(map[string]rawClient, len(lcr.items))
+	for _, lc := range lcr.items {
+		if m := strings.ToLower(strings.TrimSpace(lc.MAC)); m != "" {
+			legacyClientByMAC[m] = lc
+		}
+	}
+	legacyDevByMAC := make(map[string]rawDevice, len(ldr.items))
+	for _, ld := range ldr.items {
+		if m := strings.ToLower(strings.TrimSpace(ld.MAC)); m != "" {
+			legacyDevByMAC[m] = ld
+		}
+	}
+
 	clients := make([]Client, 0, len(cr.items))
 	for _, rc := range cr.items {
+		mac := strings.ToLower(strings.TrimSpace(rc.MACAddress))
 		cl := Client{
-			MAC:      strings.ToLower(strings.TrimSpace(rc.MACAddress)),
+			MAC:      mac,
 			IP:       strings.TrimSpace(rc.IPAddress),
 			Hostname: strings.TrimSpace(rc.Name),
 			Name:     strings.TrimSpace(rc.Name),
 			IsWired:  strings.EqualFold(rc.Type, "WIRED"),
+		}
+		if lc, ok := legacyClientByMAC[mac]; ok {
+			if h := strings.TrimSpace(lc.Hostname); h != "" {
+				cl.Hostname = h
+			}
+			if o := strings.TrimSpace(lc.OUI); o != "" {
+				cl.OUI = o
+			}
+			cl.ESSID = strings.TrimSpace(lc.ESSID)
+			cl.SwitchMAC = strings.ToLower(strings.TrimSpace(lc.SwMAC))
+			cl.SwitchPort = lc.SwPort
+			cl.APMAC = strings.ToLower(strings.TrimSpace(lc.APMAC))
 		}
 		if addr, err := netip.ParseAddr(cl.IP); err == nil {
 			// Pick the most specific matching CIDR (longest prefix) in case
@@ -442,15 +497,22 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 
 	devices := make([]Device, 0, len(dr.items))
 	for _, rd := range dr.items {
-		devices = append(devices, Device{
-			MAC:        strings.ToLower(strings.TrimSpace(rd.MACAddress)),
+		mac := strings.ToLower(strings.TrimSpace(rd.MACAddress))
+		dev := Device{
+			MAC:        mac,
 			IP:         strings.TrimSpace(rd.IPAddress),
 			Name:       strings.TrimSpace(rd.Name),
 			Model:      rd.Model,
 			Type:       strings.ToLower(rd.State),
 			Version:    rd.FirmwareVersion,
 			Upgradable: rd.FirmwareUpdatable,
-		})
+		}
+		if ld, ok := legacyDevByMAC[mac]; ok && ld.Uplink != nil {
+			dev.UplinkMAC = strings.ToLower(strings.TrimSpace(ld.Uplink.UplinkMAC))
+			dev.UplinkName = strings.TrimSpace(ld.Uplink.UplinkDeviceName)
+			dev.UplinkPort = ld.Uplink.UplinkRemotePort
+		}
+		devices = append(devices, dev)
 	}
 
 	forwards := convertPortForwards(fr.items)
@@ -558,6 +620,10 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			NetworkName: rc.Network,
 			VLAN:        string(rc.VLAN),
 			IsWired:     rc.IsWired,
+			ESSID:       strings.TrimSpace(rc.ESSID),
+			SwitchMAC:   strings.ToLower(strings.TrimSpace(rc.SwMAC)),
+			SwitchPort:  rc.SwPort,
+			APMAC:       strings.ToLower(strings.TrimSpace(rc.APMAC)),
 		}
 
 		// Fill missing network name or VLAN tag from the site's network table.
@@ -579,7 +645,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 
 	devices := make([]Device, 0, len(dr.items))
 	for _, rd := range dr.items {
-		devices = append(devices, Device{
+		dev := Device{
 			MAC:        strings.ToLower(strings.TrimSpace(rd.MAC)),
 			IP:         strings.TrimSpace(rd.IP),
 			Name:       strings.TrimSpace(rd.Name),
@@ -587,7 +653,13 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			Type:       rd.Type,
 			Version:    rd.Version,
 			Upgradable: rd.Upgradable,
-		})
+		}
+		if rd.Uplink != nil {
+			dev.UplinkMAC = strings.ToLower(strings.TrimSpace(rd.Uplink.UplinkMAC))
+			dev.UplinkName = strings.TrimSpace(rd.Uplink.UplinkDeviceName)
+			dev.UplinkPort = rd.Uplink.UplinkRemotePort
+		}
+		devices = append(devices, dev)
 	}
 
 	return &Snapshot{

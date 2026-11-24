@@ -161,6 +161,18 @@ type Client struct {
 
 	// IsWired reports whether the client is connected over Ethernet rather than Wi-Fi.
 	IsWired bool `json:"is_wired"`
+
+	// ESSID is the Wi-Fi network SSID for wireless clients, when reported.
+	ESSID string `json:"essid,omitempty"`
+
+	// SwitchMAC is the MAC address of the parent UniFi switch for wired clients.
+	SwitchMAC string `json:"switch_mac,omitempty"`
+
+	// SwitchPort is the physical switch port index for wired clients.
+	SwitchPort int `json:"switch_port,omitempty"`
+
+	// APMAC is the MAC address of the parent UniFi access point for wireless clients.
+	APMAC string `json:"ap_mac,omitempty"`
 }
 
 // DisplayName returns the most readable identifier available for a client,
@@ -201,6 +213,15 @@ type Device struct {
 
 	// Upgradable reports whether the controller knows of a newer firmware release.
 	Upgradable bool `json:"upgradable"`
+
+	// UplinkMAC is the parent UniFi device MAC discovered via LLDP, if any.
+	UplinkMAC string `json:"uplink_mac,omitempty"`
+
+	// UplinkName is the parent UniFi device display name, if reported.
+	UplinkName string `json:"uplink_name,omitempty"`
+
+	// UplinkPort is the remote port number on the parent switch/gateway.
+	UplinkPort int `json:"uplink_port,omitempty"`
 }
 
 // Network describes a UniFi LAN or VLAN segment along with its structural
@@ -408,6 +429,10 @@ type rawClient struct {
 	Network   string     `json:"network"`
 	VLAN      flexString `json:"vlan"`
 	IsWired   bool       `json:"is_wired"`
+	ESSID     string     `json:"essid"`
+	SwMAC     string     `json:"sw_mac"`
+	SwPort    int        `json:"sw_port"`
+	APMAC     string     `json:"ap_mac"`
 }
 
 // rawDevice maps the wire fields returned by /api/s/<site>/stat/device.
@@ -419,6 +444,11 @@ type rawDevice struct {
 	Type       string `json:"type"`
 	Version    string `json:"version"`
 	Upgradable bool   `json:"upgradable"`
+	Uplink     *struct {
+		UplinkMAC        string `json:"uplink_mac"`
+		UplinkDeviceName string `json:"uplink_device_name"`
+		UplinkRemotePort int    `json:"uplink_remote_port"`
+	} `json:"uplink"`
 }
 
 // rawNetwork maps the wire fields returned by /api/s/<site>/rest/networkconf.

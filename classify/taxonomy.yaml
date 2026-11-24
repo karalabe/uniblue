@@ -1,0 +1,104 @@
+# Declarative hardware vendor & hostname taxonomy used by UniBlue's
+# deterministic device classifier alongside active protocol/port signals and
+# IEEE OUI lookups.
+#
+# Multi-purpose hardware vendors (e.g., Ubiquiti, Apple, Google, ASUSTeK,
+# Raspberry Pi, Intel, Dell, Lenovo) are intentionally handled by protocol,
+# hostname, and UniFi metadata rules rather than forcing a single OUI category.
+
+vendor_rules:
+  # --- Out-of-Band Management / BMCs ---
+  - category: bmc
+    role: Out-of-Band BMC / IPMI
+    vendor_regex: "(?i)(american megatrends|raritan|avocent|lantronix|aten international)"
+
+  # --- Cameras & Security ---
+  - category: camera
+    role: IP Camera / NVR
+    vendor_regex: "(?i)(hikvision|dahua|axis communications|reolink|amcrest|hanwha|vivotek|arlo|ring llc|wyze|eufy|foscam|lorex|swann|mobotix|bosch security)"
+
+  # --- Printers & 3D Printers ---
+  - category: printer
+    role: Network Printer
+    vendor_regex: "(?i)(brother industries|seiko epson|canon inc|lexmark|kyocera|xerox|ricoh|konica minolta|oki electric|zebra technologies)"
+
+  - category: printer
+    role: 3D Printer
+    vendor_regex: "(?i)(prusa research|bambu lab|ultimaker|creality|formlabs)"
+
+  # --- AV Receivers, Smart TVs & Media ---
+  - category: media
+    role: AV Receiver / Audio
+    vendor_regex: "(?i)(d&m holdings|d&mholdi|denon|marantz|sonos|yamaha|onkyo|bose|bang & olufsen|bluesound|nad electronics|harman|devialet|wiim)"
+
+  - category: media
+    role: Streaming / Media / Console
+    vendor_regex: "(?i)(roku|vizio|nvidia|nintendo|sony interactive|valve corp|tiVo)"
+
+  # --- IoT, HVAC, Appliances & Smart Home ---
+  - category: iot
+    role: Smart Home / Appliance
+    vendor_regex: "(?i)(irobot|roborock|ecovacs|dreame|zehnder|tuya|shelly|allterco|signify|philips lighting|aqara|lumi united|ecobee|lutron|netatmo|tado|fibaro|nanoleaf|lifx|wiz|yeelight|switchbot|meross|kasa|tapo|govee|sonoff|itead|chamberlain|myq|rachio|bsh hausgeraete|miele|dyson|whirlpool|nest labs)"
+
+  - category: iot
+    role: Solar / Energy / Industrial
+    vendor_regex: "(?i)(fronius|sma solar|solaredge|enphase|victron|goodwe|sungrow|huawei digital power|schneider electric|siemens ag|wago|phoenix contact|beckhoff)"
+
+  # --- NAS / Dedicated Storage ---
+  - category: server
+    role: NAS / Storage Appliance
+    vendor_regex: "(?i)(synology|qnap|ixsystems|asustor|terramaster|buffalo|drobo|netgear readyNAS|western digital)"
+
+  # --- Dedicated Networking ---
+  - category: network
+    role: Network Infrastructure
+    vendor_regex: "(?i)(mikrotik|cisco|juniper|arista|aruba|ruckus|fortinet|palo alto|zyxel|tp-link omada|netgate|firewalla)"
+
+# Embedded Wi-Fi / MCU chipmakers evaluated after specific product hostname
+# rules so devices like an ESP32-based 3D printer keep their specific category
+# while unnamed ESP32/MCU boards still classify cleanly as IoT.
+silicon_vendor_rules:
+  - category: iot
+    role: Embedded Wi-Fi / MCU Device
+    vendor_regex: "(?i)(espressif|shanghai high-flying|shenzhen bilian|texas instruments|microchip technology|nordic semiconductor|silicon laboratories|realtek semiconductor.*iot|telink|beken)"
+
+hostname_rules:
+  - category: bmc
+    role: Out-of-Band BMC / IPMI
+    regex: "(?i)(^|[-_.\\s])(ipmi|idrac|ilo|ikvm|bmc|mgmt[-_]?console|management console)($|[-_.\\s])"
+
+  - category: camera
+    role: IP Camera / Doorbell
+    regex: "(?i)(^|[-_.\\s])(cam|camera|doorbell|chime|nvr|protect|g3|g4|g5)[-_0-9a-z]*($|[-_.\\s])"
+
+  - category: printer
+    role: 3D Printer
+    regex: "(?i)(prusa|bambu|octoprint|klipper|voron|ender[-_]?[0-9]|mk[34]s?)"
+
+  - category: printer
+    role: Network Printer
+    regex: "(?i)(laserjet|officejet|deskjet|printer|mfc-|hl-|dcp-|pixma|ecotank)"
+
+  - category: media
+    role: Media / Streaming Device
+    regex: "(?i)(chromecast|apple[-_\\s]?tv|fire[-_\\s]?tv|roku|shield|bravia|webos|lg[-_]?tv|samsung[-_]?tv|sonos|marantz|denon|avr[-_]?[0-9]|playstation|ps[45]|xbox)"
+
+  - category: iot
+    role: Smart Home Hub
+    regex: "(?i)(home[-_\\s]?assistant|homeassistant|hassio|openhab|hubitat|homebridge|zigbee2mqtt)"
+
+  - category: iot
+    role: IoT / Appliance
+    regex: "(?i)(roomba|roborock|comfoconnect|ventilation|thermostat|tasmota|shelly|esphome|wled|inverter|wallbox|charger|sensor|plug|bulb)"
+
+  - category: netservice
+    role: DNS / Ad-Blocker
+    regex: "(?i)(pi-?hole|adguard|unbound|dns[-_]?server)"
+
+  - category: server
+    role: Server / NAS / Hypervisor
+    regex: "(?i)(truenas|freenas|unraid|proxmox|pve|synology|diskstation|qnap|esxi|nas|hypervisor)"
+
+  - category: personal
+    role: Mobile / Workstation
+    regex: "(?i)(^|[-_.\\s])(iphone|ipad|macbook|imac|mac[-_\\s]|pixel|galaxy|oneplus|android|thinkpad|surface|desktop-|laptop-)"

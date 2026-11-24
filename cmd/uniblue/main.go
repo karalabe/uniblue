@@ -20,11 +20,14 @@ import (
 	"time"
 
 	builtinchecks "github.com/karalabe/uniblue/checks"
+	classifydata "github.com/karalabe/uniblue/classify"
 	"github.com/karalabe/uniblue/fingerprints"
 	"github.com/karalabe/uniblue/internal/checks"
+	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/cve"
 	"github.com/karalabe/uniblue/internal/notify"
+	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -59,6 +62,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runCheck(ctx, args[1:], stdout, stderr)
 	case "cve":
 		return runCVE(ctx, args[1:], stdout, stderr)
+	case "oui":
+		return runOUI(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return nil
@@ -80,7 +85,8 @@ Commands:
   watch       Continuously scan on an interval and notify only on new/escalated changes
   inventory   Fetch and display UniFi clients, devices, VLANs, and port forwards
   check       Validate or test declarative YAML checks against a single host
-  cve         Sync, search, and match a local NVD + CISA KEV cache against your LAN`)
+  cve         Sync, search, and match a local NVD + CISA KEV cache against your LAN
+  oui         Sync and query the official IEEE MAC OUI registries (MA-L, MA-M, MA-S)`)
 }
 
 // runScan executes one complete UniFi sync, gentle host probe, check pass,
@@ -230,13 +236,14 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 }
 
-// runInventory connects to UniFi and prints the discovered clients, UniFi gear,
-// VLANs, and port forwards without actively probing LAN hosts.
+// runInventory connects to UniFi and prints the discovered networks, zones,
+// UniFi infrastructure uplinks, deterministically classified clients, and port forwards.
 func runInventory(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("inventory", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
 	jsonOut := fs.Bool("json", false, "output inventory snapshot as JSON")
+	withProbe := fs.Bool("probe", false, "also probe LAN ports to enrich device classification with protocol proof")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -257,10 +264,33 @@ func runInventory(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return err
 	}
 
-	if *jsonOut {
-		return writeJSON(stdout, snap)
+	var profiles []probe.HostProfile
+	if *withProbe {
+		checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
+		if err != nil {
+			return err
+		}
+		scanPorts := mergePorts(cfg.Scan.Ports, checkList)
+		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+		fp.SetHostPortHints(snap.PortHintsByIP())
+		profiles = fp.FingerprintAll(ctx, snap.Clients)
 	}
-	printInventory(stdout, snap)
+
+	ouiDB := oui.New("")
+	_ = ouiDB.Load()
+	classifier, err := classify.Load(classifydata.BuiltinFS, ouiDB)
+	if err != nil {
+		return err
+	}
+	classes := classifier.ClassifyAll(snap, profiles)
+
+	if *jsonOut {
+		return writeJSON(stdout, map[string]any{
+			"snapshot":        snap,
+			"classifications": classes,
+		})
+	}
+	printInventory(stdout, snap, classes)
 	return nil
 }
 
@@ -601,7 +631,7 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVE
 }
 
 // printInventory renders the UniFi snapshot tables cleanly for `uniblue inventory`.
-func printInventory(w io.Writer, snap *unifi.Snapshot) {
+func printInventory(w io.Writer, snap *unifi.Snapshot, classes map[string]classify.Result) {
 	fmt.Fprintf(w, "UniFi Site: %s (%s) | Clients: %d | Devices: %d | Networks: %d | Zones: %d | Port Forwards: %d\n\n",
 		snap.Site, snap.ControllerType, len(snap.Clients), len(snap.Devices), len(snap.Networks), len(snap.Zones), len(snap.PortForwards))
 
@@ -627,11 +657,63 @@ func printInventory(w io.Writer, snap *unifi.Snapshot) {
 		fmt.Fprintln(w)
 	}
 
+	if len(snap.Devices) > 0 {
+		fmt.Fprintln(w, "UniFi Infrastructure:")
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "DEVICE\tMODEL\tIP\tFIRMWARE\tUPLINK")
+		for _, d := range snap.Devices {
+			uplink := "-"
+			if d.UplinkName != "" {
+				uplink = d.UplinkName
+				if d.UplinkPort > 0 {
+					uplink = fmt.Sprintf("%s (port %d)", d.UplinkName, d.UplinkPort)
+				}
+			}
+			ver := d.Version
+			if d.Upgradable {
+				ver += " (update)"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", d.Name, d.Model, d.IP, ver, uplink)
+		}
+		_ = tw.Flush()
+		fmt.Fprintln(w)
+	}
+
+	devNameByMAC := make(map[string]string, len(snap.Devices))
+	for _, d := range snap.Devices {
+		if d.MAC != "" {
+			devNameByMAC[strings.ToLower(d.MAC)] = d.Name
+		}
+	}
+
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "CLIENT\tIP\tMAC\tVLAN\tVENDOR")
+	fmt.Fprintln(tw, "CLIENT\tIP\tVLAN\tCATEGORY\tROLE\tVENDOR\tLINK")
 	for _, cl := range snap.Clients {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			cl.DisplayName(), cl.IP, cl.MAC, cl.NetworkName, cl.OUI)
+		key := cl.IP
+		if key == "" {
+			key = cl.MAC
+		}
+		res := classes[key]
+		vendor := res.Vendor
+		if vendor == "" {
+			vendor = "-"
+		}
+		link := "Wi-Fi"
+		if cl.IsWired {
+			link = "Wired"
+			if cl.SwitchPort > 0 {
+				sw := devNameByMAC[cl.SwitchMAC]
+				if sw != "" {
+					link = fmt.Sprintf("%s:%d", sw, cl.SwitchPort)
+				} else {
+					link = fmt.Sprintf("port %d", cl.SwitchPort)
+				}
+			}
+		} else if cl.ESSID != "" {
+			link = "Wi-Fi:" + cl.ESSID
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			cl.DisplayName(), cl.IP, cl.NetworkName, res.Category, res.Role, vendor, link)
 	}
 	_ = tw.Flush()
 
@@ -969,4 +1051,62 @@ func printCVEMatchTable(w io.Writer, matches []cve.Match, maxRows int) {
 		)
 	}
 	_ = tw.Flush()
+}
+
+// runOUI dispatches `uniblue oui <sync|lookup>` for managing the local official
+// IEEE MAC OUI database (MA-L 24-bit, MA-M 28-bit, MA-S 36-bit, and IAB).
+func runOUI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: uniblue oui <sync|lookup> [flags]")
+	}
+	switch args[0] {
+	case "sync":
+		fs := flag.NewFlagSet("oui sync", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		cacheDir := fs.String("cache", oui.DefaultCacheDir(), "local IEEE OUI cache directory")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		db := oui.New(*cacheDir)
+		meta, err := db.Sync(ctx, func(msg string) {
+			fmt.Fprintln(stderr, msg)
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "\nIEEE OUI Cache Ready (%s)\n", db.Dir())
+		fmt.Fprintf(stdout, "  MA-L (24-bit):  %d\n", meta.MALCount)
+		fmt.Fprintf(stdout, "  MA-M (28-bit):  %d\n", meta.MAMCount)
+		fmt.Fprintf(stdout, "  MA-S/IAB (36b): %d\n", meta.MASCount)
+		fmt.Fprintf(stdout, "  Total entries:  %d (%.1f KB compiled)\n", meta.TotalEntries, float64(meta.CompiledBytes)/1024)
+		return nil
+
+	case "lookup":
+		fs := flag.NewFlagSet("oui lookup", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		cacheDir := fs.String("cache", oui.DefaultCacheDir(), "local IEEE OUI cache directory")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			return errors.New("usage: uniblue oui lookup <mac> [mac...]")
+		}
+		db := oui.New(*cacheDir)
+		if err := db.Load(); err != nil {
+			return err
+		}
+		for _, mac := range fs.Args() {
+			res := db.Lookup(mac)
+			vendor := res.Vendor
+			if vendor == "" {
+				vendor = "(unknown)"
+			}
+			fmt.Fprintf(stdout, "%-20s %-8s %-10s %s (local=%v, virtual=%v)\n",
+				mac, res.Registry, res.Prefix, vendor, res.IsLocallyAdministered, res.IsVirtual)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown oui subcommand %q (want sync or lookup)", args[0])
+	}
 }
