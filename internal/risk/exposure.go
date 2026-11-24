@@ -231,8 +231,7 @@ func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg conf
 	if snap == nil {
 		return nil
 	}
-	trustedSet := toLowerSet(netCfg.TrustedVLANs)
-	isolatedSet := toLowerSet(netCfg.IsolatedVLANs)
+	trustedSet, isolatedSet := resolveVLANTiers(snap, netCfg)
 
 	// Count active clients per network name.
 	clientsPerNet := make(map[string]int, len(snap.Networks))
@@ -243,24 +242,30 @@ func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg conf
 	}
 
 	// Identify isolated/IoT/smart VLANs configured on the gateway that currently
-	// hold zero active clients.
+	// hold zero active clients (skipping guest networks, which are for visitors
+	// rather than permanently homed smart appliances).
 	var emptyIoTVLANs []unifi.Network
 	for _, n := range snap.Networks {
-		lower := strings.ToLower(n.Name)
+		lower := strings.ToLower(strings.TrimSpace(n.Name))
+		purpose := strings.ToLower(strings.TrimSpace(n.Purpose))
+		if purpose == "guest" || strings.Contains(lower, "guest") {
+			continue
+		}
 		_, explicitIsolated := isolatedSet[lower]
 		if !explicitIsolated && n.VLAN != "" {
 			_, explicitIsolated = isolatedSet[strings.ToLower(n.VLAN)]
 		}
-		looksLikeIoT := explicitIsolated || strings.Contains(lower, "iot") || strings.Contains(lower, "smart") || strings.Contains(lower, "not")
+		looksLikeIoT := explicitIsolated || strings.Contains(lower, "iot") || strings.Contains(lower, "smart") || lower == "not"
 		if looksLikeIoT && clientsPerNet[lower] == 0 {
 			emptyIoTVLANs = append(emptyIoTVLANs, n)
 		}
 	}
 
-	// Count findings belonging to appliances sitting on trusted VLANs.
+	// Collect exposed hosts sitting on a general trusted LAN, skipping dedicated
+	// server/management VLANs that are already segmented away from user devices.
 	trustedHosts := make(map[string]struct{})
 	for _, f := range findings {
-		if f.Port > 0 && matchesVLAN(f.Client, trustedSet) {
+		if f.Port > 0 && matchesVLAN(f.Client, trustedSet) && !isServerOrMgmtVLAN(f.Client.NetworkName) {
 			trustedHosts[f.Client.DisplayName()] = struct{}{}
 		}
 	}
@@ -310,4 +315,17 @@ func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg conf
 	}
 
 	return notes
+}
+
+// isServerOrMgmtVLAN reports whether a UniFi network name designates a
+// dedicated server, storage, or infrastructure management segment rather than
+// a general user/default LAN.
+func isServerOrMgmtVLAN(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(lower, "server") ||
+		strings.Contains(lower, "mgmt") ||
+		strings.Contains(lower, "management") ||
+		strings.Contains(lower, "admin") ||
+		strings.Contains(lower, "infra") ||
+		strings.Contains(lower, "storage")
 }

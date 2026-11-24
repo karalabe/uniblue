@@ -20,15 +20,17 @@ It combines your UniFi gateway's live network topology (clients, VLANs, firmware
 
 ### Blast-Radius Severity Adjustments
 
-A raw check severity is automatically adjusted using your UniFi topology:
+UniBlue automatically infers trusted (`Default`, VLAN `1`, `Servers`, `Mgmt`, etc.) and isolated (`Smart Devices`, `IoT`, `Guest`, `Camera`, etc.) tiers directly from your UniFi network definitions — no manual VLAN listing required unless you want custom overrides (`network.trusted_vlans` / `network.isolated_vlans`):
 
 | UniFi Context | Effect | Why |
 | :--- | :--- | :--- |
 | Affected host + port is **WAN port-forwarded** | **Force `CRITICAL`** | Directly reachable from the public internet |
-| Device sits on a **`trusted_vlans`** network | **`+1` severity level** | High lateral-movement blast radius on your main LAN |
-| Device sits on an **`isolated_vlans`** network | **`-1` severity level** | Already mitigated by IoT VLAN segmentation |
+| Device sits on a **trusted VLAN** | **`+1` severity level** | High lateral-movement blast radius on your main/server LAN |
+| Device sits on an **isolated VLAN** | **`-1` severity level** | Already mitigated by IoT/Guest VLAN segmentation |
 
 ## Quickstart
+
+Only your UniFi controller URL and credentials are required — ports, VLAN tiers, and local cache paths use smart defaults automatically (you can even skip `config.yaml` via `UNIBLUE_UNIFI_URL` + `UNIBLUE_UNIFI_API_KEY`):
 
 ```sh
 # 1. Build

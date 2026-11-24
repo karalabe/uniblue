@@ -105,8 +105,13 @@ type ScanConfig struct {
 	// Timeout bounds each individual TCP connect or HTTP probe.
 	Timeout time.Duration `yaml:"timeout"`
 
-	// Ports specifies which TCP ports are inspected during host fingerprinting.
+	// Ports optionally replaces DefaultPorts when non-empty. Leave empty to
+	// inherit UniBlue's curated DefaultPorts automatically.
 	Ports []int `yaml:"ports"`
+
+	// ExtraPorts appends additional TCP ports onto DefaultPorts without
+	// replacing the built-in list.
+	ExtraPorts []int `yaml:"extra_ports"`
 
 	// ChecksDir is an optional filesystem directory containing additional YAML
 	// checks loaded alongside the embedded built-in checks.
@@ -165,19 +170,37 @@ func Default() *Config {
 
 // Load reads a YAML configuration file from path, applies defaults for omitted
 // fields, merges environment variable overrides, and validates the result.
+//
+// If path does not exist and UNIBLUE_UNIFI_URL is set in the environment, Load
+// constructs a zero-file configuration directly from environment variables.
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read config %q: %w", path, err)
-	}
-	if err := yaml.Unmarshal(raw, cfg); err != nil {
-		return nil, fmt.Errorf("parse config %q: %w", path, err)
+		if !(errors.Is(err, os.ErrNotExist) && os.Getenv("UNIBLUE_UNIFI_URL") != "") {
+			return nil, fmt.Errorf("read config %q: %w", path, err)
+		}
+	} else {
+		// Clear default ports before unmarshaling so we can tell whether the
+		// user explicitly overrode scan.ports vs. left it omitted.
+		cfg.Scan.Ports = nil
+		if err := yaml.Unmarshal(raw, cfg); err != nil {
+			return nil, fmt.Errorf("parse config %q: %w", path, err)
+		}
 	}
 
-	// Overlay secret values from the environment so users can keep config.yaml
-	// free of credentials without duplicating the entire file.
+	// Overlay connection and secret values from the environment so UniBlue can
+	// run with a minimal (or even absent) config.yaml.
+	if v := os.Getenv("UNIBLUE_UNIFI_URL"); v != "" {
+		cfg.UniFi.URL = v
+	}
+	if v := os.Getenv("UNIBLUE_UNIFI_SITE"); v != "" {
+		cfg.UniFi.Site = v
+	}
+	if v := os.Getenv("UNIBLUE_UNIFI_USERNAME"); v != "" {
+		cfg.UniFi.Username = v
+	}
 	if v := os.Getenv("UNIBLUE_UNIFI_PASSWORD"); v != "" {
 		cfg.UniFi.Password = v
 	}
@@ -204,6 +227,9 @@ func Load(path string) (*Config, error) {
 	}
 	if len(cfg.Scan.Ports) == 0 {
 		cfg.Scan.Ports = append([]int(nil), DefaultPorts...)
+	}
+	if len(cfg.Scan.ExtraPorts) > 0 {
+		cfg.Scan.Ports = dedupeInts(append(cfg.Scan.Ports, cfg.Scan.ExtraPorts...))
 	}
 	if cfg.Scan.Interval <= 0 {
 		cfg.Scan.Interval = 15 * time.Minute
@@ -259,4 +285,19 @@ func (n NetworkConfig) ExcludedSet() map[string]struct{} {
 		}
 	}
 	return set
+}
+
+// dedupeInts removes duplicate integers from nums while preserving their first
+// seen order.
+func dedupeInts(nums []int) []int {
+	seen := make(map[int]struct{}, len(nums))
+	out := make([]int, 0, len(nums))
+	for _, n := range nums {
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	return out
 }

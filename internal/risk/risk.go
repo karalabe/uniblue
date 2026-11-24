@@ -110,8 +110,7 @@ func (d Diff) HasAlerts(minSeverity checks.Severity) bool {
 // built-in UniFi posture findings (such as active WAN port forwards or
 // upgradable UniFi infrastructure firmware).
 func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.NetworkConfig) Report {
-	trustedSet := toLowerSet(netCfg.TrustedVLANs)
-	isolatedSet := toLowerSet(netCfg.IsolatedVLANs)
+	trustedSet, isolatedSet := resolveVLANTiers(snap, netCfg)
 
 	// Index active clients by IP so port-forward rules can link back to client
 	// metadata when generating posture findings.
@@ -285,7 +284,7 @@ func scoreFinding(f checks.Finding, forwards []unifi.PortForward, trustedSet, is
 // BuildState extracts a compact State baseline from a UniFi snapshot and its
 // evaluated Report.
 func BuildState(snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig) *State {
-	trustedSet := toLowerSet(netCfg.TrustedVLANs)
+	trustedSet, _ := resolveVLANTiers(snap, netCfg)
 
 	st := &State{
 		UpdatedAt:      time.Now().UTC(),
@@ -315,7 +314,7 @@ func BuildState(snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig
 // and port-forward baselines are initialized quietly.
 func ComputeDiff(prev *State, snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig) Diff {
 	var diff Diff
-	trustedSet := toLowerSet(netCfg.TrustedVLANs)
+	trustedSet, _ := resolveVLANTiers(snap, netCfg)
 
 	if prev == nil {
 		diff.NewFindings = append(diff.NewFindings, report.Findings...)
@@ -402,6 +401,76 @@ func SaveState(path string, st *State) error {
 		return fmt.Errorf("commit state %q: %w", path, err)
 	}
 	return nil
+}
+
+// resolveVLANTiers merges any explicit user-configured trusted/isolated VLANs
+// with deterministic auto-inference from UniFi's own network definitions (VLAN
+// name, VLAN tag 1, and guest purpose). Explicit user config always wins so
+// zero-config setups work smartly out of the box while remaining overridable.
+func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (trusted, isolated map[string]struct{}) {
+	trusted = toLowerSet(netCfg.TrustedVLANs)
+	isolated = toLowerSet(netCfg.IsolatedVLANs)
+	if snap == nil {
+		return trusted, isolated
+	}
+
+	for _, n := range snap.Networks {
+		nameLower := strings.ToLower(strings.TrimSpace(n.Name))
+		vlanLower := strings.ToLower(strings.TrimSpace(n.VLAN))
+		if nameLower == "" && vlanLower == "" {
+			continue
+		}
+
+		// Respect explicit user placement before applying heuristics.
+		if _, ok := trusted[nameLower]; ok {
+			continue
+		}
+		if _, ok := isolated[nameLower]; ok {
+			continue
+		}
+		if vlanLower != "" {
+			if _, ok := trusted[vlanLower]; ok {
+				continue
+			}
+			if _, ok := isolated[vlanLower]; ok {
+				continue
+			}
+		}
+
+		purposeLower := strings.ToLower(strings.TrimSpace(n.Purpose))
+		switch {
+		case purposeLower == "guest" ||
+			strings.Contains(nameLower, "iot") ||
+			strings.Contains(nameLower, "smart") ||
+			strings.Contains(nameLower, "guest") ||
+			strings.Contains(nameLower, "untrusted") ||
+			strings.Contains(nameLower, "camera") ||
+			nameLower == "not":
+			if nameLower != "" {
+				isolated[nameLower] = struct{}{}
+			}
+			if vlanLower != "" {
+				isolated[vlanLower] = struct{}{}
+			}
+		case vlanLower == "1" ||
+			nameLower == "default" ||
+			nameLower == "lan" ||
+			nameLower == "main" ||
+			strings.Contains(nameLower, "trusted") ||
+			strings.Contains(nameLower, "server") ||
+			strings.Contains(nameLower, "mgmt") ||
+			strings.Contains(nameLower, "management") ||
+			strings.Contains(nameLower, "admin") ||
+			strings.Contains(nameLower, "corp"):
+			if nameLower != "" {
+				trusted[nameLower] = struct{}{}
+			}
+			if vlanLower != "" {
+				trusted[vlanLower] = struct{}{}
+			}
+		}
+	}
+	return trusted, isolated
 }
 
 // matchesVLAN reports whether a client's resolved network name or numeric VLAN

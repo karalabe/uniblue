@@ -1,75 +1,36 @@
-# UniBlue configuration example.
-# Copy to config.yaml and adjust for your UniFi deployment.
-# Sensitive fields can also be provided via environment variables:
-#   UNIBLUE_UNIFI_PASSWORD
-#   UNIBLUE_UNIFI_API_KEY
-#   UNIBLUE_WEBHOOK_URL
+# Minimal UniBlue configuration.
+# Everything except your UniFi URL and credentials is inferred automatically
+# (VLAN trust tiers, curated 30-port discovery list, local CVE cache path).
+#
+# You can even skip config.yaml altogether using environment variables:
+#   UNIBLUE_UNIFI_URL=https://192.168.1.1
+#   UNIBLUE_UNIFI_API_KEY=...
 
 unifi:
-  # Base URL of your UniFi gateway or controller.
-  # UDM Pro / Cloud Gateway (UniFi OS): https://192.168.1.1
-  # Older Cloud Key / standalone controller: https://192.168.1.2:8443
+  # Local URL of your UDM Pro / Cloud Gateway (or Cloud Key on :8443).
   url: "https://192.168.1.1"
-  site: "default"
 
   # Recommended (works with 2FA enabled on your UI.com account):
-  # Generate a local API key in UniFi Network -> Settings -> Control Plane -> Integrations
-  # and pass it via UNIBLUE_UNIFI_API_KEY (or set api_key below).
+  # Settings -> Control Plane -> Integrations -> Create API Key
   api_key: ""
 
-  # Alternatively, use a Local-Only View-Only admin account (required for older
-  # Cloud Key controllers without Integration API v1 or to inspect legacy port forwards).
-  username: ""
-  password: ""
+  # Optional fallback for older Cloud Keys without Integration API v1:
+  # username: ""
+  # password: ""   # or UNIBLUE_UNIFI_PASSWORD
 
-  # Most local UniFi gateways use self-signed TLS certificates.
-  insecure_skip_verify: true
-  timeout: 10s
+# --- Optional Overrides (smart defaults apply when omitted) ---
 
-network:
-  # VLAN names or numeric IDs considered high-trust (findings here get escalated).
-  trusted_vlans:
-    - "Default"
-    - "LAN"
+# network:
+#   trusted_vlans: ["Default", "Servers"]
+#   isolated_vlans: ["IoT", "Guest"]
+#   exclude_ips: []
 
-  # VLAN names or numeric IDs isolated for IoT gear (findings here get de-escalated
-  # when not WAN-exposed, since lateral movement is already restricted).
-  isolated_vlans:
-    - "IoT"
-    - "NoT"
+# scan:
+#   extra_ports: []        # Added on top of UniBlue's curated 30-port list
+#   checks_dir: ""         # Extra local directory of community YAML checks
+#   interval: 15m          # Polling interval for `uniblue watch`
 
-  # Optional IP addresses to skip during active probing (e.g., fragile medical/OT gear).
-  exclude_ips: []
-
-scan:
-  # Number of hosts probed concurrently. Keep modest to stay gentle on the network.
-  concurrency: 8
-  # Timeout per individual port or HTTP probe.
-  timeout: 3s
-  # Optional override for the TCP ports checked during fingerprinting.
-  # Leave commented/empty to use UniBlue's curated DefaultPorts (30 homelab,
-  # database, and IoT ports) plus any specialty ports required by loaded checks.
-  # ports: [21, 22, 23, 53, 80, 443, 445, 502, 554, 1883, 3000, 5900, 8080, 8123, 8443, 8545]
-  # Optional directory of extra local or community YAML checks loaded in addition
-  # to the built-in checks.
-  checks_dir: ""
-  # Polling interval used by `uniblue watch`.
-  interval: 15m
-
-state:
-  # Local JSON file tracking previous findings, devices, and port forwards for diffing.
-  path: "uniblue-state.json"
-
-cve:
-  # Optional override for the local NVD JSON 2.0 + CISA KEV cache directory.
-  # Defaults to ~/.cache/uniblue/cve (or ~/Library/Caches/uniblue/cve on macOS).
-  cache_dir: ""
-
-notify:
-  # Optional webhook endpoint for `uniblue watch` alerts.
-  webhook_url: ""
-  # Payload format: "json", "discord", "slack", or "ntfy".
-  format: "json"
-  # Minimum adjusted severity required to trigger a notification:
-  # "info", "low", "medium", "high", or "critical".
-  min_severity: "medium"
+# notify:
+#   webhook_url: ""        # Or UNIBLUE_WEBHOOK_URL
+#   format: "ntfy"         # json | discord | slack | ntfy
+#   min_severity: "medium" # info | low | medium | high | critical

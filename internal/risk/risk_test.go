@@ -2,6 +2,7 @@ package risk
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/karalabe/uniblue/internal/checks"
@@ -160,5 +161,54 @@ func TestExposureClassificationAndPostureNotes(t *testing.T) {
 	// Unused "IoT" VLAN posture note should fire automatically.
 	if len(report.PostureNotes) == 0 {
 		t.Fatal("expected posture note flagging unused IoT VLAN")
+	}
+}
+
+func TestAutoInferredVLANTiersWithEmptyConfig(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Networks: []unifi.Network{
+			{ID: "n1", Name: "Default", VLAN: "1"},
+			{ID: "n2", Name: "Servers", VLAN: "2"},
+			{ID: "n3", Name: "IoT", VLAN: "30"},
+			{ID: "n4", Name: "Guest Devices", VLAN: "100", Purpose: "guest"},
+		},
+		Clients: []unifi.Client{
+			{IP: "10.0.0.50", MAC: "aa:01", Name: "hvac", NetworkName: "Default", VLAN: "1"},
+			{IP: "192.168.10.2", MAC: "aa:03", Name: "truenas", NetworkName: "Servers", VLAN: "2"},
+			{IP: "192.168.30.50", MAC: "aa:02", Name: "cam", NetworkName: "IoT", VLAN: "30"},
+		},
+	}
+	raw := []checks.Finding{
+		{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[0], Port: 23},
+		{CheckID: "UB-0005", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[1], Port: 5900},
+		{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[2], Port: 23},
+	}
+
+	// Pass a completely empty NetworkConfig{} and verify smart VLAN inference.
+	report := Evaluate(snap, raw, config.NetworkConfig{})
+	got := make(map[string]checks.Severity)
+	for _, f := range report.Findings {
+		got[f.Key()] = f.EffectiveSeverity
+	}
+	if got["UB-0001|aa:01|23"] != checks.SeverityCritical {
+		t.Fatalf("expected Default VLAN auto-inferred as trusted (high->critical), got %v", got["UB-0001|aa:01|23"])
+	}
+	if got["UB-0005|aa:03|5900"] != checks.SeverityCritical {
+		t.Fatalf("expected Servers VLAN auto-inferred as trusted (high->critical), got %v", got["UB-0005|aa:03|5900"])
+	}
+	if got["UB-0001|aa:02|23"] != checks.SeverityMedium {
+		t.Fatalf("expected IoT VLAN auto-inferred as isolated (high->medium), got %v", got["UB-0001|aa:02|23"])
+	}
+
+	// If IoT is empty, PostureNotes should recommend moving Default-LAN
+	// appliances (not Servers-VLAN infrastructure like truenas) onto it.
+	snap.Clients = snap.Clients[:2]
+	report2 := Evaluate(snap, raw[:2], config.NetworkConfig{})
+	if len(report2.PostureNotes) != 1 {
+		t.Fatalf("expected 1 posture note for unused IoT VLAN, got %d", len(report2.PostureNotes))
+	}
+	if !strings.Contains(report2.PostureNotes[0].Detail, "hvac") || strings.Contains(report2.PostureNotes[0].Detail, "truenas") {
+		t.Fatalf("unexpected posture note detail: %s", report2.PostureNotes[0].Detail)
 	}
 }
