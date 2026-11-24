@@ -30,8 +30,6 @@
   header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 20; flex-wrap: wrap; }
   .brand { display: flex; align-items: center; gap: 14px; }
   .brand img { height: 34px; display: block; }
-  .logo-dark { display: none; }
-  @media (prefers-color-scheme: dark) { .logo-light { display: none; } .logo-dark { display: block; } }
   .status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--surface-alt); border: 1px solid var(--border); color: var(--muted); }
   .pill.live { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-bd); }
@@ -79,8 +77,10 @@
 <body>
 <header>
   <div class="brand">
-    <img class="logo-light" src="/assets/logo-light.svg" alt="UniBlue">
-    <img class="logo-dark" src="/assets/logo-dark.svg" alt="UniBlue">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="/assets/logo-dark.svg">
+      <img src="/assets/logo-light.svg" alt="UniBlue">
+    </picture>
   </div>
   <div class="status-row">
     <span id="live-pill" class="pill live"><span class="dot"></span><span id="mode-lbl">Connecting…</span></span>
