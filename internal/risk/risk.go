@@ -55,6 +55,10 @@ type Report struct {
 	// connected peers, and port-security status for every UniFi switch, gateway,
 	// and In-Wall AP.
 	SwitchPorts []SwitchDeviceView `json:"switch_ports,omitempty"`
+
+	// UniFiPosture summarizes gateway security controls, Wi-Fi SSID posture,
+	// neighboring AP/evil-twin counts, WAN/VPN health, and recent controller logs.
+	UniFiPosture *UniFiPostureSummary `json:"unifi_posture,omitempty"`
 }
 
 // State captures the minimal baseline persisted to disk between consecutive
@@ -209,6 +213,11 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	switchPorts, portFindings, portNotes := AnalyzeSwitchPorts(snap, netCfg, trustedSet, isolatedSet)
 	scored = append(scored, portFindings...)
 
+	// Audit Wi-Fi SSIDs, Evil-Twin/Rogue APs, UniFi device SSH, UPnP, IDS/IPS,
+	// Honeypot, DNS Shield, and recent controller security logs.
+	unifiPosture, postureFindings, unifiNotes := AnalyzeUniFiPosture(snap, trustedSet, isolatedSet)
+	scored = append(scored, postureFindings...)
+
 	// Emit a low-severity posture finding for UniFi infrastructure gear running
 	// outdated firmware reported as upgradable by the controller.
 	cleanUniFi := 0
@@ -259,6 +268,7 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 
 	postureNotes := AnalyzePosture(snap, scored, netCfg)
 	postureNotes = append(postureNotes, portNotes...)
+	postureNotes = append(postureNotes, unifiNotes...)
 
 	return Report{
 		GeneratedAt:       time.Now().UTC(),
@@ -271,6 +281,7 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		WANSurface:        wanSurface,
 		PostureNotes:      postureNotes,
 		SwitchPorts:       switchPorts,
+		UniFiPosture:      unifiPosture,
 	}
 }
 

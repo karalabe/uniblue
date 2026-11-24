@@ -87,6 +87,10 @@
   .zone-external, .zone-external_uplink { color: var(--crit); background: var(--crit-bg); border-color: var(--crit-bd); }
   .zone-uplink, .zone-wan { color: var(--blue); background: var(--blue-bg); border-color: var(--blue); }
   .zone-unused { color: var(--high); background: var(--high-bg); border-color: var(--high-bd); }
+  .ctrl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; padding: 14px 16px; }
+  .ctrl-box { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+  .ctrl-box .clbl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); font-weight: 600; }
+  .ctrl-box .cval { font-size: 13.5px; font-weight: 700; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -197,14 +201,14 @@ function renderAll() {
     <div class="kpi"><div class="lbl">Switch Ports &amp; Gear</div><div class="val">${activePorts}/${totalPorts}</div><div class="sub">${atRiskPorts} at risk · ${state.report?.clean_unifi_devices || 0}/${state.report?.unifi_device_count || 0} devices up to date</div></div>
   `;
 
-  renderFindings(findings, exactCVEs, state.potential_cves || [], wanSurface, state.report?.posture_notes || []);
+  renderFindings(findings, exactCVEs, state.potential_cves || [], wanSurface, state.report?.posture_notes || [], state.report?.unifi_posture || null);
   renderPorts(switches);
   renderTopology();
   renderClients();
   renderEvents();
 }
 
-function renderFindings(findings, exactCVEs, potentialCVEs, wanSurface, postureNotes) {
+function renderFindings(findings, exactCVEs, potentialCVEs, wanSurface, postureNotes, unifiPosture) {
   let html = '<div class="card"><div class="card-hd"><span>Confirmed LAN &amp; Firewall Exposures (' + findings.length + ')</span></div>';
   if (!findings.length) {
     html += '<div class="empty">No confirmed exposures detected.</div>';
@@ -254,6 +258,47 @@ function renderFindings(findings, exactCVEs, potentialCVEs, wanSurface, postureN
       </tr>`;
     }
     html += '</tbody></table></div>';
+  }
+
+  if (unifiPosture && (unifiPosture.settings || unifiPosture.health || (unifiPosture.wlans && unifiPosture.wlans.length))) {
+    const s = unifiPosture.settings || {};
+    const h = unifiPosture.health || {};
+    const sshBadge = s.ssh_enabled ? (s.ssh_password_auth ? sevBadge("high") + " Password" : sevBadge("low") + " Key-only") : sevBadge("clean") + " Disabled";
+    const upnpBadge = s.upnp_enabled ? sevBadge("high") + " Enabled" : sevBadge("clean") + " Disabled";
+    const ipsBadge = (s.ips_mode === "ips" || s.ips_mode === "ids") ? sevBadge("clean") + " " + esc(s.ips_mode.toUpperCase()) : sevBadge("medium") + " Off";
+    const hpBadge = s.honeypot_enabled ? sevBadge("clean") + " Active (" + (s.honeypot_ips || []).length + ")" : sevBadge("low") + " Off";
+    const dohBadge = (s.doh_state && s.doh_state !== "off") ? sevBadge("clean") + " " + esc(s.doh_state) : sevBadge("info") + " Off";
+    const vpnBadge = (h.active_vpn_users || 0) > 0 ? sevBadge("medium") + " " + h.active_vpn_users + " active" : sevBadge("clean") + " 0 active";
+    const wanBadge = h.wan_status ? (h.wan_status === "ok" ? sevBadge("clean") : sevBadge("high")) + " " + esc(h.wan_ip || h.wan_status) : "-";
+    const rogueBadge = (unifiPosture.evil_twin_count || 0) > 0 ? sevBadge("critical") + " " + unifiPosture.evil_twin_count + " Evil-Twin!" : sevBadge("clean") + " " + (unifiPosture.neighbor_aps || 0) + " neighbors";
+
+    html += `<div class="card"><div class="card-hd"><span>UniFi Gateway, Airspace &amp; Security Controls</span></div>
+      <div class="ctrl-grid">
+        <div class="ctrl-box"><div class="clbl">Device SSH</div><div class="cval">${sshBadge}</div></div>
+        <div class="ctrl-box"><div class="clbl">Gateway UPnP</div><div class="cval">${upnpBadge}</div></div>
+        <div class="ctrl-box"><div class="clbl">IDS / IPS</div><div class="cval">${ipsBadge}</div></div>
+        <div class="ctrl-box"><div class="clbl">LAN Honeypot</div><div class="cval">${hpBadge}</div></div>
+        <div class="ctrl-box"><div class="clbl">DNS Shield (DoH)</div><div class="cval">${dohBadge}</div></div>
+        <div class="ctrl-box"><div class="clbl">Remote VPN</div><div class="cval">${vpnBadge}</div></div>
+        <div class="ctrl-box"><div class="clbl">WAN Health</div><div class="cval mono">${wanBadge}</div></div>
+        <div class="ctrl-box"><div class="clbl">Wi-Fi Airspace</div><div class="cval">${rogueBadge}</div></div>
+      </div>`;
+    if (unifiPosture.wlans && unifiPosture.wlans.length) {
+      html += `<table><thead><tr><th>Wi-Fi SSID</th><th>Status</th><th>VLAN</th><th>Encryption</th><th>PMF</th><th>L2 Client Isolation</th></tr></thead><tbody>`;
+      for (const w of unifiPosture.wlans) {
+        const enc = (w.security || "-") + (w.wpa3_support ? " (WPA3)" : (w.wpa_mode ? " (" + w.wpa_mode.toUpperCase() + ")" : ""));
+        html += `<tr>
+          <td><strong>${esc(w.name)}</strong>${w.is_guest ? ' <span class="zone-pill">Guest</span>' : ''}</td>
+          <td>${w.enabled ? sevBadge("clean") : sevBadge("info")}</td>
+          <td>${esc(w.network_name || "-")}</td>
+          <td class="mono">${esc(enc)}</td>
+          <td class="mono">${esc(w.pmf_mode || "disabled")}</td>
+          <td>${w.l2_isolation ? sevBadge("clean") : '<span class="proof">off</span>'}</td>
+        </tr>`;
+      }
+      html += `</tbody></table>`;
+    }
+    html += `</div>`;
   }
 
   if (postureNotes.length) {
@@ -335,7 +380,7 @@ function renderPorts(switches) {
     }
 
     html += `</div><table><thead><tr>
-      <th>Port</th><th>State</th><th>Zone</th><th>Native VLAN</th><th>Tagged VLANs</th><th>MAC Lock</th><th>PoE</th><th>Connected Peer(s)</th><th>Security Status</th>
+      <th>Port</th><th>State</th><th>Zone</th><th>Native VLAN</th><th>Tagged VLANs</th><th>MAC Lock / Count</th><th>PoE</th><th>Connected Peer(s)</th><th>Security Status</th>
     </tr></thead><tbody>`;
 
     for (const p of (sw.ports || [])) {
@@ -347,7 +392,9 @@ function renderPorts(switches) {
         ? p.peers.map(x => `<div><strong>${esc(x.name)}</strong>${x.ip ? ' <span class="mono">(' + esc(x.ip) + ')</span>' : ''}</div>`).join("")
         : (p.label ? `<span class="proof">${esc(p.label)}</span>` : '<span class="proof">-</span>');
       const poeTxt = p.poe_enabled ? (p.poe_power ? p.poe_power + "W" : "ON") : "-";
-      const macLock = p.port_security ? '<span class="sev sev-clean">ON</span>' : '<span class="proof">off</span>';
+      const macCnt = p.mac_table_count ? ` <span class="proof mono">(${p.mac_table_count} MAC${p.mac_table_count > 1 ? 's' : ''})</span>` : '';
+      const macLock = (p.port_security ? '<span class="sev sev-clean">ON</span>' : '<span class="proof">off</span>') + macCnt;
+      const stpBadge = (p.stp_state === "discarding" || p.stp_state === "blocking") ? ' <span class="sev sev-high">STP ' + esc(p.stp_state) + '</span>' : '';
       const statusBadge = p.status === "critical"
         ? sevBadge("critical")
         : (p.status === "warn" ? sevBadge("high") : sevBadge("clean"));
@@ -357,7 +404,7 @@ function renderPorts(switches) {
 
       html += `<tr>
         <td class="mono"><strong>#${p.port_idx}</strong> <span class="proof">${esc(p.name)}</span></td>
-        <td class="mono">${esc(stateTxt)}</td>
+        <td class="mono">${esc(stateTxt)}${stpBadge}</td>
         <td><span class="zone-pill zone-${esc(p.zone)}">${esc(zoneLabel)}</span></td>
         <td>${esc(p.native_vlan || "-")}</td>
         <td class="mono">${esc(p.tagged_policy)}</td>

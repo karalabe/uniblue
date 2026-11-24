@@ -40,6 +40,26 @@ type Snapshot struct {
 	// FirewallPolicies holds UniFi Zone-Based Firewall policies when supported
 	// by the console.
 	FirewallPolicies []FirewallPolicy `json:"firewall_policies,omitempty"`
+
+	// WLANs holds configured Wi-Fi SSIDs and their security/isolation posture.
+	WLANs []WLANConfig `json:"wlans,omitempty"`
+
+	// RogueAPs holds neighboring/foreign BSSIDs observed by UniFi APs.
+	RogueAPs []RogueAP `json:"rogue_aps,omitempty"`
+
+	// SecuritySettings summarizes gateway/site security controls (SSH, UPnP,
+	// IDS/IPS, Honeypot, DNS Shield, Teleport) without retaining credentials.
+	SecuritySettings *SiteSecuritySettings `json:"security_settings,omitempty"`
+
+	// Health summarizes WAN status, active public IP, and live VPN sessions.
+	Health *SystemHealth `json:"health,omitempty"`
+
+	// KnownClients holds historical client records from rest/user for dormant
+	// wakeup and wired/wireless medium-swap anomaly detection.
+	KnownClients []HistoricalClient `json:"known_clients,omitempty"`
+
+	// RecentLogs holds recent security and admin activity events from the console.
+	RecentLogs []ControllerLogEvent `json:"recent_logs,omitempty"`
 }
 
 // PortHintsByIP collects concrete destination TCP ports explicitly referenced
@@ -173,6 +193,18 @@ type Client struct {
 
 	// APMAC is the MAC address of the parent UniFi access point for wireless clients.
 	APMAC string `json:"ap_mac,omitempty"`
+
+	// TxBytes is total bytes transmitted by the client (wired or wireless).
+	TxBytes int64 `json:"tx_bytes,omitempty"`
+
+	// RxBytes is total bytes received by the client (wired or wireless).
+	RxBytes int64 `json:"rx_bytes,omitempty"`
+
+	// FirstSeen is the Unix timestamp (seconds) when UniFi first observed this MAC.
+	FirstSeen int64 `json:"first_seen,omitempty"`
+
+	// LastSeen is the Unix timestamp (seconds) when UniFi last observed this MAC.
+	LastSeen int64 `json:"last_seen,omitempty"`
 }
 
 // DisplayName returns the most readable identifier available for a client,
@@ -280,6 +312,9 @@ type SwitchPort struct {
 	// PoEPower is the live power draw in watts when PoE is active.
 	PoEPower string `json:"poe_power,omitempty"`
 
+	// PoEPowerWatts is the numeric PoE draw in watts parsed from PoEPower.
+	PoEPowerWatts float64 `json:"poe_power_watts,omitempty"`
+
 	// PortSecurityEnabled reports whether MAC address allowlisting is enforced.
 	PortSecurityEnabled bool `json:"port_security_enabled,omitempty"`
 
@@ -291,6 +326,119 @@ type SwitchPort struct {
 
 	// MACTableCount is the number of active MAC addresses learned on this port.
 	MACTableCount int `json:"mac_table_count,omitempty"`
+
+	// STPState is the Spanning Tree state ("forwarding", "discarding", "blocking", "disabled").
+	STPState string `json:"stp_state,omitempty"`
+
+	// STPStateChanges counts STP topology transitions on this port.
+	STPStateChanges int `json:"stp_state_changes,omitempty"`
+
+	// RXErrors counts receive frame errors on this port.
+	RXErrors int64 `json:"rx_errors,omitempty"`
+
+	// TXErrors counts transmit frame errors on this port.
+	TXErrors int64 `json:"tx_errors,omitempty"`
+
+	// RXDropped counts dropped inbound packets on this port.
+	RXDropped int64 `json:"rx_dropped,omitempty"`
+
+	// TXDropped counts dropped outbound packets on this port.
+	TXDropped int64 `json:"tx_dropped,omitempty"`
+}
+
+// WLANConfig represents one UniFi Wi-Fi SSID and its encryption/isolation settings.
+type WLANConfig struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Enabled     bool   `json:"enabled"`
+	Security    string `json:"security"`     // "wpapsk", "open", "wep", "wpaeap"
+	WPAMode     string `json:"wpa_mode"`     // "wpa2", "wpa3", "wpa1"
+	WPA3Support bool   `json:"wpa3_support"` // WPA3 transition or WPA3-only enabled
+	PMFMode     string `json:"pmf_mode"`     // "disabled", "optional", "required"
+	L2Isolation bool   `json:"l2_isolation"`
+	IsGuest     bool   `json:"is_guest"`
+	NetworkID   string `json:"network_id,omitempty"`
+	NetworkName string `json:"network_name,omitempty"`
+}
+
+// RogueAP represents a neighboring or foreign wireless BSSID observed by UniFi APs.
+type RogueAP struct {
+	BSSID    string `json:"bssid"`
+	ESSID    string `json:"essid"`
+	APMAC    string `json:"ap_mac,omitempty"`
+	Channel  int    `json:"channel,omitempty"`
+	Band     string `json:"band,omitempty"`
+	Security string `json:"security,omitempty"`
+	OUI      string `json:"oui,omitempty"`
+	RSSI     int    `json:"rssi,omitempty"`
+	IsRogue  bool   `json:"is_rogue,omitempty"`
+	IsUBNT   bool   `json:"is_ubnt,omitempty"`
+	IsAdhoc  bool   `json:"is_adhoc,omitempty"`
+	LastSeen int64  `json:"last_seen,omitempty"`
+}
+
+// SiteSecuritySettings summarizes non-secret controller/gateway security posture
+// parsed from /rest/setting (mgmt, usg, ips, doh, teleport).
+type SiteSecuritySettings struct {
+	SSHEnabled        bool     `json:"ssh_enabled"`
+	SSHPasswordAuth   bool     `json:"ssh_password_auth"`
+	SSHKeyCount       int      `json:"ssh_key_count"`
+	UPnPEnabled       bool     `json:"upnp_enabled"`
+	UPnPNATPMPEnabled bool     `json:"upnp_nat_pmp_enabled"`
+	UPnPSecureMode    bool     `json:"upnp_secure_mode"`
+	IPSMode           string   `json:"ips_mode,omitempty"` // "ips", "ids", "disabled"
+	HoneypotEnabled   bool     `json:"honeypot_enabled"`
+	HoneypotIPs       []string `json:"honeypot_ips,omitempty"`
+	DNSFiltering      bool     `json:"dns_filtering"`
+	DoHState          string   `json:"doh_state,omitempty"` // "off", "auto", "custom"
+	TeleportEnabled   bool     `json:"teleport_enabled"`
+}
+
+// VPNConnection describes one currently active remote-access VPN session.
+type VPNConnection struct {
+	ID       string `json:"id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	User     string `json:"user,omitempty"`
+	Type     string `json:"type,omitempty"`
+	RemoteIP string `json:"remote_ip,omitempty"`
+	LocalIP  string `json:"local_ip,omitempty"`
+}
+
+// SystemHealth summarizes gateway WAN health and active VPN sessions.
+type SystemHealth struct {
+	WANStatus      string          `json:"wan_status,omitempty"`
+	WANIP          string          `json:"wan_ip,omitempty"`
+	ActiveVPNUsers int             `json:"active_vpn_users"`
+	VPNConnections []VPNConnection `json:"vpn_connections,omitempty"`
+}
+
+// HistoricalClient records a known client MAC from /rest/user for dormant
+// reappearance and wired/Wi-Fi medium-swap detection.
+type HistoricalClient struct {
+	MAC             string `json:"mac"`
+	Name            string `json:"name,omitempty"`
+	Hostname        string `json:"hostname,omitempty"`
+	IsWired         bool   `json:"is_wired"`
+	FirstSeen       int64  `json:"first_seen,omitempty"`
+	LastSeen        int64  `json:"last_seen,omitempty"`
+	LastNetworkName string `json:"last_network_name,omitempty"`
+}
+
+// ControllerLogEvent represents a normalized security or admin activity event
+// from UniFi's v2 System Log (or legacy stat/event fallback).
+type ControllerLogEvent struct {
+	ID        string    `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+	Category  string    `json:"category"` // "SECURITY", "ADMIN", "NETWORK", "CLIENT_DEVICES", ...
+	Event     string    `json:"event"`    // "THREAT_BLOCKED", "ADMIN_ACCESS", ...
+	Key       string    `json:"key,omitempty"`
+	Severity  string    `json:"severity"` // "critical", "high", "medium", "low", "info"
+	Title     string    `json:"title,omitempty"`
+	Message   string    `json:"message"`
+	SrcIP     string    `json:"src_ip,omitempty"`
+	DstIP     string    `json:"dst_ip,omitempty"`
+	Admin     string    `json:"admin,omitempty"`
+	Device    string    `json:"device,omitempty"`
 }
 
 // Network describes a UniFi LAN or VLAN segment along with its structural
@@ -489,19 +637,25 @@ type apiEnvelope[T any] struct {
 
 // rawClient maps the wire fields returned by /api/s/<site>/stat/sta.
 type rawClient struct {
-	MAC       string     `json:"mac"`
-	IP        string     `json:"ip"`
-	Hostname  string     `json:"hostname"`
-	Name      string     `json:"name"`
-	OUI       string     `json:"oui"`
-	NetworkID string     `json:"network_id"`
-	Network   string     `json:"network"`
-	VLAN      flexString `json:"vlan"`
-	IsWired   bool       `json:"is_wired"`
-	ESSID     string     `json:"essid"`
-	SwMAC     string     `json:"sw_mac"`
-	SwPort    int        `json:"sw_port"`
-	APMAC     string     `json:"ap_mac"`
+	MAC          string     `json:"mac"`
+	IP           string     `json:"ip"`
+	Hostname     string     `json:"hostname"`
+	Name         string     `json:"name"`
+	OUI          string     `json:"oui"`
+	NetworkID    string     `json:"network_id"`
+	Network      string     `json:"network"`
+	VLAN         flexString `json:"vlan"`
+	IsWired      bool       `json:"is_wired"`
+	ESSID        string     `json:"essid"`
+	SwMAC        string     `json:"sw_mac"`
+	SwPort       int        `json:"sw_port"`
+	APMAC        string     `json:"ap_mac"`
+	TxBytes      int64      `json:"tx_bytes"`
+	RxBytes      int64      `json:"rx_bytes"`
+	WiredTxBytes int64      `json:"wired-tx_bytes"`
+	WiredRxBytes int64      `json:"wired-rx_bytes"`
+	FirstSeen    int64      `json:"first_seen"`
+	LastSeen     int64      `json:"last_seen"`
 }
 
 // rawDevice maps the wire fields returned by /api/s/<site>/stat/device.
@@ -522,27 +676,64 @@ type rawDevice struct {
 	PortOverrides []rawPort `json:"port_overrides"`
 }
 
+// flexSTPCount unmarshals UniFi's stp_state_change_count, which modern switch
+// firmware emits as an array of {mst, change_count} objects while older
+// firmware may emit a plain integer.
+type flexSTPCount int
+
+func (f *flexSTPCount) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*f = 0
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(data, &n); err == nil {
+		*f = flexSTPCount(n)
+		return nil
+	}
+	var entries []struct {
+		ChangeCount int `json:"change_count"`
+	}
+	if err := json.Unmarshal(data, &entries); err == nil {
+		total := 0
+		for _, e := range entries {
+			total += e.ChangeCount
+		}
+		*f = flexSTPCount(total)
+		return nil
+	}
+	*f = 0
+	return nil
+}
+
 // rawPort maps a single port entry in UniFi's port_table or port_overrides array.
 type rawPort struct {
-	PortIdx             int        `json:"port_idx"`
-	Name                string     `json:"name"`
-	Enable              *bool      `json:"enable"`
-	Up                  bool       `json:"up"`
-	Speed               int        `json:"speed"`
-	Media               string     `json:"media"`
-	IsUplink            bool       `json:"is_uplink"`
-	NetworkName         string     `json:"network_name"`
-	OpMode              string     `json:"op_mode"`
-	Forward             string     `json:"forward"`
-	TaggedVLANMgmt      string     `json:"tagged_vlan_mgmt"`
-	NativeNetworkConfID string     `json:"native_networkconf_id"`
-	PoEEnable           bool       `json:"poe_enable"`
-	PoEMode             string     `json:"poe_mode"`
-	PoEPower            flexString `json:"poe_power"`
-	PortSecurityEnabled *bool      `json:"port_security_enabled"`
-	PortSecurityMACs    []string   `json:"port_security_mac_address"`
-	Isolation           *bool      `json:"isolation"`
-	MACTableCount       int        `json:"mac_table_count"`
+	PortIdx             int          `json:"port_idx"`
+	Name                string       `json:"name"`
+	Enable              *bool        `json:"enable"`
+	Up                  bool         `json:"up"`
+	Speed               int          `json:"speed"`
+	Media               string       `json:"media"`
+	IsUplink            bool         `json:"is_uplink"`
+	NetworkName         string       `json:"network_name"`
+	OpMode              string       `json:"op_mode"`
+	Forward             string       `json:"forward"`
+	TaggedVLANMgmt      string       `json:"tagged_vlan_mgmt"`
+	NativeNetworkConfID string       `json:"native_networkconf_id"`
+	PoEEnable           bool         `json:"poe_enable"`
+	PoEMode             string       `json:"poe_mode"`
+	PoEPower            flexString   `json:"poe_power"`
+	PortSecurityEnabled *bool        `json:"port_security_enabled"`
+	PortSecurityMACs    []string     `json:"port_security_mac_address"`
+	Isolation           *bool        `json:"isolation"`
+	MACTableCount       int          `json:"mac_table_count"`
+	STPState            string       `json:"stp_state"`
+	STPStateChangeCount flexSTPCount `json:"stp_state_change_count"`
+	RXErrors            int64        `json:"rx_errors"`
+	TXErrors            int64        `json:"tx_errors"`
+	RXDropped           int64        `json:"rx_dropped"`
+	TXDropped           int64        `json:"tx_dropped"`
 }
 
 // rawNetwork maps the wire fields returned by /api/s/<site>/rest/networkconf.

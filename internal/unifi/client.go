@@ -12,6 +12,7 @@ import (
 	"net/http/cookiejar"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,6 +86,8 @@ func New(cfg config.UniFiConfig) (*Controller, error) {
 	}
 
 	transport := &http.Transport{
+		MaxIdleConnsPerHost: 4,
+		MaxConnsPerHost:     4,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec // local gateways typically serve self-signed certs
 		},
@@ -297,8 +300,13 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	policiesCh := make(chan policiesRes, 1)
 	legacyClientsCh := make(chan legacyClientsRes, 1)
 	legacyDevicesCh := make(chan legacyDevicesRes, 1)
+	telemetryCh := make(chan siteTelemetry, 1)
 
 	siteBase := fmt.Sprintf("%s/sites/%s", integrationV1Prefix, c.siteID)
+
+	go func() {
+		telemetryCh <- c.fetchSiteTelemetry(ctx)
+	}()
 
 	go func() {
 		items, err := fetchAllPages[integrationClient](ctx, c, siteBase+"/clients")
@@ -481,6 +489,10 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			cl.SwitchMAC = strings.ToLower(strings.TrimSpace(lc.SwMAC))
 			cl.SwitchPort = lc.SwPort
 			cl.APMAC = strings.ToLower(strings.TrimSpace(lc.APMAC))
+			cl.TxBytes = lc.TxBytes + lc.WiredTxBytes
+			cl.RxBytes = lc.RxBytes + lc.WiredRxBytes
+			cl.FirstSeen = lc.FirstSeen
+			cl.LastSeen = lc.LastSeen
 		}
 		if addr, err := netip.ParseAddr(cl.IP); err == nil {
 			// Pick the most specific matching CIDR (longest prefix) in case
@@ -547,6 +559,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	}
 
 	forwards := convertPortForwards(fr.items)
+	telem := <-telemetryCh
 
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
@@ -558,6 +571,12 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		PortForwards:     forwards,
 		Zones:            zones,
 		FirewallPolicies: policies,
+		WLANs:            convertWLANs(telem.wlans, netByID),
+		RogueAPs:         convertRogueAPs(telem.rogueAPs),
+		SecuritySettings: telem.settings,
+		Health:           telem.health,
+		KnownClients:     convertHistoricalClients(telem.knownUsers, netByID),
+		RecentLogs:       telem.recentLogs,
 	}, nil
 }
 
@@ -585,6 +604,11 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	devicesCh := make(chan devicesRes, 1)
 	networksCh := make(chan networksRes, 1)
 	forwardsCh := make(chan forwardsRes, 1)
+	telemetryCh := make(chan siteTelemetry, 1)
+
+	go func() {
+		telemetryCh <- c.fetchSiteTelemetry(ctx)
+	}()
 
 	go func() {
 		var env apiEnvelope[rawClient]
@@ -655,6 +679,10 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			SwitchMAC:   strings.ToLower(strings.TrimSpace(rc.SwMAC)),
 			SwitchPort:  rc.SwPort,
 			APMAC:       strings.ToLower(strings.TrimSpace(rc.APMAC)),
+			TxBytes:     rc.TxBytes + rc.WiredTxBytes,
+			RxBytes:     rc.RxBytes + rc.WiredRxBytes,
+			FirstSeen:   rc.FirstSeen,
+			LastSeen:    rc.LastSeen,
 		}
 
 		// Fill missing network name or VLAN tag from the site's network table.
@@ -695,14 +723,21 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		devices = append(devices, dev)
 	}
 
+	telem := <-telemetryCh
 	return &Snapshot{
-		CollectedAt:    time.Now().UTC(),
-		Site:           c.site,
-		ControllerType: c.controllerType,
-		Clients:        clients,
-		Devices:        devices,
-		Networks:       networks,
-		PortForwards:   convertPortForwards(fr.items),
+		CollectedAt:      time.Now().UTC(),
+		Site:             c.site,
+		ControllerType:   c.controllerType,
+		Clients:          clients,
+		Devices:          devices,
+		Networks:         networks,
+		PortForwards:     convertPortForwards(fr.items),
+		WLANs:            convertWLANs(telem.wlans, netByID),
+		RogueAPs:         convertRogueAPs(telem.rogueAPs),
+		SecuritySettings: telem.settings,
+		Health:           telem.health,
+		KnownClients:     convertHistoricalClients(telem.knownUsers, netByID),
+		RecentLogs:       telem.recentLogs,
 	}, nil
 }
 
@@ -844,6 +879,9 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, defaultNetName
 			}
 		}
 
+		poeStr := strings.TrimSpace(string(rp.PoEPower))
+		poeWatts, _ := strconv.ParseFloat(poeStr, 64)
+
 		ports = append(ports, SwitchPort{
 			PortIdx:             rp.PortIdx,
 			Name:                strings.TrimSpace(rp.Name),
@@ -860,11 +898,18 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, defaultNetName
 			NativeNetworkName:   nativeName,
 			PoEEnabled:          rp.PoEEnable,
 			PoEMode:             strings.ToLower(strings.TrimSpace(rp.PoEMode)),
-			PoEPower:            strings.TrimSpace(string(rp.PoEPower)),
+			PoEPower:            poeStr,
+			PoEPowerWatts:       poeWatts,
 			PortSecurityEnabled: psec,
 			PortSecurityMACs:    psecMACs,
 			Isolation:           iso,
 			MACTableCount:       rp.MACTableCount,
+			STPState:            strings.ToLower(strings.TrimSpace(rp.STPState)),
+			STPStateChanges:     int(rp.STPStateChangeCount),
+			RXErrors:            rp.RXErrors,
+			TXErrors:            rp.TXErrors,
+			RXDropped:           rp.RXDropped,
+			TXDropped:           rp.TXDropped,
 		})
 	}
 	sort.Slice(ports, func(i, j int) bool {
@@ -1113,8 +1158,33 @@ func (e *httpStatusError) Error() string {
 }
 
 // getJSON performs a read-only GET request against a full controller path and
-// decodes its JSON response into dst.
+// decodes its JSON response into dst, retrying once on transient 429/5xx bursts.
 func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) error {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		err := c.getJSONOnce(ctx, fullPath, dst)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		var httpErr *httpStatusError
+		if errors.As(err, &httpErr) && httpErr.status != http.StatusTooManyRequests && httpErr.status < 500 {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func (c *Controller) getJSONOnce(ctx context.Context, fullPath string, dst any) error {
 	fullURL := c.baseURL + fullPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {

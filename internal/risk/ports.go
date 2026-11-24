@@ -54,11 +54,16 @@ type SwitchPortView struct {
 	PoEEnabled       bool       `json:"poe_enabled,omitempty"`
 	PoEMode          string     `json:"poe_mode,omitempty"`
 	PoEPower         string     `json:"poe_power,omitempty"`
+	PoEPowerWatts    float64    `json:"poe_power_watts,omitempty"`
 	NativeVLAN       string     `json:"native_vlan,omitempty"`
 	TaggedPolicy     string     `json:"tagged_policy"` // "all", "block_all", "custom", "disabled"
 	PortSecurity     bool       `json:"port_security"`
 	PortSecurityMACs []string   `json:"port_security_macs,omitempty"`
 	Isolation        bool       `json:"isolation,omitempty"`
+	MACTableCount    int        `json:"mac_table_count,omitempty"`
+	STPState         string     `json:"stp_state,omitempty"`
+	RXErrors         int64      `json:"rx_errors,omitempty"`
+	TXErrors         int64      `json:"tx_errors,omitempty"`
 	Peers            []PortPeer `json:"peers,omitempty"`
 	Status           string     `json:"status"` // "ok", "warn", "critical"
 	Issues           []string   `json:"issues,omitempty"`
@@ -284,11 +289,16 @@ func AnalyzeSwitchPorts(
 				PoEEnabled:       sp.PoEEnabled,
 				PoEMode:          sp.PoEMode,
 				PoEPower:         sp.PoEPower,
+				PoEPowerWatts:    sp.PoEPowerWatts,
 				NativeVLAN:       sp.NativeNetworkName,
 				TaggedPolicy:     taggedPolicy,
 				PortSecurity:     sp.PortSecurityEnabled,
 				PortSecurityMACs: sp.PortSecurityMACs,
 				Isolation:        sp.Isolation,
+				MACTableCount:    sp.MACTableCount,
+				STPState:         sp.STPState,
+				RXErrors:         sp.RXErrors,
+				TXErrors:         sp.TXErrors,
 				Peers:            peers,
 				Status:           "ok",
 			}
@@ -445,6 +455,81 @@ func AnalyzeSwitchPorts(
 						indoorTrunkAccessPorts = append(indoorTrunkAccessPorts, sp.PortIdx)
 					}
 				}
+			}
+
+			// Detect inline hubs / rogue mini-switches / MITM taps on external access ports
+			// (multiple MAC addresses learned behind a single exterior cable drop).
+			if zone == "external" && sp.Enabled && sp.Up && (sp.MACTableCount > 1 || len(peers) > 1) {
+				macCount := sp.MACTableCount
+				if len(peers) > macCount {
+					macCount = len(peers)
+				}
+				pv.Status = "critical"
+				pv.Issues = append(pv.Issues, fmt.Sprintf("Multiple MACs (%d) detected on external access port (possible inline hub/tap)", macCount))
+				dv.AtRiskPorts++
+				findings = append(findings, checks.Finding{
+					CheckID:           "UB-UNIFI-PORT-EXT-MULTI-MAC",
+					Title:             fmt.Sprintf("Multiple MACs on External Access Port (%s Port %d)", dev.Name, sp.PortIdx),
+					Category:          "physical-port",
+					BaseSeverity:      checks.SeverityCritical,
+					EffectiveSeverity: checks.SeverityCritical,
+					Client: unifi.Client{
+						MAC:         devMAC,
+						IP:          dev.IP,
+						Name:        fmt.Sprintf("%s Port %d", dev.Name, sp.PortIdx),
+						NetworkName: sp.NativeNetworkName,
+					},
+					Port:     sp.PortIdx,
+					Evidence: fmt.Sprintf("%s Port %d (zone=external) has %d learned MACs (%s); single-device exterior cable drop should only present 1 MAC", dev.Name, sp.PortIdx, macCount, formatPeers(peers)),
+					Remediation: checks.Remediation{
+						Summary: "An exterior single-device cable drop is presenting multiple MAC addresses, which can indicate an unauthorized mini-switch, travel router, or inline hardware tap. Inspect the physical run and enable MAC Port Security locked to the authorized device MAC.",
+						UniFiActions: []string{
+							"inspect_physical_cable_run",
+							"enable_port_security_mac_restrict",
+						},
+					},
+				})
+			}
+
+			// Detect Spanning Tree (STP) loop blocking or high frame error counters.
+			if sp.Enabled && (sp.STPState == "discarding" || sp.STPState == "blocking") {
+				if pv.Status != "critical" {
+					pv.Status = "warn"
+				}
+				pv.Issues = append(pv.Issues, fmt.Sprintf("STP state=%s (L2 loop blocked)", sp.STPState))
+				dv.AtRiskPorts++
+				findings = append(findings, checks.Finding{
+					CheckID:           "UB-UNIFI-PORT-STP-BLOCKED",
+					Title:             fmt.Sprintf("Switch Port Blocked by Spanning Tree (%s Port %d)", dev.Name, sp.PortIdx),
+					Category:          "physical-port",
+					BaseSeverity:      checks.SeverityHigh,
+					EffectiveSeverity: checks.SeverityHigh,
+					Client: unifi.Client{
+						MAC:         devMAC,
+						IP:          dev.IP,
+						Name:        fmt.Sprintf("%s Port %d", dev.Name, sp.PortIdx),
+						NetworkName: sp.NativeNetworkName,
+					},
+					Port:     sp.PortIdx,
+					Evidence: fmt.Sprintf("%s Port %d STP state is %q (transitions=%d, peer=%s)", dev.Name, sp.PortIdx, sp.STPState, sp.STPStateChanges, formatPeers(peers)),
+					Remediation: checks.Remediation{
+						Summary: "Spanning Tree Protocol blocked this port due to a detected Layer-2 loop or rogue bridge BPDU. Check connected cabling and downstream devices for accidental loops or unauthorized switches.",
+						UniFiActions: []string{
+							"inspect_l2_loop_and_stp",
+						},
+					},
+				})
+			}
+			if sp.Enabled && sp.Up && (sp.RXErrors+sp.TXErrors) >= 1000 {
+				if pv.Status == "ok" {
+					pv.Status = "warn"
+				}
+				pv.Issues = append(pv.Issues, fmt.Sprintf("High port errors (rx=%d, tx=%d)", sp.RXErrors, sp.TXErrors))
+				notes = append(notes, PostureNote{
+					Severity: checks.SeverityLow,
+					Title:    fmt.Sprintf("High Ethernet error counters on %s Port %d", dev.Name, sp.PortIdx),
+					Detail:   fmt.Sprintf("Port #%d (%s) reports %d RX errors and %d TX errors. Inspect cable termination, duplex negotiation, or PoE noise.", sp.PortIdx, formatPeers(peers), sp.RXErrors, sp.TXErrors),
+				})
 			}
 
 			// Enforce explicit allowed_macs policy if configured for this port.

@@ -164,16 +164,19 @@ type missingClient struct {
 // portLiveState captures the previous link and security configuration of a
 // single physical switch port so pollDelta can emit real-time link/config events.
 type portLiveState struct {
-	DeviceName   string
-	DeviceIP     string
-	PortIdx      int
-	PortName     string
-	Zone         string
-	Up           bool
-	Enabled      bool
-	NativeVLAN   string
-	TaggedPolicy string
-	PortSecurity bool
+	DeviceName    string
+	DeviceIP      string
+	PortIdx       int
+	PortName      string
+	Zone          string
+	Up            bool
+	Enabled       bool
+	NativeVLAN    string
+	TaggedPolicy  string
+	PortSecurity  bool
+	PoEPowerWatts float64
+	MACTableCount int
+	STPState      string
 }
 
 // Engine coordinates UniFi event ingestion, targeted single-host live checks,
@@ -201,6 +204,8 @@ type Engine struct {
 	profilesByMAC  map[string]probe.HostProfile
 	missingClients map[string]missingClient
 	lastPorts      map[string]portLiveState
+	anomalies      *anomalyTracker
+	lastClasses    map[string]classify.Result
 	lastPolicySig  string
 	lastFwdSig     string
 	prevRiskState  *risk.State
@@ -276,6 +281,8 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 		profilesByMAC:  make(map[string]probe.HostProfile),
 		missingClients: make(map[string]missingClient),
 		lastPorts:      make(map[string]portLiveState),
+		anomalies:      newAnomalyTracker(),
+		lastClasses:    make(map[string]classify.Result),
 		prevRiskState:  prevState,
 		fullRescanCh:   make(chan string, 1),
 		hostScanCh:     make(chan unifi.Client, 64),
@@ -315,6 +322,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.lastFwdSig = portForwardSignature(snap.PortForwards)
 	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
 	e.lastPorts = snapshotPortStates(snap, e.cfg.Network)
+	e.anomalies.Seed(snap, e.lastPorts, time.Now().UTC())
 	e.mu.Unlock()
 	e.recomputeAndPublish(ctx, false)
 
@@ -514,6 +522,9 @@ func (e *Engine) pollDelta(ctx context.Context) {
 				IP:       cl.IP,
 				Summary:  fmt.Sprintf("%s joined %s (%s)", cl.DisplayName(), fallbackVLAN(cl.NetworkName), cl.IP),
 			})
+			for _, aev := range e.anomalies.EvaluateClientJoinAnomalies(cl, now) {
+				e.emitLocked(aev)
+			}
 			if cl.IP != "" {
 				toScan = append(toScan, cl)
 			}
@@ -652,6 +663,22 @@ func (e *Engine) pollDelta(ctx context.Context) {
 				})
 			}
 		}
+	}
+
+	// Evaluate physical-layer tamper anomalies (PoE drop cable swap, inline hub
+	// MAC surge, STP blocking), IoT upload spikes, and site security telemetry
+	// (IDS/IPS/Honeypot/Admin logs, Evil-Twin APs, VPN/WAN transitions, config drift).
+	for _, aev := range e.anomalies.EvaluatePortAnomalies(e.lastPorts, currPorts) {
+		changed = true
+		e.emitLocked(aev)
+	}
+	for _, aev := range e.anomalies.EvaluateIoTUploadSpikes(snap.Clients, e.lastClasses, now) {
+		changed = true
+		e.emitLocked(aev)
+	}
+	for _, aev := range e.anomalies.EvaluateSiteTelemetry(snap, snap.RecentLogs) {
+		changed = true
+		e.emitLocked(aev)
 	}
 
 	e.snap = snap
@@ -919,6 +946,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 	now := time.Now().UTC()
 	e.mu.Lock()
 	e.prevRiskState = nextState
+	e.lastClasses = classes
 	lastFull := e.current.LastFullScanAt
 	if isFullScan {
 		lastFull = now
@@ -1014,16 +1042,19 @@ func snapshotPortStates(snap *unifi.Snapshot, netCfg config.NetworkConfig) map[s
 		for _, p := range sw.Ports {
 			key := fmt.Sprintf("%s|%d", sw.MAC, p.PortIdx)
 			out[key] = portLiveState{
-				DeviceName:   sw.Name,
-				DeviceIP:     sw.IP,
-				PortIdx:      p.PortIdx,
-				PortName:     p.Name,
-				Zone:         p.Zone,
-				Up:           p.Up,
-				Enabled:      p.Enabled,
-				NativeVLAN:   p.NativeVLAN,
-				TaggedPolicy: p.TaggedPolicy,
-				PortSecurity: p.PortSecurity,
+				DeviceName:    sw.Name,
+				DeviceIP:      sw.IP,
+				PortIdx:       p.PortIdx,
+				PortName:      p.Name,
+				Zone:          p.Zone,
+				Up:            p.Up,
+				Enabled:       p.Enabled,
+				NativeVLAN:    p.NativeVLAN,
+				TaggedPolicy:  p.TaggedPolicy,
+				PortSecurity:  p.PortSecurity,
+				PoEPowerWatts: p.PoEPowerWatts,
+				MACTableCount: p.MACTableCount,
+				STPState:      p.STPState,
 			}
 		}
 	}
