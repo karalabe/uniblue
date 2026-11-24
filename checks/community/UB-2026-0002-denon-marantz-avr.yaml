@@ -4,6 +4,7 @@ cve: null
 category: unauth-control
 severity: medium
 safety: read-only
+supersedes: ["UB-0001"]
 
 metadata:
   vendor: Denon / Marantz (D&M Holdings)
@@ -19,7 +20,7 @@ preconditions:
   hostname_regex: "(?i)(marantz|denon|avr|sr[0-9]{4})"
 
 probe:
-  type: tcp
+  type: avr
   port: 23
   timeout: 3s
 

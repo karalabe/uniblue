@@ -19,7 +19,7 @@ preconditions:
   hostname_regex: "(?i)(zehnder|comfoconnect|comfoair|ventilation)"
 
 probe:
-  type: tcp
+  type: comfoconnect
   port: 56747
   timeout: 3s
 

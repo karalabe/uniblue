@@ -17,7 +17,7 @@ preconditions:
   ports_any: [23]
 
 probe:
-  type: tcp
+  type: telnet
   port: 23
   timeout: 3s
 

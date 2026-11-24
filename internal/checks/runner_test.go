@@ -2,11 +2,13 @@ package checks
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	builtinchecks "github.com/karalabe/uniblue/checks"
@@ -194,18 +196,92 @@ func TestProtocolProbes(t *testing.T) {
 		}
 	})
 
-	t.Run("vnc security none", func(t *testing.T) {
+	t.Run("vnc confirmed serverinit", func(t *testing.T) {
+		port, closeFn := startMockTCP(t, func(conn net.Conn) {
+			_, _ = io.WriteString(conn, "RFB 003.008\n")
+			ver := make([]byte, 12)
+			if _, err := io.ReadFull(conn, ver); err != nil {
+				return
+			}
+			// 2 security types: VNC Auth (2) and None (1).
+			_, _ = conn.Write([]byte{0x02, 0x02, 0x01})
+			sel := make([]byte, 1)
+			if _, err := io.ReadFull(conn, sel); err != nil || sel[0] != 0x01 {
+				return
+			}
+			// SecurityResult = 0 (OK).
+			_, _ = conn.Write([]byte{0x00, 0x00, 0x00, 0x00})
+			// Read ClientInit (shared=1).
+			ci := make([]byte, 1)
+			if _, err := io.ReadFull(conn, ci); err != nil || ci[0] != 0x01 {
+				return
+			}
+			// Send ServerInit with 1024x768 and desktop name "QEMU (Ubuntu)".
+			name := "QEMU (Ubuntu)"
+			hdr := make([]byte, 24)
+			binary.BigEndian.PutUint16(hdr[0:2], 1024)
+			binary.BigEndian.PutUint16(hdr[2:4], 768)
+			binary.BigEndian.PutUint32(hdr[20:24], uint32(len(name)))
+			_, _ = conn.Write(append(hdr, []byte(name)...))
+		})
+		defer closeFn()
+
+		ev, ok := probeVNC(context.Background(), "127.0.0.1", port)
+		if !ok {
+			t.Fatal("expected VNC ServerInit probe to match")
+		}
+		if !strings.Contains(ev, "QEMU (Ubuntu)") || !strings.Contains(ev, "1024x768") {
+			t.Fatalf("unexpected VNC evidence: %q", ev)
+		}
+	})
+
+	t.Run("vnc securityresult rejected", func(t *testing.T) {
 		port, closeFn := startMockTCP(t, func(conn net.Conn) {
 			_, _ = io.WriteString(conn, "RFB 003.008\n")
 			ver := make([]byte, 12)
 			_, _ = io.ReadFull(conn, ver)
-			// 2 security types: VNC Auth (2) and None (1).
-			_, _ = conn.Write([]byte{0x02, 0x02, 0x01})
+			_, _ = conn.Write([]byte{0x01, 0x01})
+			sel := make([]byte, 1)
+			_, _ = io.ReadFull(conn, sel)
+			// SecurityResult = 1 (Failed) -> must not report false positive.
+			_, _ = conn.Write([]byte{0x00, 0x00, 0x00, 0x01})
 		})
 		defer closeFn()
 
-		if _, ok := probeVNC(context.Background(), "127.0.0.1", port); !ok {
-			t.Fatal("expected VNC None-auth probe to match")
+		if _, ok := probeVNC(context.Background(), "127.0.0.1", port); ok {
+			t.Fatal("expected failed SecurityResult to reject VNC match")
+		}
+	})
+
+	t.Run("avr read-only power query", func(t *testing.T) {
+		port, closeFn := startMockTCP(t, func(conn net.Conn) {
+			buf := make([]byte, 16)
+			n, _ := conn.Read(buf)
+			if strings.HasPrefix(string(buf[:n]), "PW?") {
+				_, _ = io.WriteString(conn, "PWSTANDBY\r")
+			}
+		})
+		defer closeFn()
+
+		ev, ok := probeDenonMarantzAVR(context.Background(), "127.0.0.1", port)
+		if !ok || !strings.Contains(ev, "PWSTANDBY") {
+			t.Fatalf("expected AVR probe match with PWSTANDBY, got ok=%v ev=%q", ok, ev)
+		}
+	})
+
+	t.Run("telnet iac negotiation and banner", func(t *testing.T) {
+		port, closeFn := startMockTCP(t, func(conn net.Conn) {
+			// Send IAC DO ECHO followed by a standard login prompt.
+			_, _ = conn.Write([]byte{255, 253, 1})
+			reply := make([]byte, 3)
+			_, _ = io.ReadFull(conn, reply)
+			_, _ = io.WriteString(conn, "RouterOS login: ")
+		})
+		defer closeFn()
+
+		ev, ok := probeTelnet(context.Background(), "127.0.0.1", port)
+		if !ok || !strings.Contains(ev, "RouterOS login:") {
+			t.Fatalf("expected telnet login banner evidence, got ok=%v ev=%q", ok, ev)
 		}
 	})
 }

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -177,6 +178,10 @@ func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Fin
 // their Stage 2 verification probes sequentially against that host.
 func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 	var findings []Finding
+	// Track (checkID|port) pairs superseded by more specific device checks on
+	// the same host so operators aren't shown redundant generic warnings.
+	superseded := make(map[string]struct{})
+
 	for _, chk := range r.checks {
 		if ctx.Err() != nil {
 			break
@@ -190,6 +195,9 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 				break
 			}
 			if evidence, matched := r.executeProbe(ctx, chk, hp.Client.IP, port); matched {
+				for _, supID := range chk.Supersedes {
+					superseded[fmt.Sprintf("%s|%d", supID, port)] = struct{}{}
+				}
 				findings = append(findings, Finding{
 					CheckID:           chk.ID,
 					Title:             chk.Title,
@@ -205,7 +213,18 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 			}
 		}
 	}
-	return findings
+
+	if len(superseded) == 0 {
+		return findings
+	}
+	filtered := make([]Finding, 0, len(findings))
+	for _, f := range findings {
+		if _, drop := superseded[fmt.Sprintf("%s|%d", f.CheckID, f.Port)]; drop {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	return filtered
 }
 
 // matchPreconditions checks Stage 1 rules against already-fingerprinted host
@@ -306,6 +325,8 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 	switch chk.Probe.Type {
 	case "tcp":
 		return probeTCP(probeCtx, ip, port, chk)
+	case "telnet":
+		return probeTelnet(probeCtx, ip, port)
 	case "http":
 		return r.probeHTTP(probeCtx, ip, port, chk)
 	case "mqtt":
@@ -316,6 +337,10 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 		return probeRTSP(probeCtx, ip, port)
 	case "vnc":
 		return probeVNC(probeCtx, ip, port)
+	case "avr":
+		return probeDenonMarantzAVR(probeCtx, ip, port)
+	case "comfoconnect":
+		return probeComfoConnect(probeCtx, ip, port)
 	default:
 		return "", false
 	}
@@ -555,8 +580,176 @@ func probeRTSP(ctx context.Context, ip string, port int) (string, bool) {
 	return "RTSP OPTIONS returned 200 OK without authentication", true
 }
 
-// probeVNC performs the initial read-only RFB version handshake and inspects
-// whether the server advertises security type 1 ("None" — passwordless access).
+// probeTelnet connects to a Telnet service, politely declines IAC option
+// negotiations (replying WONT/DONT), and reads the initial banner so operators
+// know whether the port exposes a login prompt, an unauthenticated shell, or
+// a silent custom protocol instead of a blind "port 23 open" warning.
+func probeTelnet(ctx context.Context, ip string, port int) (string, bool) {
+	conn, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+
+	// Give the daemon up to ~1s to send IAC negotiations and a greeting banner
+	// without stalling the full probe timeout on silent services.
+	shortDeadline := time.Now().Add(1200 * time.Millisecond)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(shortDeadline) {
+		shortDeadline = ctxDeadline
+	}
+	_ = conn.SetReadDeadline(shortDeadline)
+
+	var text bytes.Buffer
+	buf := make([]byte, 512)
+	for text.Len() < 512 {
+		n, readErr := conn.Read(buf)
+		if n > 0 {
+			reply, cleaned := stripTelnetIAC(buf[:n])
+			if len(reply) > 0 {
+				_, _ = conn.Write(reply)
+			}
+			text.Write(cleaned)
+			// Stop early once we see a recognizable prompt.
+			lower := strings.ToLower(text.String())
+			if strings.Contains(lower, "login:") || strings.Contains(lower, "password:") ||
+				strings.Contains(lower, "username:") || strings.HasSuffix(strings.TrimSpace(lower), "#") ||
+				strings.HasSuffix(strings.TrimSpace(lower), "$") || strings.HasSuffix(strings.TrimSpace(lower), ">") {
+				break
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	banner := compactASCII(text.String(), 120)
+	lower := strings.ToLower(banner)
+	switch {
+	case banner == "":
+		return "Telnet port 23 accepted connection (silent/no banner — likely custom cleartext control protocol)", true
+	case strings.Contains(lower, "login:") || strings.Contains(lower, "username:") || strings.Contains(lower, "password:"):
+		return fmt.Sprintf("cleartext Telnet login prompt observed (%q)", banner), true
+	case strings.HasSuffix(banner, "#") || strings.HasSuffix(banner, "$") || strings.HasSuffix(banner, ">"):
+		return fmt.Sprintf("unauthenticated Telnet command prompt observed without login (%q)", banner), true
+	default:
+		return fmt.Sprintf("cleartext Telnet banner observed (%q)", banner), true
+	}
+}
+
+// stripTelnetIAC parses RFC 854 Telnet IAC (0xFF) negotiation triplets,
+// generating polite WONT/DONT refusals so standard telnetd proceeds to emit its
+// login/shell banner, and returning the remaining printable payload bytes.
+func stripTelnetIAC(data []byte) (reply []byte, cleaned []byte) {
+	const (
+		iac  = 255
+		will = 251
+		wont = 252
+		do   = 253
+		dont = 254
+		sb   = 250
+		se   = 240
+	)
+	for i := 0; i < len(data); {
+		if data[i] != iac {
+			cleaned = append(cleaned, data[i])
+			i++
+			continue
+		}
+		if i+1 >= len(data) {
+			break
+		}
+		cmd := data[i+1]
+		switch cmd {
+		case will, wont, do, dont:
+			if i+2 >= len(data) {
+				return reply, cleaned
+			}
+			opt := data[i+2]
+			if cmd == do {
+				reply = append(reply, iac, wont, opt)
+			} else if cmd == will {
+				reply = append(reply, iac, dont, opt)
+			}
+			i += 3
+		case sb:
+			// Skip subnegotiation payload through IAC SE.
+			i += 2
+			for i+1 < len(data) && !(data[i] == iac && data[i+1] == se) {
+				i++
+			}
+			i += 2
+		default:
+			i += 2
+		}
+	}
+	return reply, cleaned
+}
+
+// probeDenonMarantzAVR sends a strictly read-only status query ("PW?\r" —
+// Power State query) to a Denon/Marantz AVR Telnet control port. Receiving
+// "PWON" or "PWSTANDBY" confirms unauthenticated control access without
+// changing power, volume, or input state.
+func probeDenonMarantzAVR(ctx context.Context, ip string, port int) (string, bool) {
+	conn, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+
+	if _, err := io.WriteString(conn, "PW?\r"); err != nil {
+		return "", false
+	}
+
+	buf := make([]byte, 128)
+	n, _ := conn.Read(buf)
+	if n == 0 {
+		return "", false
+	}
+	resp := compactASCII(string(buf[:n]), 80)
+	if strings.Contains(resp, "PWON") || strings.Contains(resp, "PWSTANDBY") {
+		return fmt.Sprintf("confirmed unauthenticated AVR control via read-only query PW? -> %q", resp), true
+	}
+	return "", false
+}
+
+// probeComfoConnect sends a strictly read-only 2-byte unicast UDP discovery
+// beacon (0x0a 0x00) directly to the target host on port 56747 to verify it is
+// an active Zehnder ComfoConnect LAN C bridge without ever attempting app
+// registration or disrupting an existing Home Assistant TCP session.
+func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) {
+	// First confirm TCP port 56747 is listening.
+	tcpConn, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return "", false
+	}
+	_ = tcpConn.Close()
+
+	// Send unicast read-only UDP discovery request (protobuf SearchGatewayRequest = 0x0a 0x00).
+	udpConn, err := (&net.Dialer{}).DialContext(ctx, "udp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		return fmt.Sprintf("TCP port %d accepted connection (ComfoConnect control API)", port), true
+	}
+	defer udpConn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = udpConn.SetDeadline(deadline)
+	}
+	if _, err := udpConn.Write([]byte{0x0a, 0x00}); err == nil {
+		buf := make([]byte, 256)
+		if n, readErr := udpConn.Read(buf); readErr == nil && n >= 8 {
+			// Discovery response ends with the bridge UUID/MAC identifier.
+			return fmt.Sprintf("confirmed active ComfoConnect LAN C bridge via read-only UDP discovery (%d-byte response) + TCP:%d open", n, port), true
+		}
+	}
+	return fmt.Sprintf("TCP port %d accepted connection (ComfoConnect control API)", port), true
+}
+
+// probeVNC completes the read-only RFB initialization handshake when security
+// type 1 ("None") is offered: it selects None, confirms SecurityResult == 0
+// (authentication genuinely bypassed), sends ClientInit with shared=1 so any
+// active viewer is never disconnected, and reads ServerInit to report the exact
+// exposed desktop name and framebuffer dimensions — without sending input or
+// reading screen pixels.
 func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
@@ -564,8 +757,7 @@ func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 	}
 	defer conn.Close()
 
-	// RFB servers open every connection with a 12-byte version string such as
-	// "RFB 003.008\n".
+	// Step 1: Read the 12-byte RFB server version banner (e.g., "RFB 003.008\n").
 	version := make([]byte, 12)
 	if _, err := io.ReadFull(conn, version); err != nil {
 		return "", false
@@ -575,43 +767,107 @@ func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 	}
 
 	// Negotiate RFB 3.8 if supported, otherwise echo the server's 3.3/3.7 version.
+	isRFB33 := bytes.HasPrefix(version, []byte("RFB 003.003"))
+	isRFB37 := bytes.HasPrefix(version, []byte("RFB 003.007"))
 	clientVer := []byte("RFB 003.008\n")
-	if bytes.HasPrefix(version, []byte("RFB 003.003")) {
+	if isRFB33 {
 		clientVer = []byte("RFB 003.003\n")
-	} else if bytes.HasPrefix(version, []byte("RFB 003.007")) {
+	} else if isRFB37 {
 		clientVer = []byte("RFB 003.007\n")
 	}
 	if _, err := conn.Write(clientVer); err != nil {
 		return "", false
 	}
 
-	// RFB 3.3 replies with a 4-byte uint32 security type (1 = None).
-	if bytes.Equal(clientVer, []byte("RFB 003.003\n")) {
+	// Step 2: Confirm security type 1 ("None") is offered and accepted.
+	if isRFB33 {
 		sec := make([]byte, 4)
 		if _, err := io.ReadFull(conn, sec); err != nil {
 			return "", false
 		}
-		if binary.BigEndian.Uint32(sec) == 1 {
-			return "VNC server selected RFB 3.3 security type None (no password)", true
+		if binary.BigEndian.Uint32(sec) != 1 {
+			return "", false
 		}
-		return "", false
+	} else {
+		countBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, countBuf); err != nil || countBuf[0] == 0 {
+			return "", false
+		}
+		types := make([]byte, int(countBuf[0]))
+		if _, err := io.ReadFull(conn, types); err != nil {
+			return "", false
+		}
+		hasNone := false
+		for _, t := range types {
+			if t == 1 {
+				hasNone = true
+				break
+			}
+		}
+		if !hasNone {
+			return "", false
+		}
+		// Select security type 1 (None).
+		if _, err := conn.Write([]byte{0x01}); err != nil {
+			return "", false
+		}
+		// RFB 3.8 sends a 4-byte SecurityResult (0 = OK); reject false positives
+		// where the server advertised None in its list but fails SecurityResult.
+		if !isRFB37 {
+			secRes := make([]byte, 4)
+			if _, err := io.ReadFull(conn, secRes); err != nil {
+				return "", false
+			}
+			if binary.BigEndian.Uint32(secRes) != 0 {
+				return "", false
+			}
+		}
 	}
 
-	// RFB 3.7+ replies with a 1-byte count followed by that many security type IDs.
-	countBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, countBuf); err != nil || countBuf[0] == 0 {
-		return "", false
+	// Step 3: Send ClientInit with shared-flag=1 (never kicks off active sessions)
+	// and read ServerInit to identify which VM or desktop is actually exposed.
+	if _, err := conn.Write([]byte{0x01}); err != nil {
+		return "confirmed passwordless VNC access (RFB SecurityResult=OK)", true
 	}
-	types := make([]byte, int(countBuf[0]))
-	if _, err := io.ReadFull(conn, types); err != nil {
-		return "", false
+	// ServerInit fixed header: 2B width + 2B height + 16B pixel-format + 4B name-length = 24 bytes.
+	initHdr := make([]byte, 24)
+	if _, err := io.ReadFull(conn, initHdr); err != nil {
+		return "confirmed passwordless VNC access (RFB SecurityResult=OK)", true
 	}
-	for _, t := range types {
-		if t == 1 {
-			return "VNC server advertises RFB security type None (no password)", true
+	width := binary.BigEndian.Uint16(initHdr[0:2])
+	height := binary.BigEndian.Uint16(initHdr[2:4])
+	nameLen := binary.BigEndian.Uint32(initHdr[20:24])
+
+	var desktopName string
+	if nameLen > 0 && nameLen <= 256 {
+		nameBuf := make([]byte, nameLen)
+		if _, err := io.ReadFull(conn, nameBuf); err == nil {
+			desktopName = compactASCII(string(nameBuf), 80)
 		}
 	}
-	return "", false
+
+	if desktopName != "" {
+		return fmt.Sprintf("confirmed passwordless VNC session: desktop %q (%dx%d, RFB None)", desktopName, width, height), true
+	}
+	return fmt.Sprintf("confirmed passwordless VNC session (%dx%d, RFB None)", width, height), true
+}
+
+// compactASCII strips control bytes, collapses whitespace, and caps length so
+// device banners render cleanly in reports without terminal escape injection.
+func compactASCII(s string, maxLen int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == '\r' || r == '\n' || r == '\t' {
+			b.WriteByte(' ')
+		} else if r >= 0x20 && r <= 0x7E {
+			b.WriteRune(r)
+		}
+	}
+	clean := strings.Join(strings.Fields(b.String()), " ")
+	if len(clean) > maxLen {
+		return clean[:maxLen-3] + "..."
+	}
+	return clean
 }
 
 // dialWithContextDeadline dials a TCP address and applies the context's

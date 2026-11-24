@@ -130,6 +130,11 @@ type Check struct {
 	// "read-only" so community checks cannot alter or reboot fragile devices.
 	Safety string `yaml:"safety"`
 
+	// Supersedes optionally lists generic check IDs (e.g., "UB-0001") that
+	// should be suppressed on the same (host, port) when this more specific
+	// device check confirms a match.
+	Supersedes []string `yaml:"supersedes,omitempty"`
+
 	// Metadata holds vendor, product, authorship, and reference links.
 	Metadata Metadata `yaml:"metadata"`
 
@@ -201,7 +206,8 @@ type Preconditions struct {
 // ProbeSpec defines the target-only verification probe executed when a host
 // satisfies a check's Preconditions.
 type ProbeSpec struct {
-	// Type selects the probe protocol: "tcp", "http", "mqtt", "modbus", "rtsp", or "vnc".
+	// Type selects the probe protocol: "tcp", "telnet", "http", "mqtt",
+	// "modbus", "rtsp", "vnc", "avr", or "comfoconnect".
 	Type string `yaml:"type"`
 
 	// Port optionally pins the target port. When 0, the runner tests whichever
@@ -381,7 +387,7 @@ func (c *Check) Validate() error {
 	// mutate device state.
 	c.Probe.Type = strings.ToLower(strings.TrimSpace(c.Probe.Type))
 	switch c.Probe.Type {
-	case "tcp", "mqtt", "modbus", "rtsp", "vnc":
+	case "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect":
 	case "http":
 		method := strings.ToUpper(strings.TrimSpace(c.Probe.Method))
 		if method == "" {
