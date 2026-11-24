@@ -4,6 +4,7 @@
 package probe
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -45,12 +46,21 @@ type HTTPBanner struct {
 	// Server is the raw HTTP Server response header, if present.
 	Server string `json:"server,omitempty"`
 
+	// PoweredBy is the raw X-Powered-By response header, if present.
+	PoweredBy string `json:"powered_by,omitempty"`
+
 	// Title is the trimmed HTML <title> text extracted from the landing page.
 	Title string `json:"title,omitempty"`
 
 	// WWWAuthenticate records the WWW-Authenticate header when the device asks
 	// for HTTP authentication.
 	WWWAuthenticate string `json:"www_authenticate,omitempty"`
+
+	// TLSSubjectCN is the leaf TLS certificate Common Name observed on HTTPS ports.
+	TLSSubjectCN string `json:"tls_subject_cn,omitempty"`
+
+	// TLSSubjectOrg is the leaf TLS certificate Organization observed on HTTPS ports.
+	TLSSubjectOrg string `json:"tls_subject_org,omitempty"`
 }
 
 // HostProfile holds everything learned about a single LAN host during the
@@ -64,6 +74,10 @@ type HostProfile struct {
 
 	// HTTP maps open HTTP/HTTPS port numbers to their observed landing-page banner.
 	HTTP map[int]HTTPBanner `json:"http,omitempty"`
+
+	// SSHBanner stores the passive greeting line advertised on port 22 (e.g.,
+	// "SSH-2.0-OpenSSH_9.6p1"), read without attempting authentication.
+	SSHBanner string `json:"ssh_banner,omitempty"`
 
 	// ScannedAt records when fingerprinting finished for this host.
 	ScannedAt time.Time `json:"scanned_at"`
@@ -239,11 +253,19 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		if err != nil {
 			continue
 		}
+
+		// On SSH (port 22), passively read the server's initial identification
+		// banner before closing so version-based CVE checks have exact OpenSSH
+		// or Dropbear versions without sending any auth packets.
+		if port == 22 && profile.SSHBanner == "" {
+			profile.SSHBanner = readSSHBanner(conn, f.timeout)
+		}
 		_ = conn.Close()
 		profile.OpenPorts = append(profile.OpenPorts, port)
 
 		// For well-known HTTP/HTTPS ports, grab a single read-only banner so
-		// HTTP checks can match titles, headers, and status codes cheaply.
+		// HTTP checks and CVE fingerprinters can match headers, titles, and TLS
+		// certificate metadata cheaply.
 		if scheme, ok := httpSchemeForPort(port); ok {
 			if banner, ok := f.fetchHTTPBanner(ctx, scheme, cl.IP, port); ok {
 				profile.HTTP[port] = banner
@@ -254,8 +276,24 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	return profile
 }
 
+// readSSHBanner reads a single identification line (e.g., "SSH-2.0-OpenSSH_9.6p1")
+// sent by an SSH server immediately upon connection.
+func readSSHBanner(conn net.Conn, timeout time.Duration) string {
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	line, err := bufio.NewReader(io.LimitReader(conn, 256)).ReadString('\n')
+	if err != nil && !strings.HasPrefix(line, "SSH-") {
+		return ""
+	}
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "SSH-") {
+		return ""
+	}
+	return trimmed
+}
+
 // fetchHTTPBanner performs one bounded GET / request against a local host and
-// extracts its status code, Server header, WWW-Authenticate header, and HTML title.
+// extracts its status code, Server/X-Powered-By headers, HTML title, and peer
+// TLS certificate subject metadata.
 func (f *Fingerprinter) fetchHTTPBanner(ctx context.Context, scheme, ip string, port int) (HTTPBanner, bool) {
 	targetURL := fmt.Sprintf("%s://%s/", scheme, net.JoinHostPort(ip, strconv.Itoa(port)))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
@@ -271,13 +309,22 @@ func (f *Fingerprinter) fetchHTTPBanner(ctx context.Context, scheme, ip string, 
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPFingerprintBytes))
-	return HTTPBanner{
+	banner := HTTPBanner{
 		Scheme:          scheme,
 		StatusCode:      resp.StatusCode,
 		Server:          strings.TrimSpace(resp.Header.Get("Server")),
+		PoweredBy:       strings.TrimSpace(resp.Header.Get("X-Powered-By")),
 		Title:           extractTitle(string(body)),
 		WWWAuthenticate: strings.TrimSpace(resp.Header.Get("WWW-Authenticate")),
-	}, true
+	}
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		cert := resp.TLS.PeerCertificates[0]
+		banner.TLSSubjectCN = strings.TrimSpace(cert.Subject.CommonName)
+		if len(cert.Subject.Organization) > 0 {
+			banner.TLSSubjectOrg = strings.TrimSpace(cert.Subject.Organization[0])
+		}
+	}
+	return banner, true
 }
 
 // extractTitle pulls a compact single-line title from raw HTML, returning an
@@ -299,7 +346,7 @@ func extractTitle(html string) string {
 // httpSchemeForPort maps common web ports to their expected HTTP scheme.
 func httpSchemeForPort(port int) (string, bool) {
 	switch port {
-	case 80, 8080, 8000, 8081:
+	case 80, 8080, 8000, 8081, 8123:
 		return "http", true
 	case 443, 8443:
 		return "https", true

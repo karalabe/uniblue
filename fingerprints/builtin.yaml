@@ -1,0 +1,95 @@
+# Declarative fingerprint rules mapping observed LAN host signals to exact NVD
+# CPE vendor/product tokens. Patterns without "*" require exact equality so
+# generic names (e.g., "nginx") never bleed into unrelated products like
+# "nginx_unit" or "nginx_controller".
+
+- name: TrueNAS
+  hostname_regex: "(?i)truenas"
+  http_title_regex: "(?i)truenas"
+  vendors: ["ixsystems"]
+  products: ["truenas_firmware", "truenas"]
+
+- name: Unraid
+  hostname_regex: "(?i)unraid"
+  http_title_regex: "(?i)unraid"
+  vendors: ["unraid"]
+  products: ["unraid"]
+
+- name: Home Assistant
+  hostname_regex: "(?i)home.?assistant"
+  http_title_regex: "(?i)home\\s+assistant"
+  ports_any: [8123]
+  vendors: ["home-assistant"]
+  products: ["home-assistant"]
+
+- name: HP LaserJet
+  hostname_regex: "(?i)laserjet[^a-z0-9]*([a-z][0-9]{3,4})?"
+  http_title_regex: "(?i)hp\\s+laserjet[^a-z0-9]*([a-z][0-9]{3,4})?"
+  vendors: ["hp"]
+  products: ["*laserjet*{model}*"]
+  model_group: 1
+
+- name: Prusa 3D Printer
+  hostname_regex: "(?i)prusa"
+  http_title_regex: "(?i)prusalink|prusa"
+  vendors: ["prusa3d", "prusa"]
+  products: ["*prusa*"]
+
+- name: Zehnder ComfoConnect
+  hostname_regex: "(?i)zehnder|comfoconnect|comfoair"
+  mac_prefix: ["14:4f:d7"]
+  vendors: ["zehnder"]
+  products: ["*comfo*"]
+
+- name: Marantz / Denon AVR
+  hostname_regex: "(?i)marantz|denon"
+  mac_prefix: ["00:05:cd"]
+  vendors: ["marantz", "denon", "soundunited"]
+  products: ["*avr*", "*marantz*", "*denon*"]
+
+- name: iRobot Roomba
+  hostname_regex: "(?i)roomba|irobot"
+  mac_prefix: ["50:14:79"]
+  vendors: ["irobot"]
+  products: ["*roomba*"]
+
+- name: Google Chromecast
+  hostname_regex: "(?i)chromecast"
+  vendors: ["google"]
+  products: ["chromecast", "chromecast_firmware"]
+
+- name: Synology DSM
+  hostname_regex: "(?i)synology|diskstation"
+  http_title_regex: "(?i)synology|diskstation"
+  vendors: ["synology"]
+  products: ["diskstation_manager"]
+
+- name: Nginx
+  http_server_regex: "(?i)nginx(?:/([0-9][0-9a-zA-Z._-]*))?"
+  vendors: ["f5", "nginx"]
+  products: ["nginx", "nginx_open_source"]
+  version_group: 1
+
+- name: Apache HTTP Server
+  http_server_regex: "(?i)apache(?:/([0-9][0-9a-zA-Z._-]*))?"
+  vendors: ["apache"]
+  products: ["http_server"]
+  version_group: 1
+
+- name: Lighttpd
+  http_server_regex: "(?i)lighttpd(?:/([0-9][0-9a-zA-Z._-]*))?"
+  vendors: ["lighttpd"]
+  products: ["lighttpd"]
+  version_group: 1
+
+- name: OpenSSH
+  ssh_banner_regex: "(?i)OpenSSH[_-]([0-9]+\\.[0-9]+(?:p[0-9]+)?)"
+  vendors: ["openbsd"]
+  products: ["openssh"]
+  version_group: 1
+
+- name: Dropbear SSH
+  ssh_banner_regex: "(?i)dropbear[_-]([0-9]+\\.[0-9]+)"
+  vendors: ["dropbear_ssh_project"]
+  products: ["dropbear_ssh"]
+  version_group: 1

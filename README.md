@@ -66,6 +66,22 @@ Built-in checks live under `checks/generic/` and `checks/community/` and are emb
 ./uniblue check test -target 192.168.1.42
 ```
 
+## Local CVE Cache & Explorer
+
+UniBlue can sync the full NVD JSON 2.0 database alongside CISA's Known Exploited Vulnerabilities (KEV) catalog into a compact (~38 MB) vendor-sharded local cache, then match your UniFi firmware and fingerprinted LAN services offline:
+
+```sh
+# Download and compile the full NVD 2.0 + CISA KEV local cache (~17s cold, ~1s incremental)
+./uniblue cve sync
+
+# Fingerprint your UniFi gear & LAN hosts and match against the local CVE cache
+./uniblue cve explore -config config.yaml
+
+# Search cached CVEs offline or inspect full affected CPE ranges
+./uniblue cve search -vendor ui unifi
+./uniblue cve show CVE-2026-9773
+```
+
 ## Controller Compatibility
 
 UniBlue automatically detects how your UniFi console authenticates:

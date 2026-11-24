@@ -16,7 +16,7 @@ import (
 // DefaultPorts lists the curated set of high-signal service and IoT ports
 // checked when no custom port list is supplied in configuration. Keeping the
 // default list small avoids overwhelming fragile embedded devices.
-var DefaultPorts = []int{23, 80, 443, 502, 554, 1883, 5900, 8080, 8443, 47808}
+var DefaultPorts = []int{22, 23, 80, 443, 502, 554, 1883, 5900, 8080, 8123, 8443, 47808}
 
 // Config is the top-level UniBlue configuration structure.
 type Config struct {
@@ -33,8 +33,18 @@ type Config struct {
 	// State configures where scan snapshots are persisted for change detection.
 	State StateConfig `yaml:"state"`
 
+	// CVE configures the local NVD/KEV vulnerability cache used by `uniblue cve`.
+	CVE CVEConfig `yaml:"cve"`
+
 	// Notify configures optional outbound alerting for `uniblue watch`.
 	Notify NotifyConfig `yaml:"notify"`
+}
+
+// CVEConfig controls where the local NVD JSON 2.0 and CISA KEV cache is stored.
+type CVEConfig struct {
+	// CacheDir is the directory storing vendor-sharded CVE indexes and sync metadata.
+	// When omitted, UniBlue defaults to ~/.cache/uniblue/cve.
+	CacheDir string `yaml:"cache_dir"`
 }
 
 // UniFiConfig holds connection and authentication settings for a UniFi OS

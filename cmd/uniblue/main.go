@@ -20,8 +20,10 @@ import (
 	"time"
 
 	builtinchecks "github.com/karalabe/uniblue/checks"
+	"github.com/karalabe/uniblue/fingerprints"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
+	"github.com/karalabe/uniblue/internal/cve"
 	"github.com/karalabe/uniblue/internal/notify"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
@@ -55,6 +57,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runInventory(ctx, args[1:], stdout, stderr)
 	case "check":
 		return runCheck(ctx, args[1:], stdout, stderr)
+	case "cve":
+		return runCVE(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return nil
@@ -75,7 +79,8 @@ Commands:
   scan        Run a single UniFi + LAN security scan and print prioritized findings
   watch       Continuously scan on an interval and notify only on new/escalated changes
   inventory   Fetch and display UniFi clients, devices, VLANs, and port forwards
-  check       Validate or test declarative YAML checks against a single host`)
+  check       Validate or test declarative YAML checks against a single host
+  cve         Sync, search, and match a local NVD + CISA KEV cache against your LAN`)
 }
 
 // runScan executes one complete UniFi sync, gentle host probe, check pass, and
@@ -496,4 +501,321 @@ func writeJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// runCVE dispatches `uniblue cve <sync|explore|search|show>` subcommands.
+func runCVE(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: uniblue cve <sync|explore|search|show> [flags]")
+	}
+	switch args[0] {
+	case "sync":
+		return runCVESync(ctx, args[1:], stdout, stderr)
+	case "explore":
+		return runCVEExplore(ctx, args[1:], stdout, stderr)
+	case "search":
+		return runCVESearch(ctx, args[1:], stdout, stderr)
+	case "show":
+		return runCVEShow(ctx, args[1:], stdout, stderr)
+	default:
+		return fmt.Errorf("unknown cve subcommand %q (want sync, explore, search, or show)", args[0])
+	}
+}
+
+// runCVESync downloads CISA KEV and NVD JSON 2.0 yearly feeds into the local
+// vendor-sharded cache and prints storage and timing metrics.
+func runCVESync(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("cve sync", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cacheDir := fs.String("cache", cve.DefaultCacheDir(), "local CVE cache directory")
+	since := fs.Int("since", 2002, "earliest NVD year to download (2002 = full database)")
+	force := fs.Bool("force", false, "re-download and re-index even if feeds are unchanged")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cache := cve.NewCache(*cacheDir)
+	stats, err := cache.Sync(ctx, cve.SyncOptions{
+		SinceYear: *since,
+		Force:     *force,
+		Progress: func(msg string) {
+			fmt.Fprintln(stderr, msg)
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "\nCVE Cache Ready (%s)\n", cache.Dir())
+	fmt.Fprintf(stdout, "  Total CVEs parsed:    %d (%d with CPEs)\n", stats.TotalCVEs, stats.IndexedCPECVEs)
+	fmt.Fprintf(stdout, "  Vendor shards:        %d\n", stats.VendorCount)
+	fmt.Fprintf(stdout, "  CISA KEV catalog:     %d\n", stats.KEVCount)
+	fmt.Fprintf(stdout, "  Raw NVD feeds size:   %.1f MB\n", float64(stats.RawFeedBytes)/(1024*1024))
+	fmt.Fprintf(stdout, "  Compiled index size:  %.1f MB\n", float64(stats.IndexBytes)/(1024*1024))
+	fmt.Fprintf(stdout, "  Elapsed:              %.1fs\n", float64(stats.ElapsedMS)/1000)
+	return nil
+}
+
+// runCVEExplore fingerprints UniFi gear and active LAN hosts, maps them to
+// canonical products, and matches them against the local CVE cache.
+func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("cve explore", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
+	cacheDir := fs.String("cache", "", "local CVE cache directory (overrides config)")
+	minSevStr := fs.String("min-severity", "high", "minimum CVE severity (info, low, medium, high, critical)")
+	recentYears := fs.Int("recent-years", 2, "limit version-unknown non-KEV matches to CVEs published in the last N years (0 = all)")
+	limit := fs.Int("limit", 40, "max potential (version-unknown) CVEs to print")
+	jsonOut := fs.Bool("json", false, "output matches as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	minSev, err := checks.ParseSeverity(*minSevStr)
+	if err != nil {
+		return err
+	}
+	dir := *cacheDir
+	if dir == "" {
+		dir = cfg.CVE.CacheDir
+	}
+	cache := cve.NewCache(dir)
+	stats, err := cache.Stats()
+	if err != nil {
+		return fmt.Errorf("cve cache not ready at %q (run `uniblue cve sync` first): %w", cache.Dir(), err)
+	}
+
+	ctrl, err := unifi.New(cfg.UniFi)
+	if err != nil {
+		return err
+	}
+	if err := ctrl.Login(ctx); err != nil {
+		return err
+	}
+	snap, err := ctrl.FetchSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
+	fp := probe.NewFingerprinter(cfg.Scan.Ports, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+	profiles := fp.FingerprintAll(ctx, snap.Clients)
+
+	identifier, err := cve.LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		return err
+	}
+	products := identifier.Identify(snap, profiles)
+
+	matches, err := cache.MatchProducts(products, cve.MatchOptions{
+		MinSeverity:          minSev,
+		PotentialMaxAgeYears: *recentYears,
+	})
+	if err != nil {
+		return err
+	}
+
+	if *jsonOut {
+		return writeJSON(stdout, map[string]any{
+			"cache_stats": stats,
+			"products":    products,
+			"matches":     matches,
+		})
+	}
+
+	fmt.Fprintf(stdout, "UniBlue CVE Explorer | Cache: %d CVEs (%d KEV) | Detected Products: %d\n\n",
+		stats.TotalCVEs, stats.KEVCount, len(products))
+
+	// Show every fingerprinted software/hardware item so operators can audit
+	// exactly what UniBlue detected on their LAN.
+	fmt.Fprintln(stdout, "Detected Software & Hardware:")
+	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "HOST\tIP\tVLAN\tPRODUCT\tVERSION\tSOURCE")
+	for _, p := range products {
+		ver := p.Version
+		if ver == "" {
+			ver = "(unknown)"
+		}
+		vlan := p.VLAN
+		if vlan == "" {
+			vlan = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", p.HostName, p.HostIP, vlan, p.Label, ver, p.Source)
+	}
+	_ = tw.Flush()
+
+	var exact, potential []cve.Match
+	for _, m := range matches {
+		if m.Confidence == cve.ConfidenceExact {
+			exact = append(exact, m)
+		} else {
+			potential = append(potential, m)
+		}
+	}
+
+	fmt.Fprintf(stdout, "\nExact Version CVE Matches (%d):\n", len(exact))
+	if len(exact) == 0 {
+		fmt.Fprintln(stdout, "  None detected for observed exact versions.")
+	} else {
+		printCVEMatchTable(stdout, exact, len(exact))
+	}
+
+	fmt.Fprintf(stdout, "\nPotential Product Matches — Version Unknown (%d total, showing up to %d):\n", len(potential), *limit)
+	if len(potential) == 0 {
+		fmt.Fprintln(stdout, "  None.")
+	} else {
+		printCVEMatchTable(stdout, potential, *limit)
+	}
+	return nil
+}
+
+// runCVESearch performs an offline search across the local CVE cache.
+func runCVESearch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("cve search", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cacheDir := fs.String("cache", cve.DefaultCacheDir(), "local CVE cache directory")
+	vendor := fs.String("vendor", "", "restrict search to one CPE vendor shard")
+	kevOnly := fs.Bool("kev", false, "show only CISA KEV actively exploited CVEs")
+	minSevStr := fs.String("min-severity", "low", "minimum severity (info, low, medium, high, critical)")
+	limit := fs.Int("limit", 30, "maximum number of results")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	minSev, err := checks.ParseSeverity(*minSevStr)
+	if err != nil {
+		return err
+	}
+	query := strings.Join(fs.Args(), " ")
+	if query == "" && *vendor == "" && !*kevOnly {
+		return errors.New("cve search requires a query, -vendor, or -kev")
+	}
+
+	cache := cve.NewCache(*cacheDir)
+	recs, err := cache.Search(ctx, query, cve.SearchOptions{
+		Vendor:      *vendor,
+		KEVOnly:     *kevOnly,
+		MinSeverity: minSev,
+		Limit:       *limit,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Found %d CVE(s) (limit %d):\n\n", len(recs), *limit)
+	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "CVE\tSEV\tCVSS\tKEV\tPUBLISHED\tSUMMARY")
+	for _, r := range recs {
+		kev := ""
+		if r.KEV {
+			kev = "KEV"
+		}
+		summary := r.Description
+		if len(summary) > 95 {
+			summary = summary[:92] + "..."
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%.1f\t%s\t%s\t%s\n",
+			r.ID, strings.ToUpper(r.Severity.String()), r.CVSS, kev, r.Published, summary)
+	}
+	_ = tw.Flush()
+	return nil
+}
+
+// runCVEShow prints full cached details and affected CPE version ranges for a
+// single CVE identifier without hitting the network.
+func runCVEShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("cve show", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cacheDir := fs.String("cache", cve.DefaultCacheDir(), "local CVE cache directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: uniblue cve show [-cache <dir>] <CVE-ID>")
+	}
+
+	cache := cve.NewCache(*cacheDir)
+	rec, err := cache.LookupCVE(ctx, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	kevTag := "no"
+	if rec.KEV {
+		kevTag = "YES (CISA Known Exploited)"
+	}
+	fmt.Fprintf(stdout, "%s\n", rec.ID)
+	fmt.Fprintf(stdout, "  Severity:   %s (CVSS %.1f)\n", strings.ToUpper(rec.Severity.String()), rec.CVSS)
+	fmt.Fprintf(stdout, "  Published:  %s\n", rec.Published)
+	fmt.Fprintf(stdout, "  CISA KEV:   %s\n", kevTag)
+	fmt.Fprintf(stdout, "  Summary:    %s\n", rec.Description)
+
+	if len(rec.Matches) > 0 {
+		fmt.Fprintf(stdout, "\nAffected CPE Ranges (%d):\n", len(rec.Matches))
+		for _, m := range rec.Matches {
+			fmt.Fprintf(stdout, "  - %s:%s %s\n", m.Vendor, m.Product, formatCPERange(m))
+		}
+	}
+	return nil
+}
+
+// formatCPERange renders a CPE match's exact version or bounds compactly.
+func formatCPERange(m cve.CPEMatch) string {
+	if m.Version != "" {
+		return "== " + m.Version
+	}
+	var parts []string
+	if m.StartIncl != "" {
+		parts = append(parts, ">= "+m.StartIncl)
+	}
+	if m.StartExcl != "" {
+		parts = append(parts, "> "+m.StartExcl)
+	}
+	if m.EndIncl != "" {
+		parts = append(parts, "<= "+m.EndIncl)
+	}
+	if m.EndExcl != "" {
+		parts = append(parts, "< "+m.EndExcl)
+	}
+	if len(parts) == 0 {
+		return "(all versions)"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// printCVEMatchTable renders a compact, readable table of CVE matches.
+func printCVEMatchTable(w io.Writer, matches []cve.Match, maxRows int) {
+	if len(matches) > maxRows {
+		matches = matches[:maxRows]
+	}
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "CVE\tSEV\tCVSS\tKEV\tHOST\tPRODUCT\tSUMMARY")
+	for _, m := range matches {
+		kev := ""
+		if m.Record.KEV {
+			kev = "KEV"
+		}
+		prod := m.Product.Label
+		if m.Product.Version != "" {
+			prod = fmt.Sprintf("%s %s", prod, m.Product.Version)
+		}
+		summary := m.Record.Description
+		if len(summary) > 78 {
+			summary = summary[:75] + "..."
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%.1f\t%s\t%s (%s)\t%s\t%s\n",
+			m.Record.ID,
+			strings.ToUpper(m.Record.Severity.String()),
+			m.Record.CVSS,
+			kev,
+			m.Product.HostName,
+			m.Product.HostIP,
+			prod,
+			summary,
+		)
+	}
+	_ = tw.Flush()
 }

@@ -47,7 +47,7 @@ scan:
   # Timeout per individual port or HTTP probe.
   timeout: 3s
   # Curated high-signal ports checked during host fingerprinting.
-  ports: [23, 80, 443, 502, 554, 1883, 5900, 8080, 8443, 47808]
+  ports: [22, 23, 80, 443, 502, 554, 1883, 5900, 8080, 8123, 8443, 47808]
   # Optional directory of extra local or community YAML checks loaded in addition
   # to the built-in checks.
   checks_dir: ""
@@ -57,6 +57,11 @@ scan:
 state:
   # Local JSON file tracking previous findings, devices, and port forwards for diffing.
   path: "uniblue-state.json"
+
+cve:
+  # Optional override for the local NVD JSON 2.0 + CISA KEV cache directory.
+  # Defaults to ~/.cache/uniblue/cve (or ~/Library/Caches/uniblue/cve on macOS).
+  cache_dir: ""
 
 notify:
   # Optional webhook endpoint for `uniblue watch` alerts.
