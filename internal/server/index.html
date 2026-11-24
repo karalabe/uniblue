@@ -3,105 +3,481 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>UniBlue — Live UniFi Security Monitor</title>
+<title>UniBlue — UniFi Security Console</title>
 <style>
   :root {
-    --bg: #f8fafc; --surface: #ffffff; --surface-alt: #f1f5f9;
-    --border: #e2e8f0; --text: #0f172a; --muted: #64748b;
-    --blue: #0759d8; --blue-bg: #eff6ff;
-    --crit: #b91c1c; --crit-bg: #fef2f2; --crit-bd: #fca5a5;
-    --high: #b45309; --high-bg: #fffbeb; --high-bd: #fcd34d;
-    --med: #0369a1; --med-bg: #f0f9ff; --med-bd: #7dd3fc;
-    --ok: #047857; --ok-bg: #ecfdf5; --ok-bd: #6ee7b7;
+    --bg: #f1f5f9;
+    --surface: #ffffff;
+    --surface-2: #f8fafc;
+    --surface-3: #e2e8f0;
+    --border: #e2e8f0;
+    --border-strong: #cbd5e1;
+    --text: #0f172a;
+    --text-2: #334155;
+    --muted: #64748b;
+    --blue: #0759d8;
+    --blue-bg: #eff6ff;
+    --blue-bd: #bfdbfe;
+    --crit: #b91c1c;
+    --crit-bg: #fef2f2;
+    --crit-bd: #fca5a5;
+    --crit-tint: rgba(220, 38, 38, 0.05);
+    --high: #b45309;
+    --high-bg: #fffbeb;
+    --high-bd: #fcd34d;
+    --med: #0369a1;
+    --med-bg: #f0f9ff;
+    --med-bd: #7dd3fc;
+    --ok: #047857;
+    --ok-bg: #ecfdf5;
+    --ok-bd: #6ee7b7;
+    --shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 1px 3px rgba(15, 23, 42, 0.04);
+    --shadow-lg: 0 12px 32px rgba(15, 23, 42, 0.16);
+    --radius: 12px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0b1120; --surface: #111827; --surface-alt: #1e293b;
-      --border: #1f2937; --text: #f1f5f9; --muted: #94a3b8;
-      --blue: #449aff; --blue-bg: #172554;
-      --crit: #fca5a5; --crit-bg: #450a0a; --crit-bd: #991b1b;
-      --high: #fcd34d; --high-bg: #451a03; --high-bd: #92400e;
-      --med: #7dd3fc; --med-bg: #082f49; --med-bd: #075985;
-      --ok: #6ee7b7; --ok-bg: #022c22; --ok-bd: #065f46;
+      --bg: #070d19;
+      --surface: #0f172a;
+      --surface-2: #162033;
+      --surface-3: #1e293b;
+      --border: #1e293b;
+      --border-strong: #334155;
+      --text: #f1f5f9;
+      --text-2: #cbd5e1;
+      --muted: #94a3b8;
+      --blue: #60a5fa;
+      --blue-bg: rgba(37, 99, 235, 0.16);
+      --blue-bd: rgba(96, 165, 250, 0.35);
+      --crit: #fca5a5;
+      --crit-bg: rgba(153, 27, 27, 0.32);
+      --crit-bd: rgba(248, 113, 113, 0.45);
+      --crit-tint: rgba(239, 68, 68, 0.07);
+      --high: #fcd34d;
+      --high-bg: rgba(146, 64, 14, 0.30);
+      --high-bd: rgba(251, 191, 36, 0.40);
+      --med: #7dd3fc;
+      --med-bg: rgba(7, 89, 133, 0.30);
+      --med-bd: rgba(56, 189, 248, 0.38);
+      --ok: #6ee7b7;
+      --ok-bg: rgba(6, 95, 70, 0.30);
+      --ok-bd: rgba(52, 211, 153, 0.38);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+      --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.55);
     }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.45; }
-  header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 20; flex-wrap: wrap; }
-  .brand { display: flex; align-items: center; gap: 14px; }
-  .brand img { height: 34px; display: block; }
-  .status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--surface-alt); border: 1px solid var(--border); color: var(--muted); }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13.5px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .subtext { font-size: 12px; color: var(--muted); }
+
+  /* Header & Navigation */
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 0 24px; min-height: 60px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 30; flex-wrap: wrap;
+  }
+  .hdr-left { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+  .brand img { height: 30px; display: block; }
+  .nav { display: flex; gap: 4px; align-items: stretch; }
+  .nav-btn {
+    appearance: none; background: none; border: 0; border-bottom: 2.5px solid transparent;
+    padding: 18px 13px 16px; font-size: 13.5px; font-weight: 600; color: var(--muted);
+    cursor: pointer; display: inline-flex; align-items: center; gap: 7px; transition: color .15s;
+  }
+  .nav-btn:hover { color: var(--text); }
+  .nav-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+  .nav-badge {
+    font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+    background: var(--surface-3); color: var(--text-2);
+  }
+  .nav-badge.crit { background: var(--crit-bg); color: var(--crit); border: 1px solid var(--crit-bd); }
+  .nav-badge.high { background: var(--high-bg); color: var(--high); border: 1px solid var(--high-bd); }
+  .hdr-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 0; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 999px; font-size: 11.5px; font-weight: 600;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
+  }
   .pill.live { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-bd); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-  .btn { appearance: none; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 6px 12px; border-radius: 7px; font-size: 12.5px; font-weight: 600; cursor: pointer; text-decoration: none; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; flex-shrink: 0; }
+  .btn {
+    appearance: none; border: 1px solid var(--border-strong); background: var(--surface);
+    color: var(--text); padding: 6px 12px; border-radius: 8px; font-size: 12.5px;
+    font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+  }
   .btn:hover { border-color: var(--blue); color: var(--blue); }
   .btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
-  .btn.primary:hover { opacity: 0.92; color: #fff; }
-  .btn.sm { padding: 3px 8px; font-size: 11.5px; }
-  main { max-width: 1440px; margin: 0 auto; padding: 20px 24px 48px; }
-  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 20px; }
-  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
-  .kpi .lbl { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); }
-  .kpi .val { font-size: 26px; font-weight: 700; margin-top: 4px; }
-  .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
-  .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 18px; flex-wrap: wrap; }
-  .tab { padding: 9px 15px; font-weight: 600; font-size: 13.5px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; background: none; border-top: 0; border-left: 0; border-right: 0; }
-  .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
-  .panel { display: none; }
-  .panel.active { display: block; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 18px; overflow: hidden; }
-  .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-alt); font-weight: 700; font-size: 13.5px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 9px 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface); }
-  td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  tr:last-child td { border-bottom: 0; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
-  .sev { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+  .btn.primary:hover { opacity: .92; color: #fff; }
+  .btn.sm { padding: 4px 9px; font-size: 11.5px; border-radius: 6px; }
+  .btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+  .btn.ghost:hover { background: var(--surface-2); color: var(--text); }
+
+  /* Layout */
+  main { max-width: 1480px; margin: 0 auto; padding: 20px 24px 56px; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* Badges & Pills */
+  .sev {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 7px; border-radius: 5px; font-size: 10.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .3px; white-space: nowrap;
+  }
   .sev-critical { color: var(--crit); background: var(--crit-bg); border: 1px solid var(--crit-bd); }
   .sev-high { color: var(--high); background: var(--high-bg); border: 1px solid var(--high-bd); }
   .sev-medium { color: var(--med); background: var(--med-bg); border: 1px solid var(--med-bd); }
-  .sev-low, .sev-info { color: var(--muted); background: var(--surface-alt); border: 1px solid var(--border); }
-  .sev-clean { color: var(--ok); background: var(--ok-bg); border: 1px solid var(--ok-bd); }
-  .proof { font-size: 12px; color: var(--muted); margin-top: 3px; }
-  .topo-wrap { padding: 14px; overflow-x: auto; text-align: center; background: #f8fafc; }
-  .topo-wrap img { max-width: 100%; height: auto; display: inline-block; }
-  .toolbar { display: flex; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); align-items: center; }
-  .search { padding: 6px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); width: 280px; max-width: 100%; font-size: 13px; }
-  .ev-item { display: flex; gap: 12px; align-items: baseline; padding: 9px 16px; border-bottom: 1px solid var(--border); font-size: 13px; }
-  .ev-item:last-child { border-bottom: 0; }
-  .ev-time { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
-  .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
-  .port-strip { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--bg); }
-  .ptile { min-width: 60px; padding: 6px 8px; border-radius: 7px; border: 1.5px solid var(--border); background: var(--surface); text-align: center; font-size: 11px; line-height: 1.3; }
-  .ptile .pnum { font-weight: 700; font-size: 12.5px; display: flex; align-items: center; justify-content: center; gap: 3px; }
-  .ptile .pmeta { font-size: 10px; color: var(--muted); margin-top: 2px; white-space: nowrap; }
+  .sev-low, .sev-info { color: var(--muted); background: var(--surface-2); border: 1px solid var(--border); }
+  .sev-clean, .sev-ok { color: var(--ok); background: var(--ok-bg); border: 1px solid var(--ok-bd); }
+  .sev-blue { color: var(--blue); background: var(--blue-bg); border: 1px solid var(--blue-bd); }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px;
+    border-radius: 6px; font-size: 11.5px; font-weight: 600;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2);
+    cursor: pointer; transition: all .12s;
+  }
+  .chip:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-bg); }
+  .chip.crit { background: var(--crit-bg); border-color: var(--crit-bd); color: var(--crit); }
+  .chip.high { background: var(--high-bg); border-color: var(--high-bd); color: var(--high); }
+  .chip.ok { background: var(--ok-bg); border-color: var(--ok-bd); color: var(--ok); }
+  .chip.blue { background: var(--blue-bg); border-color: var(--blue-bd); color: var(--blue); }
+
+  /* 4-Layer Health Strip */
+  .health-strip {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 20px;
+  }
+  @media (max-width: 980px) { .health-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 560px) { .health-strip { grid-template-columns: 1fr; } }
+  .hcard {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px; box-shadow: var(--shadow); cursor: pointer; position: relative;
+    overflow: hidden; transition: transform .12s, border-color .12s;
+  }
+  .hcard:hover { transform: translateY(-1px); border-color: var(--border-strong); }
+  .hcard::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3.5px; background: var(--ok); }
+  .hcard.st-crit::before { background: #dc2626; }
+  .hcard.st-high::before { background: #d97706; }
+  .hcard.st-med::before { background: #0284c7; }
+  .hcard-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .hcard-title { font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .45px; color: var(--muted); }
+  .hcard-val { font-size: 22px; font-weight: 800; margin-top: 6px; letter-spacing: -.3px; }
+  .hcard-sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+  /* Cards & Grids */
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); margin-bottom: 16px; overflow: hidden;
+  }
+  .card-hd {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-2);
+    font-weight: 700; font-size: 13.5px; flex-wrap: wrap;
+  }
+  .card-body { padding: 14px 16px; }
+  .overview-grid { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(300px, 1fr); gap: 18px; align-items: start; }
+  @media (max-width: 1080px) { .overview-grid { grid-template-columns: 1fr; } }
+
+  /* Action Queue Problem Groups */
+  .action-group {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); margin-bottom: 14px; overflow: hidden;
+  }
+  .action-group.grp-crit { border-left: 4px solid #dc2626; }
+  .action-group.grp-high { border-left: 4px solid #d97706; }
+  .action-group.grp-med { border-left: 4px solid #0284c7; }
+  .action-group.grp-ok { border-left: 4px solid #10b981; }
+  .ag-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 13px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .ag-title { font-size: 14.5px; font-weight: 700; display: flex; align-items: center; gap: 9px; }
+  .ag-desc { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .ag-items { divide-y: 1px solid var(--border); }
+  .ag-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer;
+    transition: background .1s; flex-wrap: wrap;
+  }
+  .ag-row:last-child { border-bottom: 0; }
+  .ag-row:hover { background: var(--surface-2); }
+  .ag-row-main { min-width: 220px; flex: 1; }
+  .ag-row-pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+  /* Controls Mini Grid */
+  .ctrl-list { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px 14px; }
+  .ctrl-item {
+    display: flex; flex-direction: column; gap: 3px; padding: 9px 11px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2);
+  }
+  .ctrl-lbl { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .35px; color: var(--muted); }
+  .ctrl-val { font-size: 12.5px; font-weight: 700; display: flex; align-items: center; gap: 6px; }
+
+  /* =========================================================================
+     PHYSICAL & PERIMETER MAP
+     ========================================================================= */
+  .toolbar-bar {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    flex-wrap: wrap; margin-bottom: 16px; padding: 10px 14px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); }
+  .leg-item { display: inline-flex; align-items: center; gap: 5px; }
+  .leg-swatch { width: 12px; height: 12px; border-radius: 3px; border: 1.5px solid var(--border); display: inline-block; }
+  .leg-swatch.crit { background: var(--crit-bg); border-color: var(--crit-bd); }
+  .leg-swatch.warn { background: var(--high-bg); border-color: var(--high-bd); }
+  .leg-swatch.ok { background: var(--ok-bg); border-color: var(--ok-bd); }
+  .leg-swatch.up { background: var(--blue-bg); border-color: var(--blue-bd); }
+  .leg-swatch.open { border-style: dashed; border-color: var(--muted); background: var(--surface); }
+  .leg-swatch.off { background: var(--surface-3); opacity: .55; }
+
+  .seg-ctrl { display: inline-flex; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; gap: 2px; }
+  .seg-btn {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    padding: 5px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
+  }
+  .seg-btn.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+
+  /* WAN Edge Banner */
+  .wan-banner {
+    background: var(--surface); border: 1.5px solid var(--blue-bd); border-radius: var(--radius);
+    padding: 12px 16px; margin-bottom: 14px; display: flex; align-items: center;
+    justify-content: space-between; gap: 14px; flex-wrap: wrap; box-shadow: var(--shadow);
+  }
+  .wan-banner.has-crit { border-color: var(--crit-bd); background: var(--crit-tint); }
+
+  /* Inside vs Outside Perimeter Containers */
+  .zone-box {
+    border-radius: 14px; padding: 16px; margin-bottom: 14px; position: relative;
+  }
+  .zone-inside {
+    background: var(--surface-2); border: 1.5px solid var(--border-strong);
+  }
+  .zone-outside {
+    background: var(--crit-tint); border: 2px dashed var(--crit-bd);
+  }
+  .zone-hdr {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .zone-tag {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; font-weight: 800;
+    text-transform: uppercase; letter-spacing: .6px; padding: 4px 10px; border-radius: 6px;
+  }
+  .zone-tag.in { background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue-bd); }
+  .zone-tag.out { background: var(--crit-bg); color: var(--crit); border: 1px solid var(--crit-bd); }
+
+  /* Perimeter Wall Crossing Divider */
+  .wall-divider {
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    margin: 12px 0; padding: 10px 14px;
+    border-top: 2px dashed var(--crit-bd); border-bottom: 2px dashed var(--crit-bd);
+    background: var(--surface); border-radius: 10px;
+  }
+  .wall-label {
+    font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--crit);
+  }
+  .wall-cables { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+
+  /* Topology Tiers inside Zone */
+  .topo-tier { display: flex; flex-direction: column; gap: 12px; }
+  .tier-connector {
+    display: flex; justify-content: center; align-items: center;
+    height: 18px; position: relative; color: var(--muted); font-size: 11px; font-weight: 600;
+  }
+  .tier-connector::before {
+    content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 2px;
+    background: var(--border-strong);
+  }
+  .tier-row {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px;
+  }
+  .tier-row.single { grid-template-columns: minmax(0, 1fr); }
+
+  /* Switch / Device Hardware Card */
+  .hw-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); overflow: hidden; transition: border-color .15s;
+  }
+  .hw-card.hw-ext { border-color: var(--crit-bd); }
+  .hw-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 11px 14px; border-bottom: 1px solid var(--border); background: var(--surface-2);
+    cursor: pointer; flex-wrap: wrap;
+  }
+  .hw-head:hover { background: var(--surface-3); }
+  .hw-name { font-weight: 700; font-size: 13.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .hw-meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+  /* Interactive Rack Frontplate Port Grid */
+  .frontplate {
+    display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 14px; background: var(--surface);
+  }
+  .ptile {
+    width: 58px; padding: 6px 4px; border-radius: 7px; border: 1.5px solid var(--border);
+    background: var(--surface-2); text-align: center; cursor: pointer;
+    transition: transform .1s, box-shadow .1s, border-color .1s; user-select: none;
+    position: relative;
+  }
+  .ptile:hover { transform: translateY(-2px); box-shadow: var(--shadow); z-index: 2; }
+  .ptile.selected { outline: 2.5px solid var(--blue); outline-offset: 1px; z-index: 3; }
+  .ptile .pnum { font-weight: 800; font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 2px; }
+  .ptile .pmeta { font-size: 10px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .88; }
+  .ptile .pdot { position: absolute; top: 3px; right: 4px; font-size: 9px; line-height: 1; }
   .ptile.st-active-ok { background: var(--ok-bg); border-color: var(--ok-bd); color: var(--ok); }
-  .ptile.st-active-uplink { background: var(--blue-bg); border-color: var(--blue); color: var(--blue); }
+  .ptile.st-active-uplink { background: var(--blue-bg); border-color: var(--blue-bd); color: var(--blue); }
   .ptile.st-active-warn { background: var(--high-bg); border-color: var(--high-bd); color: var(--high); }
   .ptile.st-active-crit { background: var(--crit-bg); border-color: var(--crit-bd); color: var(--crit); }
-  .ptile.st-inactive-ok { border-style: dashed; color: var(--muted); }
-  .ptile.st-inactive-warn { border-style: dashed; background: var(--high-bg); border-color: var(--high-bd); color: var(--high); }
-  .ptile.st-disabled { opacity: 0.48; background: var(--surface-alt); color: var(--muted); }
-  .zone-pill { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; border: 1px solid var(--border); background: var(--surface-alt); color: var(--muted); }
-  .zone-external, .zone-external_uplink { color: var(--crit); background: var(--crit-bg); border-color: var(--crit-bd); }
-  .zone-uplink, .zone-wan { color: var(--blue); background: var(--blue-bg); border-color: var(--blue); }
-  .zone-unused { color: var(--high); background: var(--high-bg); border-color: var(--high-bd); }
-  .ctrl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; padding: 14px 16px; }
-  .ctrl-box { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
-  .ctrl-box .clbl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); font-weight: 600; }
-  .ctrl-box .cval { font-size: 13.5px; font-weight: 700; margin-top: 4px; }
+  .ptile.st-inactive-ok { background: var(--surface); border-style: dashed; border-color: var(--border-strong); color: var(--muted); }
+  .ptile.st-inactive-warn { background: var(--high-bg); border-style: dashed; border-color: var(--high-bd); color: var(--high); }
+  .ptile.st-disabled { background: var(--surface-3); border-color: var(--border); color: var(--muted); opacity: .45; }
+
+  .hw-callouts {
+    padding: 8px 14px 11px; border-top: 1px solid var(--border); background: var(--surface-2);
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  }
+
+  /* Exterior Endpoints Strip */
+  .ext-peers { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin-top: 12px; }
+  .ext-peer-card {
+    background: var(--surface); border: 1px solid var(--crit-bd); border-radius: 9px;
+    padding: 9px 12px; cursor: pointer; display: flex; flex-direction: column; gap: 4px;
+    transition: transform .1s;
+  }
+  .ext-peer-card.ok { border-color: var(--ok-bd); }
+  .ext-peer-card:hover { transform: translateY(-1px); border-color: var(--blue); }
+
+  /* =========================================================================
+     VLANS & SERVICES VIEW
+     ========================================================================= */
+  .search-input {
+    padding: 6px 11px; border: 1px solid var(--border-strong); border-radius: 8px;
+    background: var(--surface-2); color: var(--text); font-size: 13px; width: 280px; max-width: 100%;
+  }
+  .search-input:focus { outline: none; border-color: var(--blue); background: var(--surface); }
+
+  .vlan-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); margin-bottom: 16px; overflow: hidden;
+  }
+  .vlan-hd {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-2); flex-wrap: wrap;
+  }
+  .vlan-tip {
+    padding: 9px 16px; background: var(--high-bg); color: var(--high);
+    border-bottom: 1px solid var(--high-bd); font-size: 12.5px; font-weight: 500;
+  }
+  .host-row {
+    display: grid; grid-template-columns: minmax(210px, 1.4fr) 125px minmax(150px, 1fr) minmax(220px, 1.6fr) auto;
+    gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--border);
+    cursor: pointer; transition: background .1s;
+  }
+  .host-row:last-child { border-bottom: 0; }
+  .host-row:hover { background: var(--surface-2); }
+  @media (max-width: 960px) {
+    .host-row { grid-template-columns: 1fr; gap: 6px; }
+  }
+  .host-id { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .status-orb { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; background: #10b981; }
+  .status-orb.critical { background: #dc2626; box-shadow: 0 0 0 3px var(--crit-bg); }
+  .status-orb.high { background: #d97706; box-shadow: 0 0 0 3px var(--high-bg); }
+  .status-orb.medium { background: #0284c7; box-shadow: 0 0 0 3px var(--med-bg); }
+  .host-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .svc-pills { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+
+  /* Tables (compact, secondary) */
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th {
+    text-align: left; padding: 8px 14px; font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: .4px; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface-2);
+  }
+  td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--surface-2); }
+
+  /* Activity Timeline */
+  .ev-row {
+    display: flex; gap: 12px; align-items: baseline; padding: 10px 16px;
+    border-bottom: 1px solid var(--border); font-size: 13px;
+  }
+  .ev-row:last-child { border-bottom: 0; }
+  .ev-time { color: var(--muted); font-size: 11.5px; white-space: nowrap; min-width: 72px; }
+  .empty { padding: 24px 16px; color: var(--muted); text-align: center; font-size: 13px; }
+
+  /* =========================================================================
+     CROSS-REFERENCED INSPECTOR DRAWER
+     ========================================================================= */
+  .drawer-backdrop {
+    position: fixed; inset: 0; background: rgba(15, 23, 42, 0.35);
+    z-index: 45; opacity: 0; pointer-events: none; transition: opacity .18s;
+  }
+  .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+  .drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 480px; max-width: 100vw;
+    background: var(--surface); border-left: 1px solid var(--border-strong);
+    box-shadow: var(--shadow-lg); z-index: 50; display: flex; flex-direction: column;
+    transform: translateX(100%); transition: transform .2s cubic-bezier(.16, 1, .3, 1);
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer-hd {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    padding: 16px 18px; border-bottom: 1px solid var(--border); background: var(--surface-2);
+  }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 16px 18px 32px; }
+  .drawer-sec { margin-bottom: 18px; }
+  .drawer-sec-title {
+    font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--muted); margin-bottom: 8px;
+  }
+  .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .kv { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+  .kv .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; font-weight: 700; }
+  .kv .v { font-size: 12.5px; font-weight: 600; margin-top: 2px; word-break: break-word; }
+  .finding-box {
+    border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-bottom: 10px;
+    background: var(--surface-2);
+  }
+  .finding-box.crit { border-color: var(--crit-bd); background: var(--crit-tint); }
+  .finding-box.high { border-color: var(--high-bd); }
+  .finding-box .ftitle { font-weight: 700; font-size: 13px; margin-top: 5px; }
+  .finding-box .fproof { font-size: 12px; color: var(--text-2); margin-top: 4px; }
+  .finding-box .faction { font-size: 12px; color: var(--muted); margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
+
+  .topo-svg-wrap { padding: 14px; overflow-x: auto; text-align: center; background: #f8fafc; border-top: 1px solid var(--border); }
+  .topo-svg-wrap img { max-width: 100%; height: auto; display: inline-block; }
 </style>
 </head>
 <body>
+
 <header>
-  <div class="brand">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="/assets/logo-dark.svg">
-      <img src="/assets/logo-light.svg" alt="UniBlue">
-    </picture>
+  <div class="hdr-left">
+    <div class="brand">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="/assets/logo-dark.svg">
+        <img src="/assets/logo-light.svg" alt="UniBlue">
+      </picture>
+    </div>
+    <nav class="nav" role="tablist">
+      <button class="nav-btn active" data-view="overview">Overview <span id="nb-overview" class="nav-badge">0</span></button>
+      <button class="nav-btn" data-view="physical">Physical &amp; Perimeter <span id="nb-physical" class="nav-badge">0</span></button>
+      <button class="nav-btn" data-view="logical">VLANs &amp; Services <span id="nb-logical" class="nav-badge">0</span></button>
+      <button class="nav-btn" data-view="activity">Live Activity <span id="nb-activity" class="nav-badge">0</span></button>
+    </nav>
   </div>
-  <div class="status-row">
+  <div class="hdr-right">
     <span id="live-pill" class="pill live"><span class="dot"></span><span id="mode-lbl">Connecting…</span></span>
     <span id="site-pill" class="pill">Site: -</span>
     <span id="updated-pill" class="pill">Updated: -</span>
@@ -110,226 +486,87 @@
 </header>
 
 <main>
-  <div class="kpis" id="kpis"></div>
-
-  <div class="tabs">
-    <button class="tab active" data-tab="findings">Findings &amp; CVEs</button>
-    <button class="tab" data-tab="ports">Switch Ports</button>
-    <button class="tab" data-tab="topology">Network Topology</button>
-    <button class="tab" data-tab="clients">Clients &amp; Inventory</button>
-    <button class="tab" data-tab="events">Live Event Stream</button>
-  </div>
-
-  <section id="panel-findings" class="panel active"></section>
-  <section id="panel-ports" class="panel"></section>
-  <section id="panel-topology" class="panel"></section>
-  <section id="panel-clients" class="panel"></section>
-  <section id="panel-events" class="panel"></section>
+  <section id="view-overview" class="view active"></section>
+  <section id="view-physical" class="view"></section>
+  <section id="view-logical" class="view"></section>
+  <section id="view-activity" class="view"></section>
 </main>
+
+<div id="drawer-backdrop" class="drawer-backdrop" onclick="closeDrawer()"></div>
+<aside id="drawer" class="drawer" aria-hidden="true">
+  <div class="drawer-hd">
+    <div id="drawer-title-wrap"></div>
+    <button class="btn sm ghost" onclick="closeDrawer()" title="Close (Esc)">✕</button>
+  </div>
+  <div id="drawer-body" class="drawer-body"></div>
+</aside>
 
 <script>
 let state = null;
-let clientFilter = "";
-let activeTab = "findings";
-let lastTopoUpdatedAt = "";
+let idx = null;
+let activeView = "overview";
+let portDisplayMode = "active_or_risk"; // "active_or_risk" | "all"
+let showClassicSVG = false;
+let logicalFilter = "all"; // "all" | "risk" | "wan" | "wired" | "wifi"
+let logicalSearch = "";
+let activityFilter = "all"; // "all" | "threats" | "ports" | "clients" | "admin"
+let drawerState = null; // { kind: "port"|"client"|"device", ... }
 
-document.querySelectorAll(".tab").forEach(btn => {
-  btn.addEventListener("click", () => {
-    activeTab = btn.dataset.tab;
-    document.querySelectorAll(".tab").forEach(b => b.classList.toggle("active", b === btn));
-    document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + activeTab));
-    if (activeTab === "topology") refreshTopologyImg();
-  });
+document.querySelectorAll(".nav-btn").forEach(btn => {
+  btn.addEventListener("click", () => switchView(btn.dataset.view));
 });
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") closeDrawer();
+});
+
+function switchView(view) {
+  activeView = view;
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.view === view));
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + view));
+  renderActiveView();
+}
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
 
 function fmtTime(iso) {
-  if (!iso || iso.startsWith("0001-")) return "-";
-  return new Date(iso).toLocaleTimeString();
+  if (!iso || String(iso).startsWith("0001-")) return "-";
+  return new Date(iso).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
 }
 
-function sevBadge(sev) {
+function fmtDateTime(iso) {
+  if (!iso || String(iso).startsWith("0001-")) return "-";
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+}
+
+function fmtSpeed(speed) {
+  if (!speed) return "-";
+  return speed >= 1000 ? (speed / 1000) + "G" : speed + "M";
+}
+
+function sevRank(sev) {
+  switch ((sev || "").toLowerCase()) {
+    case "critical": return 5;
+    case "high": return 4;
+    case "medium": return 3;
+    case "low": return 2;
+    case "info": return 1;
+    default: return 0;
+  }
+}
+
+function sevBadge(sev, label) {
   const s = (sev || "info").toLowerCase();
-  return '<span class="sev sev-' + esc(s) + '">' + esc(s) + '</span>';
-}
-
-async function fetchState() {
-  const r = await fetch("/api/state", {cache: "no-store"});
-  if (!r.ok) return;
-  state = await r.json();
-  renderAll();
-}
-
-async function triggerRescan(ip) {
-  const url = ip ? ("/api/rescan?ip=" + encodeURIComponent(ip)) : "/api/rescan";
-  await fetch(url, {method: "POST"});
-  setTimeout(fetchState, 600);
-}
-
-function refreshTopologyImg() {
-  const img = document.getElementById("topo-svg-img");
-  if (img) img.src = "/api/topology.svg?t=" + Date.now();
-}
-
-function renderAll() {
-  if (!state) return;
-  document.getElementById("mode-lbl").textContent = (state.scanning ? "Scanning… · " : "LIVE · ") + (state.event_mode || "poll");
-  document.getElementById("site-pill").textContent = "Site: " + state.site + " (" + state.controller_type + ")";
-  document.getElementById("updated-pill").textContent = "Updated: " + fmtTime(state.updated_at);
-
-  const findings = (state.report?.findings || []).filter(f => f.check_id !== "UB-UNIFI-PORTFWD" && f.check_id !== "UB-UNIFI-FIRMWARE");
-  const critCount = findings.filter(f => f.effective_severity === "critical").length;
-  const highCount = findings.filter(f => f.effective_severity === "high").length;
-  const exactCVEs = state.exact_cves || [];
-  const wanSurface = state.report?.wan_surface || [];
-
-  const switches = state.report?.switch_ports || [];
-  let totalPorts = 0, activePorts = 0, atRiskPorts = 0;
-  for (const sw of switches) {
-    totalPorts += sw.total_ports || 0;
-    activePorts += sw.active_ports || 0;
-    atRiskPorts += sw.at_risk_ports || 0;
-  }
-
-  document.getElementById("kpis").innerHTML = `
-    <div class="kpi"><div class="lbl">Confirmed Exposures</div><div class="val">${findings.length}</div><div class="sub">${critCount} critical · ${highCount} high · ${exactCVEs.length} exact CVE rollups</div></div>
-    <div class="kpi"><div class="lbl">Active LAN Clients</div><div class="val">${state.report?.client_count || 0}</div><div class="sub">${state.report?.clean_clients || 0} clean · ${(state.topology?.vlans || []).length} VLANs</div></div>
-    <div class="kpi"><div class="lbl">WAN Surface</div><div class="val">${wanSurface.length}</div><div class="sub">${wanSurface.filter(w => w.severity !== "info").length} review/high · ${wanSurface.filter(w => w.severity === "info").length} expected P2P</div></div>
-    <div class="kpi"><div class="lbl">Switch Ports &amp; Gear</div><div class="val">${activePorts}/${totalPorts}</div><div class="sub">${atRiskPorts} at risk · ${state.report?.clean_unifi_devices || 0}/${state.report?.unifi_device_count || 0} devices up to date</div></div>
-  `;
-
-  renderFindings(findings, exactCVEs, state.potential_cves || [], wanSurface, state.report?.posture_notes || [], state.report?.unifi_posture || null);
-  renderPorts(switches);
-  renderTopology();
-  renderClients();
-  renderEvents();
-}
-
-function renderFindings(findings, exactCVEs, potentialCVEs, wanSurface, postureNotes, unifiPosture) {
-  let html = '<div class="card"><div class="card-hd"><span>Confirmed LAN &amp; Firewall Exposures (' + findings.length + ')</span></div>';
-  if (!findings.length) {
-    html += '<div class="empty">No confirmed exposures detected.</div>';
-  } else {
-    html += '<table><thead><tr><th>Severity</th><th>Check</th><th>Host</th><th>Target / Zone</th><th>Finding &amp; Proof</th><th></th></tr></thead><tbody>';
-    for (const f of findings) {
-      const target = f.port > 0 ? (f.client.ip + ":" + f.port) : (f.client.ip || "-");
-      const canScan = f.client?.ip && !f.check_id.startsWith("UB-UNIFI-");
-      html += `<tr>
-        <td>${sevBadge(f.effective_severity)}</td>
-        <td class="mono">${esc(f.check_id)}</td>
-        <td><strong>${esc(f.client?.name || f.client?.hostname || f.client?.ip)}</strong><div class="proof">${esc(f.client?.network_name || "-")}</div></td>
-        <td class="mono">${esc(target)}</td>
-        <td><strong>${esc(f.title)}</strong><div class="proof">Proof: ${esc(f.evidence)}</div>${f.remediation?.summary ? '<div class="proof">Action: ' + esc(f.remediation.summary) + '</div>' : ''}</td>
-        <td>${canScan ? '<button class="btn sm" onclick="triggerRescan(\'' + esc(f.client.ip) + '\')">Rescan</button>' : ''}</td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-  }
-  html += '</div>';
-
-  if (exactCVEs.length) {
-    html += '<div class="card"><div class="card-hd"><span>Exact-Version CVE Rollups (' + exactCVEs.length + ')</span></div><table><thead><tr><th>Severity</th><th>Host</th><th>VLAN</th><th>Product &amp; Summary</th><th>Top CVEs</th></tr></thead><tbody>';
-    for (const s of exactCVEs) {
-      const label = s.product.label + (s.product.version ? " " + s.product.version : "");
-      html += `<tr>
-        <td>${sevBadge(s.max_severity)}</td>
-        <td><strong>${esc(s.product.host_name)}</strong> <span class="mono">(${esc(s.product.host_ip)})</span></td>
-        <td>${esc(s.product.vlan || "-")}</td>
-        <td><strong>${esc(label)}</strong>: ${s.total_cves} CVE(s) (max CVSS ${Number(s.max_cvss).toFixed(1)}${s.kev_count ? ", " + s.kev_count + " KEV" : ""}${s.suggested_fix ? ", verify &gt;= " + esc(s.suggested_fix) : ""})</td>
-        <td class="mono">${esc((s.top_cves || []).join(", "))}</td>
-      </tr>`;
-    }
-    html += '</tbody></table></div>';
-  }
-
-  if (wanSurface.length) {
-    html += '<div class="card"><div class="card-hd"><span>WAN Port-Forward Surface (' + wanSurface.length + ')</span></div><table><thead><tr><th>Severity</th><th>Class</th><th>Rule</th><th>Mapping</th><th>Host</th><th>Assessment</th></tr></thead><tbody>';
-    for (const a of wanSurface) {
-      html += `<tr>
-        <td>${sevBadge(a.severity)}</td>
-        <td class="mono">${esc(a.class)}</td>
-        <td>${esc(a.forward.name)}</td>
-        <td class="mono">${esc(a.forward.proto)}:${esc(a.forward.dst_port)} -&gt; ${esc(a.forward.fwd_ip)}:${esc(a.forward.fwd_port)}</td>
-        <td>${esc(a.client?.name || a.client?.hostname || a.client?.mac || a.forward.fwd_ip)}</td>
-        <td>${esc(a.rule_name)}</td>
-      </tr>`;
-    }
-    html += '</tbody></table></div>';
-  }
-
-  if (unifiPosture && (unifiPosture.settings || unifiPosture.health || (unifiPosture.wlans && unifiPosture.wlans.length))) {
-    const s = unifiPosture.settings || {};
-    const h = unifiPosture.health || {};
-    const sshBadge = s.ssh_enabled ? (s.ssh_password_auth ? sevBadge("high") + " Password" : sevBadge("low") + " Key-only") : sevBadge("clean") + " Disabled";
-    const upnpBadge = s.upnp_enabled ? sevBadge("high") + " Enabled" : sevBadge("clean") + " Disabled";
-    const ipsBadge = (s.ips_mode === "ips" || s.ips_mode === "ids") ? sevBadge("clean") + " " + esc(s.ips_mode.toUpperCase()) : sevBadge("medium") + " Off";
-    const hpBadge = s.honeypot_enabled ? sevBadge("clean") + " Active (" + (s.honeypot_ips || []).length + ")" : sevBadge("low") + " Off";
-    const dohBadge = (s.doh_state && s.doh_state !== "off") ? sevBadge("clean") + " " + esc(s.doh_state) : sevBadge("info") + " Off";
-    const vpnBadge = (h.active_vpn_users || 0) > 0 ? sevBadge("medium") + " " + h.active_vpn_users + " active" : sevBadge("clean") + " 0 active";
-    const wanBadge = h.wan_status ? (h.wan_status === "ok" ? sevBadge("clean") : sevBadge("high")) + " " + esc(h.wan_ip || h.wan_status) : "-";
-    const rogueBadge = (unifiPosture.evil_twin_count || 0) > 0 ? sevBadge("critical") + " " + unifiPosture.evil_twin_count + " Evil-Twin!" : sevBadge("clean") + " " + (unifiPosture.neighbor_aps || 0) + " neighbors";
-
-    html += `<div class="card"><div class="card-hd"><span>UniFi Gateway, Airspace &amp; Security Controls</span></div>
-      <div class="ctrl-grid">
-        <div class="ctrl-box"><div class="clbl">Device SSH</div><div class="cval">${sshBadge}</div></div>
-        <div class="ctrl-box"><div class="clbl">Gateway UPnP</div><div class="cval">${upnpBadge}</div></div>
-        <div class="ctrl-box"><div class="clbl">IDS / IPS</div><div class="cval">${ipsBadge}</div></div>
-        <div class="ctrl-box"><div class="clbl">LAN Honeypot</div><div class="cval">${hpBadge}</div></div>
-        <div class="ctrl-box"><div class="clbl">DNS Shield (DoH)</div><div class="cval">${dohBadge}</div></div>
-        <div class="ctrl-box"><div class="clbl">Remote VPN</div><div class="cval">${vpnBadge}</div></div>
-        <div class="ctrl-box"><div class="clbl">WAN Health</div><div class="cval mono">${wanBadge}</div></div>
-        <div class="ctrl-box"><div class="clbl">Wi-Fi Airspace</div><div class="cval">${rogueBadge}</div></div>
-      </div>`;
-    if (unifiPosture.wlans && unifiPosture.wlans.length) {
-      html += `<table><thead><tr><th>Wi-Fi SSID</th><th>Status</th><th>VLAN</th><th>Encryption</th><th>PMF</th><th>L2 Client Isolation</th></tr></thead><tbody>`;
-      for (const w of unifiPosture.wlans) {
-        const enc = (w.security || "-") + (w.wpa3_support ? " (WPA3)" : (w.wpa_mode ? " (" + w.wpa_mode.toUpperCase() + ")" : ""));
-        html += `<tr>
-          <td><strong>${esc(w.name)}</strong>${w.is_guest ? ' <span class="zone-pill">Guest</span>' : ''}</td>
-          <td>${w.enabled ? sevBadge("clean") : sevBadge("info")}</td>
-          <td>${esc(w.network_name || "-")}</td>
-          <td class="mono">${esc(enc)}</td>
-          <td class="mono">${esc(w.pmf_mode || "disabled")}</td>
-          <td>${w.l2_isolation ? sevBadge("clean") : '<span class="proof">off</span>'}</td>
-        </tr>`;
-      }
-      html += `</tbody></table>`;
-    }
-    html += `</div>`;
-  }
-
-  if (postureNotes.length) {
-    html += '<div class="card"><div class="card-hd"><span>Network Posture Observations</span></div>';
-    for (const n of postureNotes) {
-      html += `<div class="ev-item">${sevBadge(n.severity)}<div><strong>${esc(n.title)}</strong><div class="proof">${esc(n.detail)}</div></div></div>`;
-    }
-    html += '</div>';
-  }
-
-  if (potentialCVEs.length) {
-    html += '<div class="card"><div class="card-hd"><span>Patch Verification — Version Unknown (' + potentialCVEs.length + ')</span></div><table><thead><tr><th>Max Sev</th><th>Host</th><th>Product</th><th>Summary</th><th>Top CVEs</th></tr></thead><tbody>';
-    for (const s of potentialCVEs) {
-      html += `<tr>
-        <td>${sevBadge(s.max_severity)}</td>
-        <td>${esc(s.product.host_name)} <span class="mono">(${esc(s.product.host_ip)})</span></td>
-        <td>${esc(s.product.label)}</td>
-        <td>${s.total_cves} CVE(s) (max CVSS ${Number(s.max_cvss).toFixed(1)}${s.kev_count ? ", " + s.kev_count + " KEV" : ""}${s.suggested_fix ? ", verify &gt;= " + esc(s.suggested_fix) : ""})</td>
-        <td class="mono">${esc((s.top_cves || []).join(", "))}</td>
-      </tr>`;
-    }
-    html += '</tbody></table></div>';
-  }
-
-  document.getElementById("panel-findings").innerHTML = html;
+  return '<span class="sev sev-' + esc(s) + '">' + esc(label || s) + '</span>';
 }
 
 function portTileClass(p) {
   if (p.state === "disabled") return "st-disabled";
   if (p.state === "inactive_enabled") {
-    return p.status === "warn" || p.status === "critical" ? "st-inactive-warn" : "st-inactive-ok";
+    return (p.status === "warn" || p.status === "critical") ? "st-inactive-warn" : "st-inactive-ok";
   }
   if (p.status === "critical") return "st-active-crit";
   if (p.status === "warn") return "st-active-warn";
@@ -337,168 +574,1200 @@ function portTileClass(p) {
   return "st-active-ok";
 }
 
-function fmtSpeed(speed) {
-  if (!speed) return "-";
-  if (speed >= 1000) return (speed / 1000) + "G";
-  return speed + "M";
+function isSelectedPort(mac, portIdx) {
+  return drawerState && drawerState.kind === "port" && drawerState.mac === mac && drawerState.portIdx === portIdx;
 }
 
-function renderPorts(switches) {
-  const el = document.getElementById("panel-ports");
-  if (!switches || !switches.length) {
-    el.innerHTML = '<div class="card"><div class="empty">No physical switch port telemetry reported by UniFi.</div></div>';
-    return;
-  }
-  let html = "";
+/* ============================================================================
+   CROSS-REFERENCE INDEX BUILDER
+   ============================================================================ */
+function buildIndex(st) {
+  const switches = st.report?.switch_ports || [];
+  const clients = st.clients || [];
+  const allFindings = (st.report?.findings || []).filter(f => f.check_id !== "UB-UNIFI-PORTFWD" && f.check_id !== "UB-UNIFI-FIRMWARE");
+  const wanSurface = st.report?.wan_surface || [];
+  const exactCVEs = st.exact_cves || [];
+  const potCVEs = st.potential_cves || [];
+  const posture = st.report?.unifi_posture || null;
+
+  const swByMAC = {};
+  const swByName = {};
+  const portByKey = {};
+  let totalPorts = 0, activePorts = 0, unusedOpenPorts = 0, disabledPorts = 0, extPorts = 0, atRiskPorts = 0;
+
   for (const sw of switches) {
-    const extBadge = sw.external_device
-      ? ' <span class="sev sev-critical">EXTERNAL EQUIPMENT (' + esc(sw.zone_source || "auto") + ')</span>'
-      : '';
-    const uplink = sw.uplink_name
-      ? 'Uplink: ' + esc(sw.uplink_name) + (sw.uplink_port ? ' Port ' + sw.uplink_port : '')
-      : 'Root Gateway';
-    const summary = `${sw.active_ports} active · ${sw.inactive_enabled_ports} unused-open · ${sw.disabled_ports} disabled` +
-      (sw.at_risk_ports ? ` · ${sw.at_risk_ports} at risk` : '');
-
-    html += `<div class="card">
-      <div class="card-hd">
-        <div><strong>${esc(sw.name)}</strong> <span class="mono" style="font-weight:400;color:var(--muted)">(${esc(sw.model)} · ${esc(sw.ip)})</span>${extBadge}</div>
-        <div class="proof" style="margin:0">${uplink} · ${summary}</div>
-      </div>
-      <div class="port-strip">`;
-
+    const mac = (sw.mac || "").toLowerCase();
+    swByMAC[mac] = sw;
+    swByName[(sw.name || "").toLowerCase()] = sw;
+    totalPorts += sw.total_ports || 0;
+    activePorts += sw.active_ports || 0;
+    unusedOpenPorts += sw.inactive_enabled_ports || 0;
+    disabledPorts += sw.disabled_ports || 0;
+    extPorts += sw.external_ports || 0;
+    atRiskPorts += sw.at_risk_ports || 0;
     for (const p of (sw.ports || [])) {
-      const peersTxt = (p.peers || []).map(x => x.name).join(", ") || (p.up ? "active link" : p.state);
-      const tip = `Port ${p.port_idx} (${p.name}) | Zone: ${p.zone} | VLAN: ${p.native_vlan || "-"} | Tagged: ${p.tagged_policy} | Peer: ${peersTxt}` +
-        ((p.issues && p.issues.length) ? " | Issues: " + p.issues.join("; ") : "");
-      const poeMark = p.poe_enabled ? "⚡" : "";
-      const meta = p.up ? fmtSpeed(p.speed) : (p.enabled ? "open" : "off");
-      html += `<div class="ptile ${portTileClass(p)}" title="${esc(tip)}">
-        <div class="pnum">#${p.port_idx}${poeMark}</div>
-        <div class="pmeta">${esc(meta)}</div>
+      portByKey[mac + "|" + p.port_idx] = { sw, port: p };
+    }
+  }
+
+  const clientByIP = {};
+  const clientByMAC = {};
+  for (const c of clients) {
+    if (c.client?.ip) clientByIP[c.client.ip] = c;
+    if (c.client?.mac) clientByMAC[c.client.mac.toLowerCase()] = c;
+  }
+
+  // Partition findings cleanly into 4 intuitive operational domains
+  const portFindings = [];
+  const fwFindings = [];
+  const controllerFindings = [];
+  const serviceFindings = [];
+  const findingsByIP = {};
+  const findingsByPortKey = {};
+
+  for (const f of allFindings) {
+    const id = f.check_id || "";
+    if (id.startsWith("UB-UNIFI-PORT-")) {
+      portFindings.push(f);
+      const pk = (f.client?.mac || "").toLowerCase() + "|" + f.port;
+      (findingsByPortKey[pk] = findingsByPortKey[pk] || []).push(f);
+    } else if (id.startsWith("UB-UNIFI-FW-")) {
+      fwFindings.push(f);
+    } else if (id.startsWith("UB-UNIFI-")) {
+      controllerFindings.push(f);
+    } else {
+      serviceFindings.push(f);
+      if (f.client?.ip) {
+        (findingsByIP[f.client.ip] = findingsByIP[f.client.ip] || []).push(f);
+      }
+    }
+  }
+
+  const wanByIP = {};
+  const wanReview = [];
+  const wanExpected = [];
+  for (const a of wanSurface) {
+    const ip = a.forward?.fwd_ip || a.client?.ip;
+    if (ip) (wanByIP[ip] = wanByIP[ip] || []).push(a);
+    if (sevRank(a.severity) >= 2) wanReview.push(a); else wanExpected.push(a);
+  }
+
+  const exactCVEsByIP = {};
+  for (const s of exactCVEs) {
+    const ip = s.product?.host_ip;
+    if (ip) (exactCVEsByIP[ip] = exactCVEsByIP[ip] || []).push(s);
+  }
+  const potCVEsByIP = {};
+  for (const s of potCVEs) {
+    const ip = s.product?.host_ip;
+    if (ip) (potCVEsByIP[ip] = potCVEsByIP[ip] || []).push(s);
+  }
+
+  // Group LAN service findings by host IP so hosts aren't repeated 4 times
+  const hostIssueMap = {};
+  for (const f of serviceFindings) {
+    const key = f.client?.ip || f.client?.mac || f.client?.name;
+    if (!hostIssueMap[key]) {
+      hostIssueMap[key] = {
+        ip: f.client?.ip || "",
+        mac: (f.client?.mac || "").toLowerCase(),
+        name: f.client?.name || f.client?.hostname || f.client?.ip,
+        vlan: f.client?.network_name || "-",
+        maxSev: f.effective_severity,
+        findings: []
+      };
+    }
+    hostIssueMap[key].findings.push(f);
+    if (sevRank(f.effective_severity) > sevRank(hostIssueMap[key].maxSev)) {
+      hostIssueMap[key].maxSev = f.effective_severity;
+    }
+  }
+  const hostIssues = Object.values(hostIssueMap).sort((a, b) =>
+    sevRank(b.maxSev) - sevRank(a.maxSev) || b.findings.length - a.findings.length || a.name.localeCompare(b.name)
+  );
+
+  // Separate Inside vs Outside hardware & cables crossing the physical perimeter
+  const insideSwitches = switches.filter(s => !s.external_device);
+  const outsideSwitches = switches.filter(s => s.external_device);
+  const wallCrossings = []; // { sw, port, targetLabel }
+  const exteriorDrops = []; // { sw, port, peer }
+  for (const sw of insideSwitches) {
+    for (const p of (sw.ports || [])) {
+      if (p.zone === "external_uplink") {
+        const target = (p.peers && p.peers.length) ? p.peers[0].name : (p.label || "External Switch");
+        wallCrossings.push({ sw, port: p, kind: "feeder", target });
+      } else if (p.zone === "external") {
+        const peer = (p.peers && p.peers.length) ? p.peers[0] : null;
+        wallCrossings.push({ sw, port: p, kind: "drop", target: peer ? peer.name : (p.label || p.name) });
+        exteriorDrops.push({ sw, port: p, peer });
+      }
+    }
+  }
+
+  // Unified activity feed (SSE live events + UniFi 24h security/admin logs)
+  const unifiedLogs = [];
+  const seenMsg = new Set();
+  for (const ev of (st.events || [])) {
+    unifiedLogs.push({
+      time: ev.time,
+      severity: ev.severity || "info",
+      type: ev.type || "event",
+      host: ev.host || "",
+      ip: ev.ip || "",
+      summary: ev.summary || "",
+      source: "live"
+    });
+    seenMsg.add(ev.summary);
+  }
+  for (const lg of (posture?.recent_logs || [])) {
+    if (seenMsg.has(lg.message)) continue;
+    let t = "controller_log";
+    if (lg.category === "ADMIN") t = "admin_activity";
+    else if ((lg.event || "").includes("HONEYPOT")) t = "honeypot_hit";
+    else if (lg.category === "SECURITY" || (lg.event || "").includes("THREAT")) t = "ids_threat";
+    unifiedLogs.push({
+      time: lg.timestamp,
+      severity: lg.severity || "info",
+      type: t,
+      host: lg.device || lg.admin || lg.src_ip || "",
+      ip: lg.src_ip || "",
+      summary: lg.message || lg.title || lg.event,
+      source: "unifi-24h"
+    });
+  }
+  unifiedLogs.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+
+  return {
+    switches, insideSwitches, outsideSwitches, swByMAC, swByName, portByKey,
+    totalPorts, activePorts, unusedOpenPorts, disabledPorts, extPorts, atRiskPorts,
+    wallCrossings, exteriorDrops,
+    clients, clientByIP, clientByMAC,
+    allFindings, portFindings, fwFindings, controllerFindings, serviceFindings,
+    findingsByIP, findingsByPortKey, hostIssues,
+    wanSurface, wanReview, wanExpected, wanByIP,
+    exactCVEs, potCVEs, exactCVEsByIP, potCVEsByIP,
+    posture, unifiedLogs
+  };
+}
+
+function getClientPortLink(cl) {
+  if (!idx || !cl) return null;
+  if (cl.is_wired && cl.switch_mac && cl.switch_port > 0) {
+    return idx.portByKey[cl.switch_mac.toLowerCase() + "|" + cl.switch_port] || null;
+  }
+  return null;
+}
+
+/* ============================================================================
+   DATA FETCH & SSE
+   ============================================================================ */
+async function fetchState() {
+  const r = await fetch("/api/state", {cache: "no-store"});
+  if (!r.ok) return;
+  state = await r.json();
+  idx = buildIndex(state);
+  renderHeader();
+  renderActiveView();
+  if (drawerState) renderDrawer();
+}
+
+async function triggerRescan(ip) {
+  const url = ip ? ("/api/rescan?ip=" + encodeURIComponent(ip)) : "/api/rescan";
+  await fetch(url, {method: "POST"});
+  setTimeout(fetchState, 650);
+}
+
+function renderHeader() {
+  document.getElementById("mode-lbl").textContent = (state.scanning ? "Scanning… · " : "LIVE · ") + (state.event_mode || "poll");
+  document.getElementById("site-pill").textContent = "Site: " + state.site;
+  document.getElementById("updated-pill").textContent = "Updated: " + fmtTime(state.updated_at);
+
+  const totalAlerts = idx.allFindings.length;
+  const ovBadge = document.getElementById("nb-overview");
+  ovBadge.textContent = totalAlerts;
+  ovBadge.className = "nav-badge" + (idx.allFindings.some(f => f.effective_severity === "critical") ? " crit" : totalAlerts ? " high" : "");
+
+  const physBadge = document.getElementById("nb-physical");
+  physBadge.textContent = idx.portFindings.length;
+  physBadge.className = "nav-badge" + (idx.portFindings.some(f => f.effective_severity === "critical") ? " crit" : idx.portFindings.length ? " high" : "");
+
+  const logBadge = document.getElementById("nb-logical");
+  logBadge.textContent = idx.hostIssues.length + "/" + idx.clients.length;
+  logBadge.className = "nav-badge" + (idx.hostIssues.some(h => h.maxSev === "critical") ? " crit" : idx.hostIssues.length ? " high" : "");
+
+  document.getElementById("nb-activity").textContent = idx.unifiedLogs.length;
+}
+
+function renderActiveView() {
+  if (!state || !idx) return;
+  if (activeView === "overview") renderOverview();
+  else if (activeView === "physical") renderPhysical();
+  else if (activeView === "logical") renderLogical();
+  else if (activeView === "activity") renderActivity();
+}
+
+/* ============================================================================
+   VIEW 1: OVERVIEW (COMMAND CENTER)
+   ============================================================================ */
+function maxSevOf(list) {
+  let max = "ok";
+  for (const item of list) {
+    const s = (item.effective_severity || item.severity || "ok").toLowerCase();
+    if (sevRank(s) > sevRank(max)) max = s;
+  }
+  return max;
+}
+
+function healthClass(sev) {
+  if (sev === "critical") return "st-crit";
+  if (sev === "high") return "st-high";
+  if (sev === "medium") return "st-med";
+  return "";
+}
+
+function renderOverview() {
+  const physSev = maxSevOf(idx.portFindings);
+  const wanSev = maxSevOf([...idx.fwFindings, ...idx.wanReview]);
+  const lanSev = maxSevOf([...idx.serviceFindings, ...idx.exactCVEs.map(c => ({severity: c.max_severity}))]);
+  const ctrlSev = maxSevOf(idx.controllerFindings);
+
+  let html = `
+  <div class="health-strip">
+    <div class="hcard ${healthClass(physSev)}" onclick="switchView('physical')">
+      <div class="hcard-top"><span class="hcard-title">Physical Perimeter</span>${sevBadge(physSev === "ok" ? "clean" : physSev, physSev === "ok" ? "Secured" : idx.portFindings.length + " alert(s)")}</div>
+      <div class="hcard-val">${idx.extPorts} External Port${idx.extPorts === 1 ? "" : "s"}</div>
+      <div class="hcard-sub">${idx.outsideSwitches.length} outside switch · ${idx.activePorts}/${idx.totalPorts} ports active</div>
+    </div>
+    <div class="hcard ${healthClass(wanSev)}" onclick="switchView('logical'); setLogicalFilter('wan')">
+      <div class="hcard-top"><span class="hcard-title">Internet / WAN Edge</span>${sevBadge(wanSev === "ok" ? "clean" : wanSev, wanSev === "ok" ? "Clean" : (idx.fwFindings.length + idx.wanReview.length) + " to review")}</div>
+      <div class="hcard-val">${idx.fwFindings.length} FW · ${idx.wanSurface.length} Forward${idx.wanSurface.length === 1 ? "" : "s"}</div>
+      <div class="hcard-sub">${idx.wanReview.length} web/review · ${idx.wanExpected.length} expected P2P</div>
+    </div>
+    <div class="hcard ${healthClass(lanSev)}" onclick="switchView('logical'); setLogicalFilter('risk')">
+      <div class="hcard-top"><span class="hcard-title">LAN Services &amp; CVEs</span>${sevBadge(lanSev === "ok" ? "clean" : lanSev, idx.hostIssues.length ? idx.hostIssues.length + " host(s)" : "All Clean")}</div>
+      <div class="hcard-val">${state.report?.clean_clients || 0}/${state.report?.client_count || 0} Clean</div>
+      <div class="hcard-sub">${idx.serviceFindings.length} service exposure(s) · ${idx.exactCVEs.length} exact CVE rollup(s)</div>
+    </div>
+    <div class="hcard ${healthClass(ctrlSev)}" onclick="document.getElementById('ctrl-card')?.scrollIntoView({behavior:'smooth'})">
+      <div class="hcard-top"><span class="hcard-title">Controller &amp; Airspace</span>${sevBadge(ctrlSev === "ok" ? "clean" : ctrlSev, idx.controllerFindings.length ? idx.controllerFindings.length + " issue(s)" : "Hardened")}</div>
+      <div class="hcard-val">${state.report?.clean_unifi_devices || 0}/${state.report?.unifi_device_count || 0} Gear Current</div>
+      <div class="hcard-sub">${idx.posture?.settings?.ips_mode ? "IDS: " + esc(idx.posture.settings.ips_mode.toUpperCase()) : "UniFi OS"} · ${idx.posture?.evil_twin_count ? idx.posture.evil_twin_count + " Evil-Twin!" : (idx.posture?.neighbor_aps || 0) + " neighbor APs"}</div>
+    </div>
+  </div>
+
+  <div class="overview-grid">
+    <div>`;
+
+  // --- Action Group 1: Physical Perimeter ---
+  if (idx.portFindings.length) {
+    const critN = idx.portFindings.filter(f => f.effective_severity === "critical").length;
+    html += `<div class="action-group ${critN ? "grp-crit" : "grp-high"}">
+      <div class="ag-head">
+        <div>
+          <div class="ag-title">${sevBadge(critN ? "critical" : "high")} Physical Perimeter &amp; Exterior Cables (${idx.portFindings.length})</div>
+          <div class="ag-desc">Cables leaving the secured building or unused ports on outdoor switches lack VLAN/MAC restrictions.</div>
+        </div>
+        <button class="btn sm" onclick="switchView('physical')">Open Physical Map →</button>
+      </div>`;
+    for (const f of idx.portFindings) {
+      const mac = (f.client?.mac || "").toLowerCase();
+      const hasPort = idx.portByKey[mac + "|" + f.port];
+      const onclick = hasPort ? `inspectPort('${esc(mac)}', ${f.port})` : `inspectDevice('${esc(mac)}')`;
+      html += `<div class="ag-row" onclick="${onclick}">
+        <div class="ag-row-main">
+          <div>${sevBadge(f.effective_severity)} <strong>${esc(f.title)}</strong></div>
+          <div class="subtext" style="margin-top:2px">${esc(f.evidence)}</div>
+        </div>
+        <div class="ag-row-pills"><span class="chip ${f.effective_severity === "critical" ? "crit" : "high"}">Inspect Port →</span></div>
       </div>`;
     }
-
-    html += `</div><table><thead><tr>
-      <th>Port</th><th>State</th><th>Zone</th><th>Native VLAN</th><th>Tagged VLANs</th><th>MAC Lock / Count</th><th>PoE</th><th>Connected Peer(s)</th><th>Security Status</th>
-    </tr></thead><tbody>`;
-
-    for (const p of (sw.ports || [])) {
-      const stateTxt = p.state === "active"
-        ? `UP (${fmtSpeed(p.speed)})`
-        : (p.state === "disabled" ? "DISABLED" : "INACTIVE (open)");
-      const zoneLabel = p.zone === "external_uplink" ? "EXT UPLINK" : p.zone;
-      const peersHtml = (p.peers || []).length
-        ? p.peers.map(x => `<div><strong>${esc(x.name)}</strong>${x.ip ? ' <span class="mono">(' + esc(x.ip) + ')</span>' : ''}</div>`).join("")
-        : (p.label ? `<span class="proof">${esc(p.label)}</span>` : '<span class="proof">-</span>');
-      const poeTxt = p.poe_enabled ? (p.poe_power ? p.poe_power + "W" : "ON") : "-";
-      const macCnt = p.mac_table_count ? ` <span class="proof mono">(${p.mac_table_count} MAC${p.mac_table_count > 1 ? 's' : ''})</span>` : '';
-      const macLock = (p.port_security ? '<span class="sev sev-clean">ON</span>' : '<span class="proof">off</span>') + macCnt;
-      const stpBadge = (p.stp_state === "discarding" || p.stp_state === "blocking") ? ' <span class="sev sev-high">STP ' + esc(p.stp_state) + '</span>' : '';
-      const statusBadge = p.status === "critical"
-        ? sevBadge("critical")
-        : (p.status === "warn" ? sevBadge("high") : sevBadge("clean"));
-      const issuesHtml = (p.issues || []).length
-        ? '<div class="proof">' + p.issues.map(esc).join("; ") + '</div>'
-        : '';
-
-      html += `<tr>
-        <td class="mono"><strong>#${p.port_idx}</strong> <span class="proof">${esc(p.name)}</span></td>
-        <td class="mono">${esc(stateTxt)}${stpBadge}</td>
-        <td><span class="zone-pill zone-${esc(p.zone)}">${esc(zoneLabel)}</span></td>
-        <td>${esc(p.native_vlan || "-")}</td>
-        <td class="mono">${esc(p.tagged_policy)}</td>
-        <td>${macLock}</td>
-        <td class="mono">${esc(poeTxt)}</td>
-        <td>${peersHtml}</td>
-        <td>${statusBadge}${issuesHtml}</td>
-      </tr>`;
-    }
-    html += '</tbody></table></div>';
+    html += `</div>`;
   }
+
+  // --- Action Group 2: WAN & Firewall ---
+  if (idx.fwFindings.length || idx.wanReview.length) {
+    const topSev = maxSevOf([...idx.fwFindings, ...idx.wanReview]);
+    html += `<div class="action-group ${topSev === "critical" ? "grp-crit" : "grp-high"}">
+      <div class="ag-head">
+        <div>
+          <div class="ag-title">${sevBadge(topSev)} Internet / WAN &amp; Firewall Edge (${idx.fwFindings.length + idx.wanReview.length})</div>
+          <div class="ag-desc">Rules allowing inbound public internet traffic into your gateway or internal hosts.</div>
+        </div>
+        <button class="btn sm" onclick="switchView('logical'); setLogicalFilter('wan')">View WAN Surface →</button>
+      </div>`;
+    for (const f of idx.fwFindings) {
+      html += `<div class="ag-row" onclick="inspectFinding('${esc(f.check_id)}','${esc(f.client?.ip || "")}',${f.port || 0})">
+        <div class="ag-row-main">
+          <div>${sevBadge(f.effective_severity)} <strong>${esc(f.title)}</strong></div>
+          <div class="subtext" style="margin-top:2px">${esc(f.evidence)}</div>
+        </div>
+        <div class="ag-row-pills"><span class="chip crit">Inspect Rule →</span></div>
+      </div>`;
+    }
+    for (const a of idx.wanReview) {
+      const ip = a.forward?.fwd_ip || a.client?.ip || "";
+      html += `<div class="ag-row" onclick="inspectClient('${esc(ip)}','${esc(a.client?.mac || "")}')">
+        <div class="ag-row-main">
+          <div>${sevBadge(a.severity)} <strong>${esc(a.forward?.name)}</strong> <span class="mono subtext">${esc(a.forward?.proto)}:${esc(a.forward?.dst_port)} → ${esc(ip)}:${esc(a.forward?.fwd_port)}</span></div>
+          <div class="subtext" style="margin-top:2px">${esc(a.rule_name)} · Host: ${esc(a.client?.name || a.client?.hostname || a.client?.mac || ip)}</div>
+        </div>
+        <div class="ag-row-pills"><span class="chip high">Inspect Host →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // --- Action Group 3: Vulnerable LAN Services (Grouped by Host!) ---
+  if (idx.hostIssues.length || idx.exactCVEs.length) {
+    html += `<div class="action-group ${lanSev === "critical" ? "grp-crit" : lanSev === "high" ? "grp-high" : "grp-med"}">
+      <div class="ag-head">
+        <div>
+          <div class="ag-title">${sevBadge(lanSev)} Vulnerable LAN Services (${idx.hostIssues.length} Host${idx.hostIssues.length === 1 ? "" : "s"})</div>
+          <div class="ag-desc">Confirmed unauthenticated APIs, legacy protocols, or weak TLS — grouped per host with switch port cross-links.</div>
+        </div>
+        <button class="btn sm" onclick="switchView('logical'); setLogicalFilter('risk')">Explore VLANs →</button>
+      </div>`;
+    for (const h of idx.hostIssues) {
+      const cv = idx.clientByIP[h.ip] || idx.clientByMAC[h.mac];
+      const portLink = cv ? getClientPortLink(cv.client) : null;
+      const attachTxt = portLink
+        ? `${portLink.sw.name} #${portLink.port.port_idx}`
+        : (cv?.client?.essid ? `Wi-Fi: ${cv.client.essid}` : (cv?.client?.is_wired ? "Wired" : ""));
+      const pills = h.findings.map(f => {
+        const cls = f.effective_severity === "critical" ? "crit" : f.effective_severity === "high" ? "high" : "";
+        const shortLabel = shortFindingLabel(f);
+        return `<span class="chip ${cls}">${esc(shortLabel)}</span>`;
+      }).join("");
+      html += `<div class="ag-row" onclick="inspectClient('${esc(h.ip)}','${esc(h.mac)}')">
+        <div class="ag-row-main">
+          <div><span class="status-orb ${esc(h.maxSev)}" style="display:inline-block;margin-right:7px"></span><strong>${esc(h.name)}</strong> <span class="mono subtext">${esc(h.ip)}</span></div>
+          <div class="subtext" style="margin-top:2px">VLAN: <strong>${esc(h.vlan)}</strong>${attachTxt ? " · Plugged into: <strong>" + esc(attachTxt) + "</strong>" : ""}</div>
+        </div>
+        <div class="ag-row-pills">${pills}</div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // --- Action Group 4: Controller, Wi-Fi & Posture ---
+  if (idx.controllerFindings.length) {
+    html += `<div class="action-group ${ctrlSev === "critical" ? "grp-crit" : "grp-high"}">
+      <div class="ag-head">
+        <div>
+          <div class="ag-title">${sevBadge(ctrlSev)} Controller &amp; Wi-Fi Hardening (${idx.controllerFindings.length})</div>
+          <div class="ag-desc">Site-wide UniFi configuration and wireless airspace findings.</div>
+        </div>
+      </div>`;
+    for (const f of idx.controllerFindings) {
+      html += `<div class="ag-row" onclick="inspectFinding('${esc(f.check_id)}','${esc(f.client?.ip || "")}',${f.port || 0})">
+        <div class="ag-row-main">
+          <div>${sevBadge(f.effective_severity)} <strong>${esc(f.title)}</strong></div>
+          <div class="subtext" style="margin-top:2px">${esc(f.evidence)}</div>
+        </div>
+        <div class="ag-row-pills"><span class="chip high">Fix Details →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  if (!idx.allFindings.length && !idx.wanReview.length) {
+    html += `<div class="action-group grp-ok"><div class="ag-head"><div class="ag-title">${sevBadge("clean")} All Clear — Zero Confirmed Exposures</div></div></div>`;
+  }
+
+  // Posture Notes (cleanly collapsible/secondary)
+  const notes = state.report?.posture_notes || [];
+  if (notes.length) {
+    html += `<div class="card"><div class="card-hd"><span>Architectural &amp; Hardening Notes (${notes.length})</span><span class="subtext">Informational observations</span></div>`;
+    for (const n of notes) {
+      html += `<div class="ev-row">${sevBadge(n.severity)}<div><strong>${esc(n.title)}</strong><div class="subtext">${esc(n.detail)}</div></div></div>`;
+    }
+    html += `</div>`;
+  }
+
+  html += `</div>`; // end left col
+
+  // --- Right Sidebar ---
+  html += `<div>`;
+
+  // Mini Inside vs Outside Perimeter Card
+  html += `<div class="card">
+    <div class="card-hd"><span>Inside vs Outside Perimeter</span><button class="btn sm" onclick="switchView('physical')">Map →</button></div>
+    <div class="card-body">
+      <div class="kv-grid">
+        <div class="kv"><div class="k">Inside Gear</div><div class="v">${idx.insideSwitches.length} switches/APs</div></div>
+        <div class="kv"><div class="k">Outside Gear</div><div class="v" style="color:${idx.outsideSwitches.length ? "var(--crit)" : "var(--ok)"}">${idx.outsideSwitches.length} external</div></div>
+        <div class="kv"><div class="k">Wall Crossings</div><div class="v">${idx.wallCrossings.length} cable(s)</div></div>
+        <div class="kv"><div class="k">At-Risk Ports</div><div class="v" style="color:${idx.atRiskPorts ? "var(--crit)" : "var(--ok)"}">${idx.atRiskPorts} of ${idx.totalPorts}</div></div>
+      </div>
+      ${idx.wallCrossings.length ? `<div style="margin-top:12px">
+        <div class="drawer-sec-title">Cables Crossing Perimeter</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          ${idx.wallCrossings.map(w => `<span class="chip ${w.port.status === "critical" ? "crit" : w.port.status === "warn" ? "high" : "ok"}" onclick="inspectPort('${esc(w.sw.mac)}',${w.port.port_idx})">${esc(w.sw.name)} #${w.port.port_idx} → ${esc(w.target)}</span>`).join("")}
+        </div>
+      </div>` : ""}
+    </div>
+  </div>`;
+
+  // Gateway & Airspace Controls Card
+  if (idx.posture && (idx.posture.settings || idx.posture.health)) {
+    const s = idx.posture.settings || {};
+    const h = idx.posture.health || {};
+    html += `<div id="ctrl-card" class="card">
+      <div class="card-hd"><span>Gateway &amp; Airspace Controls</span></div>
+      <div class="ctrl-list">
+        <div class="ctrl-item"><div class="ctrl-lbl">Device SSH</div><div class="ctrl-val">${s.ssh_enabled ? (s.ssh_password_auth ? sevBadge("high","Password") : sevBadge("low","Key-only")) : sevBadge("clean","Off")}</div></div>
+        <div class="ctrl-item"><div class="ctrl-lbl">Gateway UPnP</div><div class="ctrl-val">${s.upnp_enabled ? sevBadge("high","Enabled") : sevBadge("clean","Disabled")}</div></div>
+        <div class="ctrl-item"><div class="ctrl-lbl">IDS / IPS</div><div class="ctrl-val">${(s.ips_mode === "ips" || s.ips_mode === "ids") ? sevBadge("clean", s.ips_mode.toUpperCase()) : sevBadge("medium","Off")}</div></div>
+        <div class="ctrl-item"><div class="ctrl-lbl">LAN Honeypot</div><div class="ctrl-val">${s.honeypot_enabled ? sevBadge("clean", (s.honeypot_ips || []).length + " VLANs") : sevBadge("low","Off")}</div></div>
+        <div class="ctrl-item"><div class="ctrl-lbl">DNS Shield</div><div class="ctrl-val">${(s.doh_state && s.doh_state !== "off") ? sevBadge("clean", s.doh_state) : sevBadge("info","Off")}</div></div>
+        <div class="ctrl-item"><div class="ctrl-lbl">Wi-Fi Airspace</div><div class="ctrl-val">${idx.posture.evil_twin_count ? sevBadge("critical", idx.posture.evil_twin_count + " Evil-Twin") : sevBadge("clean", (idx.posture.neighbor_aps || 0) + " neighbors")}</div></div>
+        <div class="ctrl-item"><div class="ctrl-lbl">WAN Status</div><div class="ctrl-val mono">${h.wan_status ? sevBadge(h.wan_status === "ok" ? "clean" : "high", h.wan_status) : "-"}</div></div>
+        <div class="ctrl-item"><div class="ctrl-lbl">Remote VPN</div><div class="ctrl-val">${(h.active_vpn_users || 0) > 0 ? sevBadge("medium", h.active_vpn_users + " active") : sevBadge("clean","0 active")}</div></div>
+      </div>
+    </div>`;
+  }
+
+  // Mini Recent Activity
+  html += `<div class="card">
+    <div class="card-hd"><span>Recent Activity &amp; Threats</span><button class="btn sm" onclick="switchView('activity')">All (${idx.unifiedLogs.length}) →</button></div>`;
+  const recent = idx.unifiedLogs.slice(0, 6);
+  if (!recent.length) {
+    html += `<div class="empty">No events yet.</div>`;
+  } else {
+    for (const ev of recent) {
+      html += `<div class="ev-row"><span class="ev-time mono">${fmtTime(ev.time)}</span>${sevBadge(ev.severity)}<div class="subtext" style="color:var(--text)">${esc(ev.summary)}</div></div>`;
+    }
+  }
+  html += `</div>`;
+
+  html += `</div></div>`; // end right col + grid
+  document.getElementById("view-overview").innerHTML = html;
+}
+
+function shortFindingLabel(f) {
+  const id = f.check_id || "";
+  if (id === "UB-0005") return "VNC :" + f.port;
+  if (id === "UB-0020") return "TLS 1.0/1.1 :" + f.port;
+  if (id === "UB-0021") return "SNMP public";
+  if (id === "UB-2026-0001") return "Zehnder :" + f.port;
+  if (id === "UB-2026-0002") return "Telnet AVR :23";
+  if (id === "UB-2026-0026") return "Cast API :8008";
+  if (id.includes("SMB-V1")) return "SMBv1 :445";
+  if (id.includes("SMB-SIGNING")) return "SMB Unsigned";
+  if (id.includes("TLS-CERTIFICATE-EXPIRED")) return "Expired Cert";
+  return (f.title || id).slice(0, 26) + (f.port ? " :" + f.port : "");
+}
+
+/* ============================================================================
+   VIEW 2: PHYSICAL & PERIMETER MAP
+   ============================================================================ */
+function setPortDisplayMode(mode) {
+  portDisplayMode = mode;
+  renderPhysical();
+}
+
+function toggleClassicSVG() {
+  showClassicSVG = !showClassicSVG;
+  renderPhysical();
+}
+
+function renderPhysical() {
+  const el = document.getElementById("view-physical");
+  if (!idx.switches.length) {
+    el.innerHTML = `<div class="card"><div class="empty">No physical switch port telemetry reported by UniFi.</div></div>`;
+    return;
+  }
+
+  let html = `
+  <div class="toolbar-bar">
+    <div class="legend">
+      <span class="leg-item"><span class="leg-swatch crit"></span>Critical (Unrestricted External / Trunk)</span>
+      <span class="leg-item"><span class="leg-swatch warn"></span>Warn (Open External / Trunk Access)</span>
+      <span class="leg-item"><span class="leg-swatch ok"></span>Secured OK</span>
+      <span class="leg-item"><span class="leg-swatch up"></span>Uplink / WAN</span>
+      <span class="leg-item"><span class="leg-swatch open"></span>Unused Indoor (Open)</span>
+      <span class="leg-item"><span class="leg-swatch off"></span>Disabled</span>
+      <span class="leg-item">⚡ PoE</span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="seg-ctrl">
+        <button class="seg-btn ${portDisplayMode === "active_or_risk" ? "active" : ""}" onclick="setPortDisplayMode('active_or_risk')">Active &amp; Risk Only</button>
+        <button class="seg-btn ${portDisplayMode === "all" ? "active" : ""}" onclick="setPortDisplayMode('all')">All ${idx.totalPorts} Ports</button>
+      </div>
+      <button class="btn sm" onclick="toggleClassicSVG()">${showClassicSVG ? "Hide" : "Show"} Full SVG Diagram</button>
+    </div>
+  </div>`;
+
+  if (showClassicSVG) {
+    html += `<div class="card">
+      <div class="card-hd">
+        <span>Full Logical + Physical Topology SVG</span>
+        <a class="btn sm" href="/api/topology.svg" download="uniblue-topology.svg">Download SVG</a>
+      </div>
+      <div class="topo-svg-wrap"><img src="/api/topology.svg?t=${Date.now()}" alt="UniBlue Topology"></div>
+    </div>`;
+  }
+
+  // Layer 0: INTERNET / WAN EDGE
+  const wanH = idx.posture?.health;
+  const wanCrit = idx.fwFindings.length > 0;
+  html += `<div class="wan-banner ${wanCrit ? "has-crit" : ""}">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span class="sev sev-blue">INTERNET / WAN</span>
+      ${wanH?.wan_ip ? `<span class="mono"><strong>${esc(wanH.wan_ip)}</strong></span>` : ""}
+      ${wanH?.wan_status ? sevBadge(wanH.wan_status === "ok" ? "clean" : "high", "WAN " + wanH.wan_status) : ""}
+      ${idx.fwFindings.map(f => `<span class="chip crit" onclick="inspectFinding('${esc(f.check_id)}','${esc(f.client?.ip || "")}',0)">⚠ ${esc(f.title)}</span>`).join("")}
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      ${idx.wanReview.map(a => `<span class="chip high" onclick="inspectClient('${esc(a.forward?.fwd_ip || "")}','${esc(a.client?.mac || "")}')">WAN:${esc(a.forward?.dst_port)} → ${esc(a.forward?.fwd_ip)}</span>`).join("")}
+      ${idx.wanExpected.length ? `<span class="pill">${idx.wanExpected.length} expected P2P forward(s)</span>` : ""}
+    </div>
+  </div>`;
+
+  // Layer 1: INSIDE — SECURED BUILDING PERIMETER
+  // Organize indoor gear into logical tiers: Root Gateways -> Core Switches -> Edge Switches / In-Wall APs
+  const roots = [];
+  const coreSwitches = [];
+  const edgeIndoor = [];
+  for (const sw of idx.insideSwitches) {
+    const t = (sw.type || "").toLowerCase();
+    const m = (sw.model || "").toLowerCase();
+    if (!sw.uplink_name || t === "udm" || t === "ugw" || t === "uxg" || m.includes("udm")) {
+      roots.push(sw);
+    } else if (t === "uap" || m.includes("iw") || m.includes("ap")) {
+      edgeIndoor.push(sw);
+    } else {
+      coreSwitches.push(sw);
+    }
+  }
+
+  html += `<div class="zone-box zone-inside">
+    <div class="zone-hdr">
+      <span class="zone-tag in">🏠 INSIDE · SECURED BUILDING PERIMETER</span>
+      <span class="subtext">Click any port tile to inspect VLAN tagging, PoE draw, connected host, and remediation</span>
+    </div>
+    <div class="topo-tier">`;
+
+  if (roots.length) {
+    html += `<div class="tier-row ${roots.length === 1 ? "single" : ""}">${roots.map(renderSwitchNode).join("")}</div>`;
+  }
+  if (coreSwitches.length) {
+    if (roots.length) html += `<div class="tier-connector"></div>`;
+    html += `<div class="tier-row ${coreSwitches.length === 1 ? "single" : ""}">${coreSwitches.map(renderSwitchNode).join("")}</div>`;
+  }
+  if (edgeIndoor.length) {
+    if (roots.length || coreSwitches.length) html += `<div class="tier-connector"></div>`;
+    html += `<div class="tier-row">${edgeIndoor.map(renderSwitchNode).join("")}</div>`;
+  }
+  html += `</div></div>`;
+
+  // Layer 2: PERIMETER BOUNDARY WALL (CABLES EXITING THE BUILDING)
+  if (idx.wallCrossings.length || idx.outsideSwitches.length) {
+    html += `<div class="wall-divider">
+      <div class="wall-label">▼ PHYSICAL BUILDING PERIMETER WALL · ${idx.wallCrossings.length} CABLE(S) EXITING SECURED ZONE ▼</div>
+      <div class="wall-cables">
+        ${idx.wallCrossings.map(w => {
+          const cls = w.port.status === "critical" ? "crit" : w.port.status === "warn" ? "high" : "ok";
+          const tag = w.kind === "feeder" ? "FEEDER TRUNK" : "EXTERIOR DROP";
+          return `<span class="chip ${cls}" onclick="inspectPort('${esc(w.sw.mac)}',${w.port.port_idx})">${esc(w.sw.name)} <strong>#${w.port.port_idx}</strong> ──[${tag}]──▶ <strong>${esc(w.target)}</strong></span>`;
+        }).join("")}
+      </div>
+    </div>`;
+
+    // Layer 3: OUTSIDE — EXPOSED PHYSICAL PERIMETER
+    html += `<div class="zone-box zone-outside">
+      <div class="zone-hdr">
+        <span class="zone-tag out">⚠️ OUTSIDE · EXPOSED PHYSICAL PERIMETER</span>
+        <span class="subtext">Equipment &amp; cables physically reachable outside your server room / house</span>
+      </div>`;
+
+    if (idx.outsideSwitches.length) {
+      html += `<div class="tier-row ${idx.outsideSwitches.length === 1 ? "single" : ""}">${idx.outsideSwitches.map(renderSwitchNode).join("")}</div>`;
+    }
+
+    if (idx.exteriorDrops.length) {
+      html += `<div class="drawer-sec-title" style="margin-top:14px">Direct Exterior PoE / Wall Drops (${idx.exteriorDrops.length})</div>
+      <div class="ext-peers">`;
+      for (const d of idx.exteriorDrops) {
+        const isOk = d.port.status === "ok";
+        const peerName = d.peer ? d.peer.name : (d.port.label || "Unidentified device");
+        const peerIP = d.peer?.ip || "";
+        html += `<div class="ext-peer-card ${isOk ? "ok" : ""}" onclick="inspectPort('${esc(d.sw.mac)}',${d.port.port_idx})">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+            <strong>${esc(peerName)}</strong>
+            ${sevBadge(d.port.status === "critical" ? "critical" : d.port.status === "warn" ? "high" : "clean")}
+          </div>
+          <div class="subtext mono">${peerIP ? esc(peerIP) + " · " : ""}${esc(d.sw.name)} #${d.port.port_idx}${d.port.poe_power ? " · ⚡" + esc(d.port.poe_power) + "W" : ""}</div>
+          <div class="subtext">VLAN: <strong>${esc(d.port.native_vlan || "-")}</strong> · Tagged: <span class="mono">${esc(d.port.tagged_policy)}</span> · MAC Lock: <strong>${d.port.port_security ? "ON" : "off"}</strong></div>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+
   el.innerHTML = html;
 }
 
-function renderTopology() {
-  const el = document.getElementById("panel-topology");
-  if (!el.querySelector("#topo-svg-img")) {
-    el.innerHTML = `
-      <div class="card">
-        <div class="card-hd">
-          <span>Live Network Topology &amp; Device Placement</span>
-          <div>
-            <button class="btn sm" onclick="refreshTopologyImg()">Refresh SVG</button>
-            <a class="btn sm" href="/api/topology.svg" download="uniblue-topology.svg">Download SVG</a>
-          </div>
-        </div>
-        <div class="topo-wrap"><img id="topo-svg-img" src="/api/topology.svg?t=${Date.now()}" alt="Live Network Topology"></div>
-      </div>`;
-    lastTopoUpdatedAt = state.updated_at || "";
-    return;
-  }
-  if (state.updated_at && state.updated_at !== lastTopoUpdatedAt) {
-    lastTopoUpdatedAt = state.updated_at;
-    if (activeTab === "topology") refreshTopologyImg();
-  }
-}
+function renderSwitchNode(sw) {
+  const mac = (sw.mac || "").toLowerCase();
+  const uplinkTxt = sw.uplink_name
+    ? `↑ ${sw.uplink_name}${sw.uplink_port ? " #" + sw.uplink_port : ""}`
+    : "Root Gateway";
+  const allPorts = sw.ports || [];
+  const visiblePorts = portDisplayMode === "all"
+    ? allPorts
+    : allPorts.filter(p => p.up || p.status === "critical" || p.status === "warn" || p.zone === "external" || p.zone === "external_uplink");
+  const hiddenCount = allPorts.length - visiblePorts.length;
 
-function renderClients() {
-  const el = document.getElementById("panel-clients");
-  if (!el.querySelector("#clients-tbody")) {
-    el.innerHTML = `<div class="card">
-      <div class="toolbar">
-        <input id="client-search" class="search" type="search" placeholder="Filter by host, IP, VLAN, category, vendor…">
-        <span id="clients-count" class="proof"></span>
-      </div>
-      <table><thead><tr><th>Status</th><th>Client</th><th>IP</th><th>VLAN</th><th>Category &amp; Role</th><th>Vendor</th><th>Open Ports</th><th></th></tr></thead><tbody id="clients-tbody"></tbody></table>
+  const riskPorts = allPorts.filter(p => p.status === "critical" || p.status === "warn");
+
+  let tiles = visiblePorts.map(p => {
+    const sel = isSelectedPort(mac, p.port_idx) ? " selected" : "";
+    const peersTxt = (p.peers || []).map(x => x.name).join(", ") || (p.label || (p.up ? "active" : p.state));
+    const tip = `#${p.port_idx} (${p.name}) · Zone: ${p.zone} · VLAN: ${p.native_vlan || "-"} (${p.tagged_policy}) · Peer: ${peersTxt}` + (p.issues?.length ? " · " + p.issues.join("; ") : "");
+    const meta = p.up ? (p.poe_enabled && p.poe_power ? "⚡" + p.poe_power + "W" : fmtSpeed(p.speed)) : (p.enabled ? "open" : "off");
+    const corner = p.zone === "external_uplink" ? "↗" : (p.zone === "external" ? "!" : (p.zone === "wan" ? "W" : ""));
+    return `<div class="ptile ${portTileClass(p)}${sel}" title="${esc(tip)}" onclick="event.stopPropagation(); inspectPort('${esc(mac)}', ${p.port_idx})">
+      ${corner ? `<span class="pdot">${corner}</span>` : ""}
+      <div class="pnum">#${p.port_idx}</div>
+      <div class="pmeta">${esc(meta)}</div>
     </div>`;
-    el.querySelector("#client-search").addEventListener("input", e => {
-      clientFilter = e.target.value;
-      renderClients();
-    });
+  }).join("");
+
+  if (hiddenCount > 0) {
+    tiles += `<div class="ptile st-inactive-ok" title="Click to show all ${allPorts.length} ports" onclick="event.stopPropagation(); setPortDisplayMode('all')">
+      <div class="pnum">+${hiddenCount}</div>
+      <div class="pmeta">unused</div>
+    </div>`;
   }
-  const clients = (state.clients || []).filter(c => {
-    if (!clientFilter) return true;
-    const hay = [c.client.name, c.client.hostname, c.client.ip, c.client.mac, c.client.network_name, c.class?.category, c.class?.role, c.class?.vendor].join(" ").toLowerCase();
-    return hay.includes(clientFilter.toLowerCase());
-  });
-  document.getElementById("clients-count").textContent = clients.length + " of " + (state.clients || []).length + " clients";
-  let rows = "";
-  for (const c of clients) {
-    const ports = (c.open_ports || []).join(", ") || "-";
-    rows += `<tr>
-      <td>${sevBadge(c.max_severity)}</td>
-      <td><strong>${esc(c.client.name || c.client.hostname || c.client.mac)}</strong><div class="proof mono">${esc(c.client.mac)}</div></td>
-      <td class="mono">${esc(c.client.ip)}</td>
-      <td>${esc(c.client.network_name || "-")}</td>
-      <td><strong>${esc(c.class?.category || "unknown")}</strong><div class="proof">${esc(c.class?.role || "")}</div></td>
-      <td>${esc(c.class?.vendor || "-")}</td>
-      <td class="mono">${esc(ports)}</td>
-      <td>${c.client.ip ? '<button class="btn sm" onclick="triggerRescan(\'' + esc(c.client.ip) + '\')">Rescan</button>' : ''}</td>
-    </tr>`;
-  }
-  document.getElementById("clients-tbody").innerHTML = rows || '<tr><td colspan="8" class="empty">No matching clients.</td></tr>';
+
+  return `<div class="hw-card ${sw.external_device ? "hw-ext" : ""}">
+    <div class="hw-head" onclick="inspectDevice('${esc(mac)}')">
+      <div>
+        <div class="hw-name">
+          <span>${esc(sw.name)}</span>
+          ${sw.external_device ? sevBadge("critical", "EXTERNAL (" + (sw.zone_source || "auto") + ")") : ""}
+          ${sw.at_risk_ports ? sevBadge(riskPorts.some(p => p.status === "critical") ? "critical" : "high", sw.at_risk_ports + " at risk") : sevBadge("clean", "Clean")}
+        </div>
+        <div class="hw-meta">${esc(sw.model)} · <span class="mono">${esc(sw.ip)}</span> · ${esc(uplinkTxt)}</div>
+      </div>
+      <div class="subtext">${sw.active_ports} up · ${sw.inactive_enabled_ports} open · ${sw.disabled_ports} off</div>
+    </div>
+    <div class="frontplate">${tiles || '<span class="subtext">No ports</span>'}</div>
+    ${riskPorts.length ? `<div class="hw-callouts">
+      <span class="subtext" style="font-weight:700">Needs attention:</span>
+      ${riskPorts.slice(0, 8).map(p => {
+        const cls = p.status === "critical" ? "crit" : "high";
+        const peer = (p.peers && p.peers.length) ? " " + p.peers[0].name.split(" ")[0] : (p.state === "inactive_enabled" ? " unused-open" : "");
+        return `<span class="chip ${cls}" onclick="inspectPort('${esc(mac)}',${p.port_idx})">#${p.port_idx}${esc(peer)}</span>`;
+      }).join("")}
+      ${riskPorts.length > 8 ? `<span class="subtext">+${riskPorts.length - 8} more</span>` : ""}
+    </div>` : ""}
+  </div>`;
 }
 
-function renderEvents() {
-  const evs = state.events || [];
-  let html = '<div class="card"><div class="card-hd"><span>Live Event Stream (' + evs.length + ')</span></div>';
-  if (!evs.length) {
-    html += '<div class="empty">Waiting for network events…</div>';
-  } else {
-    for (const ev of evs) {
-      html += `<div class="ev-item"><span class="ev-time mono">${fmtTime(ev.time)}</span>${sevBadge(ev.severity)}<span class="mono">${esc(ev.type)}</span><span>${esc(ev.summary)}</span></div>`;
+/* ============================================================================
+   VIEW 3: VLANS & SERVICES (LOGICAL VIEW)
+   ============================================================================ */
+function setLogicalFilter(f) {
+  logicalFilter = f;
+  renderLogical();
+}
+
+function renderLogical() {
+  const el = document.getElementById("view-logical");
+  const vlans = state.topology?.vlans || [];
+
+  // Build lookup of clients per VLAN name
+  const clientsByVLAN = {};
+  for (const cv of idx.clients) {
+    const vn = cv.client?.network_name || "Unassigned";
+    (clientsByVLAN[vn] = clientsByVLAN[vn] || []).push(cv);
+  }
+
+  // Ensure every VLAN in topology plus any unassigned group is represented
+  const vlanGroups = vlans.map(v => ({
+    name: v.name,
+    vlan: v.vlan,
+    subnet: v.subnet,
+    zone: v.zone_name || v.tier || "-",
+    isolated: v.isolated || v.tier === "isolated",
+    clients: clientsByVLAN[v.name] || []
+  }));
+  const knownNames = new Set(vlanGroups.map(v => v.name));
+  for (const [vn, list] of Object.entries(clientsByVLAN)) {
+    if (!knownNames.has(vn)) {
+      vlanGroups.push({ name: vn, vlan: "", subnet: "", zone: "-", isolated: false, clients: list });
     }
   }
-  html += '</div>';
-  document.getElementById("panel-events").innerHTML = html;
+
+  const filterHost = (cv) => {
+    const cl = cv.client;
+    const isWAN = (idx.wanByIP[cl.ip] || []).length > 0;
+    const hasRisk = cv.finding_count > 0 || (idx.exactCVEsByIP[cl.ip] || []).length > 0;
+    if (logicalFilter === "risk" && !hasRisk) return false;
+    if (logicalFilter === "wan" && !isWAN) return false;
+    if (logicalFilter === "wired" && !cl.is_wired) return false;
+    if (logicalFilter === "wifi" && cl.is_wired) return false;
+    if (logicalSearch) {
+      const hay = [
+        cl.name, cl.hostname, cl.ip, cl.mac, cl.network_name, cl.essid,
+        cv.class?.category, cv.class?.role, cv.class?.vendor,
+        (cv.open_ports || []).join(" "),
+        (idx.findingsByIP[cl.ip] || []).map(f => f.title + " " + f.check_id).join(" ")
+      ].join(" ").toLowerCase();
+      if (!hay.includes(logicalSearch.toLowerCase())) return false;
+    }
+    return true;
+  };
+
+  let html = `
+  <div class="toolbar-bar">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="seg-ctrl">
+        <button class="seg-btn ${logicalFilter === "all" ? "active" : ""}" onclick="setLogicalFilter('all')">All Hosts (${idx.clients.length})</button>
+        <button class="seg-btn ${logicalFilter === "risk" ? "active" : ""}" onclick="setLogicalFilter('risk')">At Risk (${idx.hostIssues.length})</button>
+        <button class="seg-btn ${logicalFilter === "wan" ? "active" : ""}" onclick="setLogicalFilter('wan')">WAN Exposed</button>
+        <button class="seg-btn ${logicalFilter === "wired" ? "active" : ""}" onclick="setLogicalFilter('wired')">Wired</button>
+        <button class="seg-btn ${logicalFilter === "wifi" ? "active" : ""}" onclick="setLogicalFilter('wifi')">Wi-Fi</button>
+      </div>
+      <input id="logical-search" class="search-input" type="search" value="${esc(logicalSearch)}" placeholder="Search host, IP, port, service, vendor…">
+    </div>
+    <span class="subtext">Click any host to see full services, switch port &amp; fix</span>
+  </div>`;
+
+  let renderedHosts = 0;
+  for (const vg of vlanGroups) {
+    const filtered = vg.clients.filter(filterHost).sort((a, b) =>
+      sevRank(b.max_severity) - sevRank(a.max_severity) || (a.client.name || a.client.ip).localeCompare(b.client.name || b.client.ip)
+    );
+    if (logicalFilter !== "all" && !filtered.length) continue;
+    if (logicalSearch && !filtered.length) continue;
+    renderedHosts += filtered.length;
+
+    const exposedCount = vg.clients.filter(c => c.finding_count > 0).length;
+    html += `<div class="vlan-card">
+      <div class="vlan-hd">
+        <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">
+          <strong style="font-size:14.5px">${esc(vg.name)}</strong>
+          ${vg.vlan ? `<span class="pill mono">VLAN ${esc(vg.vlan)}</span>` : ""}
+          ${vg.subnet ? `<span class="subtext mono">${esc(vg.subnet)}</span>` : ""}
+          ${vg.isolated ? sevBadge("clean", "Isolated Zone") : sevBadge("blue", "Trusted / " + vg.zone)}
+        </div>
+        <div class="subtext"><strong>${filtered.length}</strong> host(s)${exposedCount ? ` · <strong style="color:var(--crit)">${exposedCount} at risk</strong>` : " · all clean"}</div>
+      </div>`;
+
+    if (vg.isolated && vg.clients.length === 0 && idx.hostIssues.length > 0 && logicalFilter === "all") {
+      html += `<div class="vlan-tip">💡 This isolated VLAN currently has 0 clients while ${idx.hostIssues.length} exposed host(s) sit on Trusted VLANs — move IoT/embedded appliances here to reduce blast radius.</div>`;
+    }
+
+    if (!filtered.length) {
+      html += `<div class="empty">No active clients in this VLAN.</div>`;
+    } else {
+      for (const cv of filtered) {
+        const cl = cv.client;
+        const portLink = getClientPortLink(cl);
+        const hostF = idx.findingsByIP[cl.ip] || [];
+        const hostWAN = idx.wanByIP[cl.ip] || [];
+        const hostCVEs = idx.exactCVEsByIP[cl.ip] || [];
+        const maxSev = cv.max_severity || "clean";
+
+        const linkHtml = portLink
+          ? `<span class="chip ${portLink.port.status === "critical" ? "crit" : portLink.port.status === "warn" ? "high" : ""}" onclick="event.stopPropagation(); inspectPort('${esc(portLink.sw.mac)}',${portLink.port.port_idx})">🔌 ${esc(portLink.sw.name)} #${portLink.port.port_idx}</span>`
+          : (cl.essid ? `<span class="pill">📶 ${esc(cl.essid)}</span>` : `<span class="subtext">${cl.is_wired ? "Wired" : "Wi-Fi"}</span>`);
+
+        let svcHtml = "";
+        for (const f of hostF) {
+          const cls = f.effective_severity === "critical" ? "crit" : f.effective_severity === "high" ? "high" : "";
+          svcHtml += `<span class="chip ${cls}">${esc(shortFindingLabel(f))}</span>`;
+        }
+        for (const w of hostWAN) {
+          svcHtml += `<span class="chip ${sevRank(w.severity) >= 2 ? "high" : "blue"}">WAN:${esc(w.forward?.dst_port)}</span>`;
+        }
+        for (const cve of hostCVEs) {
+          svcHtml += `<span class="chip crit">${cve.total_cves} CVE(s)</span>`;
+        }
+        if (!svcHtml) {
+          const pCnt = (cv.open_ports || []).length;
+          svcHtml = `${sevBadge("clean", "Clean")}${pCnt ? `<span class="subtext mono">${pCnt} open port${pCnt === 1 ? "" : "s"}</span>` : ""}`;
+        }
+
+        html += `<div class="host-row" onclick="inspectClient('${esc(cl.ip)}','${esc(cl.mac)}')">
+          <div class="host-id">
+            <span class="status-orb ${esc(maxSev)}"></span>
+            <div style="min-width:0">
+              <div class="host-name">${esc(cl.name || cl.hostname || cl.mac)}</div>
+              <div class="subtext">${esc(cv.class?.category || "unknown")}${cv.class?.vendor ? " · " + esc(cv.class.vendor) : ""}</div>
+            </div>
+          </div>
+          <div class="mono">${esc(cl.ip || "-")}</div>
+          <div>${linkHtml}</div>
+          <div class="svc-pills">${svcHtml}</div>
+          <div><button class="btn sm" onclick="event.stopPropagation(); triggerRescan('${esc(cl.ip)}')">Rescan</button></div>
+        </div>`;
+      }
+    }
+    html += `</div>`;
+  }
+
+  if (!renderedHosts && (logicalFilter !== "all" || logicalSearch)) {
+    html += `<div class="card"><div class="empty">No hosts match the current filter.</div></div>`;
+  }
+
+  // Wi-Fi SSIDs -> VLAN Mapping & WAN Surface Cards
+  const wlans = idx.posture?.wlans || [];
+  if (wlans.length && logicalFilter === "all" && !logicalSearch) {
+    html += `<div class="card">
+      <div class="card-hd"><span>Wi-Fi SSIDs &amp; Security Posture (${wlans.length})</span><span class="subtext">${idx.posture?.neighbor_aps || 0} neighboring APs observed</span></div>
+      <table><thead><tr><th>SSID</th><th>State</th><th>Mapped VLAN</th><th>Encryption</th><th>PMF</th><th>Client Isolation</th></tr></thead><tbody>`;
+    for (const w of wlans) {
+      const enc = (w.security || "-") + (w.wpa3_support ? " / WPA3" : (w.wpa_mode ? " (" + w.wpa_mode.toUpperCase() + ")" : ""));
+      html += `<tr>
+        <td><strong>${esc(w.name)}</strong>${w.is_guest ? ' <span class="pill">Guest</span>' : ''}</td>
+        <td>${w.enabled ? sevBadge("clean", "Enabled") : sevBadge("info", "Off")}</td>
+        <td><strong>${esc(w.network_name || "-")}</strong></td>
+        <td class="mono">${esc(enc)}</td>
+        <td class="mono">${esc(w.pmf_mode || "disabled")}</td>
+        <td>${w.l2_isolation ? sevBadge("clean", "Isolated") : '<span class="subtext">off</span>'}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  if (idx.wanSurface.length && (logicalFilter === "all" || logicalFilter === "wan")) {
+    html += `<div class="card">
+      <div class="card-hd"><span>WAN Port-Forward Surface (${idx.wanSurface.length})</span><span class="subtext">${idx.wanReview.length} review/high · ${idx.wanExpected.length} expected P2P</span></div>
+      <table><thead><tr><th>Severity</th><th>Rule</th><th>Mapping</th><th>Target Host</th><th>Assessment</th></tr></thead><tbody>`;
+    for (const a of idx.wanSurface) {
+      const ip = a.forward?.fwd_ip || a.client?.ip || "";
+      html += `<tr class="clickable" onclick="inspectClient('${esc(ip)}','${esc(a.client?.mac || "")}')">
+        <td>${sevBadge(a.severity)}</td>
+        <td><strong>${esc(a.forward?.name)}</strong></td>
+        <td class="mono">${esc(a.forward?.proto)}:${esc(a.forward?.dst_port)} → ${esc(ip)}:${esc(a.forward?.fwd_port)}</td>
+        <td>${esc(a.client?.name || a.client?.hostname || a.client?.mac || ip)}</td>
+        <td class="subtext">${esc(a.rule_name)}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  el.innerHTML = html;
+  const searchEl = document.getElementById("logical-search");
+  if (searchEl) {
+    searchEl.addEventListener("input", e => {
+      const pos = e.target.selectionStart;
+      logicalSearch = e.target.value;
+      renderLogical();
+      const again = document.getElementById("logical-search");
+      if (again) { again.focus(); again.setSelectionRange(pos, pos); }
+    });
+  }
+}
+
+/* ============================================================================
+   VIEW 4: LIVE ACTIVITY & THREAT LOGS
+   ============================================================================ */
+function setActivityFilter(f) {
+  activityFilter = f;
+  renderActivity();
+}
+
+function renderActivity() {
+  const el = document.getElementById("view-activity");
+  const filtered = idx.unifiedLogs.filter(ev => {
+    const t = (ev.type || "").toLowerCase();
+    if (activityFilter === "threats") return t.includes("threat") || t.includes("honeypot") || t.includes("evil") || t.includes("tamper") || t.includes("surge") || t.includes("spike") || t.includes("finding");
+    if (activityFilter === "ports") return t.startsWith("port_");
+    if (activityFilter === "clients") return t.startsWith("client_") || t.startsWith("vpn_") || t.includes("host_scanned");
+    if (activityFilter === "admin") return t.includes("admin") || t.includes("policy") || t.includes("config") || t.includes("wan_");
+    return true;
+  });
+
+  let html = `
+  <div class="toolbar-bar">
+    <div class="seg-ctrl">
+      <button class="seg-btn ${activityFilter === "all" ? "active" : ""}" onclick="setActivityFilter('all')">All (${idx.unifiedLogs.length})</button>
+      <button class="seg-btn ${activityFilter === "threats" ? "active" : ""}" onclick="setActivityFilter('threats')">Threats &amp; Tamper</button>
+      <button class="seg-btn ${activityFilter === "ports" ? "active" : ""}" onclick="setActivityFilter('ports')">Physical Ports</button>
+      <button class="seg-btn ${activityFilter === "clients" ? "active" : ""}" onclick="setActivityFilter('clients')">Clients &amp; VPN</button>
+      <button class="seg-btn ${activityFilter === "admin" ? "active" : ""}" onclick="setActivityFilter('admin')">Admin &amp; Config</button>
+    </div>
+    <span class="subtext">Combines real-time SSE stream + UniFi 24h IDS/Admin logs</span>
+  </div>
+  <div class="card">`;
+
+  if (!filtered.length) {
+    html += `<div class="empty">No matching events in this category.</div>`;
+  } else {
+    for (const ev of filtered) {
+      html += `<div class="ev-row">
+        <span class="ev-time mono">${fmtDateTime(ev.time)}</span>
+        ${sevBadge(ev.severity)}
+        <span class="pill mono">${esc(ev.type)}</span>
+        <div style="flex:1">${esc(ev.summary)}</div>
+        <span class="subtext">${esc(ev.source)}</span>
+      </div>`;
+    }
+  }
+  html += `</div>`;
+  document.getElementById("view-activity").innerHTML = html;
+}
+
+/* ============================================================================
+   UNIVERSAL CROSS-REFERENCED INSPECTOR DRAWER
+   ============================================================================ */
+function openDrawer(st) {
+  drawerState = st;
+  renderDrawer();
+  document.getElementById("drawer").classList.add("open");
+  document.getElementById("drawer").setAttribute("aria-hidden", "false");
+  document.getElementById("drawer-backdrop").classList.add("open");
+  if (activeView === "physical") renderPhysical();
+}
+
+function closeDrawer() {
+  drawerState = null;
+  document.getElementById("drawer").classList.remove("open");
+  document.getElementById("drawer").setAttribute("aria-hidden", "true");
+  document.getElementById("drawer-backdrop").classList.remove("open");
+  if (activeView === "physical") renderPhysical();
+}
+
+function inspectPort(mac, portIdx) {
+  openDrawer({ kind: "port", mac: (mac || "").toLowerCase(), portIdx: Number(portIdx) });
+}
+
+function inspectClient(ip, mac) {
+  openDrawer({ kind: "client", ip: ip || "", mac: (mac || "").toLowerCase() });
+}
+
+function inspectDevice(mac) {
+  openDrawer({ kind: "device", mac: (mac || "").toLowerCase() });
+}
+
+function inspectFinding(checkID, ip, port) {
+  openDrawer({ kind: "finding", checkID, ip: ip || "", port: Number(port || 0) });
+}
+
+function renderDrawer() {
+  if (!drawerState || !idx) return;
+  const titleEl = document.getElementById("drawer-title-wrap");
+  const bodyEl = document.getElementById("drawer-body");
+
+  if (drawerState.kind === "port") {
+    const rec = idx.portByKey[drawerState.mac + "|" + drawerState.portIdx];
+    if (!rec) { closeDrawer(); return; }
+    const { sw, port: p } = rec;
+    const pFindings = idx.findingsByPortKey[drawerState.mac + "|" + p.port_idx] || [];
+    const statusSev = p.status === "critical" ? "critical" : p.status === "warn" ? "high" : "clean";
+
+    titleEl.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        ${sevBadge(statusSev)}
+        <span class="sev ${p.zone === "external" || p.zone === "external_uplink" ? "sev-critical" : "sev-blue"}">${esc(p.zone.replace("_", " "))}</span>
+      </div>
+      <div style="font-size:16px;font-weight:800;margin-top:6px">${esc(sw.name)} · Port #${p.port_idx}</div>
+      <div class="subtext">${esc(p.name)}${p.label ? " · " + esc(p.label) : ""} · <span class="mono">${esc(sw.ip)}</span></div>`;
+
+    let b = `<div class="drawer-sec">
+      <div class="drawer-sec-title">Physical Port Telemetry</div>
+      <div class="kv-grid">
+        <div class="kv"><div class="k">Link State</div><div class="v">${p.up ? "UP (" + fmtSpeed(p.speed) + ")" : (p.enabled ? "INACTIVE (Enabled)" : "DISABLED")}</div></div>
+        <div class="kv"><div class="k">Native VLAN</div><div class="v">${esc(p.native_vlan || "-")}</div></div>
+        <div class="kv"><div class="k">Tagged VLANs</div><div class="v mono">${esc(p.tagged_policy)}</div></div>
+        <div class="kv"><div class="k">MAC Port Security</div><div class="v">${p.port_security ? "✅ Enabled" : "Off"}</div></div>
+        <div class="kv"><div class="k">PoE Power</div><div class="v mono">${p.poe_enabled ? (p.poe_power ? "⚡ " + esc(p.poe_power) + "W" : "ON") : "Off"}</div></div>
+        <div class="kv"><div class="k">Learned MACs / STP</div><div class="v mono">${p.mac_table_count || 0} MAC(s) · ${esc(p.stp_state || "-")}</div></div>
+      </div>
+    </div>`;
+
+    // Connected Peers (cross-link to Client OR Downstream Switch Inspector!)
+    b += `<div class="drawer-sec"><div class="drawer-sec-title">Connected Peer(s)</div>`;
+    if (!(p.peers || []).length) {
+      b += `<div class="subtext">${p.up ? "Active physical link (no UniFi client record — may be a silent/static/bridge device)" : "No link connected."}</div>`;
+    } else {
+      for (const peer of p.peers) {
+        const isDev = peer.kind === "device" || idx.swByMAC[(peer.mac || "").toLowerCase()];
+        const onclick = isDev
+          ? `inspectDevice('${esc((peer.mac || "").toLowerCase())}')`
+          : `inspectClient('${esc(peer.ip || "")}','${esc((peer.mac || "").toLowerCase())}')`;
+        b += `<div class="finding-box" style="cursor:pointer" onclick="${onclick}">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <strong>${isDev ? "🔀 " : "💻 "}${esc(peer.name)}</strong>
+            <span class="chip blue">Inspect ${isDev ? "Switch" : "Host"} →</span>
+          </div>
+          <div class="subtext mono" style="margin-top:3px">${peer.ip ? esc(peer.ip) + " · " : ""}${esc(peer.mac)}${peer.vlan ? " · VLAN " + esc(peer.vlan) : ""}</div>
+        </div>`;
+      }
+    }
+    b += `</div>`;
+
+    // Security Findings & Exact Remediation
+    b += `<div class="drawer-sec"><div class="drawer-sec-title">Security Assessment &amp; Fix</div>`;
+    if (pFindings.length) {
+      for (const f of pFindings) {
+        b += `<div class="finding-box ${f.effective_severity === "critical" ? "crit" : "high"}">
+          <div>${sevBadge(f.effective_severity)} <span class="mono subtext">${esc(f.check_id)}</span></div>
+          <div class="ftitle">${esc(f.title)}</div>
+          <div class="fproof"><strong>Proof:</strong> ${esc(f.evidence)}</div>
+          ${f.remediation?.summary ? `<div class="faction"><strong>How to fix in UniFi:</strong> ${esc(f.remediation.summary)}</div>` : ""}
+        </div>`;
+      }
+    } else if (p.issues && p.issues.length) {
+      b += `<div class="finding-box high">
+        <div class="ftitle">Port Observations</div>
+        <div class="fproof">${p.issues.map(esc).join("<br>")}</div>
+      </div>`;
+    } else {
+      b += `<div class="finding-box" style="border-color:var(--ok-bd)">${sevBadge("clean")} <strong>Port configuration looks good.</strong></div>`;
+    }
+    b += `</div>`;
+    bodyEl.innerHTML = b;
+    return;
+  }
+
+  if (drawerState.kind === "client") {
+    const cv = idx.clientByIP[drawerState.ip] || idx.clientByMAC[drawerState.mac];
+    const cl = cv?.client || { ip: drawerState.ip, mac: drawerState.mac, name: drawerState.ip || drawerState.mac };
+    const hostF = idx.findingsByIP[cl.ip] || [];
+    const hostWAN = idx.wanByIP[cl.ip] || [];
+    const hostExact = idx.exactCVEsByIP[cl.ip] || [];
+    const hostPot = idx.potCVEsByIP[cl.ip] || [];
+    const portLink = getClientPortLink(cl);
+    const maxSev = cv?.max_severity || (hostF.length ? maxSevOf(hostF) : "clean");
+
+    titleEl.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        ${sevBadge(maxSev)}
+        ${cl.network_name ? `<span class="pill">${esc(cl.network_name)}</span>` : ""}
+        ${cl.ip ? `<button class="btn sm" onclick="triggerRescan('${esc(cl.ip)}')">Rescan Host</button>` : ""}
+      </div>
+      <div style="font-size:16px;font-weight:800;margin-top:6px">${esc(cl.name || cl.hostname || cl.ip || cl.mac)}</div>
+      <div class="subtext mono">${esc(cl.ip || "-")} · ${esc(cl.mac || "-")}</div>`;
+
+    let b = `<div class="drawer-sec">
+      <div class="drawer-sec-title">Identity &amp; Physical Attachment</div>
+      <div class="kv-grid">
+        <div class="kv"><div class="k">Category / Role</div><div class="v">${esc(cv?.class?.category || "unknown")}${cv?.class?.role ? " · " + esc(cv.class.role) : ""}</div></div>
+        <div class="kv"><div class="k">Hardware Vendor</div><div class="v">${esc(cv?.class?.vendor || cl.oui || "-")}</div></div>
+        <div class="kv"><div class="k">VLAN / Network</div><div class="v">${esc(cl.network_name || "-")}</div></div>
+        <div class="kv"><div class="k">Physical Link</div><div class="v">${portLink
+          ? `<span class="chip ${portLink.port.status === "critical" ? "crit" : ""}" onclick="inspectPort('${esc(portLink.sw.mac)}',${portLink.port.port_idx})">🔌 ${esc(portLink.sw.name)} #${portLink.port.port_idx}</span>`
+          : (cl.essid ? "📶 Wi-Fi: " + esc(cl.essid) : (cl.is_wired ? "Wired" : "Wi-Fi"))}</div></div>
+      </div>
+    </div>`;
+
+    if (cv?.open_ports && cv.open_ports.length) {
+      b += `<div class="drawer-sec"><div class="drawer-sec-title">Open TCP Ports (${cv.open_ports.length})</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">${cv.open_ports.map(p => `<span class="pill mono">:${p}</span>`).join("")}</div>
+      </div>`;
+    }
+
+    if (hostWAN.length) {
+      b += `<div class="drawer-sec"><div class="drawer-sec-title">WAN Port Forwards (${hostWAN.length})</div>`;
+      for (const a of hostWAN) {
+        b += `<div class="finding-box ${sevRank(a.severity) >= 2 ? "high" : ""}">
+          <div>${sevBadge(a.severity)} <strong>${esc(a.forward?.name)}</strong></div>
+          <div class="fproof mono">${esc(a.forward?.proto)}:${esc(a.forward?.dst_port)} → ${esc(a.forward?.fwd_ip)}:${esc(a.forward?.fwd_port)}</div>
+          <div class="subtext" style="margin-top:3px">${esc(a.rule_name)}</div>
+        </div>`;
+      }
+      b += `</div>`;
+    }
+
+    b += `<div class="drawer-sec"><div class="drawer-sec-title">Confirmed Exposures (${hostF.length})</div>`;
+    if (!hostF.length) {
+      b += `<div class="finding-box" style="border-color:var(--ok-bd)">${sevBadge("clean")} <strong>No unauthenticated services or exposures detected on this host.</strong></div>`;
+    } else {
+      for (const f of hostF) {
+        b += `<div class="finding-box ${f.effective_severity === "critical" ? "crit" : f.effective_severity === "high" ? "high" : ""}">
+          <div>${sevBadge(f.effective_severity)} <span class="mono subtext">${esc(f.check_id)}${f.port ? " · port " + f.port : ""}</span></div>
+          <div class="ftitle">${esc(f.title)}</div>
+          <div class="fproof"><strong>Proof:</strong> ${esc(f.evidence)}</div>
+          ${f.risk_reasons?.length ? `<div class="subtext" style="margin-top:4px"><strong>Blast Radius:</strong> ${esc(f.risk_reasons.join("; "))}</div>` : ""}
+          ${f.remediation?.summary ? `<div class="faction"><strong>Remediation:</strong> ${esc(f.remediation.summary)}</div>` : ""}
+        </div>`;
+      }
+    }
+    b += `</div>`;
+
+    if (hostExact.length || hostPot.length) {
+      b += `<div class="drawer-sec"><div class="drawer-sec-title">CVE Rollups (${hostExact.length} exact · ${hostPot.length} version-unknown)</div>`;
+      for (const s of [...hostExact, ...hostPot]) {
+        b += `<div class="finding-box">
+          <div>${sevBadge(s.max_severity)} <strong>${esc(s.product.label)} ${esc(s.product.version || "")}</strong></div>
+          <div class="fproof">${s.total_cves} CVE(s) (max CVSS ${Number(s.max_cvss).toFixed(1)}${s.kev_count ? ", " + s.kev_count + " KEV" : ""})</div>
+          <div class="subtext mono" style="margin-top:3px">${esc((s.top_cves || []).join(", "))}</div>
+        </div>`;
+      }
+      b += `</div>`;
+    }
+
+    bodyEl.innerHTML = b;
+    return;
+  }
+
+  if (drawerState.kind === "device") {
+    const sw = idx.swByMAC[drawerState.mac];
+    if (!sw) { closeDrawer(); return; }
+    const riskPorts = (sw.ports || []).filter(p => p.status === "critical" || p.status === "warn");
+
+    titleEl.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        ${sw.external_device ? sevBadge("critical", "EXTERNAL EQUIPMENT") : sevBadge("blue", "INSIDE INFRASTRUCTURE")}
+      </div>
+      <div style="font-size:16px;font-weight:800;margin-top:6px">${esc(sw.name)}</div>
+      <div class="subtext">${esc(sw.model)} · <span class="mono">${esc(sw.ip)}</span> · <span class="mono">${esc(sw.mac)}</span></div>`;
+
+    let b = `<div class="drawer-sec">
+      <div class="drawer-sec-title">Switch Summary</div>
+      <div class="kv-grid">
+        <div class="kv"><div class="k">Uplink</div><div class="v">${sw.uplink_name ? esc(sw.uplink_name) + (sw.uplink_port ? " #" + sw.uplink_port : "") : "Root Gateway"}</div></div>
+        <div class="kv"><div class="k">Perimeter Zone</div><div class="v">${sw.external_device ? "Outside (" + esc(sw.zone_source || "auto") + ")" : "Inside Building"}</div></div>
+        <div class="kv"><div class="k">Active / Open / Off</div><div class="v">${sw.active_ports} / ${sw.inactive_enabled_ports} / ${sw.disabled_ports}</div></div>
+        <div class="kv"><div class="k">At-Risk Ports</div><div class="v" style="color:${sw.at_risk_ports ? "var(--crit)" : "var(--ok)"}">${sw.at_risk_ports}</div></div>
+      </div>
+    </div>`;
+
+    b += `<div class="drawer-sec"><div class="drawer-sec-title">At-Risk Ports (${riskPorts.length})</div>`;
+    if (!riskPorts.length) {
+      b += `<div class="finding-box" style="border-color:var(--ok-bd)">${sevBadge("clean")} <strong>All ports on this device look good.</strong></div>`;
+    } else {
+      for (const p of riskPorts) {
+        b += `<div class="finding-box ${p.status === "critical" ? "crit" : "high"}" style="cursor:pointer" onclick="inspectPort('${esc(sw.mac)}',${p.port_idx})">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span>${sevBadge(p.status === "critical" ? "critical" : "high")} <strong>Port #${p.port_idx}</strong> (${esc(p.zone)})</span>
+            <span class="chip">Inspect →</span>
+          </div>
+          <div class="fproof">${(p.issues || []).map(esc).join("; ")}</div>
+        </div>`;
+      }
+    }
+    b += `</div>`;
+    bodyEl.innerHTML = b;
+    return;
+  }
+
+  if (drawerState.kind === "finding") {
+    const f = idx.allFindings.find(x => x.check_id === drawerState.checkID && (x.client?.ip || "") === drawerState.ip && (x.port || 0) === drawerState.port)
+      || idx.allFindings.find(x => x.check_id === drawerState.checkID);
+    if (!f) { closeDrawer(); return; }
+    titleEl.innerHTML = `
+      <div>${sevBadge(f.effective_severity)} <span class="mono subtext">${esc(f.check_id)}</span></div>
+      <div style="font-size:16px;font-weight:800;margin-top:6px">${esc(f.title)}</div>
+      <div class="subtext">${esc(f.client?.name || "-")} · <span class="mono">${esc(f.client?.ip || "-")}</span></div>`;
+    bodyEl.innerHTML = `<div class="finding-box ${f.effective_severity === "critical" ? "crit" : "high"}">
+      <div class="fproof"><strong>Proof:</strong> ${esc(f.evidence)}</div>
+      ${f.risk_reasons?.length ? `<div class="subtext" style="margin-top:6px"><strong>Blast Radius:</strong> ${esc(f.risk_reasons.join("; "))}</div>` : ""}
+      ${f.remediation?.summary ? `<div class="faction"><strong>How to fix:</strong> ${esc(f.remediation.summary)}</div>` : ""}
+    </div>`;
+  }
 }
 
 function connectSSE() {
   const es = new EventSource("/api/events");
-  es.addEventListener("uniblue", () => {
-    fetchState();
-  });
+  es.addEventListener("uniblue", () => fetchState());
   es.onerror = () => {
     document.getElementById("live-pill").classList.remove("live");
     document.getElementById("mode-lbl").textContent = "Reconnecting…";
