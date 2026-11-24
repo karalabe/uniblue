@@ -12,25 +12,27 @@ It combines your UniFi gateway's live network topology (clients, VLANs, firmware
 
 ## Why UniBlue?
 
-- **UniFi blast-radius awareness:** A vulnerable ventilation controller or unauthenticated camera is scored differently depending on whether it sits on an isolated IoT VLAN, your trusted LAN, or behind an active WAN port forward.
-- **Built-in 170+ protocol discovery:** Embeds Praetorian's `nerva` (in IoT-safe `FastMode`) to fingerprint SMBv1, SSH, NFS, RPC, databases, Grafana, Pi-hole, and expired TLS certs alongside UniBlue's own deep read-only verification checks.
+- **UniFi blast-radius awareness:** A vulnerable appliance or unauthenticated service is scored differently depending on whether it sits on an isolated VLAN, an internal LAN, or behind an active WAN port forward.
+- **Built-in 170+ protocol discovery:** Embeds Praetorian's `nerva` (in safe `FastMode`) to fingerprint common network services — file shares, remote access, databases, web dashboards, and TLS certificates — alongside UniBlue's own deep read-only verification checks.
 - **Informal IoT/LAN bug registry:** Many nasty bugs in local hardware (HVAC systems, inverters, cameras, smart relays) never get a formal CVE. UniBlue lets anyone drop a safe, read-only YAML check into `checks/` and run it locally.
 - **Gentle by design:** Fingerprinting uses a bounded worker pool, sequential per-host port checks with pacing, strict read-only verification probes, and target-IP-only sandboxing.
 - **Low-noise alerting:** `uniblue watch` tracks baseline state in a local JSON file and only notifies you when something new appears, a finding escalates, an unknown device joins a trusted VLAN, or a new WAN port forward is enabled.
 
-### Blast-Radius Severity Adjustments
+### Blast-Radius Severity Adjustments & Firewall Policy Audits
 
-UniBlue automatically infers trusted (`Default`, VLAN `1`, `Servers`, `Mgmt`, etc.) and isolated (`Smart Devices`, `IoT`, `Guest`, `Camera`, etc.) tiers directly from your UniFi network definitions — no manual VLAN listing required unless you want custom overrides (`network.trusted_vlans` / `network.isolated_vlans`):
+UniBlue reads your UniFi controller's **actual network topology** — Firewall Zones (`Internal`, `Hotspot`, `Dmz`, or custom zones blocked from `Internal`), explicit `isolationEnabled` flags, `guest` network purpose, and Zone-Based Firewall policies — without guessing from VLAN names. Explicit overrides (`network.trusted_vlans` / `network.isolated_vlans`) are optional for classic controllers without Zone-Based Firewall:
 
 | UniFi Context | Effect | Why |
 | :--- | :--- | :--- |
 | Affected host + port is **WAN port-forwarded** | **Force `CRITICAL`** | Directly reachable from the public internet |
-| Device sits on a **trusted VLAN** | **`+1` severity level** | High lateral-movement blast radius on your main/server LAN |
-| Device sits on an **isolated VLAN** | **`-1` severity level** | Already mitigated by IoT/Guest VLAN segmentation |
+| Device sits on an **Internal / non-isolated VLAN** | **`+1` severity level** | High lateral-movement blast radius across internal hosts |
+| Device sits on an **isolated / Hotspot / DMZ / Guest VLAN** | **`-1` severity level** | Already mitigated by network isolation |
+
+UniBlue also audits **user-defined Zone-Based Firewall policies** directly (catching overly broad `External → Gateway`, `External → LAN`, or isolated-zone-to-`Internal` `ALLOW` rules) and automatically seeds per-host probe ports from your enabled port forwards and firewall policies.
 
 ## Quickstart
 
-Only your UniFi controller URL and credentials are required — ports, VLAN tiers, and local cache paths use smart defaults automatically (you can even skip `config.yaml` via `UNIBLUE_UNIFI_URL` + `UNIBLUE_UNIFI_API_KEY`):
+Only your UniFi controller URL and credentials are required — network topology, isolation tiers, port hints, and local cache paths are derived automatically (you can even skip `config.yaml` via `UNIBLUE_UNIFI_URL` + `UNIBLUE_UNIFI_API_KEY`):
 
 ```sh
 # 1. Build

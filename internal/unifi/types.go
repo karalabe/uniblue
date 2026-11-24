@@ -33,6 +33,103 @@ type Snapshot struct {
 
 	// PortForwards holds WAN-to-LAN port-forwarding rules configured on the gateway.
 	PortForwards []PortForward `json:"port_forwards"`
+
+	// Zones holds UniFi Zone-Based Firewall zones when supported by the console.
+	Zones []FirewallZone `json:"zones,omitempty"`
+
+	// FirewallPolicies holds UniFi Zone-Based Firewall policies when supported
+	// by the console.
+	FirewallPolicies []FirewallPolicy `json:"firewall_policies,omitempty"`
+}
+
+// PortHintsByIP collects concrete destination TCP ports explicitly referenced
+// for specific internal IPs by UniFi port forwards and ALLOW firewall policies.
+// Wide ranges (>16 ports) are ignored so catch-all rules never trigger bulky scans.
+func (s *Snapshot) PortHintsByIP() map[string][]int {
+	if s == nil {
+		return nil
+	}
+	const maxHintRange = 16
+	byIP := make(map[string]map[int]struct{})
+	add := func(ip string, port int) {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || port < 1 || port > 65535 {
+			return
+		}
+		if byIP[ip] == nil {
+			byIP[ip] = make(map[int]struct{})
+		}
+		byIP[ip][port] = struct{}{}
+	}
+
+	for _, pf := range s.PortForwards {
+		if !pf.Enabled || pf.FwdIP == "" {
+			continue
+		}
+		// Only seed ports that include TCP (skip pure UDP forwards such as WireGuard).
+		if pf.Proto != "" && strings.EqualFold(pf.Proto, "udp") {
+			continue
+		}
+		for _, p := range expandPortSpec(pf.FwdPort, maxHintRange) {
+			add(pf.FwdIP, p)
+		}
+	}
+
+	for _, pol := range s.FirewallPolicies {
+		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
+			continue
+		}
+		if strings.EqualFold(pol.Protocol, "udp") || strings.EqualFold(pol.Protocol, "icmp") {
+			continue
+		}
+		if len(pol.Destination.IPs) == 0 || len(pol.Destination.Ports) == 0 {
+			continue
+		}
+		for _, ip := range pol.Destination.IPs {
+			for _, p := range pol.Destination.Ports {
+				add(ip, p)
+			}
+		}
+	}
+
+	if len(byIP) == 0 {
+		return nil
+	}
+	out := make(map[string][]int, len(byIP))
+	for ip, set := range byIP {
+		ports := make([]int, 0, len(set))
+		for p := range set {
+			ports = append(ports, p)
+		}
+		out[ip] = ports
+	}
+	return out
+}
+
+// expandPortSpec expands a UniFi port spec ("443", "80,443", "9000-9002") into
+// concrete port numbers, skipping ranges wider than maxRange.
+func expandPortSpec(spec string, maxRange int) []int {
+	var ports []int
+	for _, token := range strings.Split(spec, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if startStr, endStr, ok := strings.Cut(token, "-"); ok {
+			start, err1 := strconv.Atoi(strings.TrimSpace(startStr))
+			end, err2 := strconv.Atoi(strings.TrimSpace(endStr))
+			if err1 == nil && err2 == nil && start >= 1 && end <= 65535 && end >= start && (end-start+1) <= maxRange {
+				for p := start; p <= end; p++ {
+					ports = append(ports, p)
+				}
+			}
+			continue
+		}
+		if single, err := strconv.Atoi(token); err == nil && single >= 1 && single <= 65535 {
+			ports = append(ports, single)
+		}
+	}
+	return ports
 }
 
 // Client represents a connected endpoint on the local network as observed by
@@ -106,12 +203,13 @@ type Device struct {
 	Upgradable bool `json:"upgradable"`
 }
 
-// Network describes a UniFi LAN or VLAN segment.
+// Network describes a UniFi LAN or VLAN segment along with its structural
+// isolation and firewall-zone placement reported by the controller.
 type Network struct {
-	// ID is the internal Mongo/controller identifier referenced by clients.
+	// ID is the internal controller identifier referenced by clients and zones.
 	ID string `json:"id"`
 
-	// Name is the user-facing network name (e.g., "Default", "IoT").
+	// Name is the user-facing network name.
 	Name string `json:"name"`
 
 	// Purpose describes how UniFi uses the network (e.g., "corporate", "guest", "wan").
@@ -122,6 +220,86 @@ type Network struct {
 
 	// Subnet is the CIDR range configured on the gateway (e.g., "192.168.1.1/24").
 	Subnet string `json:"subnet"`
+
+	// IsolationEnabled reports whether UniFi's explicit Network Isolation flag
+	// is enabled on this network.
+	IsolationEnabled bool `json:"isolation_enabled,omitempty"`
+
+	// ZoneID is the UniFi Zone-Based Firewall zone UUID containing this network.
+	ZoneID string `json:"zone_id,omitempty"`
+
+	// ZoneName is the resolved firewall zone name (e.g., "Internal", "Hotspot", "Dmz").
+	ZoneName string `json:"zone_name,omitempty"`
+}
+
+// FirewallZone represents a UniFi Zone-Based Firewall zone grouping one or more
+// networks under shared inter-zone traffic policies.
+type FirewallZone struct {
+	// ID is the zone UUID assigned by UniFi.
+	ID string `json:"id"`
+
+	// Name is the zone display name (e.g., "Internal", "External", "Hotspot", "Dmz", "Gateway").
+	Name string `json:"name"`
+
+	// Origin indicates whether UniFi created the zone ("SYSTEM_DEFINED") or the
+	// operator created a custom zone ("USER_DEFINED").
+	Origin string `json:"origin,omitempty"`
+
+	// NetworkIDs lists the network UUIDs assigned to this zone.
+	NetworkIDs []string `json:"network_ids,omitempty"`
+}
+
+// FirewallPolicy represents a single UniFi Zone-Based Firewall rule governing
+// traffic between a source and destination zone.
+type FirewallPolicy struct {
+	// ID is the unique rule identifier on the console.
+	ID string `json:"id"`
+
+	// Name is the human-readable policy label.
+	Name string `json:"name"`
+
+	// Enabled reports whether the firewall policy is actively enforced.
+	Enabled bool `json:"enabled"`
+
+	// Action is the rule verdict ("ALLOW", "BLOCK", or "REJECT").
+	Action string `json:"action"`
+
+	// Origin distinguishes built-in rules ("SYSTEM_DEFINED") from operator rules ("USER_DEFINED").
+	Origin string `json:"origin,omitempty"`
+
+	// Protocol is the matched IP protocol ("all", "tcp", "udp", "tcp_udp", "icmp", etc.).
+	Protocol string `json:"protocol,omitempty"`
+
+	// Source describes the traffic origin zone and optional IP/port filters.
+	Source PolicyEndpoint `json:"source"`
+
+	// Destination describes the traffic target zone and optional IP/port filters.
+	Destination PolicyEndpoint `json:"destination"`
+
+	// LoggingEnabled reports whether matches are logged to syslog/system log.
+	LoggingEnabled bool `json:"logging_enabled,omitempty"`
+}
+
+// PolicyEndpoint captures the zone and optional IP/port constraints on one side
+// of a UniFi FirewallPolicy.
+type PolicyEndpoint struct {
+	// ZoneID is the UniFi firewall zone UUID.
+	ZoneID string `json:"zone_id"`
+
+	// ZoneName is the resolved firewall zone display name.
+	ZoneName string `json:"zone_name,omitempty"`
+
+	// IPs holds explicit IPv4/IPv6 addresses targeted by this endpoint, if filtered.
+	IPs []string `json:"ips,omitempty"`
+
+	// Ports holds explicit port numbers matched by this endpoint, if filtered.
+	Ports []int `json:"ports,omitempty"`
+
+	// AnyTarget is true when no IP/network/MAC target filter narrows the zone.
+	AnyTarget bool `json:"any_target"`
+
+	// AnyPort is true when no port filter narrows the matched ports.
+	AnyPort bool `json:"any_port"`
 }
 
 // PortForward represents a gateway NAT rule exposing an internal host and port
@@ -245,11 +423,12 @@ type rawDevice struct {
 
 // rawNetwork maps the wire fields returned by /api/s/<site>/rest/networkconf.
 type rawNetwork struct {
-	ID       string     `json:"_id"`
-	Name     string     `json:"name"`
-	Purpose  string     `json:"purpose"`
-	VLAN     flexString `json:"vlan"`
-	IPSubnet string     `json:"ip_subnet"`
+	ID                      string     `json:"_id"`
+	Name                    string     `json:"name"`
+	Purpose                 string     `json:"purpose"`
+	VLAN                    flexString `json:"vlan"`
+	IPSubnet                string     `json:"ip_subnet"`
+	NetworkIsolationEnabled bool       `json:"network_isolation_enabled"`
 }
 
 // rawPortForward maps the wire fields returned by /api/s/<site>/rest/portforward.
@@ -310,8 +489,79 @@ type integrationNetwork struct {
 	Management        string     `json:"management"`
 	VLANID            flexString `json:"vlanId"`
 	Subnet            string     `json:"subnet"`
+	IsolationEnabled  bool       `json:"isolationEnabled"`
+	ZoneID            string     `json:"zoneId"`
 	IPv4Configuration *struct {
 		HostIPAddress string `json:"hostIpAddress"`
 		PrefixLength  int    `json:"prefixLength"`
 	} `json:"ipv4Configuration"`
+}
+
+// integrationFirewallZone maps a zone entry returned by GET /integration/v1/sites/{id}/firewall/zones.
+type integrationFirewallZone struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	NetworkIDs []string `json:"networkIds"`
+	Metadata   *struct {
+		Origin string `json:"origin"`
+	} `json:"metadata"`
+}
+
+// integrationFirewallPolicy maps a policy entry returned by GET /integration/v1/sites/{id}/firewall/policies.
+type integrationFirewallPolicy struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	Action  struct {
+		Type string `json:"type"`
+	} `json:"action"`
+	Source          integrationPolicyEndpoint `json:"source"`
+	Destination     integrationPolicyEndpoint `json:"destination"`
+	IPProtocolScope *struct {
+		IPVersion      string `json:"ipVersion"`
+		ProtocolFilter *struct {
+			Type     string `json:"type"`
+			Protocol *struct {
+				Name string `json:"name"`
+			} `json:"protocol"`
+			NamedProtocol string `json:"namedProtocol"`
+		} `json:"protocolFilter"`
+	} `json:"ipProtocolScope"`
+	LoggingEnabled bool `json:"loggingEnabled"`
+	Metadata       *struct {
+		Origin string `json:"origin"`
+	} `json:"metadata"`
+}
+
+// integrationPolicyEndpoint maps the source or destination filter block of an
+// Integration v1 firewall policy.
+type integrationPolicyEndpoint struct {
+	ZoneID        string `json:"zoneId"`
+	TrafficFilter *struct {
+		Type            string `json:"type"`
+		IPAddressFilter *struct {
+			Type          string `json:"type"`
+			MatchOpposite bool   `json:"matchOpposite"`
+			Items         []struct {
+				Type  string     `json:"type"`
+				Value flexString `json:"value"`
+			} `json:"items"`
+		} `json:"ipAddressFilter"`
+		PortFilter *struct {
+			Type          string `json:"type"`
+			MatchOpposite bool   `json:"matchOpposite"`
+			Items         []struct {
+				Type  string     `json:"type"`
+				Value flexString `json:"value"`
+				Start int        `json:"start"`
+				End   int        `json:"end"`
+			} `json:"items"`
+		} `json:"portFilter"`
+		NetworkFilter *struct {
+			NetworkIDs []string `json:"networkIds"`
+		} `json:"networkFilter"`
+		MACAddressFilter *struct {
+			MACAddresses []string `json:"macAddresses"`
+		} `json:"macAddressFilter"`
+	} `json:"trafficFilter"`
 }

@@ -90,7 +90,7 @@ type Service struct {
 	TLS bool `json:"tls,omitempty"`
 
 	// Version is the software version string extracted from the protocol banner
-	// or handshake, when advertised (e.g., "nginx/1.26.3", "llama.cpp").
+	// or handshake, when advertised (e.g., "nginx/1.24.0", "OpenSSH_9.6p1").
 	Version string `json:"version,omitempty"`
 
 	// Title holds an extracted web page title when Protocol is HTTP/HTTPS.
@@ -111,7 +111,7 @@ type Service struct {
 }
 
 // ServiceFinding represents one high-signal protocol misconfiguration surfaced
-// by Nerva (such as SMBv1 enabled, anonymous Grafana, or an expired TLS cert).
+// by Nerva (such as legacy protocol versions, anonymous access, or an expired TLS cert).
 type ServiceFinding struct {
 	// ID is Nerva's canonical finding identifier (e.g., "smb-v1-enabled").
 	ID string `json:"id"`
@@ -178,10 +178,21 @@ type Fingerprinter struct {
 	// excludeIPs contains IP addresses skipped without sending any packets.
 	excludeIPs map[string]struct{}
 
+	// hostPortHints maps specific client IPs to extra TCP ports discovered from
+	// UniFi port forwards or firewall policies so custom ports are probed automatically.
+	hostPortHints map[string][]int
+
 	// httpClient is configured with redirects disabled and self-signed TLS
 	// accepted so local LAN devices can be fingerprinted without leaking requests
 	// to external hosts.
 	httpClient *http.Client
+}
+
+// SetHostPortHints attaches optional per-host TCP port hints (such as ports
+// derived from UniFi port forwards or firewall policies) that are merged into
+// the base scan port list when fingerprinting matching hosts.
+func (f *Fingerprinter) SetHostPortHints(hints map[string][]int) {
+	f.hostPortHints = hints
 }
 
 // NewFingerprinter creates a Fingerprinter with safe defaults for zero-valued
@@ -310,7 +321,8 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	}
 	dialer := net.Dialer{Timeout: dialTimeout}
 
-	for i, port := range f.ports {
+	ports := f.portsForHost(cl.IP)
+	for i, port := range ports {
 		if ctx.Err() != nil {
 			break
 		}
@@ -351,24 +363,51 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 	}
 
-	// Hypervisors (Unraid, Proxmox, QEMU/KVM) assign VNC displays sequentially
+	// Hypervisors (QEMU/KVM, Proxmox, libvirt) assign VNC displays sequentially
 	// starting at 5900 (:0, :1, :2...). When a host already exposes a VNC port,
 	// adaptively walk upward to discover additional VM displays without sending
-	// extra probes to non-VNC IoT devices.
+	// extra probes to hosts that do not speak VNC.
 	if profile.HasPort(5900) || profile.HasPort(5901) {
-		f.walkVNCDisplays(ctx, dialer, cl.IP, &profile)
+		f.walkVNCDisplays(ctx, dialer, cl.IP, ports, &profile)
 	}
 
 	sort.Ints(profile.OpenPorts)
 	return profile
 }
 
+// portsForHost returns the deduplicated, sorted list of TCP ports to probe on
+// ip, merging UniBlue's base port list with any UniFi-derived host port hints.
+func (f *Fingerprinter) portsForHost(ip string) []int {
+	hints := f.hostPortHints[ip]
+	if len(hints) == 0 {
+		return f.ports
+	}
+	seen := make(map[int]struct{}, len(f.ports)+len(hints))
+	out := make([]int, 0, len(f.ports)+len(hints))
+	for _, p := range f.ports {
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	for _, p := range hints {
+		if p < 1 || p > 65535 {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	sort.Ints(out)
+	return out
+}
+
 // walkVNCDisplays gently probes sequential RFB/VNC display ports (5901..5919)
 // on a host that already responded on a base VNC port, stopping once
 // vncWalkMaxConsecutiveMisses consecutive ports are closed.
-func (f *Fingerprinter) walkVNCDisplays(ctx context.Context, dialer net.Dialer, ip string, profile *HostProfile) {
-	probed := make(map[int]struct{}, len(f.ports))
-	for _, p := range f.ports {
+func (f *Fingerprinter) walkVNCDisplays(ctx context.Context, dialer net.Dialer, ip string, alreadyProbed []int, profile *HostProfile) {
+	probed := make(map[int]struct{}, len(alreadyProbed))
+	for _, p := range alreadyProbed {
 		probed[p] = struct{}{}
 	}
 

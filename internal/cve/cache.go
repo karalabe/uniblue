@@ -1067,7 +1067,7 @@ func recordMatchesQuery(r Record, needle string) bool {
 // matchesAnyPattern checks whether cpeProduct matches any configured product
 // pattern. Patterns without "*" require exact equality (preventing loose
 // collisions like "nginx" matching "nginx_unit"); patterns containing "*"
-// match wildcard globs (such as "*laserjet*m453*").
+// match wildcard globs (such as "*laserjet*m404*").
 func matchesAnyPattern(patterns []string, cpeProduct string) bool {
 	cpeProduct = strings.ToLower(strings.TrimSpace(cpeProduct))
 	if cpeProduct == "" {

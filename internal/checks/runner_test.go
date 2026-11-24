@@ -313,7 +313,7 @@ func TestFindingsFromProfilesDeduplicationAndNormalization(t *testing.T) {
 					Protocol:        "http",
 					AnonymousAccess: true,
 					Findings: []probe.ServiceFinding{
-						{ID: "grafana:13.3.1-anon-access", Severity: "medium", Evidence: "unauth query succeeded"},
+						{ID: "grafana:10.0.0-anon-access", Severity: "medium", Evidence: "unauth query succeeded"},
 					},
 				},
 				{

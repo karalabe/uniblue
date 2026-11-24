@@ -47,11 +47,11 @@ func TestPatternMatchingPreventsPrefixLeakage(t *testing.T) {
 		t.Fatal("expected exact match for nginx_open_source")
 	}
 	// Explicit wildcard patterns match targeted hardware families cleanly.
-	if !matchesAnyPattern([]string{"*laserjet*m453*"}, "laserjet_pro_m453-m454_w1y40a_firmware") {
-		t.Fatal("expected wildcard pattern to match M453 LaserJet firmware")
+	if !matchesAnyPattern([]string{"*laserjet*m404*"}, "laserjet_pro_m404-m405_firmware") {
+		t.Fatal("expected wildcard pattern to match M404 LaserJet firmware")
 	}
-	if matchesAnyPattern([]string{"*laserjet*m453*"}, "laserjet_pro_m404-m405_firmware") {
-		t.Fatal("expected M453 wildcard not to match M404 firmware")
+	if matchesAnyPattern([]string{"*laserjet*m404*"}, "laserjet_pro_m203_firmware") {
+		t.Fatal("expected M404 wildcard not to match M203 firmware")
 	}
 }
 
@@ -152,7 +152,7 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 
 	profiles := []probe.HostProfile{
 		{
-			Client:    unifi.Client{IP: "192.168.10.2", MAC: "aa:01", Name: "truenas-01", NetworkName: "Servers"},
+			Client:    unifi.Client{IP: "192.168.10.2", MAC: "aa:01", Name: "truenas-01", NetworkName: "LAN"},
 			SSHBanner: "SSH-2.0-OpenSSH_9.6p1 Debian-1",
 		},
 	}

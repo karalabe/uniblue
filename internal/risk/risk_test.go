@@ -108,25 +108,19 @@ func TestStatePersistenceAndDiffing(t *testing.T) {
 }
 
 func TestExposureClassificationAndPostureNotes(t *testing.T) {
-	netCfg := config.NetworkConfig{
-		TrustedVLANs:  []string{"Default"},
-		IsolatedVLANs: []string{"IoT"},
-	}
-
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Networks: []unifi.Network{
-			{ID: "n1", Name: "Default", VLAN: "1"},
-			{ID: "n2", Name: "IoT", VLAN: "30"},
-			{ID: "n3", Name: "Servers", VLAN: "2"},
+			{ID: "n1", Name: "VLAN-Alpha", VLAN: "1", ZoneName: "Internal", Purpose: "corporate"},
+			{ID: "n2", Name: "VLAN-Beta", VLAN: "40", ZoneName: "Hotspot", IsolationEnabled: true},
 		},
 		Clients: []unifi.Client{
-			{IP: "10.0.1.50", MAC: "aa:01", Name: "Ventilation", NetworkName: "Default"},
-			{IP: "192.168.10.3", MAC: "aa:02", Name: "p2p-node", NetworkName: "Servers"},
+			{IP: "10.0.1.50", MAC: "aa:01", Name: "appliance-1", NetworkName: "VLAN-Alpha"},
+			{IP: "10.0.1.60", MAC: "aa:02", Name: "node-1", NetworkName: "VLAN-Alpha"},
 		},
 		PortForwards: []unifi.PortForward{
-			{Name: "Ethereum DevP2P", Enabled: true, Proto: "tcp_udp", DstPort: "30303", FwdIP: "192.168.10.3", FwdPort: "30303", Src: "any"},
-			{Name: "Accidental Eth RPC", Enabled: true, Proto: "tcp", DstPort: "8545", FwdIP: "192.168.10.3", FwdPort: "8545", Src: "any"},
+			{Name: "Ethereum DevP2P", Enabled: true, Proto: "tcp_udp", DstPort: "30303", FwdIP: "10.0.1.60", FwdPort: "30303", Src: "any"},
+			{Name: "Accidental Eth RPC", Enabled: true, Proto: "tcp", DstPort: "8545", FwdIP: "10.0.1.60", FwdPort: "8545", Src: "any"},
 		},
 	}
 
@@ -134,7 +128,7 @@ func TestExposureClassificationAndPostureNotes(t *testing.T) {
 		{CheckID: "UB-2026-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[0], Port: 56747},
 	}
 
-	report := Evaluate(snap, raw, netCfg)
+	report := Evaluate(snap, raw, config.NetworkConfig{})
 
 	// Expect 2 WAN surface entries: DevP2P classified INFO (expected-p2p), RPC classified CRITICAL (dangerous-rpc).
 	if len(report.WANSurface) != 2 {
@@ -158,57 +152,145 @@ func TestExposureClassificationAndPostureNotes(t *testing.T) {
 		t.Fatalf("expected exactly 1 actionable port-forward finding (RPC only), got %d", portFwdFindings)
 	}
 
-	// Unused "IoT" VLAN posture note should fire automatically.
-	if len(report.PostureNotes) == 0 {
-		t.Fatal("expected posture note flagging unused IoT VLAN")
+	// Unused structurally-isolated VLAN posture note should fire regardless of VLAN name.
+	if len(report.PostureNotes) == 0 || !strings.Contains(report.PostureNotes[0].Title, "VLAN-Beta") {
+		t.Fatalf("expected posture note flagging unused isolated VLAN-Beta, got %+v", report.PostureNotes)
 	}
 }
 
-func TestAutoInferredVLANTiersWithEmptyConfig(t *testing.T) {
+func TestStructuralZoneIsolationAndFlatTopology(t *testing.T) {
+	// Use completely opaque VLAN names ("ZoneA", "ZoneB", "ZoneC") to guarantee
+	// zero reliance on user-chosen network names.
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Networks: []unifi.Network{
-			{ID: "n1", Name: "Default", VLAN: "1"},
-			{ID: "n2", Name: "Servers", VLAN: "2"},
-			{ID: "n3", Name: "IoT", VLAN: "30"},
-			{ID: "n4", Name: "Guest Devices", VLAN: "100", Purpose: "guest"},
+			{ID: "n1", Name: "ZoneA", VLAN: "10", ZoneName: "Internal", Purpose: "corporate"},
+			{ID: "n2", Name: "ZoneB", VLAN: "20", ZoneName: "Hotspot"},
+			{ID: "n3", Name: "ZoneC", VLAN: "30", ZoneName: "CustomSegmented"},
+		},
+		FirewallPolicies: []unifi.FirewallPolicy{
+			{
+				ID:      "p-block-custom",
+				Name:    "Block CustomSegmented to Internal",
+				Enabled: true,
+				Action:  "BLOCK",
+				Origin:  "USER_DEFINED",
+				Source:  unifi.PolicyEndpoint{ZoneName: "CustomSegmented", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{
+					ZoneName:  "Internal",
+					AnyTarget: true,
+					AnyPort:   true,
+				},
+			},
 		},
 		Clients: []unifi.Client{
-			{IP: "10.0.0.50", MAC: "aa:01", Name: "hvac", NetworkName: "Default", VLAN: "1"},
-			{IP: "192.168.10.2", MAC: "aa:03", Name: "truenas", NetworkName: "Servers", VLAN: "2"},
-			{IP: "192.168.30.50", MAC: "aa:02", Name: "cam", NetworkName: "IoT", VLAN: "30"},
+			{IP: "10.10.0.5", MAC: "aa:01", Name: "host-a", NetworkName: "ZoneA", VLAN: "10"},
+			{IP: "10.20.0.5", MAC: "aa:02", Name: "host-b", NetworkName: "ZoneB", VLAN: "20"},
+			{IP: "10.30.0.5", MAC: "aa:03", Name: "host-c", NetworkName: "ZoneC", VLAN: "30"},
 		},
 	}
 	raw := []checks.Finding{
 		{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[0], Port: 23},
-		{CheckID: "UB-0005", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[1], Port: 5900},
+		{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[1], Port: 23},
 		{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[2], Port: 23},
 	}
 
-	// Pass a completely empty NetworkConfig{} and verify smart VLAN inference.
 	report := Evaluate(snap, raw, config.NetworkConfig{})
 	got := make(map[string]checks.Severity)
 	for _, f := range report.Findings {
 		got[f.Key()] = f.EffectiveSeverity
 	}
 	if got["UB-0001|aa:01|23"] != checks.SeverityCritical {
-		t.Fatalf("expected Default VLAN auto-inferred as trusted (high->critical), got %v", got["UB-0001|aa:01|23"])
-	}
-	if got["UB-0005|aa:03|5900"] != checks.SeverityCritical {
-		t.Fatalf("expected Servers VLAN auto-inferred as trusted (high->critical), got %v", got["UB-0005|aa:03|5900"])
+		t.Fatalf("expected Internal-zone VLAN to bump high->critical, got %v", got["UB-0001|aa:01|23"])
 	}
 	if got["UB-0001|aa:02|23"] != checks.SeverityMedium {
-		t.Fatalf("expected IoT VLAN auto-inferred as isolated (high->medium), got %v", got["UB-0001|aa:02|23"])
+		t.Fatalf("expected Hotspot-zone VLAN to lower high->medium, got %v", got["UB-0001|aa:02|23"])
+	}
+	if got["UB-0001|aa:03|23"] != checks.SeverityMedium {
+		t.Fatalf("expected custom policy-blocked zone to lower high->medium, got %v", got["UB-0001|aa:03|23"])
 	}
 
-	// If IoT is empty, PostureNotes should recommend moving Default-LAN
-	// appliances (not Servers-VLAN infrastructure like truenas) onto it.
-	snap.Clients = snap.Clients[:2]
-	report2 := Evaluate(snap, raw[:2], config.NetworkConfig{})
-	if len(report2.PostureNotes) != 1 {
-		t.Fatalf("expected 1 posture note for unused IoT VLAN, got %d", len(report2.PostureNotes))
+	// Flat network (no isolated VLANs at all) should emit a flat-topology posture note.
+	flatSnap := &unifi.Snapshot{
+		Site: "default",
+		Networks: []unifi.Network{
+			{ID: "n1", Name: "OnlyNet", VLAN: "1", ZoneName: "Internal", Purpose: "corporate"},
+		},
+		Clients: []unifi.Client{
+			{IP: "192.168.1.50", MAC: "aa:01", Name: "host-a", NetworkName: "OnlyNet", VLAN: "1"},
+		},
 	}
-	if !strings.Contains(report2.PostureNotes[0].Detail, "hvac") || strings.Contains(report2.PostureNotes[0].Detail, "truenas") {
-		t.Fatalf("unexpected posture note detail: %s", report2.PostureNotes[0].Detail)
+	flatReport := Evaluate(flatSnap, []checks.Finding{
+		{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: flatSnap.Clients[0], Port: 23},
+	}, config.NetworkConfig{})
+	if len(flatReport.PostureNotes) != 1 || !strings.Contains(strings.ToLower(flatReport.PostureNotes[0].Title), "flat") {
+		t.Fatalf("expected flat-topology posture note, got %+v", flatReport.PostureNotes)
+	}
+}
+
+func TestFirewallPolicyAuditing(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Devices: []unifi.Device{
+			{Name: "Gateway", IP: "192.168.1.1", Model: "UDMPRO"},
+		},
+		FirewallPolicies: []unifi.FirewallPolicy{
+			{
+				ID:          "fw-1",
+				Name:        "Allow WAN Admin",
+				Enabled:     true,
+				Action:      "ALLOW",
+				Origin:      "USER_DEFINED",
+				Protocol:    "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, AnyPort: true},
+			},
+			{
+				ID:          "fw-2",
+				Name:        "System WireGuard",
+				Enabled:     true,
+				Action:      "ALLOW",
+				Origin:      "SYSTEM_DEFINED",
+				Protocol:    "udp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", Ports: []int{51820}},
+			},
+			{
+				ID:          "fw-3",
+				Name:        "Hotspot Leak",
+				Enabled:     true,
+				Action:      "ALLOW",
+				Origin:      "USER_DEFINED",
+				Protocol:    "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+			{
+				ID:          "fw-4",
+				Name:        "Pinpoint MQTT Pinhole",
+				Enabled:     true,
+				Action:      "ALLOW",
+				Origin:      "USER_DEFINED",
+				Protocol:    "tcp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"192.168.1.10"}, Ports: []int{1883}},
+			},
+		},
+	}
+
+	report := Evaluate(snap, nil, config.NetworkConfig{})
+	byID := make(map[string]checks.Finding)
+	for _, f := range report.Findings {
+		byID[f.CheckID] = f
+	}
+	if f, ok := byID["UB-UNIFI-FW-WAN-GW"]; !ok || f.EffectiveSeverity != checks.SeverityCritical {
+		t.Fatalf("expected CRITICAL UB-UNIFI-FW-WAN-GW finding, got %+v", byID)
+	}
+	if f, ok := byID["UB-UNIFI-FW-ISO-LEAK"]; !ok || f.EffectiveSeverity != checks.SeverityHigh {
+		t.Fatalf("expected HIGH UB-UNIFI-FW-ISO-LEAK finding, got %+v", byID)
+	}
+	// System WireGuard and pinpoint MQTT pinhole should NOT generate findings.
+	if len(report.Findings) != 2 {
+		t.Fatalf("expected exactly 2 firewall findings, got %d: %+v", len(report.Findings), report.Findings)
 	}
 }

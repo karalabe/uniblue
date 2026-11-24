@@ -51,7 +51,7 @@ type FingerprintRule struct {
 
 	// ModelGroup optionally selects a regex capture group (1-based) substituted
 	// for "{model}" inside Products patterns (useful for narrowing printer or
-	// appliance families to a specific hardware model like "m453").
+	// appliance families to a specific hardware model).
 	ModelGroup int `yaml:"model_group"`
 
 	hostnameRe   *regexp.Regexp
@@ -173,7 +173,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 
 	// 2. Apply declarative fingerprint rules to every probed LAN host, plus
 	// extract exact software versions directly from Nerva's Service discoveries
-	// (e.g., Grafana 13.3.1 from grafana:13.3.1-anon-access).
+	// (e.g., "<product>:<version>-<finding>").
 	for _, hp := range profiles {
 		wan := wanExposedIPs[hp.Client.IP]
 		for _, rule := range f.rules {
@@ -198,8 +198,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 			})
 		}
 
-		// Extract versioned products surfaced by Nerva service findings or CPEs
-		// (for example, Grafana 13.3.1 on :3000).
+		// Extract versioned products surfaced by Nerva service findings or CPEs.
 		for _, svc := range hp.Services {
 			for _, sf := range svc.Findings {
 				if name, ver := parseNervaVersionedID(sf.ID); name == "grafana" && ver != "" {
@@ -335,7 +334,7 @@ func expandProductPatterns(patterns []string, model string) []string {
 }
 
 // parseNervaVersionedID extracts (product, version) from Nerva finding IDs
-// formatted like "grafana:13.3.1-anon-access".
+// formatted like "<product>:<version>-<issue>".
 func parseNervaVersionedID(id string) (string, string) {
 	prefix, rest, ok := strings.Cut(strings.ToLower(strings.TrimSpace(id)), ":")
 	if !ok || prefix == "" {

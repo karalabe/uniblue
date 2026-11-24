@@ -387,19 +387,21 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	}
 
 	// Union configured default ports with any specialty ports required by loaded
-	// community checks (such as port 56747 for Zehnder ComfoConnect or 8545 for
-	// Ethereum RPC) so dropping a YAML check into checks/ works automatically.
+	// community checks so dropping a YAML check into checks/ works automatically.
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
 	fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+	// Seed per-host port hints discovered from UniFi port forwards and firewall
+	// policies so custom routed ports are probed automatically without config.
+	fp.SetHostPortHints(snap.PortHintsByIP())
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
 	runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
 	rawFindings := runner.RunAll(ctx, profiles)
 
-	// Merge noise-filtered Nerva protocol findings (e.g., SMBv1, anonymous
-	// Grafana, expired TLS certs) so they receive UniFi blast-radius scoring,
-	// state diffing, and watch alerting alongside UniBlue's own YAML checks.
+	// Merge noise-filtered Nerva protocol findings (e.g., legacy protocols,
+	// anonymous service access, expired TLS certs) so they receive UniFi
+	// blast-radius scoring, state diffing, and watch alerting alongside YAML checks.
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 
 	report := risk.Evaluate(snap, rawFindings, cfg.Network)
@@ -600,8 +602,30 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVE
 
 // printInventory renders the UniFi snapshot tables cleanly for `uniblue inventory`.
 func printInventory(w io.Writer, snap *unifi.Snapshot) {
-	fmt.Fprintf(w, "UniFi Site: %s (%s) | Clients: %d | Devices: %d | Networks: %d | Port Forwards: %d\n\n",
-		snap.Site, snap.ControllerType, len(snap.Clients), len(snap.Devices), len(snap.Networks), len(snap.PortForwards))
+	fmt.Fprintf(w, "UniFi Site: %s (%s) | Clients: %d | Devices: %d | Networks: %d | Zones: %d | Port Forwards: %d\n\n",
+		snap.Site, snap.ControllerType, len(snap.Clients), len(snap.Devices), len(snap.Networks), len(snap.Zones), len(snap.PortForwards))
+
+	if len(snap.Networks) > 0 {
+		clientsPerNet := make(map[string]int, len(snap.Networks))
+		for _, cl := range snap.Clients {
+			if cl.NetworkName != "" {
+				clientsPerNet[strings.ToLower(cl.NetworkName)]++
+			}
+		}
+		fmt.Fprintln(w, "Networks & Topology:")
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAME\tVLAN\tZONE\tPURPOSE\tISOLATED\tSUBNET\tCLIENTS")
+		for _, n := range snap.Networks {
+			zone := n.ZoneName
+			if zone == "" {
+				zone = "-"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%s\t%d\n",
+				n.Name, n.VLAN, zone, n.Purpose, n.IsolationEnabled, n.Subnet, clientsPerNet[strings.ToLower(n.Name)])
+		}
+		_ = tw.Flush()
+		fmt.Fprintln(w)
+	}
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "CLIENT\tIP\tMAC\tVLAN\tVENDOR")

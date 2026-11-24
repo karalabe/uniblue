@@ -224,9 +224,9 @@ func portSpecMatches(spec string, port int) bool {
 	return false
 }
 
-// AnalyzePosture inspects UniFi VLAN utilization and active findings to emit
-// deterministic architectural guidance (such as pointing out an unused IoT
-// VLAN when vulnerable appliances sit on a trusted VLAN).
+// AnalyzePosture inspects UniFi's structural network topology (zones, isolation
+// flags, client placement, and active findings) to emit generic architectural
+// guidance without relying on user-chosen VLAN names.
 func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg config.NetworkConfig) []PostureNote {
 	if snap == nil {
 		return nil
@@ -241,48 +241,73 @@ func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg conf
 		}
 	}
 
-	// Identify isolated/IoT/smart VLANs configured on the gateway that currently
-	// hold zero active clients (skipping guest networks, which are for visitors
-	// rather than permanently homed smart appliances).
-	var emptyIoTVLANs []unifi.Network
+	// Identify all structurally isolated LAN networks (excluding WAN/VPN) and
+	// track which ones currently hold zero active clients.
+	var isolatedNets []unifi.Network
+	var emptyIsolatedNets []unifi.Network
 	for _, n := range snap.Networks {
-		lower := strings.ToLower(strings.TrimSpace(n.Name))
-		purpose := strings.ToLower(strings.TrimSpace(n.Purpose))
-		if purpose == "guest" || strings.Contains(lower, "guest") {
+		purposeLower := strings.ToLower(strings.TrimSpace(n.Purpose))
+		zoneLower := strings.ToLower(strings.TrimSpace(n.ZoneName))
+		if purposeLower == "wan" || purposeLower == "remote-user-vpn" ||
+			zoneLower == "external" || zoneLower == "vpn" || zoneLower == "gateway" {
 			continue
 		}
-		_, explicitIsolated := isolatedSet[lower]
-		if !explicitIsolated && n.VLAN != "" {
-			_, explicitIsolated = isolatedSet[strings.ToLower(n.VLAN)]
+		lower := strings.ToLower(strings.TrimSpace(n.Name))
+		_, isIso := isolatedSet[lower]
+		if !isIso && n.VLAN != "" {
+			_, isIso = isolatedSet[strings.ToLower(strings.TrimSpace(n.VLAN))]
 		}
-		looksLikeIoT := explicitIsolated || strings.Contains(lower, "iot") || strings.Contains(lower, "smart") || lower == "not"
-		if looksLikeIoT && clientsPerNet[lower] == 0 {
-			emptyIoTVLANs = append(emptyIoTVLANs, n)
+		if !isIso {
+			continue
+		}
+		isolatedNets = append(isolatedNets, n)
+		if clientsPerNet[lower] == 0 {
+			emptyIsolatedNets = append(emptyIsolatedNets, n)
 		}
 	}
 
-	// Collect exposed hosts sitting on a general trusted LAN, skipping dedicated
-	// server/management VLANs that are already segmented away from user devices.
-	trustedHosts := make(map[string]struct{})
+	// Collect every host with a confirmed LAN service exposure sitting on a
+	// non-isolated (trusted/internal) network.
+	exposedInternalHosts := make(map[string]struct{})
 	for _, f := range findings {
-		if f.Port > 0 && matchesVLAN(f.Client, trustedSet) && !isServerOrMgmtVLAN(f.Client.NetworkName) {
-			trustedHosts[f.Client.DisplayName()] = struct{}{}
+		if f.Port > 0 && matchesVLAN(f.Client, trustedSet) {
+			exposedInternalHosts[f.Client.DisplayName()] = struct{}{}
 		}
 	}
 
 	var notes []PostureNote
-	if len(emptyIoTVLANs) > 0 && len(trustedHosts) > 0 {
-		vlan := emptyIoTVLANs[0]
-		names := make([]string, 0, len(trustedHosts))
-		for h := range trustedHosts {
-			names = append(names, h)
+	if len(exposedInternalHosts) > 0 {
+		hostNames := make([]string, 0, len(exposedInternalHosts))
+		for h := range exposedInternalHosts {
+			hostNames = append(hostNames, h)
 		}
-		sort.Strings(names)
-		notes = append(notes, PostureNote{
-			Severity: checks.SeverityMedium,
-			Title:    fmt.Sprintf("Unused IoT VLAN %q (VLAN %s) while exposed devices sit on Trusted LAN", vlan.Name, vlan.VLAN),
-			Detail:   fmt.Sprintf("VLAN %q currently has 0 active clients, while %d host(s) with confirmed LAN exposures (%s) share your trusted network. Moving IoT/AV/HVAC appliances onto %q immediately lowers blast radius.", vlan.Name, len(names), strings.Join(names, ", "), vlan.Name),
-		})
+		sort.Strings(hostNames)
+
+		switch {
+		case len(isolatedNets) == 0 && len(snap.Networks) > 0:
+			// Flat network topology: no isolated/guest/DMZ network exists at all.
+			notes = append(notes, PostureNote{
+				Severity: checks.SeverityMedium,
+				Title:    "Flat internal network topology with no isolated VLAN configured",
+				Detail:   fmt.Sprintf("No isolated, DMZ, or guest VLAN is configured in UniFi while %d host(s) with confirmed LAN exposures (%s) share the internal network. Creating an isolated VLAN/zone for untrusted or embedded appliances lowers lateral-movement blast radius.", len(hostNames), strings.Join(hostNames, ", ")),
+			})
+		case len(emptyIsolatedNets) > 0:
+			// One or more configured isolated networks currently hold zero clients.
+			var netLabels []string
+			for _, n := range emptyIsolatedNets {
+				label := n.Name
+				if n.VLAN != "" {
+					label = fmt.Sprintf("%s (VLAN %s)", n.Name, n.VLAN)
+				}
+				netLabels = append(netLabels, label)
+			}
+			sort.Strings(netLabels)
+			notes = append(notes, PostureNote{
+				Severity: checks.SeverityMedium,
+				Title:    fmt.Sprintf("Unused isolated network(s) (%s) while exposed hosts sit on Internal LAN", strings.Join(netLabels, ", ")),
+				Detail:   fmt.Sprintf("Isolated network(s) %s currently have 0 active clients, while %d host(s) with confirmed LAN exposures (%s) sit on internal networks. Moving untrusted or embedded appliances onto an isolated VLAN lowers blast radius.", strings.Join(netLabels, ", "), len(hostNames), strings.Join(hostNames, ", ")),
+			})
+		}
 	}
 
 	// Flag unnamed MAC-only clients that receive active WAN port forwards.
@@ -317,15 +342,175 @@ func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg conf
 	return notes
 }
 
-// isServerOrMgmtVLAN reports whether a UniFi network name designates a
-// dedicated server, storage, or infrastructure management segment rather than
-// a general user/default LAN.
-func isServerOrMgmtVLAN(name string) bool {
-	lower := strings.ToLower(strings.TrimSpace(name))
-	return strings.Contains(lower, "server") ||
-		strings.Contains(lower, "mgmt") ||
-		strings.Contains(lower, "management") ||
-		strings.Contains(lower, "admin") ||
-		strings.Contains(lower, "infra") ||
-		strings.Contains(lower, "storage")
+// auditFirewallPolicies evaluates UniFi Zone-Based Firewall policies generically
+// to catch high-risk user-defined ALLOW rules (such as WAN-to-Gateway access,
+// broad WAN-to-LAN allows, or unrestricted isolated-zone-to-Internal leaks).
+func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
+	if snap == nil || len(snap.FirewallPolicies) == 0 {
+		return nil
+	}
+
+	isoZones := isolatedZoneSet(snap)
+	gwName, gwIP := findGatewayIdentity(snap)
+
+	var findings []checks.Finding
+	for _, pol := range snap.FirewallPolicies {
+		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
+			continue
+		}
+		// Skip UniFi built-in system policies (port-forward auto-rules, DHCPv6,
+		// WireGuard listener, etc.); port forwards are audited separately via WANSurface.
+		if strings.EqualFold(pol.Origin, "SYSTEM_DEFINED") {
+			continue
+		}
+
+		srcZone := strings.ToLower(strings.TrimSpace(pol.Source.ZoneName))
+		dstZone := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
+		if srcZone == "" || dstZone == "" {
+			continue
+		}
+
+		zonePath := fmt.Sprintf("%s -> %s", pol.Source.ZoneName, pol.Destination.ZoneName)
+		portDesc := formatPolicyPorts(pol.Destination)
+		protoDesc := pol.Protocol
+		if protoDesc == "" {
+			protoDesc = "all"
+		}
+
+		switch {
+		case srcZone == "external" && dstZone == "gateway":
+			sev := checks.SeverityHigh
+			title := fmt.Sprintf("WAN-to-Gateway Firewall Policy Allows Direct Access (%s)", pol.Name)
+			if pol.Destination.AnyPort || strings.EqualFold(protoDesc, "all") {
+				sev = checks.SeverityCritical
+				title = fmt.Sprintf("Unrestricted WAN-to-Gateway Firewall Policy (%s)", pol.Name)
+			}
+			findings = append(findings, checks.Finding{
+				CheckID:           "UB-UNIFI-FW-WAN-GW",
+				Title:             title,
+				Category:          "firewall-policy",
+				BaseSeverity:      sev,
+				EffectiveSeverity: sev,
+				RiskReasons:       []string{fmt.Sprintf("user-defined ALLOW policy on %s", zonePath)},
+				Client: unifi.Client{
+					MAC:         "fw:" + pol.ID,
+					IP:          gwIP,
+					Name:        gwName,
+					NetworkName: zonePath,
+				},
+				Evidence: fmt.Sprintf("enabled policy %q allows %s (protocol=%s, ports=%s, src=%s)",
+					pol.Name, zonePath, protoDesc, portDesc, formatPolicyTarget(pol.Source)),
+				Remediation: checks.Remediation{
+					Summary:      "Remove or restrict this WAN-to-Gateway ALLOW rule. Never expose gateway management services (SSH/HTTPS) or unrestricted ports directly to the public internet; use VPN access instead.",
+					UniFiActions: []string{"disable_or_restrict_firewall_policy", "use_wireguard_vpn"},
+				},
+			})
+
+		case srcZone == "external" && dstZone != "external":
+			sev := checks.SeverityHigh
+			title := fmt.Sprintf("WAN-to-LAN Firewall Policy Allows Inbound Traffic (%s)", pol.Name)
+			if pol.Destination.AnyPort || pol.Destination.AnyTarget {
+				sev = checks.SeverityCritical
+				title = fmt.Sprintf("Broad WAN-to-LAN Firewall Policy (%s)", pol.Name)
+			}
+			findings = append(findings, checks.Finding{
+				CheckID:           "UB-UNIFI-FW-WAN-LAN",
+				Title:             title,
+				Category:          "firewall-policy",
+				BaseSeverity:      sev,
+				EffectiveSeverity: sev,
+				RiskReasons:       []string{fmt.Sprintf("user-defined ALLOW policy on %s", zonePath)},
+				Client: unifi.Client{
+					MAC:         "fw:" + pol.ID,
+					IP:          firstOrFallback(pol.Destination.IPs, gwIP),
+					Name:        fmt.Sprintf("Firewall Policy (%s)", pol.Name),
+					NetworkName: zonePath,
+				},
+				Evidence: fmt.Sprintf("enabled policy %q allows %s (protocol=%s, target=%s, ports=%s)",
+					pol.Name, zonePath, protoDesc, formatPolicyTarget(pol.Destination), portDesc),
+				Remediation: checks.Remediation{
+					Summary:      "Verify whether inbound WAN traffic to this internal zone is strictly required. Scope destination IPs, ports, and allowed WAN source IPs, or replace with VPN access.",
+					UniFiActions: []string{"restrict_firewall_policy", "use_wireguard_vpn"},
+				},
+			})
+
+		case isoZones[srcZone] && dstZone == "internal":
+			// Allow pinpoint pinholes (explicit destination IP + explicit port),
+			// but flag broad zone-to-Internal ALLOW rules that defeat isolation.
+			if !pol.Destination.AnyTarget && !pol.Destination.AnyPort {
+				continue
+			}
+			findings = append(findings, checks.Finding{
+				CheckID:           "UB-UNIFI-FW-ISO-LEAK",
+				Title:             fmt.Sprintf("Broad Isolated-to-Internal Firewall Policy (%s)", pol.Name),
+				Category:          "firewall-policy",
+				BaseSeverity:      checks.SeverityHigh,
+				EffectiveSeverity: checks.SeverityHigh,
+				RiskReasons:       []string{fmt.Sprintf("weakens isolation on %s", zonePath)},
+				Client: unifi.Client{
+					MAC:         "fw:" + pol.ID,
+					IP:          firstOrFallback(pol.Destination.IPs, gwIP),
+					Name:        fmt.Sprintf("Firewall Policy (%s)", pol.Name),
+					NetworkName: zonePath,
+				},
+				Evidence: fmt.Sprintf("enabled policy %q allows %s (protocol=%s, target=%s, ports=%s)",
+					pol.Name, zonePath, protoDesc, formatPolicyTarget(pol.Destination), portDesc),
+				Remediation: checks.Remediation{
+					Summary:      "Restrict inter-zone ALLOW rules from isolated networks to specific destination IPs and ports so compromised devices cannot scan or pivot across internal networks.",
+					UniFiActions: []string{"scope_inter_zone_policy"},
+				},
+			})
+		}
+	}
+	return findings
+}
+
+// findGatewayIdentity returns a human-readable name and IP for the UniFi
+// gateway from snap.Devices so firewall policy findings display cleanly.
+func findGatewayIdentity(snap *unifi.Snapshot) (name, ip string) {
+	for _, d := range snap.Devices {
+		modelLower := strings.ToLower(d.Model)
+		if strings.Contains(modelLower, "udm") || strings.Contains(modelLower, "ucg") ||
+			strings.Contains(modelLower, "uxg") || strings.Contains(modelLower, "usg") ||
+			strings.Contains(modelLower, "efg") || strings.EqualFold(d.Type, "ugw") ||
+			strings.EqualFold(d.Type, "udm") {
+			n := d.Name
+			if n == "" {
+				n = d.Model
+			}
+			return n, d.IP
+		}
+	}
+	return "UniFi Gateway", "gateway"
+}
+
+// formatPolicyPorts formats a PolicyEndpoint's destination port restriction.
+func formatPolicyPorts(ep unifi.PolicyEndpoint) string {
+	if ep.AnyPort || len(ep.Ports) == 0 {
+		return "any"
+	}
+	parts := make([]string, 0, len(ep.Ports))
+	for _, p := range ep.Ports {
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}
+
+// formatPolicyTarget formats a PolicyEndpoint's IP/target restriction.
+func formatPolicyTarget(ep unifi.PolicyEndpoint) string {
+	if ep.AnyTarget {
+		return "any"
+	}
+	if len(ep.IPs) > 0 {
+		return strings.Join(ep.IPs, ",")
+	}
+	return "filtered"
+}
+
+// firstOrFallback returns items[0] when non-empty, otherwise fallback.
+func firstOrFallback(items []string, fallback string) string {
+	if len(items) > 0 && items[0] != "" {
+		return items[0]
+	}
+	return fallback
 }

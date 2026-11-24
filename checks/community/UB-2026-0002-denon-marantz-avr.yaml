@@ -29,8 +29,8 @@ remediation:
     Denon and Marantz AV receivers expose an unauthenticated cleartext Telnet
     control protocol on port 23. Any reachable device on the network can power
     on the amplifier, switch inputs, or set maximum volume without credentials.
-    Isolate the receiver on a Smart Devices / IoT VLAN and restrict port 23
-    access to trusted home-automation controllers.
+    Isolate the receiver on a segmented VLAN and restrict port 23 access to
+    trusted home-automation controllers.
   unifi_actions:
     - move_to_iot_vlan
     - restrict_inter_vlan_access

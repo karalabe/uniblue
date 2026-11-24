@@ -64,13 +64,13 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 }
 
 // normalizeNervaCheckID creates a concise, uppercase check identifier (e.g.,
-// "smb-v1-enabled" -> "NERVA-SMB-V1-ENABLED", "grafana:13.3.1-anon-access" ->
-// "NERVA-GRAFANA-ANON-ACCESS") so deduplication keys stay stable across minor
+// "smb-v1-enabled" -> "NERVA-SMB-V1-ENABLED", "service:1.2.3-anon-access" ->
+// "NERVA-SERVICE-ANON-ACCESS") so deduplication keys stay stable across minor
 // software version bumps.
 func normalizeNervaCheckID(rawID string) string {
 	id := strings.ToLower(strings.TrimSpace(rawID))
-	// Strip embedded version strings like "grafana:13.3.1-anon-access" -> "grafana-anon-access"
-	// so state.json keys remain stable when Grafana updates from 13.3.1 to 13.3.2.
+	// Strip embedded version strings like "service:1.2.3-anon-access" -> "service-anon-access"
+	// so state.json keys remain stable across minor software updates.
 	if prefix, rest, ok := strings.Cut(id, ":"); ok {
 		if idx := strings.IndexByte(rest, '-'); idx >= 0 {
 			id = prefix + rest[idx:]

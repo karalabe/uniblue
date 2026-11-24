@@ -1,6 +1,6 @@
 # Minimal UniBlue configuration.
-# Everything except your UniFi URL and credentials is inferred automatically
-# (VLAN trust tiers, curated 30-port discovery list, local CVE cache path).
+# Everything except your UniFi URL and credentials is derived automatically
+# from UniFi's own networks, firewall zones, isolation flags, and policies.
 #
 # You can even skip config.yaml altogether using environment variables:
 #   UNIBLUE_UNIFI_URL=https://192.168.1.1
@@ -18,15 +18,15 @@ unifi:
   # username: ""
   # password: ""   # or UNIBLUE_UNIFI_PASSWORD
 
-# --- Optional Overrides (smart defaults apply when omitted) ---
+# --- Optional Overrides (derived from UniFi topology when omitted) ---
 
 # network:
-#   trusted_vlans: ["Default", "Servers"]
+#   trusted_vlans: ["Default"]
 #   isolated_vlans: ["IoT", "Guest"]
 #   exclude_ips: []
 
 # scan:
-#   extra_ports: []        # Added on top of UniBlue's curated 30-port list
+#   extra_ports: []        # Added on top of UniBlue's curated port list
 #   checks_dir: ""         # Extra local directory of community YAML checks
 #   interval: 15m          # Polling interval for `uniblue watch`
 

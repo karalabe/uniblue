@@ -136,8 +136,8 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 		hp.Services = append(hp.Services, svc)
 
 		// Backfill SSHBanner and HTTP banners discovered on non-default ports
-		// (e.g., Grafana on :3000, llama.cpp on :8080, Pi-hole on :443) so
-		// downstream YAML checks and CVE rules see them uniformly.
+		// (e.g., web dashboards or APIs on alternate ports) so downstream YAML
+		// checks and CVE rules see them uniformly.
 		if svc.Banner != "" && strings.HasPrefix(svc.Banner, "SSH-") && hp.SSHBanner == "" {
 			hp.SSHBanner = svc.Banner
 		}

@@ -275,11 +275,19 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	type forwardsRes struct {
 		items []rawPortForward
 	}
+	type zonesRes struct {
+		items []integrationFirewallZone
+	}
+	type policiesRes struct {
+		items []integrationFirewallPolicy
+	}
 
 	clientsCh := make(chan clientsRes, 1)
 	devicesCh := make(chan devicesRes, 1)
 	networksCh := make(chan networksRes, 1)
 	forwardsCh := make(chan forwardsRes, 1)
+	zonesCh := make(chan zonesRes, 1)
+	policiesCh := make(chan policiesRes, 1)
 
 	siteBase := fmt.Sprintf("%s/sites/%s", integrationV1Prefix, c.siteID)
 
@@ -311,22 +319,62 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		}
 		forwardsCh <- forwardsRes{}
 	}()
+	go func() {
+		// Zone-Based Firewall endpoints exist on UniFi Network 9+; silently
+		// ignore 404/auth errors on older consoles.
+		items, err := fetchAllPages[integrationFirewallZone](ctx, c, siteBase+"/firewall/zones")
+		if err != nil {
+			zonesCh <- zonesRes{}
+			return
+		}
+		zonesCh <- zonesRes{items: items}
+	}()
+	go func() {
+		items, err := fetchAllPages[integrationFirewallPolicy](ctx, c, siteBase+"/firewall/policies")
+		if err != nil {
+			policiesCh <- policiesRes{}
+			return
+		}
+		policiesCh <- policiesRes{items: items}
+	}()
 
 	cr := <-clientsCh
 	dr := <-devicesCh
 	nr := <-networksCh
 	fr := <-forwardsCh
+	zr := <-zonesCh
+	pr := <-policiesCh
 
 	if err := errors.Join(cr.err, dr.err, nr.err); err != nil {
 		return nil, fmt.Errorf("fetch unifi integration snapshot: %w", err)
 	}
 
-	// Parse each network's IPv4 CIDR so we can map clients to VLANs reliably by
-	// IP address even though /integration/v1/sites/{id}/clients omits networkId.
-	// The list endpoint often omits ipv4Configuration, so fetch individual
-	// network details concurrently for any network missing a subnet, then fall
-	// back to legacy rest/networkconf if any remain unresolved.
-	c.enrichIntegrationNetworkSubnets(ctx, siteBase, nr.items)
+	// Build firewall zone lookup maps (zoneID -> name and networkID -> zone)
+	// so every network and firewall policy carries resolved human-readable zone names.
+	zones := make([]FirewallZone, 0, len(zr.items))
+	zoneNameByID := make(map[string]string, len(zr.items))
+	zoneByNetID := make(map[string]FirewallZone)
+	for _, rz := range zr.items {
+		origin := ""
+		if rz.Metadata != nil {
+			origin = rz.Metadata.Origin
+		}
+		z := FirewallZone{
+			ID:         rz.ID,
+			Name:       rz.Name,
+			Origin:     origin,
+			NetworkIDs: rz.NetworkIDs,
+		}
+		zones = append(zones, z)
+		zoneNameByID[z.ID] = z.Name
+		for _, nid := range z.NetworkIDs {
+			zoneByNetID[nid] = z
+		}
+	}
+
+	// Enrich each network with its IPv4 subnet, isolation flag, zone ID, and
+	// legacy purpose (since the Integration v1 list omits ipv4Configuration and purpose).
+	c.enrichIntegrationNetworks(ctx, siteBase, nr.items)
 
 	type subnetEntry struct {
 		prefix netip.Prefix
@@ -336,16 +384,27 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	var subnets []subnetEntry
 	for _, rn := range nr.items {
 		subnet := extractIntegrationSubnet(rn)
-		purpose := rn.Purpose
+		purpose := strings.ToLower(strings.TrimSpace(rn.Purpose))
 		if purpose == "" {
 			purpose = strings.ToLower(rn.Management)
 		}
+		zoneID := rn.ZoneID
+		zoneName := zoneNameByID[zoneID]
+		if zoneName == "" {
+			if z, ok := zoneByNetID[rn.ID]; ok {
+				zoneID = z.ID
+				zoneName = z.Name
+			}
+		}
 		n := Network{
-			ID:      rn.ID,
-			Name:    rn.Name,
-			Purpose: purpose,
-			VLAN:    string(rn.VLANID),
-			Subnet:  subnet,
+			ID:               rn.ID,
+			Name:             rn.Name,
+			Purpose:          purpose,
+			VLAN:             string(rn.VLANID),
+			Subnet:           subnet,
+			IsolationEnabled: rn.IsolationEnabled,
+			ZoneID:           zoneID,
+			ZoneName:         zoneName,
 		}
 		networks = append(networks, n)
 
@@ -353,6 +412,8 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			subnets = append(subnets, subnetEntry{prefix: pfx, net: n})
 		}
 	}
+
+	policies := convertIntegrationPolicies(pr.items, zoneNameByID)
 
 	clients := make([]Client, 0, len(cr.items))
 	for _, rc := range cr.items {
@@ -395,13 +456,15 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	forwards := convertPortForwards(fr.items)
 
 	return &Snapshot{
-		CollectedAt:    time.Now().UTC(),
-		Site:           c.site,
-		ControllerType: c.controllerType,
-		Clients:        clients,
-		Devices:        devices,
-		Networks:       networks,
-		PortForwards:   forwards,
+		CollectedAt:      time.Now().UTC(),
+		Site:             c.site,
+		ControllerType:   c.controllerType,
+		Clients:          clients,
+		Devices:          devices,
+		Networks:         networks,
+		PortForwards:     forwards,
+		Zones:            zones,
+		FirewallPolicies: policies,
 	}, nil
 }
 
@@ -467,11 +530,12 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	netByName := make(map[string]Network, len(nr.items))
 	for _, rn := range nr.items {
 		n := Network{
-			ID:      rn.ID,
-			Name:    rn.Name,
-			Purpose: rn.Purpose,
-			VLAN:    string(rn.VLAN),
-			Subnet:  rn.IPSubnet,
+			ID:               rn.ID,
+			Name:             rn.Name,
+			Purpose:          strings.ToLower(strings.TrimSpace(rn.Purpose)),
+			VLAN:             string(rn.VLAN),
+			Subnet:           rn.IPSubnet,
+			IsolationEnabled: rn.NetworkIsolationEnabled,
 		}
 		networks = append(networks, n)
 		if n.ID != "" {
@@ -597,55 +661,156 @@ func extractIntegrationSubnet(rn integrationNetwork) string {
 	return ""
 }
 
-// enrichIntegrationNetworkSubnets fills in missing IPv4 subnets on networks
-// returned by the Integration v1 list endpoint. It concurrently queries each
-// network's detail endpoint over a channel, and if any subnets are still empty
-// (for example on older Network versions), falls back to rest/networkconf.
-func (c *Controller) enrichIntegrationNetworkSubnets(ctx context.Context, siteBase string, items []integrationNetwork) {
-	type detailRes struct {
-		idx    int
-		subnet string
+// convertIntegrationPolicies normalizes wire Integration v1 firewall policies
+// into domain FirewallPolicy values with resolved zone names and explicit
+// IP/port filter flags.
+func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[string]string) []FirewallPolicy {
+	out := make([]FirewallPolicy, 0, len(raw))
+	for _, rp := range raw {
+		origin := ""
+		if rp.Metadata != nil {
+			origin = rp.Metadata.Origin
+		}
+		proto := "all"
+		if rp.IPProtocolScope != nil && rp.IPProtocolScope.ProtocolFilter != nil {
+			pf := rp.IPProtocolScope.ProtocolFilter
+			switch {
+			case pf.Protocol != nil && pf.Protocol.Name != "":
+				proto = strings.ToLower(pf.Protocol.Name)
+			case pf.NamedProtocol != "":
+				proto = strings.ToLower(pf.NamedProtocol)
+			}
+		}
+		out = append(out, FirewallPolicy{
+			ID:             rp.ID,
+			Name:           rp.Name,
+			Enabled:        rp.Enabled,
+			Action:         strings.ToUpper(strings.TrimSpace(rp.Action.Type)),
+			Origin:         origin,
+			Protocol:       proto,
+			Source:         convertPolicyEndpoint(rp.Source, zoneNames),
+			Destination:    convertPolicyEndpoint(rp.Destination, zoneNames),
+			LoggingEnabled: rp.LoggingEnabled,
+		})
+	}
+	return out
+}
+
+// convertPolicyEndpoint extracts zone identity, IP addresses, and port numbers
+// from an Integration v1 firewall policy endpoint.
+func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]string) PolicyEndpoint {
+	out := PolicyEndpoint{
+		ZoneID:    ep.ZoneID,
+		ZoneName:  zoneNames[ep.ZoneID],
+		AnyTarget: true,
+		AnyPort:   true,
+	}
+	tf := ep.TrafficFilter
+	if tf == nil {
+		return out
 	}
 
-	var missing []int
-	for i, rn := range items {
-		if extractIntegrationSubnet(rn) == "" && rn.ID != "" {
-			missing = append(missing, i)
+	if tf.IPAddressFilter != nil && len(tf.IPAddressFilter.Items) > 0 {
+		out.AnyTarget = false
+		for _, item := range tf.IPAddressFilter.Items {
+			if v := strings.TrimSpace(string(item.Value)); v != "" {
+				out.IPs = append(out.IPs, v)
+			}
 		}
 	}
-	if len(missing) == 0 {
+	if tf.NetworkFilter != nil && len(tf.NetworkFilter.NetworkIDs) > 0 {
+		out.AnyTarget = false
+	}
+	if tf.MACAddressFilter != nil && len(tf.MACAddressFilter.MACAddresses) > 0 {
+		out.AnyTarget = false
+	}
+	if tf.PortFilter != nil && len(tf.PortFilter.Items) > 0 {
+		out.AnyPort = false
+		for _, item := range tf.PortFilter.Items {
+			if item.Start > 0 && item.End >= item.Start && (item.End-item.Start+1) <= 16 {
+				for p := item.Start; p <= item.End; p++ {
+					out.Ports = append(out.Ports, p)
+				}
+				continue
+			}
+			if v := strings.TrimSpace(string(item.Value)); v != "" {
+				out.Ports = append(out.Ports, expandPortSpec(v, 16)...)
+			}
+		}
+	}
+	return out
+}
+
+// enrichIntegrationNetworks fills in missing IPv4 subnets, isolation flags,
+// zone IDs, and network purposes on networks returned by the Integration v1
+// list endpoint. It concurrently queries each network's detail endpoint over a
+// channel and opportunistically pulls purpose/isolation from legacy rest/networkconf.
+func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase string, items []integrationNetwork) {
+	type detailRes struct {
+		idx       int
+		subnet    string
+		isolated  bool
+		zoneID    string
+		purpose   string
+		hasDetail bool
+	}
+
+	if len(items) == 0 {
 		return
 	}
 
-	ch := make(chan detailRes, len(missing))
-	for _, idx := range missing {
-		id := items[idx].ID
-		go func(i int, netID string) {
+	ch := make(chan detailRes, len(items))
+	for i := range items {
+		id := items[i].ID
+		if id == "" {
+			ch <- detailRes{idx: i}
+			continue
+		}
+		go func(idx int, netID string) {
 			var detail integrationNetwork
 			if err := c.getJSON(ctx, fmt.Sprintf("%s/networks/%s", siteBase, netID), &detail); err == nil {
-				ch <- detailRes{idx: i, subnet: extractIntegrationSubnet(detail)}
+				ch <- detailRes{
+					idx:       idx,
+					subnet:    extractIntegrationSubnet(detail),
+					isolated:  detail.IsolationEnabled,
+					zoneID:    detail.ZoneID,
+					purpose:   detail.Purpose,
+					hasDetail: true,
+				}
 				return
 			}
-			ch <- detailRes{idx: i}
-		}(idx, id)
+			ch <- detailRes{idx: idx}
+		}(i, id)
 	}
-	for range missing {
+	for range items {
 		res := <-ch
-		if res.subnet != "" {
+		if !res.hasDetail {
+			continue
+		}
+		if res.subnet != "" && extractIntegrationSubnet(items[res.idx]) == "" {
 			items[res.idx].Subnet = res.subnet
+		}
+		if res.isolated {
+			items[res.idx].IsolationEnabled = true
+		}
+		if res.zoneID != "" && items[res.idx].ZoneID == "" {
+			items[res.idx].ZoneID = res.zoneID
+		}
+		if res.purpose != "" && items[res.idx].Purpose == "" {
+			items[res.idx].Purpose = res.purpose
 		}
 	}
 
-	// Check if any network still lacks a subnet and opportunistically match
-	// against legacy rest/networkconf by network name or VLAN tag.
-	stillMissing := false
+	// Opportunistically pull legacy rest/networkconf to fill missing subnet or
+	// UniFi purpose ("corporate" vs "guest") / network_isolation_enabled metadata.
+	needsLegacy := false
 	for _, rn := range items {
-		if extractIntegrationSubnet(rn) == "" {
-			stillMissing = true
+		if extractIntegrationSubnet(rn) == "" || rn.Purpose == "" {
+			needsLegacy = true
 			break
 		}
 	}
-	if !stillMissing {
+	if !needsLegacy {
 		return
 	}
 
@@ -654,27 +819,32 @@ func (c *Controller) enrichIntegrationNetworkSubnets(ctx context.Context, siteBa
 		return
 	}
 
-	byName := make(map[string]string, len(env.Data))
-	byVLAN := make(map[string]string, len(env.Data))
+	byName := make(map[string]rawNetwork, len(env.Data))
+	byVLAN := make(map[string]rawNetwork, len(env.Data))
 	for _, rn := range env.Data {
-		if rn.IPSubnet == "" {
-			continue
-		}
 		if rn.Name != "" {
-			byName[strings.ToLower(rn.Name)] = rn.IPSubnet
+			byName[strings.ToLower(rn.Name)] = rn
 		}
 		if vlan := string(rn.VLAN); vlan != "" {
-			byVLAN[vlan] = rn.IPSubnet
+			byVLAN[vlan] = rn
 		}
 	}
 	for i := range items {
-		if extractIntegrationSubnet(items[i]) != "" {
+		rn, ok := byName[strings.ToLower(items[i].Name)]
+		if !ok {
+			rn, ok = byVLAN[string(items[i].VLANID)]
+		}
+		if !ok {
 			continue
 		}
-		if sub, ok := byName[strings.ToLower(items[i].Name)]; ok {
-			items[i].Subnet = sub
-		} else if sub, ok := byVLAN[string(items[i].VLANID)]; ok {
-			items[i].Subnet = sub
+		if extractIntegrationSubnet(items[i]) == "" && rn.IPSubnet != "" {
+			items[i].Subnet = rn.IPSubnet
+		}
+		if items[i].Purpose == "" && rn.Purpose != "" {
+			items[i].Purpose = rn.Purpose
+		}
+		if rn.NetworkIsolationEnabled {
+			items[i].IsolationEnabled = true
 		}
 	}
 }

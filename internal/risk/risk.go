@@ -195,6 +195,10 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		return wanSurface[i].Forward.Name < wanSurface[j].Forward.Name
 	})
 
+	// Audit Zone-Based Firewall policies generically for overly permissive
+	// WAN-to-Gateway, WAN-to-LAN, or isolated-zone-to-Internal ALLOW rules.
+	scored = append(scored, auditFirewallPolicies(snap)...)
+
 	// Emit a low-severity posture finding for UniFi infrastructure gear running
 	// outdated firmware reported as upgradable by the controller.
 	cleanUniFi := 0
@@ -407,15 +411,18 @@ func SaveState(path string, st *State) error {
 }
 
 // resolveVLANTiers merges any explicit user-configured trusted/isolated VLANs
-// with deterministic auto-inference from UniFi's own network definitions (VLAN
-// name, VLAN tag 1, and guest purpose). Explicit user config always wins so
-// zero-config setups work smartly out of the box while remaining overridable.
+// with factual topology metadata from UniFi itself: Firewall Zones (Internal vs
+// Hotspot/Dmz or any user zone blocked from Internal), explicit Network
+// Isolation flags, and UniFi's structural network purpose ("corporate" vs "guest").
+// It never guesses trust tiers from user-chosen VLAN names.
 func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (trusted, isolated map[string]struct{}) {
 	trusted = toLowerSet(netCfg.TrustedVLANs)
 	isolated = toLowerSet(netCfg.IsolatedVLANs)
 	if snap == nil {
 		return trusted, isolated
 	}
+
+	isoZones := isolatedZoneSet(snap)
 
 	for _, n := range snap.Networks {
 		nameLower := strings.ToLower(strings.TrimSpace(n.Name))
@@ -424,7 +431,15 @@ func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (truste
 			continue
 		}
 
-		// Respect explicit user placement before applying heuristics.
+		// Skip non-LAN entries (WAN uplinks and remote-user VPN pools).
+		purposeLower := strings.ToLower(strings.TrimSpace(n.Purpose))
+		zoneLower := strings.ToLower(strings.TrimSpace(n.ZoneName))
+		if purposeLower == "wan" || purposeLower == "remote-user-vpn" ||
+			zoneLower == "external" || zoneLower == "vpn" || zoneLower == "gateway" {
+			continue
+		}
+
+		// Respect explicit user placement before applying UniFi structural metadata.
 		if _, ok := trusted[nameLower]; ok {
 			continue
 		}
@@ -440,31 +455,15 @@ func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (truste
 			}
 		}
 
-		purposeLower := strings.ToLower(strings.TrimSpace(n.Purpose))
 		switch {
-		case purposeLower == "guest" ||
-			strings.Contains(nameLower, "iot") ||
-			strings.Contains(nameLower, "smart") ||
-			strings.Contains(nameLower, "guest") ||
-			strings.Contains(nameLower, "untrusted") ||
-			strings.Contains(nameLower, "camera") ||
-			nameLower == "not":
+		case n.IsolationEnabled || purposeLower == "guest" || isoZones[zoneLower]:
 			if nameLower != "" {
 				isolated[nameLower] = struct{}{}
 			}
 			if vlanLower != "" {
 				isolated[vlanLower] = struct{}{}
 			}
-		case vlanLower == "1" ||
-			nameLower == "default" ||
-			nameLower == "lan" ||
-			nameLower == "main" ||
-			strings.Contains(nameLower, "trusted") ||
-			strings.Contains(nameLower, "server") ||
-			strings.Contains(nameLower, "mgmt") ||
-			strings.Contains(nameLower, "management") ||
-			strings.Contains(nameLower, "admin") ||
-			strings.Contains(nameLower, "corp"):
+		case zoneLower == "internal" || purposeLower == "corporate" || vlanLower == "1":
 			if nameLower != "" {
 				trusted[nameLower] = struct{}{}
 			}
@@ -474,6 +473,33 @@ func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (truste
 		}
 	}
 	return trusted, isolated
+}
+
+// isolatedZoneSet returns the lowercase set of UniFi firewall zone names that
+// enforce isolation from internal LANs: UniFi's built-in Hotspot and DMZ zones,
+// plus any custom zone that has an enabled BLOCK/REJECT policy targeting Internal.
+func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
+	zones := map[string]bool{
+		"hotspot": true,
+		"dmz":     true,
+	}
+	if snap == nil {
+		return zones
+	}
+	for _, pol := range snap.FirewallPolicies {
+		if !pol.Enabled {
+			continue
+		}
+		if pol.Action != "BLOCK" && pol.Action != "REJECT" {
+			continue
+		}
+		src := strings.ToLower(strings.TrimSpace(pol.Source.ZoneName))
+		dst := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
+		if src != "" && src != "internal" && src != "external" && src != "gateway" && dst == "internal" && pol.Destination.AnyTarget && pol.Destination.AnyPort {
+			zones[src] = true
+		}
+	}
+	return zones
 }
 
 // matchesVLAN reports whether a client's resolved network name or numeric VLAN

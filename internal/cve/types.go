@@ -118,7 +118,7 @@ type Product struct {
 
 	// Products lists one or more CPE product patterns to match. Patterns without
 	// "*" require exact equality; patterns containing "*" perform glob matching
-	// (e.g., "*laserjet*m453*").
+	// (e.g., "*laserjet*m404*").
 	Products []string `json:"products"`
 
 	// Version is the exact observed version string when available, or empty when

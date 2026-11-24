@@ -182,8 +182,8 @@ type Preconditions struct {
 	PortsAny []int `yaml:"ports_any"`
 
 	// MACPrefix requires the client's normalized MAC address to begin with any
-	// of these colon-separated prefixes (e.g., "14:4f:d7" for Zehnder). This
-	// works reliably even when UniFi Integration v1 omits the OUI vendor string.
+	// of these colon-separated OUI prefixes (e.g., "00:11:22"). This works
+	// reliably even when UniFi Integration v1 omits the OUI vendor string.
 	MACPrefix []string `yaml:"mac_prefix"`
 
 	// OUIContains requires the client's MAC OUI/vendor string to contain any
