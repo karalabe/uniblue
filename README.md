@@ -5,12 +5,16 @@
     <img alt="UniBlue" src="docs/logo-horizontal-light.svg" width="320">
   </picture>
   <br>
-  <em>Blue-team security engine for UniFi networks</em>
+  <em>A friendly, read-only security checkup for your UniFi home or office network</em>
 </p>
 
 <br>
 
-UniBlue combines your UniFi gateway's network topology (clients, VLANs, firmware, and WAN port forwards) with gentle LAN host probing and a declarative, community-submittable library of read-only IoT/LAN security checks.
+Most network scanners dump hundreds of cryptic port numbers and leave you guessing what actually matters. **UniBlue** connects to your UniFi gateway, gently checks the devices on your network, and answers three practical questions in plain English:
+
+1. **What is on my network?** Every computer, phone, camera, smart-home gadget, switch cable, Wi-Fi network, and even downstream devices hidden behind an NVR or smart-home bridge.
+2. **What services do they offer or use?** Real wire-verified services separated cleanly from local announcements (mDNS/UPnP), encrypted sockets, and outbound internet connections.
+3. **What actually needs fixing, and how?** Plain-English steps in UniFi for open internet doors, exposed outdoor cables, leaky guest/IoT rules (across both IPv4 and IPv6), and known software security bugs.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
@@ -18,114 +22,120 @@ UniBlue combines your UniFi gateway's network topology (clients, VLANs, firmware
   <img alt="How UniBlue works" src="docs/how-it-works-light.svg">
 </picture>
 
-## Why UniBlue?
+## What makes UniBlue different?
 
-- **UniFi blast-radius awareness:** A vulnerable appliance or unauthenticated service is scored differently depending on whether it sits on an isolated VLAN, an internal LAN, or behind an active WAN port forward.
-- **Built-in 170+ protocol discovery:** Embeds Praetorian's `nerva` (in safe `FastMode`) to fingerprint common network services — file shares, remote access, databases, web dashboards, and TLS certificates — alongside UniBlue's own deep read-only verification checks.
-- **Informal IoT/LAN bug registry:** Many nasty bugs in local hardware (HVAC systems, inverters, cameras, smart relays) never get a formal CVE. UniBlue lets anyone drop a safe, read-only YAML check into `checks/` and run it locally.
-- **Gentle by design:** Fingerprinting uses a bounded worker pool, sequential per-host port checks with pacing, strict read-only verification probes, and target-IP-only sandboxing.
-- **Low-noise alerting:** `uniblue watch` tracks baseline state in a local JSON file and only notifies you when something new appears, a finding escalates, an unknown device joins a trusted VLAN, or a new WAN port forward is enabled.
-
-### Blast-Radius Severity Adjustments & Firewall Policy Audits
-
-UniBlue reads your UniFi controller's **actual network topology** — Firewall Zones (`Internal`, `Hotspot`, `Dmz`, or custom zones blocked from `Internal`), explicit `isolationEnabled` flags, `guest` network purpose, and Zone-Based Firewall policies — without guessing from VLAN names. Explicit overrides (`network.trusted_vlans` / `network.isolated_vlans`) are optional for classic controllers without Zone-Based Firewall:
-
-| UniFi Context | Effect | Why |
-| :--- | :--- | :--- |
-| Affected host + port is **WAN port-forwarded** | **Force `CRITICAL`** | Directly reachable from the public internet |
-| Device sits on an **Internal / non-isolated VLAN** | **`+1` severity level** | High lateral-movement blast radius across internal hosts |
-| Device sits on an **isolated / Hotspot / DMZ / Guest VLAN** | **`-1` severity level** | Already mitigated by network isolation |
-
-UniBlue also audits **user-defined Zone-Based Firewall policies** directly (catching overly broad `External → Gateway`, `External → LAN`, or isolated-zone-to-`Internal` `ALLOW` rules) and automatically seeds per-host probe ports from your enabled port forwards and firewall policies.
+- **Built for real humans, with full technical proof one click away:** The built-in web UI organizes your network into four calm tabs: **Checkup**, **House & Cables**, **Devices & Wi-Fi**, and **Activity**. Click any alert, device, cable port, or isolation check to slide open plain-English fix steps, with collapsible raw technical details underneath.
+- **Knows your UniFi setup, not just raw ports:** A risky service on an isolated IoT network is very different from the same service sitting next to your personal laptop or forwarded to the internet. UniBlue reads your real UniFi networks, Firewall Zones, port forwards (matching exact TCP vs. UDP transport), and switch ports automatically.
+- **Honest about what it knows:** UniBlue never flashes a fake green "all clear" while devices are still being checked, never invents "blocked" when the controller did not provide firewall or switch ACL evidence, and never guesses an application name behind opaque TLS or a shared CDN.
+- **Gentle and strictly read-only:** Probes are rate-paced and read-only so fragile IoT gadgets (HVAC controllers, solar inverters, cameras) are not knocked offline. Raw print ports (`9100`, `515`, `_pdl-datastream`) have a hard zero-byte guard so UniBlue will never spit garbage pages out of your printer.
+- **122 built-in checks + 170+ protocol recognizers:** Combines Praetorian's `nerva` fingerprinter with 122 declarative read-only YAML checks and wire protocol probes (covering smart-home gear, cameras/NVRs, printers, server BMCs, Bitcoin/Ethereum nodes, NUT UPSs, PJLink projectors, DNS/NTP/PCP/STUN, and more).
 
 ## Quickstart
 
-Only your UniFi controller URL and credentials are required — network topology, isolation tiers, port hints, and local cache paths are derived automatically (you can even skip `config.yaml` via `UNIBLUE_UNIFI_URL` + `UNIBLUE_UNIFI_API_KEY`):
+You only need your UniFi console URL and a read-only credential. Networks, VLAN isolation tiers, and port hints are discovered automatically.
 
 ```sh
-# 1. Build
+# 1. Build UniBlue
 go build ./cmd/uniblue
 
-# 2. Configure (copy and set your UDM Pro or Cloud Key URL)
+# 2. Copy the example config and set your UniFi console URL (e.g. https://192.168.1.1)
 cp config.example.yaml config.yaml
 
-# Option A (UDM Pro / modern UniFi Network with 2FA):
-# Create a key in UniFi Network -> Settings -> Control Plane -> Integrations
-export UNIBLUE_UNIFI_API_KEY="your-local-integration-api-key"
+# Option A: Recommended for UDM Pro / Cloud Gateways (works with 2FA)
+# In UniFi Network -> Settings -> Control Plane -> Integrations -> Create API Key
+export UNIBLUE_UNIFI_API_KEY="your-local-api-key"
 
-# Option B (older Cloud Key or full legacy port-forward visibility):
-# Create a Local-Only View-Only admin in Settings -> Admins & Users
+# Option B: Classic Cloud Key or local view-only account
+# In UniFi Network -> Settings -> Admins & Users -> add a Local-Only View-Only admin
 # export UNIBLUE_UNIFI_PASSWORD="your-local-readonly-password"
 
-# 3. Verify UniFi connectivity (read-only, no LAN probing)
+# 3. Start the live web dashboard (opens a clean UI at http://127.0.0.1:8080)
+./uniblue serve -config config.yaml -listen 127.0.0.1:8080
+```
+
+Prefer the terminal or scheduled reports? Every feature works from the CLI too:
+
+```sh
+# Quick read-only inventory of your UniFi networks & devices (no LAN probing)
 ./uniblue inventory -config config.yaml
 
-# 4. Run a full scan
+# Full one-shot security checkup in your terminal (add -json for structured output)
 ./uniblue scan -config config.yaml
 
-# 5. Audit physical switch port allocations, external switches, and feeder cables
+# Audit every physical switch port, outdoor cable, and PoE drop
 ./uniblue ports -config config.yaml
 
-# 6. Run live event-driven monitor + built-in web UI (polls every 5s or WebSocket)
-./uniblue serve -config config.yaml -listen 127.0.0.1:8080
+# Export a self-contained offline HTML dashboard you can open or archive anywhere
+./uniblue topology -config config.yaml -out network-checkup.html
 
-# Or run headless continuous alerting with webhooks
+# Run quietly in the background and notify only when something new changes
 ./uniblue watch -config config.yaml
 ```
 
-## Physical Switch Port & Perimeter Security
+> **Tip:** You can even skip `config.yaml` completely by setting `UNIBLUE_UNIFI_URL` and `UNIBLUE_UNIFI_API_KEY` in your environment.
 
-UniBlue inspects live `port_table` and `port_overrides` on every UniFi switch, gateway, and In-Wall AP to map active, inactive-enabled, and disabled ports alongside VLAN tagging (`Block All` vs `Allow All`), PoE draw, connected wired peers, and MAC Port Security:
+## How UniBlue checks your network
 
-- **External equipment zoning (`network.external_devices`):** Mark entire switches or APs installed outside your secured building (e.g., a garage or outdoor switch). UniBlue automatically flags unused live ports and unrestricted active ports on them **and traces their LLDP uplink back to the indoor parent switch feeder port** (`external_uplink`) so you know if an unrestricted trunk cable leaves the building.
-- **Per-port perimeter rules (`network.physical_ports`):** Pin specific wall/exterior drops as `external`, `internal`, or `unused` with optional `allowed_macs` enforcement.
-- **Zero-config inference:** Even without editing `config.yaml`, UniBlue infers outdoor/garage device names, camera/doorbell PoE drops, and isolated-VLAN access ports left on `Tagged VLAN Management = All` (VLAN-hopping risk).
-- **Physical tamper & gateway telemetry:** Audits UniFi Wi-Fi security (open/WEP, IoT/Guest SSIDs bridged to Trusted VLANs, missing L2 client isolation, Evil-Twin/Rogue APs), Device SSH password auth, Gateway UPnP, IDS/IPS, Honeypot, and DNS Shield. In `uniblue serve`, real-time SSE alerts fire on physical link flaps, **PoE wattage drops (MAC-spoofed cable swaps)**, **inline hub MAC-table surges**, STP loop blocking, live IDS/IPS & admin-activity logs, VPN sessions, WAN IP/failover changes, dormant-device wakeups, wired↔Wi-Fi medium swaps, IoT upload spikes, and security configuration drift.
+### 1. Network isolation & shared services (IPv4 + IPv6)
 
-## Working with Declarative Checks
+UniBlue evaluates your actual UniFi Zone-Based Firewall rules in order, respecting IPv4 vs. IPv6, new vs. established return traffic, and whether a path is routed by your gateway or an L3 switch:
 
-Built-in checks live under `checks/generic/` and `checks/community/` and are embedded directly in the binary. You can add extra local or community checks in a separate directory via `scan.checks_dir` in `config.yaml`.
+- **Approved workflows stay out of your way:** Declare intentional shared paths (like guests printing to an office IPPS printer on TCP 631) in `network.isolation_policy.approved_paths`. UniBlue verifies printing works while confirming printer admin pages stay blocked, leaving your action queue clear.
+- **Catches subtle leaks:** Spots IPv6 rules that quietly bypass IPv4 blocks (for example, a guest network reaching a server BMC over IPv6), distinguishes UDP game forwards from TCP admin services sharing the same port number, and marks boundaries `unknown` whenever switch ACLs or firewall feeds are not available.
+
+### 2. Outdoor cables & physical switch ports
+
+UniBlue inspects every switch, gateway, and In-Wall AP port, including link state, VLAN tagging (`Block All` vs `Allow All`), PoE wattage, connected devices, and MAC port security:
+
+- **Outdoor switches & feeder cables (`network.external_devices`):** Mark any switch or AP installed outside (garage, shed, exterior wall). UniBlue flags open unused sockets on it **and** traces the indoor feeder cable back to the parent switch so you know if an outdoor cable carries all of your home networks.
+- **Live tamper & health alerts (`uniblue serve`):** Watches for physical link changes, PoE power drops (cable-swap indicator), inline hub MAC-table surges, STP loops, Evil-Twin Wi-Fi SSIDs, dormant devices waking up, wired/Wi-Fi swaps, and UniFi firewall or port-forward drift.
+
+### 3. Declarative checks & safe protocol probes
+
+Built-in checks live in `checks/generic/` and `checks/community/` and are compiled directly into the binary. You can add your own read-only YAML checks via `scan.checks_dir`:
 
 ```sh
-# Validate all built-in + custom YAML checks (enforces read-only & safety rules)
+# Validate all built-in + custom YAML checks (enforces strict read-only safety)
 ./uniblue check validate
 
-# Test checks directly against one device on your LAN (no UniFi login needed)
+# Test checks directly against a single IP on your LAN (no UniFi login needed)
 ./uniblue check test -target 192.168.1.42
 ```
 
-## Local CVE Cache & Explorer
+### 4. Offline security bug (CVE) & hardware vendor databases
 
-UniBlue can sync the full NVD JSON 2.0 database alongside CISA's Known Exploited Vulnerabilities (KEV) catalog into a compact (~38 MB) vendor-sharded local cache, then match your UniFi firmware and fingerprinted LAN services offline:
+Sync the official NVD + CISA KEV vulnerability catalog (~38 MB) and IEEE MAC vendor tables (~550 KB) once, then match your UniFi firmware and LAN services completely offline:
 
 ```sh
-# Download and compile the full NVD 2.0 + CISA KEV local cache (~17s cold, ~1s incremental)
+# Sync local NVD + CISA KEV vulnerability cache (~17s first run, ~1s updates)
 ./uniblue cve sync
 
-# Fingerprint your UniFi gear & LAN hosts and match against the local CVE cache
+# Match your UniFi gear & LAN hosts against known vulnerabilities
 ./uniblue cve explore -config config.yaml
 
-# Search cached CVEs offline or inspect full affected CPE ranges
+# Search or inspect any CVE offline
 ./uniblue cve search -vendor ui unifi
 ./uniblue cve show CVE-2026-9773
 
-# Sync the official IEEE MAC OUI registries (MA-L, MA-M, MA-S, IAB; ~550 KB)
-# for deterministic offline hardware vendor & device-category classification
+# Sync official IEEE hardware vendor tables for accurate device classification
 ./uniblue oui sync
-./uniblue inventory -config config.yaml -probe
-
-# Export a self-contained offline interactive HTML security & topology report
-./uniblue topology -config config.yaml -out topology.html
 ```
 
-## Controller Compatibility
+### 5. Optional local feeds (NVRs, smart-home bridges, flows & switch ACLs)
 
-UniBlue automatically detects how your UniFi console authenticates:
-- **UniFi Network Integration API v1** (`X-API-Key`, recommended with 2FA enabled on your UI.com account) via `/proxy/network/integration/v1/...`
-- **UniFi OS** (UDM Pro, UDM SE, Cloud Gateways, modern Cloud Keys) via `/api/auth/login` + `/proxy/network/...`
-- **Classic Network Controller** (older Cloud Key Gen2 / standalone Network App) via `/api/login` + `/api/s/<site>/...`
+Everything works out of the box with just your UniFi console. When you want deeper visibility into things UniFi cannot see directly, `config.example.yaml` shows how to plug in optional read-only local files:
 
-Generate a local API key in **Settings → Control Plane → Integrations** (`UNIBLUE_UNIFI_API_KEY`), or create a **Local-Only View-Only admin** account (`UNIBLUE_UNIFI_PASSWORD`).
+- **`network.bridge_inventories`:** Attach downstream devices reported by an NVR (private-PoE cameras), Zigbee2MQTT, Z-Wave JS, Matter fabric, BLE proxy, or energy gateway as clickable child devices under their parent.
+- **`network.passive_flows_path`:** Ingest Zeek `known_services`, IPFIX summaries, or JSON/YAML flow exports to enrich UDP/TLS service visibility and track outbound internet dependencies separately from local listeners.
+- **`network.site_supplement_path`:** Supply controller-omitted telemetry such as switch ACL tables, reverse proxy routes, outbound publishing tunnels (Cloudflare Tunnel / Tailscale Funnel), active dynamic NAT leases, and backup freshness.
+
+## Controller compatibility
+
+UniBlue automatically detects how to talk to your UniFi console:
+
+- **UniFi Network Integration API v1** (`X-API-Key`, recommended with 2FA): `/proxy/network/integration/v1/...`
+- **UniFi OS** (UDM Pro, UDM SE, Cloud Gateways, modern Cloud Keys): `/api/auth/login` + `/proxy/network/...`
+- **Classic Network Controller** (older Cloud Key / standalone Network App): `/api/login` + `/api/s/<site>/...`
 
 ## License
 
