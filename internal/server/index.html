@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UniBlue — Live UniFi Security Monitor</title>
+<style>
+  :root {
+    --bg: #f8fafc; --surface: #ffffff; --surface-alt: #f1f5f9;
+    --border: #e2e8f0; --text: #0f172a; --muted: #64748b;
+    --blue: #0759d8; --blue-bg: #eff6ff;
+    --crit: #b91c1c; --crit-bg: #fef2f2; --crit-bd: #fca5a5;
+    --high: #b45309; --high-bg: #fffbeb; --high-bd: #fcd34d;
+    --med: #0369a1; --med-bg: #f0f9ff; --med-bd: #7dd3fc;
+    --ok: #047857; --ok-bg: #ecfdf5; --ok-bd: #6ee7b7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1120; --surface: #111827; --surface-alt: #1e293b;
+      --border: #1f2937; --text: #f1f5f9; --muted: #94a3b8;
+      --blue: #449aff; --blue-bg: #172554;
+      --crit: #fca5a5; --crit-bg: #450a0a; --crit-bd: #991b1b;
+      --high: #fcd34d; --high-bg: #451a03; --high-bd: #92400e;
+      --med: #7dd3fc; --med-bg: #082f49; --med-bd: #075985;
+      --ok: #6ee7b7; --ok-bg: #022c22; --ok-bd: #065f46;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.45; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 20; flex-wrap: wrap; }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .brand img { height: 34px; display: block; }
+  .logo-dark { display: none; }
+  @media (prefers-color-scheme: dark) { .logo-light { display: none; } .logo-dark { display: block; } }
+  .status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--surface-alt); border: 1px solid var(--border); color: var(--muted); }
+  .pill.live { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-bd); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .btn { appearance: none; border: 1px solid var(--border); background: var(--surface); color: var(--text); padding: 6px 12px; border-radius: 7px; font-size: 12.5px; font-weight: 600; cursor: pointer; text-decoration: none; }
+  .btn:hover { border-color: var(--blue); color: var(--blue); }
+  .btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .btn.primary:hover { opacity: 0.92; color: #fff; }
+  .btn.sm { padding: 3px 8px; font-size: 11.5px; }
+  main { max-width: 1440px; margin: 0 auto; padding: 20px 24px 48px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .kpi .lbl { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); }
+  .kpi .val { font-size: 26px; font-weight: 700; margin-top: 4px; }
+  .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 18px; flex-wrap: wrap; }
+  .tab { padding: 9px 15px; font-weight: 600; font-size: 13.5px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; background: none; border-top: 0; border-left: 0; border-right: 0; }
+  .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 18px; overflow: hidden; }
+  .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-alt); font-weight: 700; font-size: 13.5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 9px 14px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface); }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
+  .sev { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+  .sev-critical { color: var(--crit); background: var(--crit-bg); border: 1px solid var(--crit-bd); }
+  .sev-high { color: var(--high); background: var(--high-bg); border: 1px solid var(--high-bd); }
+  .sev-medium { color: var(--med); background: var(--med-bg); border: 1px solid var(--med-bd); }
+  .sev-low, .sev-info { color: var(--muted); background: var(--surface-alt); border: 1px solid var(--border); }
+  .sev-clean { color: var(--ok); background: var(--ok-bg); border: 1px solid var(--ok-bd); }
+  .proof { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .topo-wrap { padding: 14px; overflow-x: auto; text-align: center; background: #f8fafc; }
+  .topo-wrap img { max-width: 100%; height: auto; display: inline-block; }
+  .toolbar { display: flex; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); align-items: center; }
+  .search { padding: 6px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); width: 280px; max-width: 100%; font-size: 13px; }
+  .ev-item { display: flex; gap: 12px; align-items: baseline; padding: 9px 16px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .ev-item:last-child { border-bottom: 0; }
+  .ev-time { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+  .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <img class="logo-light" src="/assets/logo-light.svg" alt="UniBlue">
+    <img class="logo-dark" src="/assets/logo-dark.svg" alt="UniBlue">
+  </div>
+  <div class="status-row">
+    <span id="live-pill" class="pill live"><span class="dot"></span><span id="mode-lbl">Connecting…</span></span>
+    <span id="site-pill" class="pill">Site: -</span>
+    <span id="updated-pill" class="pill">Updated: -</span>
+    <button class="btn primary" onclick="triggerRescan()">Rescan Now</button>
+  </div>
+</header>
+
+<main>
+  <div class="kpis" id="kpis"></div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="findings">Findings &amp; CVEs</button>
+    <button class="tab" data-tab="topology">Network Topology</button>
+    <button class="tab" data-tab="clients">Clients &amp; Inventory</button>
+    <button class="tab" data-tab="events">Live Event Stream</button>
+  </div>
+
+  <section id="panel-findings" class="panel active"></section>
+  <section id="panel-topology" class="panel"></section>
+  <section id="panel-clients" class="panel"></section>
+  <section id="panel-events" class="panel"></section>
+</main>
+
+<script>
+let state = null;
+let clientFilter = "";
+let activeTab = "findings";
+let lastTopoUpdatedAt = "";
+
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    activeTab = btn.dataset.tab;
+    document.querySelectorAll(".tab").forEach(b => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + activeTab));
+    if (activeTab === "topology") refreshTopologyImg();
+  });
+});
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+function fmtTime(iso) {
+  if (!iso || iso.startsWith("0001-")) return "-";
+  return new Date(iso).toLocaleTimeString();
+}
+
+function sevBadge(sev) {
+  const s = (sev || "info").toLowerCase();
+  return '<span class="sev sev-' + esc(s) + '">' + esc(s) + '</span>';
+}
+
+async function fetchState() {
+  const r = await fetch("/api/state", {cache: "no-store"});
+  if (!r.ok) return;
+  state = await r.json();
+  renderAll();
+}
+
+async function triggerRescan(ip) {
+  const url = ip ? ("/api/rescan?ip=" + encodeURIComponent(ip)) : "/api/rescan";
+  await fetch(url, {method: "POST"});
+  setTimeout(fetchState, 600);
+}
+
+function refreshTopologyImg() {
+  const img = document.getElementById("topo-svg-img");
+  if (img) img.src = "/api/topology.svg?t=" + Date.now();
+}
+
+function renderAll() {
+  if (!state) return;
+  document.getElementById("mode-lbl").textContent = (state.scanning ? "Scanning… · " : "LIVE · ") + (state.event_mode || "poll");
+  document.getElementById("site-pill").textContent = "Site: " + state.site + " (" + state.controller_type + ")";
+  document.getElementById("updated-pill").textContent = "Updated: " + fmtTime(state.updated_at);
+
+  const findings = (state.report?.findings || []).filter(f => f.check_id !== "UB-UNIFI-PORTFWD" && f.check_id !== "UB-UNIFI-FIRMWARE");
+  const critCount = findings.filter(f => f.effective_severity === "critical").length;
+  const highCount = findings.filter(f => f.effective_severity === "high").length;
+  const exactCVEs = state.exact_cves || [];
+  const wanSurface = state.report?.wan_surface || [];
+
+  document.getElementById("kpis").innerHTML = `
+    <div class="kpi"><div class="lbl">Confirmed Exposures</div><div class="val">${findings.length}</div><div class="sub">${critCount} critical · ${highCount} high · ${exactCVEs.length} exact CVE rollups</div></div>
+    <div class="kpi"><div class="lbl">Active LAN Clients</div><div class="val">${state.report?.client_count || 0}</div><div class="sub">${state.report?.clean_clients || 0} clean · ${(state.topology?.vlans || []).length} VLANs</div></div>
+    <div class="kpi"><div class="lbl">WAN Surface</div><div class="val">${wanSurface.length}</div><div class="sub">${wanSurface.filter(w => w.severity !== "info").length} review/high · ${wanSurface.filter(w => w.severity === "info").length} expected P2P</div></div>
+    <div class="kpi"><div class="lbl">UniFi Infrastructure</div><div class="val">${state.report?.clean_unifi_devices || 0}/${state.report?.unifi_device_count || 0}</div><div class="sub">devices up to date</div></div>
+  `;
+
+  renderFindings(findings, exactCVEs, state.potential_cves || [], wanSurface, state.report?.posture_notes || []);
+  renderTopology();
+  renderClients();
+  renderEvents();
+}
+
+function renderFindings(findings, exactCVEs, potentialCVEs, wanSurface, postureNotes) {
+  let html = '<div class="card"><div class="card-hd"><span>Confirmed LAN &amp; Firewall Exposures (' + findings.length + ')</span></div>';
+  if (!findings.length) {
+    html += '<div class="empty">No confirmed exposures detected.</div>';
+  } else {
+    html += '<table><thead><tr><th>Severity</th><th>Check</th><th>Host</th><th>Target / Zone</th><th>Finding &amp; Proof</th><th></th></tr></thead><tbody>';
+    for (const f of findings) {
+      const target = f.port > 0 ? (f.client.ip + ":" + f.port) : (f.client.ip || "-");
+      const canScan = f.client?.ip && !f.check_id.startsWith("UB-UNIFI-");
+      html += `<tr>
+        <td>${sevBadge(f.effective_severity)}</td>
+        <td class="mono">${esc(f.check_id)}</td>
+        <td><strong>${esc(f.client?.name || f.client?.hostname || f.client?.ip)}</strong><div class="proof">${esc(f.client?.network_name || "-")}</div></td>
+        <td class="mono">${esc(target)}</td>
+        <td><strong>${esc(f.title)}</strong><div class="proof">Proof: ${esc(f.evidence)}</div>${f.remediation?.summary ? '<div class="proof">Action: ' + esc(f.remediation.summary) + '</div>' : ''}</td>
+        <td>${canScan ? '<button class="btn sm" onclick="triggerRescan(\'' + esc(f.client.ip) + '\')">Rescan</button>' : ''}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+  }
+  html += '</div>';
+
+  if (exactCVEs.length) {
+    html += '<div class="card"><div class="card-hd"><span>Exact-Version CVE Rollups (' + exactCVEs.length + ')</span></div><table><thead><tr><th>Severity</th><th>Host</th><th>VLAN</th><th>Product &amp; Summary</th><th>Top CVEs</th></tr></thead><tbody>';
+    for (const s of exactCVEs) {
+      const label = s.product.label + (s.product.version ? " " + s.product.version : "");
+      html += `<tr>
+        <td>${sevBadge(s.max_severity)}</td>
+        <td><strong>${esc(s.product.host_name)}</strong> <span class="mono">(${esc(s.product.host_ip)})</span></td>
+        <td>${esc(s.product.vlan || "-")}</td>
+        <td><strong>${esc(label)}</strong>: ${s.total_cves} CVE(s) (max CVSS ${Number(s.max_cvss).toFixed(1)}${s.kev_count ? ", " + s.kev_count + " KEV" : ""}${s.suggested_fix ? ", verify &gt;= " + esc(s.suggested_fix) : ""})</td>
+        <td class="mono">${esc((s.top_cves || []).join(", "))}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+
+  if (wanSurface.length) {
+    html += '<div class="card"><div class="card-hd"><span>WAN Port-Forward Surface (' + wanSurface.length + ')</span></div><table><thead><tr><th>Severity</th><th>Class</th><th>Rule</th><th>Mapping</th><th>Host</th><th>Assessment</th></tr></thead><tbody>';
+    for (const a of wanSurface) {
+      html += `<tr>
+        <td>${sevBadge(a.severity)}</td>
+        <td class="mono">${esc(a.class)}</td>
+        <td>${esc(a.forward.name)}</td>
+        <td class="mono">${esc(a.forward.proto)}:${esc(a.forward.dst_port)} -&gt; ${esc(a.forward.fwd_ip)}:${esc(a.forward.fwd_port)}</td>
+        <td>${esc(a.client?.name || a.client?.hostname || a.client?.mac || a.forward.fwd_ip)}</td>
+        <td>${esc(a.rule_name)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+
+  if (postureNotes.length) {
+    html += '<div class="card"><div class="card-hd"><span>Network Posture Observations</span></div>';
+    for (const n of postureNotes) {
+      html += `<div class="ev-item">${sevBadge(n.severity)}<div><strong>${esc(n.title)}</strong><div class="proof">${esc(n.detail)}</div></div></div>`;
+    }
+    html += '</div>';
+  }
+
+  if (potentialCVEs.length) {
+    html += '<div class="card"><div class="card-hd"><span>Patch Verification — Version Unknown (' + potentialCVEs.length + ')</span></div><table><thead><tr><th>Max Sev</th><th>Host</th><th>Product</th><th>Summary</th><th>Top CVEs</th></tr></thead><tbody>';
+    for (const s of potentialCVEs) {
+      html += `<tr>
+        <td>${sevBadge(s.max_severity)}</td>
+        <td>${esc(s.product.host_name)} <span class="mono">(${esc(s.product.host_ip)})</span></td>
+        <td>${esc(s.product.label)}</td>
+        <td>${s.total_cves} CVE(s) (max CVSS ${Number(s.max_cvss).toFixed(1)}${s.kev_count ? ", " + s.kev_count + " KEV" : ""}${s.suggested_fix ? ", verify &gt;= " + esc(s.suggested_fix) : ""})</td>
+        <td class="mono">${esc((s.top_cves || []).join(", "))}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+
+  document.getElementById("panel-findings").innerHTML = html;
+}
+
+function renderTopology() {
+  const el = document.getElementById("panel-topology");
+  if (!el.querySelector("#topo-svg-img")) {
+    el.innerHTML = `
+      <div class="card">
+        <div class="card-hd">
+          <span>Live Network Topology &amp; Device Placement</span>
+          <div>
+            <button class="btn sm" onclick="refreshTopologyImg()">Refresh SVG</button>
+            <a class="btn sm" href="/api/topology.svg" download="uniblue-topology.svg">Download SVG</a>
+          </div>
+        </div>
+        <div class="topo-wrap"><img id="topo-svg-img" src="/api/topology.svg?t=${Date.now()}" alt="Live Network Topology"></div>
+      </div>`;
+    lastTopoUpdatedAt = state.updated_at || "";
+    return;
+  }
+  if (state.updated_at && state.updated_at !== lastTopoUpdatedAt) {
+    lastTopoUpdatedAt = state.updated_at;
+    if (activeTab === "topology") refreshTopologyImg();
+  }
+}
+
+function renderClients() {
+  const el = document.getElementById("panel-clients");
+  if (!el.querySelector("#clients-tbody")) {
+    el.innerHTML = `<div class="card">
+      <div class="toolbar">
+        <input id="client-search" class="search" type="search" placeholder="Filter by host, IP, VLAN, category, vendor…">
+        <span id="clients-count" class="proof"></span>
+      </div>
+      <table><thead><tr><th>Status</th><th>Client</th><th>IP</th><th>VLAN</th><th>Category &amp; Role</th><th>Vendor</th><th>Open Ports</th><th></th></tr></thead><tbody id="clients-tbody"></tbody></table>
+    </div>`;
+    el.querySelector("#client-search").addEventListener("input", e => {
+      clientFilter = e.target.value;
+      renderClients();
+    });
+  }
+  const clients = (state.clients || []).filter(c => {
+    if (!clientFilter) return true;
+    const hay = [c.client.name, c.client.hostname, c.client.ip, c.client.mac, c.client.network_name, c.class?.category, c.class?.role, c.class?.vendor].join(" ").toLowerCase();
+    return hay.includes(clientFilter.toLowerCase());
+  });
+  document.getElementById("clients-count").textContent = clients.length + " of " + (state.clients || []).length + " clients";
+  let rows = "";
+  for (const c of clients) {
+    const ports = (c.open_ports || []).join(", ") || "-";
+    rows += `<tr>
+      <td>${sevBadge(c.max_severity)}</td>
+      <td><strong>${esc(c.client.name || c.client.hostname || c.client.mac)}</strong><div class="proof mono">${esc(c.client.mac)}</div></td>
+      <td class="mono">${esc(c.client.ip)}</td>
+      <td>${esc(c.client.network_name || "-")}</td>
+      <td><strong>${esc(c.class?.category || "unknown")}</strong><div class="proof">${esc(c.class?.role || "")}</div></td>
+      <td>${esc(c.class?.vendor || "-")}</td>
+      <td class="mono">${esc(ports)}</td>
+      <td>${c.client.ip ? '<button class="btn sm" onclick="triggerRescan(\'' + esc(c.client.ip) + '\')">Rescan</button>' : ''}</td>
+    </tr>`;
+  }
+  document.getElementById("clients-tbody").innerHTML = rows || '<tr><td colspan="8" class="empty">No matching clients.</td></tr>';
+}
+
+function renderEvents() {
+  const evs = state.events || [];
+  let html = '<div class="card"><div class="card-hd"><span>Live Event Stream (' + evs.length + ')</span></div>';
+  if (!evs.length) {
+    html += '<div class="empty">Waiting for network events…</div>';
+  } else {
+    for (const ev of evs) {
+      html += `<div class="ev-item"><span class="ev-time mono">${fmtTime(ev.time)}</span>${sevBadge(ev.severity)}<span class="mono">${esc(ev.type)}</span><span>${esc(ev.summary)}</span></div>`;
+    }
+  }
+  html += '</div>';
+  document.getElementById("panel-events").innerHTML = html;
+}
+
+function connectSSE() {
+  const es = new EventSource("/api/events");
+  es.addEventListener("uniblue", () => {
+    fetchState();
+  });
+  es.onerror = () => {
+    document.getElementById("live-pill").classList.remove("live");
+    document.getElementById("mode-lbl").textContent = "Reconnecting…";
+  };
+  es.onopen = () => {
+    document.getElementById("live-pill").classList.add("live");
+    fetchState();
+  };
+}
+
+fetchState();
+connectSSE();
+setInterval(fetchState, 15000);
+</script>
+</body>
+</html>

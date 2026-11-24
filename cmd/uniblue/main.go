@@ -30,6 +30,7 @@ import (
 	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
+	"github.com/karalabe/uniblue/internal/server"
 	"github.com/karalabe/uniblue/internal/topology"
 	"github.com/karalabe/uniblue/internal/unifi"
 )
@@ -57,6 +58,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "watch":
 		return runWatch(ctx, args[1:], stdout, stderr)
+	case "serve":
+		return runServe(ctx, args[1:], stdout, stderr)
 	case "inventory":
 		return runInventory(ctx, args[1:], stdout, stderr)
 	case "topology":
@@ -86,6 +89,7 @@ Usage:
 Commands:
   scan        Run a single UniFi + LAN security scan and print prioritized findings
   watch       Continuously scan on an interval and notify only on new/escalated changes
+  serve       Run live event-driven monitor (5s poll / WebSocket) with built-in web UI
   inventory   Fetch and display UniFi clients, devices, VLANs, and port forwards
   topology    Generate a network topology SVG or JSON diagram with device placement
   check       Validate or test declarative YAML checks against a single host
@@ -1209,4 +1213,47 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	fmt.Fprintln(stdout, "\nTip: pass -out topology.svg to render a visual SVG diagram.")
 	return nil
+}
+
+// runServe starts UniBlue's live event-driven monitoring server, reacting to
+// UniFi client joins/leaves/moves and firewall changes in real time (via native
+// WebSocket on cookie auth or fast 5s delta polling on API key auth) while
+// serving a lightweight live web UI and JSON/SSE API.
+func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
+	listen := fs.String("listen", "127.0.0.1:8080", "HTTP listen address for the built-in web UI")
+	poll := fs.Duration("poll", 5*time.Second, "UniFi topology delta poll interval (when WebSocket is unavailable)")
+	reconcile := fs.Duration("reconcile", 30*time.Minute, "periodic full LAN reconciliation interval")
+	noCVE := fs.Bool("no-cve", false, "skip local CVE cache correlation even if synced")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
+	if err != nil {
+		return err
+	}
+	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
+
+	logger := slog.New(slog.NewTextHandler(stdout, nil))
+	eng, err := server.NewEngine(cfg, checkList, scanPorts, server.Options{
+		ListenAddr:        *listen,
+		PollInterval:      *poll,
+		ReconcileInterval: *reconcile,
+		SkipCVE:           *noCVE,
+		Logger:            logger,
+	})
+	if err != nil {
+		return err
+	}
+	if err := eng.Start(ctx); err != nil {
+		return err
+	}
+	return eng.Serve(ctx)
 }

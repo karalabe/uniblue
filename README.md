@@ -5,12 +5,12 @@
     <img alt="UniBlue" src="docs/logo-horizontal-light.svg" width="320">
   </picture>
   <br>
-  <em>Blue-team security engine for UniFi</em>
+  <em>Blue-team security engine for UniFi networks</em>
 </p>
 
 <br>
 
-UniBlue combines your UniFi gateway's live network topology (clients, VLANs, firmware, and WAN port forwards) with gentle LAN host probing and a declarative, community-submittable library of read-only IoT/LAN security checks.
+UniBlue combines your UniFi gateway's network topology (clients, VLANs, firmware, and WAN port forwards) with gentle LAN host probing and a declarative, community-submittable library of read-only IoT/LAN security checks.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
@@ -63,7 +63,10 @@ export UNIBLUE_UNIFI_API_KEY="your-local-integration-api-key"
 # 4. Run a full scan
 ./uniblue scan -config config.yaml
 
-# 5. Run continuously with webhook alerts on new/escalated findings
+# 5. Run live event-driven monitor + built-in web UI (polls every 5s or WebSocket)
+./uniblue serve -config config.yaml -listen 127.0.0.1:8080
+
+# Or run headless continuous alerting with webhooks
 ./uniblue watch -config config.yaml
 ```
 
