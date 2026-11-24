@@ -49,6 +49,17 @@ type Finding struct {
 	// Category groups findings by bug class (e.g., "unauth-control").
 	Category string `json:"category"`
 
+	// ClaimKind distinguishes asset identity, advertised service, observed
+	// service, configured access, and confirmed permission evidence.
+	ClaimKind ClaimKind `json:"claim_kind,omitempty"`
+
+	// Property identifies the specific security property proven (e.g.,
+	// "tls-protocol", "tls-cert", "smb-v1", "smb-signing", "auth-anon").
+	Property string `json:"property,omitempty"`
+
+	// Transport records the L4 transport ("tcp" or "udp") associated with Port.
+	Transport string `json:"transport,omitempty"`
+
 	// BaseSeverity is the check's intrinsic severity before UniFi topology scoring.
 	BaseSeverity Severity `json:"base_severity"`
 
@@ -77,7 +88,41 @@ func (f Finding) Key() string {
 	if hostID == "" {
 		hostID = f.Client.IP
 	}
-	return fmt.Sprintf("%s|%s|%d", f.CheckID, hostID, f.Port)
+	base := fmt.Sprintf("%s|%s|%d", f.CheckID, hostID, f.Port)
+	if f.Category == "isolation-policy" && f.Property != "" {
+		return base + "|" + f.Property
+	}
+	if t := strings.ToLower(strings.TrimSpace(f.Transport)); t != "" && t != "tcp" {
+		return base + "|" + t
+	}
+	return base
+}
+
+// EffectiveTransport returns the normalized transport protocol ("tcp" or "udp")
+// for this finding, defaulting to "tcp" for legacy records without Transport set.
+func (f Finding) EffectiveTransport() string {
+	if t := strings.ToLower(strings.TrimSpace(f.Transport)); t != "" {
+		return t
+	}
+	if f.Port == 623 || f.Port == 161 || f.Port == 5351 || f.Port == 5683 {
+		return "udp"
+	}
+	return "tcp"
+}
+
+// IsInventoryOnly reports whether this finding establishes only asset identity
+// or service visibility at informational severity without asserting a policy
+// violation or unauthorized permission.
+func (f Finding) IsInventoryOnly() bool {
+	if f.BaseSeverity != SeverityInfo {
+		return false
+	}
+	switch f.ClaimKind {
+	case ClaimAssetIdentity, ClaimServiceAdvertised, ClaimServiceObserved:
+		return true
+	default:
+		return false
+	}
 }
 
 // Runner executes validated declarative Checks against HostProfiles using a
@@ -209,17 +254,25 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 			if chk.Probe.Type == "observe" {
 				evidence, matched = probeObserve(chk, hp, port)
 			} else {
+				// Hard raw-printer safety guard: never send active bytes to raw print sinks.
+				if hp.IsRawPrintPort(port) {
+					continue
+				}
 				evidence, matched = r.executeProbe(ctx, chk, hp.Client.IP, port)
 			}
 			if matched {
 				for _, supID := range chk.Supersedes {
 					superseded[fmt.Sprintf("%s|%d", supID, port)] = struct{}{}
 				}
+				transport := resolveFindingTransport(chk, hp, port)
 				findings = append(findings, Finding{
 					CheckID:           chk.ID,
 					Title:             chk.Title,
 					CVE:               chk.CVE,
 					Category:          chk.Category,
+					ClaimKind:         chk.Claim,
+					Property:          chk.Property,
+					Transport:         transport,
 					BaseSeverity:      chk.Severity,
 					EffectiveSeverity: chk.Severity,
 					Client:            hp.Client,
@@ -518,9 +571,63 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 		return r.probeIPP(probeCtx, ip, port)
 	case "ipmi":
 		return probeIPMI(probeCtx, ip, port)
+	case "bitcoin-p2p":
+		return probeBitcoinP2P(probeCtx, ip, port)
+	case "bitcoin-rpc":
+		return r.probeBitcoinRPC(probeCtx, ip, port)
+	case "eth-engine":
+		return r.probeEthEngineAPI(probeCtx, ip, port)
+	case "nut":
+		return probeNUT(probeCtx, ip, port)
+	case "lifx":
+		return probeLIFX(probeCtx, ip, port)
+	case "pjlink":
+		return probePJLink(probeCtx, ip, port)
+	case "nbns":
+		return probeNBNS(probeCtx, ip, port)
+	case "pcp":
+		return probePCP(probeCtx, ip, port)
+	case "dns-recursion":
+		return probeDNSRecursion(probeCtx, ip, port)
+	case "ntp":
+		return probeNTP(probeCtx, ip, port)
+	case "stun":
+		return probeSTUN(probeCtx, ip, port)
 	default:
 		return "", false
 	}
+}
+
+// resolveFindingTransport preserves the actual observed transport (e.g., UDP for
+// passive BACnet or TCP for ONVIF XAddr HTTP) before falling back to check default.
+func resolveFindingTransport(chk *Check, hp probe.HostProfile, port int) string {
+	if chk.Probe.Type == "observe" {
+		if port > 0 {
+			for _, svc := range hp.Services {
+				if svc.Port == port && strings.TrimSpace(svc.Transport) != "" {
+					return strings.ToLower(strings.TrimSpace(svc.Transport))
+				}
+			}
+			for _, md := range hp.MDNSServices {
+				if !md.Withdrawn && md.Port == port && strings.TrimSpace(md.Transport) != "" {
+					return strings.ToLower(strings.TrimSpace(md.Transport))
+				}
+			}
+			for _, u := range hp.UPnPDevices {
+				if u.Port == port {
+					return "tcp"
+				}
+			}
+			for _, w := range hp.WSDiscovery {
+				for _, wp := range w.Ports {
+					if wp == port {
+						return "tcp"
+					}
+				}
+			}
+		}
+	}
+	return chk.DefaultTransport()
 }
 
 // probeTCP confirms that ip:port accepts a TCP connection and optionally
@@ -592,6 +699,9 @@ func (r *Runner) probeHTTP(ctx context.Context, ip string, port int, chk *Check)
 		}
 		if chk.Probe.Match.EvidenceSummary != "" {
 			return fmt.Sprintf("%s (%s %s -> HTTP %d)", chk.Probe.Match.EvidenceSummary, chk.Probe.Method, path, resp.StatusCode), true
+		}
+		if chk.Claim == ClaimServiceObserved || chk.Claim == ClaimAssetIdentity {
+			return fmt.Sprintf("%s %s returned HTTP %d (service observed)", chk.Probe.Method, path, resp.StatusCode), true
 		}
 		return fmt.Sprintf("%s %s returned HTTP %d without required authentication", chk.Probe.Method, path, resp.StatusCode), true
 	}

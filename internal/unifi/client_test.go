@@ -10,6 +10,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -219,5 +221,111 @@ func TestPortMatchesSpec(t *testing.T) {
 		if got := portMatchesSpec(tc.spec, tc.port); got != tc.want {
 			t.Errorf("portMatchesSpec(%q, %d) = %v, want %v", tc.spec, tc.port, got, tc.want)
 		}
+	}
+}
+
+func TestFetchSnapshotFirewallVisibilityAndPolicySemantics(t *testing.T) {
+	// Verify Integration v1 HTTP 403 on firewall/policies marks GatewayPoliciesAvailable=false,
+	// while a 200 OK response preserves Index, ConnectionStates, MatchReturnTraffic,
+	// MatchOpposite negation, and marks unsupported REGION filters instead of AnyTarget=true.
+	policiesStatus := http.StatusForbidden
+	mux := http.NewServeMux()
+	mux.HandleFunc("/proxy/network/integration/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":1,"totalCount":1,"data":[{"id":"site-1","name":"Default","internalReference":"default"}]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-1/clients", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-1/devices", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-1/networks", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-1/firewall/zones", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":2,"totalCount":2,"data":[{"id":"z-guest","name":"Hotspot"},{"id":"z-mgmt","name":"Management"}]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-1/firewall/policies", func(w http.ResponseWriter, r *http.Request) {
+		if policiesStatus != http.StatusOK {
+			w.WriteHeader(policiesStatus)
+			return
+		}
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":2,"totalCount":2,"data":[
+			{
+				"id":"p-neg","name":"Negated IPv6 Allow","enabled":true,"index":10,
+				"action":{"type":"ALLOW","allowReturnTraffic":true},
+				"connectionStateFilter":["NEW"],
+				"ipProtocolScope":{"ipVersion":"IPV6","protocolFilter":{"protocol":{"name":"TCP"}}},
+				"source":{"zoneId":"z-guest","trafficFilter":{"type":"IP_ADDRESS","ipAddressFilter":{"matchOpposite":true,"items":[{"value":"2001:db8:50::1"}]}}},
+				"destination":{"zoneId":"z-mgmt","trafficFilter":{"type":"REGION"}}
+			},
+			{
+				"id":"p-block","name":"Higher Priority Block","enabled":true,"index":5,
+				"action":{"type":"BLOCK"},
+				"ipProtocolScope":{"ipVersion":"IPV4"},
+				"source":{"zoneId":"z-guest","trafficFilter":{"type":"MAC_ADDRESS","macAddressFilter":"aa:bb:cc:dd:ee:01"}},
+				"destination":{"zoneId":"z-mgmt"}
+			}
+		]}`))
+	})
+
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	ctrl, err := New(config.UniFiConfig{URL: srv.URL, Site: "default", APIKey: "k", InsecureSkipVerify: true, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// 1. 403 on firewall/policies -> GatewayPoliciesAvailable MUST be false!
+	snap403, err := ctrl.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("FetchSnapshot(403): %v", err)
+	}
+	if snap403.Visibility == nil || snap403.Visibility.GatewayPoliciesAvailable {
+		t.Fatalf("expected GatewayPoliciesAvailable=false on HTTP 403, got %+v", snap403.Visibility)
+	}
+
+	// 2. 200 OK -> GatewayPoliciesAvailable=true and wire fields preserved accurately!
+	policiesStatus = http.StatusOK
+	snapOK, err := ctrl.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("FetchSnapshot(200): %v", err)
+	}
+	if snapOK.Visibility == nil || !snapOK.Visibility.GatewayPoliciesAvailable {
+		t.Fatalf("expected GatewayPoliciesAvailable=true on HTTP 200, got %+v", snapOK.Visibility)
+	}
+	if len(snapOK.FirewallPolicies) != 2 {
+		t.Fatalf("expected 2 policies, got %d", len(snapOK.FirewallPolicies))
+	}
+	p0 := snapOK.FirewallPolicies[0]
+	if p0.Index != 10 || !p0.MatchReturnTraffic || len(p0.ConnectionStates) != 1 || p0.ConnectionStates[0] != "new" {
+		t.Fatalf("lost policy ordering/state semantics: %+v", p0)
+	}
+	if !p0.Source.NegateTarget || p0.Destination.AnyTarget || p0.Destination.UnsupportedSelector == "" {
+		t.Fatalf("lost negation or unsupported REGION selector: src=%+v dst=%+v", p0.Source, p0.Destination)
+	}
+	p1 := snapOK.FirewallPolicies[1]
+	if len(p1.Source.MACs) != 1 || p1.Source.MACs[0] != "aa:bb:cc:dd:ee:01" {
+		t.Fatalf("expected string-valued macAddressFilter to decode cleanly, got %+v", p1.Source)
+	}
+
+	// 3. Verify JSON site supplement preserves nested snake_case fields cleanly.
+	supPath := filepath.Join(t.TempDir(), "supplement.json")
+	supJSON := `{
+		"proxy_routes":[{"proxy_ip":"10.0.0.5","hostname":"admin.test","public_exposed":true,"frontend_auth":false,"backend_ip":"10.0.0.6","backend_port":8080,"admin_vhost":true}],
+		"dynamic_mappings":[{"protocol":"upnp","transport":"tcp","ext_port":8080,"internal_ip":"10.0.0.9","int_port":8080}]
+	}`
+	if err := os.WriteFile(supPath, []byte(supJSON), 0o600); err != nil {
+		t.Fatalf("write supplement: %v", err)
+	}
+	if err := ApplySiteSupplement(snapOK, supPath); err != nil {
+		t.Fatalf("ApplySiteSupplement: %v", err)
+	}
+	if len(snapOK.ProxyRoutes) != 1 || !snapOK.ProxyRoutes[0].PublicExposed || snapOK.ProxyRoutes[0].BackendPort != 8080 || snapOK.ProxyRoutes[0].FrontendAuth == nil || *snapOK.ProxyRoutes[0].FrontendAuth {
+		t.Fatalf("ApplySiteSupplement dropped ProxyRoute fields: %+v", snapOK.ProxyRoutes)
+	}
+	if len(snapOK.DynamicMappings) != 1 || snapOK.DynamicMappings[0].InternalIP != "10.0.0.9" || snapOK.DynamicMappings[0].ExtPort != 8080 || snapOK.DynamicMappings[0].IntPort != 8080 {
+		t.Fatalf("ApplySiteSupplement dropped DynamicPortMapping fields: %+v", snapOK.DynamicMappings)
 	}
 }

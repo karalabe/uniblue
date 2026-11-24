@@ -5,10 +5,11 @@
 # license that can be found in the LICENSE file.
 
 id: UB-2026-0046
-title: Android Wireless Debugging (ADB over TLS) Active on LAN
+title: Android Wireless Debugging (ADB over TLS) Advertised via mDNS
 cve: null
-category: exposed-protocol
-severity: medium
+category: service-inventory
+claim: service-advertised
+severity: info
 safety: read-only
 
 metadata:

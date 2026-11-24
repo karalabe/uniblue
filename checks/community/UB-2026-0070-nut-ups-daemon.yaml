@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0070
+title: Network UPS Tools (NUT) Daemon Discovered
+cve: null
+category: service-inventory
+claim: service-advertised
+property: nut-ups-identity
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Network UPS Tools (NUT)
+  product: NUT upsd Power Monitoring Daemon
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://networkupstools.org/docs/man/upsd.conf.html
+
+preconditions:
+  mdns_type_any: ["_nut._tcp"]
+  discovery_only: true
+
+probe:
+  type: observe
+  match:
+    evidence_summary: "Network UPS Tools daemon advertised on _nut._tcp (multiple read-only monitoring clients are normal)"
+
+remediation:
+  summary: >
+    NUT power monitoring daemon discovered. Separate read-only monitoring users
+    from primary/shutdown administrators in upsd.users and keep power-control
+    access restricted to infrastructure admins.
+  unifi_actions:
+    - restrict_ups_admin_access

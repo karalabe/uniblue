@@ -94,6 +94,35 @@ var mdnsQueryTypes = []string{
 	"_airgradient._tcp.local.",
 	"_rfb._tcp.local.",
 	"_smb._tcp.local.",
+	// Stage 2 high-value DNS-SD additions from Home Assistant coverage index:
+	"_matter._tcp.local.",
+	"_matterc._udp.local.",
+	"_meshcop._udp.local.",
+	"_shelly._tcp.local.",
+	"_openevse._tcp.local.",
+	"_solaredge-modbus._tcp.local.",
+	"_lutron._tcp.local.",
+	"_powerview._tcp.local.",
+	"_powerview-g3._tcp.local.",
+	"_nut._tcp.local.",
+	"_hap._udp.local.",
+	"_homekit._tcp.local.",
+	"_printer._tcp.local.",
+	"_bond._tcp.local.",
+	"_ecobee._tcp.local.",
+	"_plugwise._tcp.local.",
+	"_mypv._tcp.local.",
+	"_nrgkick._tcp.local.",
+	"_solarman._tcp.local.",
+	"_mass._tcp.local.",
+	"_wyoming._tcp.local.",
+	"_kizbox._tcp.local.",
+	"_deako._tcp.local.",
+	"_elg._tcp.local.",
+	"_bangolufsen._tcp.local.",
+	"_devialet-http._tcp.local.",
+	"_stream-magic._tcp.local.",
+	"_technove-stations._tcp.local.",
 }
 
 // safeMDNSTXTKeys restricts persisted DNS-SD TXT attributes to benign model,
@@ -101,12 +130,17 @@ var mdnsQueryTypes = []string{
 var safeMDNSTXTKeys = map[string]struct{}{
 	"md": {}, "ty": {}, "pv": {}, "sf": {}, "rp": {}, "rs": {},
 	"api_version": {}, "version": {}, "ver": {}, "fw": {}, "firmware": {},
-	"model": {}, "product": {}, "board": {}, "platform": {}, "mac": {},
+	"model": {}, "product": {}, "board": {}, "platform": {}, "mac": {}, "macaddress": {},
 	"api_encryption": {}, "network": {}, "gen": {}, "auth": {}, "auth_en": {},
 	"usb_mfg": {}, "usb_mdl": {}, "pdl": {}, "txtvers": {}, "am": {},
+	// Matter, Thread (MeshCoP), IPP/IPPS, Shelly, and NUT allowlisted metadata keys:
+	"d": {}, "vp": {}, "cm": {}, "dt": {}, "ph": {}, "pi": {}, "sii": {}, "sai": {}, "t": {},
+	"tv": {}, "sb": {}, "at": {}, "pt": {}, "sq": {}, "vn": {}, "mn": {}, "id": {},
+	"app": {}, "qtotal": {}, "adminurl": {}, "urf": {}, "color": {}, "duplex": {}, "tls": {},
 }
 
-// MDNSService records a single DNS-SD service advertisement observed on the LAN.
+// MDNSService records a single DNS-SD service advertisement observed on the LAN
+// along with observer, address-family, target, freshness, and reflection provenance.
 type MDNSService struct {
 	// Type is the normalized DNS-SD service type (e.g., "_esphomelib._tcp").
 	Type string `json:"type"`
@@ -116,6 +150,44 @@ type MDNSService struct {
 
 	// Port is the SRV target port advertised by the service.
 	Port int `json:"port,omitempty"`
+
+	// Transport is the real L4 transport ("tcp" or "udp"). Note: Matter operational
+	// (_matter._tcp) uses UDP despite its DNS-SD _tcp label.
+	Transport string `json:"transport,omitempty"`
+
+	// TargetHost is the SRV target hostname (e.g., "printer.local").
+	TargetHost string `json:"target_host,omitempty"`
+
+	// TargetIPs lists resolved IPv4 and/or IPv6 addresses for TargetHost.
+	TargetIPs []string `json:"target_ips,omitempty"`
+
+	// ResponderIP is the source IP that sent the multicast/unicast mDNS packet.
+	ResponderIP string `json:"responder_ip,omitempty"`
+
+	// Reflected is true when ResponderIP differs from the resolved target host IP,
+	// indicating an mDNS proxy/reflector forwarded the advertisement across VLANs.
+	Reflected bool `json:"reflected,omitempty"`
+
+	// AddressFamily records "ipv4", "ipv6", or "dual".
+	AddressFamily string `json:"address_family,omitempty"`
+
+	// ObserverInterface names the local interface where the record was received.
+	ObserverInterface string `json:"observer_interface,omitempty"`
+
+	// ObserverVLAN names the VLAN or zone of the observing interface.
+	ObserverVLAN string `json:"observer_vlan,omitempty"`
+
+	// ObservedAt records when this advertisement was last received.
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
+
+	// TTLSeconds is the DNS record TTL from the advertisement.
+	TTLSeconds uint32 `json:"ttl_seconds,omitempty"`
+
+	// ExpiresAt records when this cached advertisement expires.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// Withdrawn is true when an RFC 6762 TTL=0 goodbye packet revoked this service.
+	Withdrawn bool `json:"withdrawn,omitempty"`
 
 	// TXT holds allowlisted key=value metadata pairs (e.g., "sf=1", "api_encryption=Noise_NNpsk0").
 	TXT []string `json:"txt,omitempty"`
@@ -147,6 +219,15 @@ type UPnPDevice struct {
 
 	// ServiceTypes lists normalized XML <serviceType> URNs advertised by the device.
 	ServiceTypes []string `json:"service_types,omitempty"`
+
+	// ObserverInterface, ObserverVLAN, AddressFamily, ObservedAt, and ExpiresAt
+	// capture where and when this SSDP advertisement was seen.
+	ObserverInterface string     `json:"observer_interface,omitempty"`
+	ObserverVLAN      string     `json:"observer_vlan,omitempty"`
+	AddressFamily     string     `json:"address_family,omitempty"`
+	ObservedAt        *time.Time `json:"observed_at,omitempty"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	Withdrawn         bool       `json:"withdrawn,omitempty"`
 }
 
 // WSDiscoveryRecord stores one WS-Discovery ProbeMatch (ONVIF cameras, WSD printers/hosts).
@@ -159,15 +240,353 @@ type WSDiscoveryRecord struct {
 
 	// Ports lists TCP ports parsed from same-host XAddr HTTP(S) URLs.
 	Ports []int `json:"ports,omitempty"`
+
+	// ObserverInterface, ObserverVLAN, AddressFamily, and ObservedAt capture provenance.
+	ObserverInterface string     `json:"observer_interface,omitempty"`
+	ObserverVLAN      string     `json:"observer_vlan,omitempty"`
+	AddressFamily     string     `json:"address_family,omitempty"`
+	ObservedAt        *time.Time `json:"observed_at,omitempty"`
 }
 
-// LANDiscovery holds all passive/multicast observations indexed by IPv4 address.
+// LANDiscovery holds all passive/multicast observations indexed by IPv4/IPv6 address.
 type LANDiscovery struct {
 	MDNS        map[string][]MDNSService
 	UPnP        map[string][]UPnPDevice
 	WSDiscovery map[string][]WSDiscoveryRecord
 	PortsByIP   map[string][]int
 	RawPrintIPs map[string]map[int]struct{}
+	Unavailable map[string]string // observer VLAN/interface -> reason when discovery was unavailable
+}
+
+// DiscoveryCache retains durable, TTL-bounded passive discovery observations
+// across full-scan and live recomputations, supporting IPv4/IPv6 AAAA records,
+// RFC 6762 TTL=0 goodbye withdrawal, and reflection tracking.
+type DiscoveryCache struct {
+	mu       sync.RWMutex
+	mdnsInst map[string]*cachedMDNSInst
+	hostIPs  map[string]map[string]time.Time // hostname -> ip -> expiresAt
+	upnp     map[string][]UPnPDevice
+	wsd      map[string][]WSDiscoveryRecord
+	unavail  map[string]string
+}
+
+type cachedMDNSInst struct {
+	svc        MDNSService
+	targetHost string
+}
+
+// NewDiscoveryCache initializes an empty durable DiscoveryCache.
+func NewDiscoveryCache() *DiscoveryCache {
+	return &DiscoveryCache{
+		mdnsInst: make(map[string]*cachedMDNSInst),
+		hostIPs:  make(map[string]map[string]time.Time),
+		upnp:     make(map[string][]UPnPDevice),
+		wsd:      make(map[string][]WSDiscoveryRecord),
+		unavail:  make(map[string]string),
+	}
+}
+
+// MarkUnavailable records that passive discovery could not run on observerVLAN
+// (e.g., missing interface attachment or permission error) so callers preserve
+// explicit visibility gaps instead of treating silence as absence.
+func (c *DiscoveryCache) MarkUnavailable(observerVLAN, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.unavail[observerVLAN] = reason
+}
+
+// IngestMDNSPacket decodes one raw mDNS/DNS-SD UDP datagram with full PTR, SRV,
+// TXT, A, and AAAA assembly, TTL expiry tracking, RFC 6762 goodbye withdrawal
+// (TTL == 0), and mDNS reflector detection.
+func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface, observerVLAN string, now time.Time) {
+	recs := parseDNSPacket(pkt)
+	if len(recs) == 0 {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, rr := range recs {
+		switch rr.rrType {
+		case 1: // A (IPv4)
+			if rr.ipv4 != "" {
+				host := strings.ToLower(rr.name)
+				if rr.ttl == 0 {
+					delete(c.hostIPs[host], rr.ipv4)
+				} else {
+					if c.hostIPs[host] == nil {
+						c.hostIPs[host] = make(map[string]time.Time)
+					}
+					c.hostIPs[host][rr.ipv4] = now.UTC().Add(time.Duration(rr.ttl) * time.Second)
+				}
+			}
+		case 28: // AAAA (IPv6)
+			if rr.ipv6 != "" {
+				host := strings.ToLower(rr.name)
+				if rr.ttl == 0 {
+					delete(c.hostIPs[host], rr.ipv6)
+				} else {
+					if c.hostIPs[host] == nil {
+						c.hostIPs[host] = make(map[string]time.Time)
+					}
+					c.hostIPs[host][rr.ipv6] = now.UTC().Add(time.Duration(rr.ttl) * time.Second)
+				}
+			}
+		case 12: // PTR
+			svcType := normalizeMDNSType(rr.name)
+			if svcType == "" || strings.HasPrefix(svcType, "_services.") {
+				continue
+			}
+			key := strings.ToLower(observerVLAN + "|" + rr.target)
+			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.target, svcType), responderIP, observerIface, observerVLAN, now)
+			applyMDNSTTL(&inst.svc, rr.ttl, now)
+		case 33: // SRV
+			svcType := extractMDNSTypeFromFull(rr.name)
+			if svcType == "" {
+				continue
+			}
+			key := strings.ToLower(observerVLAN + "|" + rr.name)
+			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.name, svcType), responderIP, observerIface, observerVLAN, now)
+			inst.svc.Port = rr.port
+			inst.targetHost = strings.ToLower(rr.target)
+			inst.svc.TargetHost = inst.targetHost
+			applyMDNSTTL(&inst.svc, rr.ttl, now)
+		case 16: // TXT
+			svcType := extractMDNSTypeFromFull(rr.name)
+			if svcType == "" {
+				continue
+			}
+			key := strings.ToLower(observerVLAN + "|" + rr.name)
+			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.name, svcType), responderIP, observerIface, observerVLAN, now)
+			inst.svc.TXT = mergeSafeTXT(inst.svc.TXT, rr.txt)
+			applyMDNSTTL(&inst.svc, rr.ttl, now)
+		}
+	}
+}
+
+func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderIP, observerIface, observerVLAN string, now time.Time) *cachedMDNSInst {
+	inst := c.mdnsInst[key]
+	if inst == nil {
+		ts := now.UTC()
+		inst = &cachedMDNSInst{
+			svc: MDNSService{
+				Type:              svcType,
+				Instance:          instance,
+				Transport:         mdnsRealTransport(svcType),
+				ResponderIP:       responderIP,
+				ObserverInterface: observerIface,
+				ObserverVLAN:      observerVLAN,
+				ObservedAt:        &ts,
+			},
+		}
+		c.mdnsInst[key] = inst
+	} else {
+		ts := now.UTC()
+		inst.svc.ObservedAt = &ts
+		if inst.svc.Type == "" {
+			inst.svc.Type = svcType
+			inst.svc.Transport = mdnsRealTransport(svcType)
+		}
+		if inst.svc.Instance == "" {
+			inst.svc.Instance = instance
+		}
+		if responderIP != "" {
+			inst.svc.ResponderIP = responderIP
+		}
+	}
+	return inst
+}
+
+func applyMDNSTTL(svc *MDNSService, ttl uint32, now time.Time) {
+	if ttl == 0 {
+		svc.TTLSeconds = 0
+		svc.Withdrawn = true
+		exp := now.UTC()
+		svc.ExpiresAt = &exp
+		return
+	}
+	svc.Withdrawn = false
+	svc.TTLSeconds = ttl
+	exp := now.UTC().Add(time.Duration(ttl) * time.Second)
+	svc.ExpiresAt = &exp
+}
+
+// mdnsRealTransport returns the actual L4 transport for a DNS-SD service type.
+// Matter operational discovery advertises `_matter._tcp` per spec while using
+// UDP for operational MRP sessions, so it MUST NOT be fed to the TCP dialer.
+func mdnsRealTransport(svcType string) string {
+	low := strings.ToLower(strings.TrimSpace(svcType))
+	if low == "_matter._tcp" || strings.HasSuffix(low, "._udp") {
+		return "udp"
+	}
+	return "tcp"
+}
+
+// isMDNSRawPrintSink reports whether a DNS-SD type represents a raw print sink
+// that must never receive generic application-layer probe bytes.
+func isMDNSRawPrintSink(svcType string) bool {
+	low := strings.ToLower(strings.TrimSpace(svcType))
+	return strings.HasPrefix(low, "_pdl-datastream.") || low == "_printer._tcp"
+}
+
+// PruneExpired drops expired or withdrawn mDNS records (including A/AAAA entries) as of now.
+func (c *DiscoveryCache) PruneExpired(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, inst := range c.mdnsInst {
+		if inst.svc.Withdrawn || (inst.svc.ExpiresAt != nil && now.After(*inst.svc.ExpiresAt)) {
+			delete(c.mdnsInst, k)
+		}
+	}
+	for host, ipMap := range c.hostIPs {
+		for ip, exp := range ipMap {
+			if !exp.IsZero() && now.After(exp) {
+				delete(ipMap, ip)
+			}
+		}
+		if len(ipMap) == 0 {
+			delete(c.hostIPs, host)
+		}
+	}
+}
+
+// Snapshot builds a point-in-time LANDiscovery view from all non-expired,
+// non-withdrawn records in the cache.
+func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	res := &LANDiscovery{
+		MDNS:        make(map[string][]MDNSService),
+		UPnP:        make(map[string][]UPnPDevice),
+		WSDiscovery: make(map[string][]WSDiscoveryRecord),
+		PortsByIP:   make(map[string][]int),
+		RawPrintIPs: make(map[string]map[int]struct{}),
+		Unavailable: make(map[string]string, len(c.unavail)),
+	}
+	for k, v := range c.unavail {
+		res.Unavailable[k] = v
+	}
+
+	portSet := make(map[string]map[int]struct{})
+	addPort := func(ip string, port int) {
+		if ip == "" || port < 1 || port > 65535 {
+			return
+		}
+		if portSet[ip] == nil {
+			portSet[ip] = make(map[int]struct{})
+		}
+		portSet[ip][port] = struct{}{}
+	}
+
+	seen := make(map[string]struct{})
+	for _, inst := range c.mdnsInst {
+		svc := inst.svc
+		if svc.Withdrawn || (svc.ExpiresAt != nil && now.After(*svc.ExpiresAt)) {
+			continue
+		}
+		var ips []string
+		if inst.targetHost != "" {
+			for ip, exp := range c.hostIPs[inst.targetHost] {
+				if !exp.IsZero() && now.After(exp) {
+					continue
+				}
+				ips = append(ips, ip)
+			}
+			sort.Strings(ips)
+			// Never attribute an unresolved SRV target host to ResponderIP as if
+			// the reflector hosted that service directly.
+			if len(ips) == 0 {
+				continue
+			}
+		} else if svc.ResponderIP != "" {
+			ips = []string{svc.ResponderIP}
+		}
+		if len(ips) == 0 {
+			continue
+		}
+		svc.TargetIPs = ips
+		svc.AddressFamily = classifyIPFamily(ips)
+		if svc.ResponderIP != "" {
+			responderMatchesTarget := false
+			for _, tip := range ips {
+				if tip == svc.ResponderIP {
+					responderMatchesTarget = true
+					break
+				}
+			}
+			svc.Reflected = !responderMatchesTarget
+		}
+
+		for _, ip := range ips {
+			dedup := fmt.Sprintf("%s|%s|%s|%d|%s", ip, svc.ObserverVLAN, svc.Type, svc.Port, svc.Instance)
+			if _, dup := seen[dedup]; dup {
+				continue
+			}
+			seen[dedup] = struct{}{}
+			res.MDNS[ip] = append(res.MDNS[ip], svc)
+
+			if isMDNSRawPrintSink(svc.Type) {
+				if res.RawPrintIPs[ip] == nil {
+					res.RawPrintIPs[ip] = make(map[int]struct{})
+				}
+				if svc.Port > 0 {
+					res.RawPrintIPs[ip][svc.Port] = struct{}{}
+				}
+				continue
+			}
+			// Never dial Matter operational (_matter._tcp uses UDP!) or any UDP service via TCP.
+			if svc.Transport == "tcp" && svc.Port > 0 && !svc.Reflected {
+				addPort(ip, svc.Port)
+			}
+		}
+	}
+	for ip := range res.MDNS {
+		sort.Slice(res.MDNS[ip], func(i, j int) bool {
+			if res.MDNS[ip][i].Type != res.MDNS[ip][j].Type {
+				return res.MDNS[ip][i].Type < res.MDNS[ip][j].Type
+			}
+			return res.MDNS[ip][i].Port < res.MDNS[ip][j].Port
+		})
+	}
+	for ip, pset := range portSet {
+		list := make([]int, 0, len(pset))
+		for p := range pset {
+			list = append(list, p)
+		}
+		sort.Ints(list)
+		res.PortsByIP[ip] = list
+	}
+	return res
+}
+
+func classifyIPFamily(ips []string) string {
+	hasV4, hasV6 := false, false
+	for _, s := range ips {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			hasV4 = true
+		} else {
+			hasV6 = true
+		}
+	}
+	switch {
+	case hasV4 && hasV6:
+		return "dual"
+	case hasV6:
+		return "ipv6"
+	case hasV4:
+		return "ipv4"
+	default:
+		return ""
+	}
 }
 
 // DiscoverLAN performs one bounded, read-only multicast discovery sweep across
@@ -188,7 +607,8 @@ func DiscoverLAN(ctx context.Context, httpClient *http.Client) *LANDiscovery {
 
 	var wg sync.WaitGroup
 	var mdnsRes map[string][]MDNSService
-	var upnpRes map[string][]UPnPDevice
+	var ssdpHits []ssdpHit
+	var ssdpNoLoc map[string][]ssdpHit
 	var wsdRes map[string][]WSDiscoveryRecord
 
 	wg.Add(3)
@@ -198,7 +618,7 @@ func DiscoverLAN(ctx context.Context, httpClient *http.Client) *LANDiscovery {
 	}()
 	go func() {
 		defer wg.Done()
-		upnpRes = discoverSSDP(discCtx, httpClient)
+		ssdpHits, ssdpNoLoc = listenSSDP(discCtx)
 	}()
 	go func() {
 		defer wg.Done()
@@ -220,7 +640,7 @@ func DiscoverLAN(ctx context.Context, httpClient *http.Client) *LANDiscovery {
 	for ip, svcs := range mdnsRes {
 		res.MDNS[ip] = svcs
 		for _, s := range svcs {
-			if strings.HasPrefix(strings.ToLower(s.Type), "_pdl-datastream.") {
+			if isMDNSRawPrintSink(s.Type) {
 				if res.RawPrintIPs[ip] == nil {
 					res.RawPrintIPs[ip] = make(map[int]struct{})
 				}
@@ -229,16 +649,21 @@ func DiscoverLAN(ctx context.Context, httpClient *http.Client) *LANDiscovery {
 				}
 				continue
 			}
-			// Only feed TCP SRV ports into the TCP fingerprinter.
-			if strings.Contains(strings.ToLower(s.Type), "._tcp") && s.Port > 0 {
+			// Only feed genuinely TCP SRV ports into the TCP fingerprinter
+			// (skip UDP services and Matter operational _matter._tcp which runs UDP).
+			if mdnsRealTransport(s.Type) == "tcp" && s.Port > 0 && !s.Reflected {
 				addPort(ip, s.Port)
 			}
 		}
 	}
+
+	// Fetch UPnP XML descriptions AFTER collecting mDNS raw-print sink ports so
+	// SSDP never writes HTTP bytes to any advertised raw print sink.
+	upnpRes := fetchSSDPDescriptions(discCtx, httpClient, ssdpHits, ssdpNoLoc, res.RawPrintIPs)
 	for ip, devs := range upnpRes {
 		res.UPnP[ip] = devs
 		for _, d := range devs {
-			if d.Port > 0 {
+			if d.Port > 0 && !isRawPrintSinkPort(d.Port, res, ip) {
 				addPort(ip, d.Port)
 			}
 		}
@@ -263,30 +688,60 @@ func DiscoverLAN(ctx context.Context, httpClient *http.Client) *LANDiscovery {
 	return res
 }
 
-// discoverMDNS sends bounded RFC 6762 DNS-SD PTR queries to 224.0.0.251:5353
-// and collects PTR, SRV, TXT, and A responses over discoveryWindow.
+// discoverMDNS sends bounded RFC 6762 DNS-SD PTR queries over IPv4 (224.0.0.251:5353)
+// and IPv6 ([ff02::fb]:5353), assembling PTR, SRV, TXT, A, and AAAA records.
 func discoverMDNS(ctx context.Context) map[string][]MDNSService {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	cache := NewDiscoveryCache()
+	collectMDNSIntoCache(ctx, cache)
+	return cache.Snapshot(time.Now().UTC()).MDNS
+}
+
+func collectMDNSIntoCache(ctx context.Context, cache *DiscoveryCache) {
+	var wg sync.WaitGroup
+	// IPv4 mDNS sweep.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		collectMDNSFamily(ctx, cache, "udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0}, mdnsMulticastAddr, "mdns-ipv4")
+	}()
+	// IPv6 mDNS sweep (best-effort; records unavailability if host lacks IPv6 multicast).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		collectMDNSFamily(ctx, cache, "udp6", &net.UDPAddr{IP: net.IPv6unspecified, Port: 0}, "[ff02::fb]:5353", "mdns-ipv6")
+	}()
+	wg.Wait()
+}
+
+func collectMDNSFamily(ctx context.Context, cache *DiscoveryCache, network string, local *net.UDPAddr, remoteAddr, label string) {
+	conn, err := net.ListenUDP(network, local)
 	if err != nil {
-		return nil
+		cache.MarkUnavailable(label, err.Error())
+		return
 	}
 	defer conn.Close()
 
-	dst, err := net.ResolveUDPAddr("udp4", mdnsMulticastAddr)
+	dst, err := net.ResolveUDPAddr(network, remoteAddr)
 	if err != nil {
-		return nil
+		cache.MarkUnavailable(label, err.Error())
+		return
 	}
 
-	// Batch DNS-SD PTR questions into compact <= 1200-byte packets to stay well
-	// under standard 1500-byte Ethernet MTU.
+	sent := false
 	for i := 0; i < len(mdnsQueryTypes); i += 10 {
 		end := i + 10
 		if end > len(mdnsQueryTypes) {
 			end = len(mdnsQueryTypes)
 		}
 		if pkt := buildMDNSQuery(mdnsQueryTypes[i:end]); len(pkt) > 0 {
-			_, _ = conn.WriteToUDP(pkt, dst)
+			if _, werr := conn.WriteToUDP(pkt, dst); werr == nil {
+				sent = true
+			}
 		}
+	}
+	if !sent {
+		cache.MarkUnavailable(label, "multicast send failed")
+		return
 	}
 
 	deadline := time.Now().Add(discoveryWindow)
@@ -294,17 +749,6 @@ func discoverMDNS(ctx context.Context) map[string][]MDNSService {
 		deadline = dl
 	}
 	_ = conn.SetReadDeadline(deadline)
-
-	type pendingInst struct {
-		svcType  string
-		instance string
-		port     int
-		target   string
-		txt      []string
-		srcIP    string
-	}
-	instByFull := make(map[string]*pendingInst)
-	ipByHost := make(map[string]string)
 
 	buf := make([]byte, 8192)
 	for {
@@ -315,93 +759,8 @@ func discoverMDNS(ctx context.Context) map[string][]MDNSService {
 		if n < 12 || src == nil || src.IP == nil {
 			continue
 		}
-		srcIP := src.IP.String()
-		recs := parseDNSPacket(buf[:n])
-		for _, rr := range recs {
-			switch rr.rrType {
-			case 1: // A
-				if rr.ipv4 != "" {
-					ipByHost[strings.ToLower(rr.name)] = rr.ipv4
-				}
-			case 12: // PTR
-				svcType := normalizeMDNSType(rr.name)
-				if svcType == "" || strings.HasPrefix(svcType, "_services.") {
-					continue
-				}
-				key := strings.ToLower(rr.target)
-				inst := instByFull[key]
-				if inst == nil {
-					inst = &pendingInst{srcIP: srcIP}
-					instByFull[key] = inst
-				}
-				inst.svcType = svcType
-				inst.instance = extractMDNSInstance(rr.target, svcType)
-			case 33: // SRV
-				key := strings.ToLower(rr.name)
-				inst := instByFull[key]
-				if inst == nil {
-					inst = &pendingInst{srcIP: srcIP}
-					instByFull[key] = inst
-				}
-				if inst.svcType == "" {
-					inst.svcType = extractMDNSTypeFromFull(rr.name)
-				}
-				if inst.instance == "" {
-					inst.instance = extractMDNSInstance(rr.name, inst.svcType)
-				}
-				inst.port = rr.port
-				inst.target = strings.ToLower(rr.target)
-			case 16: // TXT
-				key := strings.ToLower(rr.name)
-				inst := instByFull[key]
-				if inst == nil {
-					inst = &pendingInst{srcIP: srcIP}
-					instByFull[key] = inst
-				}
-				if inst.svcType == "" {
-					inst.svcType = extractMDNSTypeFromFull(rr.name)
-				}
-				inst.txt = mergeSafeTXT(inst.txt, rr.txt)
-			}
-		}
+		cache.IngestMDNSPacket(buf[:n], src.IP.String(), src.Zone, "", time.Now().UTC())
 	}
-
-	out := make(map[string][]MDNSService)
-	seen := make(map[string]struct{})
-	for _, inst := range instByFull {
-		if inst.svcType == "" {
-			continue
-		}
-		ip := inst.srcIP
-		if inst.target != "" {
-			if resolved, ok := ipByHost[inst.target]; ok && resolved != "" {
-				ip = resolved
-			}
-		}
-		if ip == "" {
-			continue
-		}
-		dedupKey := fmt.Sprintf("%s|%s|%d|%s", ip, inst.svcType, inst.port, inst.instance)
-		if _, dup := seen[dedupKey]; dup {
-			continue
-		}
-		seen[dedupKey] = struct{}{}
-		out[ip] = append(out[ip], MDNSService{
-			Type:     inst.svcType,
-			Instance: inst.instance,
-			Port:     inst.port,
-			TXT:      inst.txt,
-		})
-	}
-	for ip := range out {
-		sort.Slice(out[ip], func(i, j int) bool {
-			if out[ip][i].Type != out[ip][j].Type {
-				return out[ip][i].Type < out[ip][j].Type
-			}
-			return out[ip][i].Port < out[ip][j].Port
-		})
-	}
-	return out
 }
 
 // buildMDNSQuery encodes a standard RFC 6762 PTR question packet for names.
@@ -430,14 +789,17 @@ func buildMDNSQuery(names []string) []byte {
 type dnsRecord struct {
 	name   string
 	rrType uint16
+	ttl    uint32
 	port   int
 	target string
 	ipv4   string
+	ipv6   string
 	txt    []string
 }
 
 // parseDNSPacket decodes Answer and Additional resource records from a raw
-// DNS/mDNS UDP datagram with full RFC 1035 name pointer decompression.
+// DNS/mDNS UDP datagram with full RFC 1035 name pointer decompression, TTL,
+// IPv4 A, and IPv6 AAAA extraction.
 func parseDNSPacket(pkt []byte) []dnsRecord {
 	if len(pkt) < 12 {
 		return nil
@@ -468,6 +830,7 @@ func parseDNSPacket(pkt []byte) []dnsRecord {
 			break
 		}
 		rrType := binary.BigEndian.Uint16(pkt[nextOff : nextOff+2])
+		ttl := binary.BigEndian.Uint32(pkt[nextOff+4 : nextOff+8])
 		rdLen := int(binary.BigEndian.Uint16(pkt[nextOff+8 : nextOff+10]))
 		rdataOff := nextOff + 10
 		if rdataOff+rdLen > len(pkt) {
@@ -479,17 +842,22 @@ func parseDNSPacket(pkt []byte) []dnsRecord {
 		case 1: // A
 			if rdLen == 4 {
 				ip := net.IP(pkt[rdataOff : rdataOff+4]).String()
-				out = append(out, dnsRecord{name: name, rrType: 1, ipv4: ip})
+				out = append(out, dnsRecord{name: name, rrType: 1, ttl: ttl, ipv4: ip})
+			}
+		case 28: // AAAA
+			if rdLen == 16 {
+				ip := net.IP(pkt[rdataOff : rdataOff+16]).String()
+				out = append(out, dnsRecord{name: name, rrType: 28, ttl: ttl, ipv6: ip})
 			}
 		case 12: // PTR
 			if target, _, ok := readDNSName(pkt, rdataOff); ok {
-				out = append(out, dnsRecord{name: name, rrType: 12, target: target})
+				out = append(out, dnsRecord{name: name, rrType: 12, ttl: ttl, target: target})
 			}
 		case 33: // SRV
 			if rdLen >= 7 {
 				port := int(binary.BigEndian.Uint16(pkt[rdataOff+4 : rdataOff+6]))
 				if target, _, ok := readDNSName(pkt, rdataOff+6); ok {
-					out = append(out, dnsRecord{name: name, rrType: 33, port: port, target: target})
+					out = append(out, dnsRecord{name: name, rrType: 33, ttl: ttl, port: port, target: target})
 				}
 			}
 		case 16: // TXT
@@ -505,7 +873,7 @@ func parseDNSPacket(pkt []byte) []dnsRecord {
 				pairs = append(pairs, string(pkt[pos:pos+l]))
 				pos += l
 			}
-			out = append(out, dnsRecord{name: name, rrType: 16, txt: pairs})
+			out = append(out, dnsRecord{name: name, rrType: 16, ttl: ttl, txt: pairs})
 		}
 	}
 	return out
@@ -593,11 +961,14 @@ func extractMDNSInstance(full, svcType string) string {
 	return trimmed
 }
 
+// mergeSafeTXT updates allowlisted DNS-SD TXT attributes by key so a refreshed
+// record (e.g. Matter cm=0 replacing cm=1) never leaves stale values behind.
 func mergeSafeTXT(existing, incoming []string) []string {
-	seen := make(map[string]struct{}, len(existing))
-	out := append([]string(nil), existing...)
+	byKey := make(map[string]string, len(existing)+len(incoming))
 	for _, kv := range existing {
-		seen[kv] = struct{}{}
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			byKey[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		}
 	}
 	for _, raw := range incoming {
 		k, v, ok := strings.Cut(raw, "=")
@@ -612,28 +983,35 @@ func mergeSafeTXT(existing, incoming []string) []string {
 		if len(v) > 64 {
 			v = v[:64]
 		}
-		entry := kLower + "=" + v
-		if _, dup := seen[entry]; !dup {
-			seen[entry] = struct{}{}
-			out = append(out, entry)
-		}
+		byKey[kLower] = v
+	}
+	out := make([]string, 0, len(byKey))
+	for k, v := range byKey {
+		out = append(out, k+"="+v)
 	}
 	sort.Strings(out)
 	return out
 }
 
-// discoverSSDP issues a single bounded SSDP M-SEARCH (MX: 1, ST: ssdp:all) and
-// fetches at most one same-host pinned UPnP XML description per unique location.
-func discoverSSDP(ctx context.Context, httpClient *http.Client) map[string][]UPnPDevice {
+type ssdpHit struct {
+	ip       string
+	st       string
+	server   string
+	location string
+}
+
+// listenSSDP issues a single bounded SSDP M-SEARCH (MX: 1, ST: ssdp:all) and
+// returns passive UDP responses without sending any HTTP requests yet.
+func listenSSDP(ctx context.Context) ([]ssdpHit, map[string][]ssdpHit) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	defer conn.Close()
 
 	dst, err := net.ResolveUDPAddr("udp4", ssdpMulticastAddr)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	msearch := "M-SEARCH * HTTP/1.1\r\n" +
 		"HOST: 239.255.255.250:1900\r\n" +
@@ -648,13 +1026,7 @@ func discoverSSDP(ctx context.Context, httpClient *http.Client) map[string][]UPn
 	}
 	_ = conn.SetReadDeadline(deadline)
 
-	type ssdpHit struct {
-		ip       string
-		st       string
-		server   string
-		location string
-	}
-	hitsByLoc := make(map[string]*ssdpHit)
+	hitsByLoc := make(map[string]ssdpHit)
 	noLocHits := make(map[string][]ssdpHit)
 
 	buf := make([]byte, 4096)
@@ -677,29 +1049,48 @@ func discoverSSDP(ctx context.Context, httpClient *http.Client) map[string][]UPn
 		if loc != "" {
 			key := ip + "|" + loc
 			if _, exists := hitsByLoc[key]; !exists && len(hitsByLoc) < 128 {
-				hitsByLoc[key] = &ssdpHit{ip: ip, st: st, server: srv, location: loc}
+				hitsByLoc[key] = ssdpHit{ip: ip, st: st, server: srv, location: loc}
 			}
 		} else if st != "" || srv != "" {
 			noLocHits[ip] = append(noLocHits[ip], ssdpHit{ip: ip, st: st, server: srv})
 		}
 	}
 
+	hits := make([]ssdpHit, 0, len(hitsByLoc))
+	for _, h := range hitsByLoc {
+		hits = append(hits, h)
+	}
+	return hits, noLocHits
+}
+
+// fetchSSDPDescriptions fetches at most one same-host pinned UPnP XML
+// description per unique location while enforcing the raw-printer guard across
+// both fixed raw print ports (9100/515) and mDNS-advertised raw print sinks.
+func fetchSSDPDescriptions(ctx context.Context, httpClient *http.Client, hits []ssdpHit, noLocHits map[string][]ssdpHit, rawPrintIPs map[string]map[int]struct{}) map[string][]UPnPDevice {
 	out := make(map[string][]UPnPDevice)
 	for ip, list := range noLocHits {
 		for _, h := range list {
 			out[ip] = append(out[ip], UPnPDevice{ST: h.st, Server: h.server})
 		}
 	}
+	isProtectedRawPrint := func(ip string, port int) bool {
+		if port == 9100 || port == 515 {
+			return true
+		}
+		if m := rawPrintIPs[ip]; m != nil {
+			_, ok := m[port]
+			return ok
+		}
+		return false
+	}
 
-	// Fetch pinned same-host XML descriptions concurrently (bounded to 8 workers).
 	var mu sync.Mutex
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
-	for _, hit := range hitsByLoc {
+	for _, hit := range hits {
 		h := hit
 		port, safeURL, ok := validateSameHostURL(h.location, h.ip)
 		if !ok {
-			// Retain passive SSDP headers without dialing cross-host/invalid URLs.
 			mu.Lock()
 			out[h.ip] = append(out[h.ip], UPnPDevice{ST: h.st, Server: h.server})
 			mu.Unlock()
@@ -711,7 +1102,7 @@ func discoverSSDP(ctx context.Context, httpClient *http.Client) map[string][]UPn
 			defer wg.Done()
 			defer func() { <-sem }()
 			dev := UPnPDevice{ST: h.st, Server: h.server, Port: port}
-			if httpClient != nil {
+			if httpClient != nil && !isProtectedRawPrint(h.ip, port) {
 				fetchUPnPXML(ctx, httpClient, safeURL, &dev)
 			}
 			mu.Lock()

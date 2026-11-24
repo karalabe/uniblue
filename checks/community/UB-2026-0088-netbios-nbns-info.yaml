@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0088
+title: NetBIOS Name Service (NBNS) Responding on LAN
+cve: null
+category: service-inventory
+claim: service-observed
+property: netbios-nbns
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: NetBIOS Name Service (RFC 1002)
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://datatracker.ietf.org/doc/html/rfc1002
+
+preconditions:
+  ports_any: [445, 139]
+  discovery_only: true
+
+probe:
+  type: nbns
+  port: 137
+  timeout: 2s
+
+remediation:
+  summary: >
+    The host answered a read-only NetBIOS Node Status (NBSTAT) query on UDP 137,
+    disclosing NetBIOS host/workgroup names. Disable legacy NetBIOS over TCP/IP
+    where modern DNS/SMB3 suffices.
+  unifi_actions:
+    - disable_legacy_netbios

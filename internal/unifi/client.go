@@ -284,12 +284,15 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	}
 	type forwardsRes struct {
 		items []rawPortForward
+		err   error
 	}
 	type zonesRes struct {
 		items []integrationFirewallZone
+		err   error
 	}
 	type policiesRes struct {
 		items []integrationFirewallPolicy
+		err   error
 	}
 	type legacyClientsRes struct {
 		items []rawClient
@@ -334,31 +337,25 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	}()
 	go func() {
 		// Port forwards are not yet exposed under /integration/v1 on all versions;
-		// opportunistically attempt the legacy endpoint and ignore auth/404 denials.
+		// opportunistically attempt the legacy endpoint and record failures in Visibility.
 		var env apiEnvelope[rawPortForward]
 		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/portforward", c.site), &env); err == nil {
 			forwardsCh <- forwardsRes{items: env.Data}
 			return
+		} else {
+			forwardsCh <- forwardsRes{err: err}
 		}
-		forwardsCh <- forwardsRes{}
 	}()
 	go func() {
-		// Zone-Based Firewall endpoints exist on UniFi Network 9+; silently
-		// ignore 404/auth errors on older consoles.
+		// Zone-Based Firewall endpoints exist on UniFi Network 9+; preserve errors
+		// so downstream isolation evaluation distinguishes unavailable telemetry
+		// from an empty policy table.
 		items, err := fetchAllPages[integrationFirewallZone](ctx, c, siteBase+"/firewall/zones")
-		if err != nil {
-			zonesCh <- zonesRes{}
-			return
-		}
-		zonesCh <- zonesRes{items: items}
+		zonesCh <- zonesRes{items: items, err: err}
 	}()
 	go func() {
 		items, err := fetchAllPages[integrationFirewallPolicy](ctx, c, siteBase+"/firewall/policies")
-		if err != nil {
-			policiesCh <- policiesRes{}
-			return
-		}
-		policiesCh <- policiesRes{items: items}
+		policiesCh <- policiesRes{items: items, err: err}
 	}()
 	go func() {
 		// Opportunistically fetch legacy stat/sta to enrich Integration v1 clients
@@ -443,14 +440,22 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			}
 		}
 		n := Network{
-			ID:               rn.ID,
-			Name:             rn.Name,
-			Purpose:          purpose,
-			VLAN:             string(rn.VLANID),
-			Subnet:           subnet,
-			IsolationEnabled: rn.IsolationEnabled,
-			ZoneID:           zoneID,
-			ZoneName:         zoneName,
+			ID:                   rn.ID,
+			Name:                 rn.Name,
+			Purpose:              purpose,
+			VLAN:                 string(rn.VLANID),
+			Subnet:               subnet,
+			IPv6Subnet:           extractIntegrationIPv6Subnet(rn),
+			IsolationEnabled:     rn.IsolationEnabled,
+			ZoneID:               zoneID,
+			ZoneName:             zoneName,
+			RouterDeviceMAC:      strings.ToLower(strings.TrimSpace(firstNonEmpty(rn.RouterDeviceMAC, rn.GatewayDevice))),
+			DHCPGuardEnabled:     rn.DHCPGuardEnabled,
+			MDNSReflectorEnabled: rn.MDNSEnabled,
+			IGMPSnooping:         rn.IGMPSnooping,
+			DNSServers:           extractIntegrationDNS(rn),
+			DHCPStart:            extractIntegrationDHCPStart(rn),
+			DHCPEnd:              extractIntegrationDHCPEnd(rn),
 		}
 		networks = append(networks, n)
 
@@ -495,6 +500,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		cl := Client{
 			MAC:      mac,
 			IP:       strings.TrimSpace(rc.IPAddress),
+			IPv6:     dedupeIPs(rc.IPv6Addresses),
 			Hostname: strings.TrimSpace(rc.Name),
 			Name:     strings.TrimSpace(rc.Name),
 			IsWired:  strings.EqualFold(rc.Type, "WIRED"),
@@ -508,6 +514,9 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			}
 			if o := strings.TrimSpace(lc.OUI); o != "" {
 				cl.OUI = o
+			}
+			if len(lc.IPv6Addresses) > 0 {
+				cl.IPv6 = dedupeIPs(append(cl.IPv6, lc.IPv6Addresses...))
 			}
 			cl.ESSID = strings.TrimSpace(lc.ESSID)
 			cl.SwitchMAC = strings.ToLower(strings.TrimSpace(lc.SwMAC))
@@ -552,6 +561,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		cl := Client{
 			MAC:        mac,
 			IP:         ip,
+			IPv6:       dedupeIPs(lc.IPv6Addresses),
 			Hostname:   strings.TrimSpace(lc.Hostname),
 			Name:       name,
 			OUI:        strings.TrimSpace(lc.OUI),
@@ -629,6 +639,43 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 
 	forwards := convertPortForwards(fr.items)
 
+	// Populate active client lease counts on networks with DHCP ranges.
+	clientsPerNetID := make(map[string]int, len(networks))
+	for _, cl := range clients {
+		if cl.NetworkID != "" {
+			clientsPerNetID[cl.NetworkID]++
+		}
+	}
+	hasDHCP := false
+	hasMDNS := false
+	for i := range networks {
+		if networks[i].DHCPStart != "" && networks[i].DHCPEnd != "" {
+			hasDHCP = true
+			if networks[i].ActiveLeases == 0 {
+				networks[i].ActiveLeases = clientsPerNetID[networks[i].ID]
+			}
+		}
+		if networks[i].MDNSReflectorEnabled != nil {
+			hasMDNS = true
+		}
+	}
+
+	gwPoliciesAvailable := zr.err == nil && pr.err == nil
+	var missingFeeds []string
+	if zr.err != nil {
+		missingFeeds = append(missingFeeds, fmt.Sprintf("firewall-zones (%s)", shortFetchErr(zr.err)))
+	}
+	if pr.err != nil {
+		missingFeeds = append(missingFeeds, fmt.Sprintf("firewall-policies (%s)", shortFetchErr(pr.err)))
+	}
+	if fr.err != nil {
+		missingFeeds = append(missingFeeds, fmt.Sprintf("port-forwards (%s)", shortFetchErr(fr.err)))
+	}
+	if !telem.wlansOK {
+		missingFeeds = append(missingFeeds, "wlan-config (unavailable)")
+	}
+	missingFeeds = append(missingFeeds, "switch-acls (not exposed by controller API)")
+
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
 		Site:             c.site,
@@ -645,6 +692,19 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		Health:           telem.health,
 		KnownClients:     convertHistoricalClients(telem.knownUsers, netByID),
 		RecentLogs:       telem.recentLogs,
+		SwitchACLCoverage: &SwitchACLCoverage{
+			Status: "unavailable",
+			Reason: "UniFi controller API does not expose switch ACL tables",
+		},
+		Visibility: &SiteVisibility{
+			APIMode:                  c.controllerType,
+			GatewayPoliciesAvailable: gwPoliciesAvailable,
+			SwitchACLsAvailable:      false,
+			WLANsAvailable:           telem.wlansOK,
+			DHCPAvailable:            hasDHCP,
+			MDNSReflectorKnown:       hasMDNS,
+			MissingFeeds:             missingFeeds,
+		},
 	}, nil
 }
 
@@ -714,13 +774,32 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	netByID := make(map[string]Network, len(nr.items))
 	netByName := make(map[string]Network, len(nr.items))
 	for _, rn := range nr.items {
+		var dnsServers []string
+		if s := strings.TrimSpace(rn.DHCPDDNS1); s != "" {
+			dnsServers = append(dnsServers, s)
+		}
+		if s := strings.TrimSpace(rn.DHCPDDNS2); s != "" {
+			dnsServers = append(dnsServers, s)
+		}
+		routerMAC := ""
+		if strings.EqualFold(strings.TrimSpace(rn.GatewayType), "switch") && rn.GatewayDevice != "" {
+			routerMAC = strings.ToLower(strings.TrimSpace(rn.GatewayDevice))
+		}
 		n := Network{
-			ID:               rn.ID,
-			Name:             rn.Name,
-			Purpose:          strings.ToLower(strings.TrimSpace(rn.Purpose)),
-			VLAN:             string(rn.VLAN),
-			Subnet:           rn.IPSubnet,
-			IsolationEnabled: rn.NetworkIsolationEnabled,
+			ID:                   rn.ID,
+			Name:                 rn.Name,
+			Purpose:              strings.ToLower(strings.TrimSpace(rn.Purpose)),
+			VLAN:                 string(rn.VLAN),
+			Subnet:               rn.IPSubnet,
+			IPv6Subnet:           strings.TrimSpace(rn.IPv6Subnet),
+			IsolationEnabled:     rn.NetworkIsolationEnabled,
+			RouterDeviceMAC:      routerMAC,
+			DHCPGuardEnabled:     rn.DHCPGuardEnabled,
+			MDNSReflectorEnabled: rn.MDNSEnabled,
+			IGMPSnooping:         rn.IGMPSnooping,
+			DNSServers:           dnsServers,
+			DHCPStart:            strings.TrimSpace(rn.DHCPDStart),
+			DHCPEnd:              strings.TrimSpace(rn.DHCPDStop),
 		}
 		networks = append(networks, n)
 		if n.ID != "" {
@@ -736,6 +815,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		cl := Client{
 			MAC:         strings.ToLower(strings.TrimSpace(rc.MAC)),
 			IP:          strings.TrimSpace(rc.IP),
+			IPv6:        dedupeIPs(rc.IPv6Addresses),
 			Hostname:    strings.TrimSpace(rc.Hostname),
 			Name:        strings.TrimSpace(rc.Name),
 			OUI:         strings.TrimSpace(rc.OUI),
@@ -791,7 +871,34 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		devices = append(devices, dev)
 	}
 
+	clientsPerNetID := make(map[string]int, len(networks))
+	for _, cl := range clients {
+		if cl.NetworkID != "" {
+			clientsPerNetID[cl.NetworkID]++
+		}
+	}
+	hasDHCP := false
+	hasMDNS := false
+	for i := range networks {
+		if networks[i].DHCPStart != "" && networks[i].DHCPEnd != "" {
+			hasDHCP = true
+			if networks[i].ActiveLeases == 0 {
+				networks[i].ActiveLeases = clientsPerNetID[networks[i].ID]
+			}
+		}
+		if networks[i].MDNSReflectorEnabled != nil {
+			hasMDNS = true
+		}
+	}
+
 	telem := <-telemetryCh
+	missingFeeds := []string{
+		"firewall-policies (legacy API does not expose Zone-Based Firewall policies)",
+		"switch-acls (legacy API does not expose switch ACLs)",
+	}
+	if !telem.wlansOK {
+		missingFeeds = append(missingFeeds, "wlan-config (unavailable)")
+	}
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
 		Site:             c.site,
@@ -806,6 +913,19 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		Health:           telem.health,
 		KnownClients:     convertHistoricalClients(telem.knownUsers, netByID),
 		RecentLogs:       telem.recentLogs,
+		SwitchACLCoverage: &SwitchACLCoverage{
+			Status: "unavailable",
+			Reason: "classic UniFi API does not expose switch ACL tables",
+		},
+		Visibility: &SiteVisibility{
+			APIMode:                  c.controllerType,
+			GatewayPoliciesAvailable: false,
+			SwitchACLsAvailable:      false,
+			WLANsAvailable:           telem.wlansOK,
+			DHCPAvailable:            hasDHCP,
+			MDNSReflectorKnown:       hasMDNS,
+			MissingFeeds:             missingFeeds,
+		},
 	}, nil
 }
 
@@ -990,15 +1110,21 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, defaultNetName
 func convertPortForwards(raw []rawPortForward) []PortForward {
 	forwards := make([]PortForward, 0, len(raw))
 	for _, rf := range raw {
+		ipVer := strings.ToLower(strings.TrimSpace(rf.IPVersion))
+		if ipVer == "" {
+			ipVer = "ipv4"
+		}
 		forwards = append(forwards, PortForward{
-			ID:      rf.ID,
-			Name:    rf.Name,
-			Enabled: rf.Enabled,
-			Proto:   strings.ToLower(rf.Proto),
-			DstPort: string(rf.DstPort),
-			FwdIP:   strings.TrimSpace(rf.Fwd),
-			FwdPort: string(rf.FwdPort),
-			Src:     strings.TrimSpace(rf.Src),
+			ID:        rf.ID,
+			Name:      rf.Name,
+			Enabled:   rf.Enabled,
+			Proto:     strings.ToLower(rf.Proto),
+			DstPort:   string(rf.DstPort),
+			FwdIP:     strings.TrimSpace(rf.Fwd),
+			FwdPort:   string(rf.FwdPort),
+			Src:       strings.TrimSpace(rf.Src),
+			Interface: strings.ToLower(strings.TrimSpace(rf.PfwdInterface)),
+			IPVersion: ipVer,
 		})
 	}
 	return forwards
@@ -1026,43 +1152,159 @@ func extractIntegrationSubnet(rn integrationNetwork) string {
 	return ""
 }
 
+func extractIntegrationIPv6Subnet(rn integrationNetwork) string {
+	if s := strings.TrimSpace(rn.IPv6Subnet); s != "" {
+		return s
+	}
+	if rn.IPv6Configuration != nil {
+		if s := strings.TrimSpace(rn.IPv6Configuration.Subnet); s != "" {
+			return s
+		}
+		if s := strings.TrimSpace(rn.IPv6Configuration.Prefix); s != "" {
+			return s
+		}
+		if rn.IPv6Configuration.HostIPAddress != "" && rn.IPv6Configuration.PrefixLength > 0 {
+			return fmt.Sprintf("%s/%d", rn.IPv6Configuration.HostIPAddress, rn.IPv6Configuration.PrefixLength)
+		}
+	}
+	return ""
+}
+
+func extractIntegrationDHCPStart(rn integrationNetwork) string {
+	if s := strings.TrimSpace(rn.DHCPStart); s != "" {
+		return s
+	}
+	if rn.IPv4Configuration != nil && rn.IPv4Configuration.DHCPConfiguration != nil && rn.IPv4Configuration.DHCPConfiguration.IPAddressRange != nil {
+		return strings.TrimSpace(rn.IPv4Configuration.DHCPConfiguration.IPAddressRange.Start)
+	}
+	return ""
+}
+
+func extractIntegrationDHCPEnd(rn integrationNetwork) string {
+	if s := strings.TrimSpace(rn.DHCPEnd); s != "" {
+		return s
+	}
+	if rn.IPv4Configuration != nil && rn.IPv4Configuration.DHCPConfiguration != nil && rn.IPv4Configuration.DHCPConfiguration.IPAddressRange != nil {
+		return strings.TrimSpace(rn.IPv4Configuration.DHCPConfiguration.IPAddressRange.Stop)
+	}
+	return ""
+}
+
+func extractIntegrationDNS(rn integrationNetwork) []string {
+	if len(rn.DNSServers) > 0 {
+		return dedupeIPs(rn.DNSServers)
+	}
+	if rn.IPv4Configuration != nil && rn.IPv4Configuration.DHCPConfiguration != nil {
+		return dedupeIPs(rn.IPv4Configuration.DHCPConfiguration.DNSServerIPAddresses)
+	}
+	return nil
+}
+
+func dedupeIPs(ips []string) []string {
+	if len(ips) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ips))
+	var out []string
+	for _, raw := range ips {
+		ip := strings.TrimSpace(raw)
+		if ip == "" {
+			continue
+		}
+		k := strings.ToLower(ip)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, ip)
+	}
+	return out
+}
+
+func shortFetchErr(err error) string {
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) {
+		return fmt.Sprintf("HTTP %d", httpErr.status)
+	}
+	return "request failed"
+}
+
 // convertIntegrationPolicies normalizes wire Integration v1 firewall policies
-// into domain FirewallPolicy values with resolved zone names and explicit
-// IP/port filter flags.
+// into domain FirewallPolicy values with resolved zone names, explicit ordering,
+// connection-state/return-traffic semantics, negation, and unsupported selector markers.
 func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[string]string) []FirewallPolicy {
 	out := make([]FirewallPolicy, 0, len(raw))
-	for _, rp := range raw {
+	for i, rp := range raw {
 		origin := ""
 		if rp.Metadata != nil {
 			origin = rp.Metadata.Origin
 		}
 		proto := "all"
-		if rp.IPProtocolScope != nil && rp.IPProtocolScope.ProtocolFilter != nil {
-			pf := rp.IPProtocolScope.ProtocolFilter
-			switch {
-			case pf.Protocol != nil && pf.Protocol.Name != "":
-				proto = strings.ToLower(pf.Protocol.Name)
-			case pf.NamedProtocol != "":
-				proto = strings.ToLower(pf.NamedProtocol)
+		ipVersion := "both"
+		unsupported := ""
+		if rp.IPProtocolScope != nil {
+			switch strings.ToUpper(strings.TrimSpace(rp.IPProtocolScope.IPVersion)) {
+			case "IPV4", "V4":
+				ipVersion = "ipv4"
+			case "IPV6", "V6":
+				ipVersion = "ipv6"
+			case "IPV4_AND_IPV6", "BOTH", "":
+				ipVersion = "both"
+			default:
+				ipVersion = strings.ToLower(strings.TrimSpace(rp.IPProtocolScope.IPVersion))
+			}
+			if rp.IPProtocolScope.ProtocolFilter != nil {
+				pf := rp.IPProtocolScope.ProtocolFilter
+				switch {
+				case pf.Protocol != nil && pf.Protocol.Name != "":
+					proto = strings.ToLower(pf.Protocol.Name)
+				case pf.NamedProtocol != "":
+					proto = strings.ToLower(pf.NamedProtocol)
+				case pf.Type != "" && !strings.EqualFold(pf.Type, "ALL") && !strings.EqualFold(pf.Type, "ANY"):
+					unsupported = fmt.Sprintf("protocol filter type %q", pf.Type)
+				}
 			}
 		}
+
+		idx := rp.Index
+		if idx <= 0 {
+			idx = i + 1
+		}
+		var states []string
+		for _, cs := range rp.ConnectionStateFilter {
+			if norm := strings.ToLower(strings.TrimSpace(cs)); norm != "" {
+				states = append(states, norm)
+			}
+		}
+		schedule := ""
+		if rp.Schedule != nil && !strings.EqualFold(rp.Schedule.Mode, "ALWAYS") && (rp.Schedule.Mode != "" || rp.Schedule.Name != "") {
+			schedule = firstNonEmpty(rp.Schedule.Name, rp.Schedule.Mode)
+		}
+
 		out = append(out, FirewallPolicy{
-			ID:             rp.ID,
-			Name:           rp.Name,
-			Enabled:        rp.Enabled,
-			Action:         strings.ToUpper(strings.TrimSpace(rp.Action.Type)),
-			Origin:         origin,
-			Protocol:       proto,
-			Source:         convertPolicyEndpoint(rp.Source, zoneNames),
-			Destination:    convertPolicyEndpoint(rp.Destination, zoneNames),
-			LoggingEnabled: rp.LoggingEnabled,
+			ID:                 rp.ID,
+			Name:               rp.Name,
+			Enabled:            rp.Enabled,
+			Action:             strings.ToUpper(strings.TrimSpace(rp.Action.Type)),
+			Origin:             origin,
+			Index:              idx,
+			IPVersion:          ipVersion,
+			Protocol:           proto,
+			ConnectionStates:   states,
+			MatchReturnTraffic: rp.MatchReturnTraffic || rp.Action.AllowReturnTraffic,
+			Schedule:           schedule,
+			UnsupportedReason:  unsupported,
+			Source:             convertPolicyEndpoint(rp.Source, zoneNames),
+			Destination:        convertPolicyEndpoint(rp.Destination, zoneNames),
+			LoggingEnabled:     rp.LoggingEnabled,
 		})
 	}
 	return out
 }
 
-// convertPolicyEndpoint extracts zone identity, IP addresses, and port numbers
-// from an Integration v1 firewall policy endpoint.
+// convertPolicyEndpoint extracts zone identity, IP addresses, network IDs, MACs,
+// port numbers, negation flags, and unsupported traffic filters from an
+// Integration v1 firewall policy endpoint.
 func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]string) PolicyEndpoint {
 	out := PolicyEndpoint{
 		ZoneID:    ep.ZoneID,
@@ -1075,8 +1317,11 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 		return out
 	}
 
+	recognized := false
 	if tf.IPAddressFilter != nil && len(tf.IPAddressFilter.Items) > 0 {
+		recognized = true
 		out.AnyTarget = false
+		out.NegateTarget = out.NegateTarget || tf.IPAddressFilter.MatchOpposite
 		for _, item := range tf.IPAddressFilter.Items {
 			if v := strings.TrimSpace(string(item.Value)); v != "" {
 				out.IPs = append(out.IPs, v)
@@ -1084,13 +1329,25 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 		}
 	}
 	if tf.NetworkFilter != nil && len(tf.NetworkFilter.NetworkIDs) > 0 {
+		recognized = true
 		out.AnyTarget = false
+		out.NegateTarget = out.NegateTarget || tf.NetworkFilter.MatchOpposite
+		out.NetworkIDs = append(out.NetworkIDs, tf.NetworkFilter.NetworkIDs...)
 	}
 	if tf.MACAddressFilter != nil && len(tf.MACAddressFilter.MACAddresses) > 0 {
+		recognized = true
 		out.AnyTarget = false
+		out.NegateTarget = out.NegateTarget || tf.MACAddressFilter.MatchOpposite
+		for _, m := range tf.MACAddressFilter.MACAddresses {
+			if norm := strings.ToLower(strings.TrimSpace(m)); norm != "" {
+				out.MACs = append(out.MACs, norm)
+			}
+		}
 	}
 	if tf.PortFilter != nil && len(tf.PortFilter.Items) > 0 {
+		recognized = true
 		out.AnyPort = false
+		out.NegatePort = out.NegatePort || tf.PortFilter.MatchOpposite
 		for _, item := range tf.PortFilter.Items {
 			if item.Start > 0 && item.End >= item.Start && (item.End-item.Start+1) <= 16 {
 				for p := item.Start; p <= item.End; p++ {
@@ -1102,6 +1359,15 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 				out.Ports = append(out.Ports, expandPortSpec(v, 16)...)
 			}
 		}
+	}
+	// If the controller supplied a non-empty trafficFilter type (e.g., REGION,
+	// DOMAIN, APP, OBJECT_GROUP) that we did not decode into IP/Network/MAC/Port,
+	// mark it unsupported so the evaluator yields "unknown" rather than treating
+	// it as AnyTarget=true.
+	tfType := strings.ToUpper(strings.TrimSpace(tf.Type))
+	if !recognized && tfType != "" && tfType != "ANY" && tfType != "ALL" {
+		out.AnyTarget = false
+		out.UnsupportedSelector = fmt.Sprintf("traffic filter type %q", tf.Type)
 	}
 	return out
 }
@@ -1203,11 +1469,40 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 		if extractIntegrationSubnet(items[i]) == "" && rn.IPSubnet != "" {
 			items[i].Subnet = rn.IPSubnet
 		}
+		if extractIntegrationIPv6Subnet(items[i]) == "" && rn.IPv6Subnet != "" {
+			items[i].IPv6Subnet = rn.IPv6Subnet
+		}
 		if items[i].Purpose == "" && rn.Purpose != "" {
 			items[i].Purpose = rn.Purpose
 		}
 		if rn.NetworkIsolationEnabled {
 			items[i].IsolationEnabled = true
+		}
+		if items[i].RouterDeviceMAC == "" && strings.EqualFold(strings.TrimSpace(rn.GatewayType), "switch") && rn.GatewayDevice != "" {
+			items[i].RouterDeviceMAC = strings.ToLower(strings.TrimSpace(rn.GatewayDevice))
+		}
+		if extractIntegrationDHCPStart(items[i]) == "" && rn.DHCPDStart != "" {
+			items[i].DHCPStart = rn.DHCPDStart
+		}
+		if extractIntegrationDHCPEnd(items[i]) == "" && rn.DHCPDStop != "" {
+			items[i].DHCPEnd = rn.DHCPDStop
+		}
+		if items[i].DHCPGuardEnabled == nil && rn.DHCPGuardEnabled != nil {
+			items[i].DHCPGuardEnabled = rn.DHCPGuardEnabled
+		}
+		if items[i].MDNSEnabled == nil && rn.MDNSEnabled != nil {
+			items[i].MDNSEnabled = rn.MDNSEnabled
+		}
+		if items[i].IGMPSnooping == nil && rn.IGMPSnooping != nil {
+			items[i].IGMPSnooping = rn.IGMPSnooping
+		}
+		if len(extractIntegrationDNS(items[i])) == 0 {
+			if s := strings.TrimSpace(rn.DHCPDDNS1); s != "" {
+				items[i].DNSServers = append(items[i].DNSServers, s)
+			}
+			if s := strings.TrimSpace(rn.DHCPDDNS2); s != "" {
+				items[i].DNSServers = append(items[i].DNSServers, s)
+			}
 		}
 	}
 	return legacyNets

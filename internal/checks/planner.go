@@ -128,7 +128,8 @@ func isGlobalBaselineCheck(chk *Check) bool {
 
 func isNonTCPProbe(probeType string) bool {
 	switch strings.ToLower(probeType) {
-	case "observe", "snmp", "coap", "natpmp", "ipmi":
+	case "observe", "snmp", "coap", "natpmp", "ipmi",
+		"lifx", "nbns", "pcp", "dns-recursion", "ntp", "stun":
 		return true
 	default:
 		return false

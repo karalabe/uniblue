@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0087
+title: Unauthenticated PJLink Projector Control Exposed
+cve: null
+category: unauth-control
+claim: confirmed-permission
+property: pjlink-unauth
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: JBMIA / Generic
+  product: PJLink Networked Projector
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://pjlink.jbmia.or.jp/english/
+
+preconditions:
+  ports_any: [4352]
+  discovery_only: true
+
+probe:
+  type: pjlink
+  timeout: 3s
+
+remediation:
+  summary: >
+    A networked projector advertised PJLink mode 0 (no authentication) on TCP
+    4352 and answered read-only status queries without a password. Enable a
+    PJLink password and isolate A/V equipment from guest networks.
+  unifi_actions:
+    - enable_pjlink_auth
+    - move_to_iot_vlan

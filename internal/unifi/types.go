@@ -66,6 +66,108 @@ type Snapshot struct {
 
 	// RecentLogs holds recent security and admin activity events from the console.
 	RecentLogs []ControllerLogEvent `json:"recent_logs,omitempty"`
+
+	// SwitchACLs holds L2/L3 switch access control lists when exposed by the controller.
+	SwitchACLs []SwitchACL `json:"switch_acls,omitempty"`
+
+	// SwitchACLCoverage reports whether switch ACL telemetry is complete, partial,
+	// unavailable from the controller API, or unsupported by a switch model.
+	SwitchACLCoverage *SwitchACLCoverage `json:"switch_acl_coverage,omitempty"`
+
+	// Visibility records which controller and site telemetry feeds were available
+	// during this snapshot so isolation verdicts clearly distinguish "denied" from "unknown".
+	Visibility *SiteVisibility `json:"visibility,omitempty"`
+
+	// DynamicMappings holds active UPnP / NAT-PMP / PCP dynamic leases when available.
+	DynamicMappings []DynamicPortMapping `json:"dynamic_mappings,omitempty"`
+
+	// PublishedTunnels holds owner-declared outbound publishing tunnels (e.g., Cloudflare Tunnel, Tailscale Funnel).
+	PublishedTunnels []PublishedTunnel `json:"published_tunnels,omitempty"`
+
+	// ProxyRoutes holds owner-declared reverse proxy frontends and backend origins.
+	ProxyRoutes []ProxyRoute `json:"proxy_routes,omitempty"`
+
+	// BackupStatus holds owner-provided network backup freshness and last verified restore test.
+	BackupStatus *BackupStatus `json:"backup_status,omitempty"`
+}
+
+// SwitchACL describes one L2/L3 switch access control rule enforced on a UniFi switch.
+type SwitchACL struct {
+	ID          string         `json:"id" yaml:"id"`
+	Name        string         `json:"name" yaml:"name"`
+	Enabled     bool           `json:"enabled" yaml:"enabled"`
+	Index       int            `json:"index" yaml:"index"`
+	Action      string         `json:"action" yaml:"action"` // "ALLOW" | "BLOCK"
+	IPVersion   string         `json:"ip_version,omitempty" yaml:"ip_version,omitempty"`
+	Protocol    string         `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+	Source      PolicyEndpoint `json:"source" yaml:"source"`
+	Destination PolicyEndpoint `json:"destination" yaml:"destination"`
+	DeviceMACs  []string       `json:"device_macs,omitempty" yaml:"device_macs,omitempty"`
+	NetworkIDs  []string       `json:"network_ids,omitempty" yaml:"network_ids,omitempty"`
+}
+
+// SwitchACLCoverage records whether switch ACL evidence was collected for a site.
+type SwitchACLCoverage struct {
+	Status string `json:"status" yaml:"status"` // "complete" | "partial" | "unavailable" | "unsupported-model"
+	Reason string `json:"reason,omitempty" yaml:"reason,omitempty"`
+}
+
+// SiteVisibility tracks per-site telemetry completeness across controller feeds.
+type SiteVisibility struct {
+	ControllerVersion        string   `json:"controller_version,omitempty" yaml:"controller_version,omitempty"`
+	APIMode                  string   `json:"api_mode,omitempty" yaml:"api_mode,omitempty"`
+	GatewayPoliciesAvailable bool     `json:"gateway_policies_available" yaml:"gateway_policies_available"`
+	SwitchACLsAvailable      bool     `json:"switch_acls_available" yaml:"switch_acls_available"`
+	WLANsAvailable           bool     `json:"wlans_available" yaml:"wlans_available"`
+	DHCPAvailable            bool     `json:"dhcp_available" yaml:"dhcp_available"`
+	MDNSReflectorKnown       bool     `json:"mdns_reflector_known" yaml:"mdns_reflector_known"`
+	MissingFeeds             []string `json:"missing_feeds,omitempty" yaml:"missing_feeds,omitempty"`
+}
+
+// DynamicPortMapping captures one live UPnP / NAT-PMP / PCP dynamic NAT lease.
+type DynamicPortMapping struct {
+	Protocol   string     `json:"protocol" yaml:"protocol"` // "upnp" | "natpmp" | "pcp"
+	Transport  string     `json:"transport" yaml:"transport"`
+	ExtPort    int        `json:"ext_port" yaml:"ext_port"`
+	InternalIP string     `json:"internal_ip" yaml:"internal_ip"`
+	IntPort    int        `json:"int_port" yaml:"int_port"`
+	OwnerIP    string     `json:"owner_ip,omitempty" yaml:"owner_ip,omitempty"`
+	Source     string     `json:"source,omitempty" yaml:"source,omitempty"`
+	Approved   bool       `json:"approved,omitempty" yaml:"approved,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
+}
+
+// PublishedTunnel captures one owner-declared outbound publishing tunnel route.
+type PublishedTunnel struct {
+	Provider      string `json:"provider" yaml:"provider"` // "cloudflare-tunnel" | "tailscale-funnel" | "ngrok" | ...
+	Hostname      string `json:"hostname" yaml:"hostname"`
+	BackendIP     string `json:"backend_ip" yaml:"backend_ip"`
+	BackendPort   int    `json:"backend_port" yaml:"backend_port"`
+	BackendRole   string `json:"backend_role,omitempty" yaml:"backend_role,omitempty"`
+	AccessPolicy  string `json:"access_policy,omitempty" yaml:"access_policy,omitempty"` // "authenticated" | "public" | "none" | "" (unknown)
+	AdminEndpoint bool   `json:"admin_endpoint,omitempty" yaml:"admin_endpoint,omitempty"`
+}
+
+// ProxyRoute captures one owner-declared reverse proxy virtual host and origin backend.
+// FrontendAuth and BackendAuth are pointers so omitted fields remain unknown rather
+// than being treated as unauthenticated.
+type ProxyRoute struct {
+	ProxyIP       string `json:"proxy_ip" yaml:"proxy_ip"`
+	Hostname      string `json:"hostname" yaml:"hostname"`
+	PublicExposed bool   `json:"public_exposed" yaml:"public_exposed"`
+	FrontendAuth  *bool  `json:"frontend_auth,omitempty" yaml:"frontend_auth,omitempty"`
+	BackendIP     string `json:"backend_ip" yaml:"backend_ip"`
+	BackendPort   int    `json:"backend_port" yaml:"backend_port"`
+	BackendAuth   *bool  `json:"backend_auth,omitempty" yaml:"backend_auth,omitempty"`
+	AdminVHost    bool   `json:"admin_vhost,omitempty" yaml:"admin_vhost,omitempty"`
+}
+
+// BackupStatus records owner-supplied controller backup and restore-test freshness.
+type BackupStatus struct {
+	LastBackupAt      *time.Time `json:"last_backup_at,omitempty" yaml:"last_backup_at,omitempty"`
+	LastRestoreTestAt *time.Time `json:"last_restore_test_at,omitempty" yaml:"last_restore_test_at,omitempty"`
+	Scope             string     `json:"scope,omitempty" yaml:"scope,omitempty"`
+	BackupHealthy     bool       `json:"backup_healthy" yaml:"backup_healthy"`
 }
 
 // PortHintsByIP collects concrete destination TCP ports explicitly referenced
@@ -166,6 +268,9 @@ type Client struct {
 
 	// IP is the client's current IPv4 address on the LAN.
 	IP string `json:"ip"`
+
+	// IPv6 holds any IPv6 addresses reported for this client by UniFi or local discovery.
+	IPv6 []string `json:"ipv6,omitempty"`
 
 	// Hostname is the DHCP or DNS hostname reported by the client.
 	Hostname string `json:"hostname"`
@@ -474,6 +579,31 @@ type Network struct {
 
 	// ZoneName is the resolved firewall zone name (e.g., "Internal", "Hotspot", "Dmz").
 	ZoneName string `json:"zone_name,omitempty"`
+
+	// IPv6Subnet records the IPv6 prefix assigned to this VLAN, if configured.
+	IPv6Subnet string `json:"ipv6_subnet,omitempty"`
+
+	// RouterDeviceMAC identifies the L3 switch MAC when inter-VLAN routing for
+	// this VLAN is owned by an L3 switch rather than the gateway. Empty means
+	// the site's primary UniFi gateway routes this VLAN.
+	RouterDeviceMAC string `json:"router_device_mac,omitempty"`
+
+	// DHCPGuardEnabled reports whether switch DHCP snooping/guard is enabled.
+	DHCPGuardEnabled *bool `json:"dhcp_guard_enabled,omitempty"`
+
+	// MDNSReflectorEnabled reports whether mDNS reflection/proxy is active on this VLAN.
+	MDNSReflectorEnabled *bool `json:"mdns_reflector_enabled,omitempty"`
+
+	// IGMPSnooping reports whether IGMP snooping is enabled on this VLAN.
+	IGMPSnooping *bool `json:"igmp_snooping,omitempty"`
+
+	// DNSServers lists DHCP-assigned DNS resolvers for this VLAN.
+	DNSServers []string `json:"dns_servers,omitempty"`
+
+	// DHCPStart, DHCPEnd, and ActiveLeases support DHCP pool exhaustion and overlap checks.
+	DHCPStart    string `json:"dhcp_start,omitempty"`
+	DHCPEnd      string `json:"dhcp_end,omitempty"`
+	ActiveLeases int    `json:"active_leases,omitempty"`
 }
 
 // FirewallZone represents a UniFi Zone-Based Firewall zone grouping one or more
@@ -511,8 +641,30 @@ type FirewallPolicy struct {
 	// Origin distinguishes built-in rules ("SYSTEM_DEFINED") from operator rules ("USER_DEFINED").
 	Origin string `json:"origin,omitempty"`
 
-	// Protocol is the matched IP protocol ("all", "tcp", "udp", "tcp_udp", "icmp", etc.).
+	// Index records the explicit rule evaluation order (lower evaluates first).
+	Index int `json:"index,omitempty"`
+
+	// IPVersion records the address family ("ipv4", "ipv6", or "both").
+	// Empty defaults to "both" for backward compatibility with legacy fixtures.
+	IPVersion string `json:"ip_version,omitempty"`
+
+	// Protocol is the matched IP protocol ("all", "tcp", "udp", "tcp_udp", "icmp", "icmpv6", etc.).
 	Protocol string `json:"protocol,omitempty"`
+
+	// ConnectionStates restricts matching to specific conntrack states
+	// ("new", "established", "related", "invalid"). Empty matches all states.
+	ConnectionStates []string `json:"connection_states,omitempty"`
+
+	// MatchReturnTraffic is true when the rule automatically allows established
+	// return packets for sessions permitted in the forward direction.
+	MatchReturnTraffic bool `json:"match_return_traffic,omitempty"`
+
+	// Schedule optionally names an active time schedule on this rule.
+	Schedule string `json:"schedule,omitempty"`
+
+	// UnsupportedReason records any top-level policy construct UniBlue cannot
+	// evaluate deterministically (e.g., an unrecognized protocol filter).
+	UnsupportedReason string `json:"unsupported_reason,omitempty"`
 
 	// Source describes the traffic origin zone and optional IP/port filters.
 	Source PolicyEndpoint `json:"source"`
@@ -528,22 +680,38 @@ type FirewallPolicy struct {
 // of a UniFi FirewallPolicy.
 type PolicyEndpoint struct {
 	// ZoneID is the UniFi firewall zone UUID.
-	ZoneID string `json:"zone_id"`
+	ZoneID string `json:"zone_id" yaml:"zone_id"`
 
 	// ZoneName is the resolved firewall zone display name.
-	ZoneName string `json:"zone_name,omitempty"`
+	ZoneName string `json:"zone_name,omitempty" yaml:"zone_name,omitempty"`
 
-	// IPs holds explicit IPv4/IPv6 addresses targeted by this endpoint, if filtered.
-	IPs []string `json:"ips,omitempty"`
+	// IPs holds explicit IPv4/IPv6 addresses or CIDRs targeted by this endpoint, if filtered.
+	IPs []string `json:"ips,omitempty" yaml:"ips,omitempty"`
+
+	// NetworkIDs holds explicit UniFi network IDs or names matched by this endpoint.
+	NetworkIDs []string `json:"network_ids,omitempty" yaml:"network_ids,omitempty"`
+
+	// MACs holds explicit MAC addresses matched by this endpoint.
+	MACs []string `json:"macs,omitempty" yaml:"macs,omitempty"`
 
 	// Ports holds explicit port numbers matched by this endpoint, if filtered.
-	Ports []int `json:"ports,omitempty"`
+	Ports []int `json:"ports,omitempty" yaml:"ports,omitempty"`
 
 	// AnyTarget is true when no IP/network/MAC target filter narrows the zone.
-	AnyTarget bool `json:"any_target"`
+	AnyTarget bool `json:"any_target" yaml:"any_target"`
 
 	// AnyPort is true when no port filter narrows the matched ports.
-	AnyPort bool `json:"any_port"`
+	AnyPort bool `json:"any_port" yaml:"any_port"`
+
+	// NegateTarget is true when matchOpposite inverts the target selector.
+	NegateTarget bool `json:"negate_target,omitempty" yaml:"negate_target,omitempty"`
+
+	// NegatePort is true when matchOpposite inverts the port selector.
+	NegatePort bool `json:"negate_port,omitempty" yaml:"negate_port,omitempty"`
+
+	// UnsupportedSelector records any opaque controller selector (e.g., dynamic
+	// region/app/schedule group) that UniBlue cannot evaluate deterministically.
+	UnsupportedSelector string `json:"unsupported_selector,omitempty" yaml:"unsupported_selector,omitempty"`
 }
 
 // PortForward represents a gateway NAT rule exposing an internal host and port
@@ -572,6 +740,12 @@ type PortForward struct {
 
 	// Src restricts allowed source IPs on WAN ("any" means open to the whole internet).
 	Src string `json:"src"`
+
+	// Interface optionally names the external WAN interface (e.g., "wan", "wan2", "both").
+	Interface string `json:"interface,omitempty"`
+
+	// IPVersion optionally specifies "ipv4", "ipv6", or "both" (defaults to "ipv4").
+	IPVersion string `json:"ip_version,omitempty"`
 }
 
 // ExposesPort reports whether an enabled port-forwarding rule forwards traffic
@@ -581,6 +755,55 @@ func (p PortForward) ExposesPort(port int) bool {
 		return false
 	}
 	return portMatchesSpec(p.FwdPort, port)
+}
+
+// MatchesTransport reports whether this port-forward's transport protocol covers
+// transport ("tcp" or "udp"). A UDP-only forward never matches TCP, and a
+// TCP-only forward never matches UDP.
+func (p PortForward) MatchesTransport(transport string) bool {
+	t := strings.ToLower(strings.TrimSpace(transport))
+	if t == "" {
+		t = "tcp"
+	}
+	proto := strings.ToLower(strings.TrimSpace(p.Proto))
+	if proto == "" || proto == "both" || proto == "all" || proto == "tcp_udp" || proto == "tcp/udp" {
+		return t == "tcp" || t == "udp"
+	}
+	return proto == t
+}
+
+// ExposesEndpoint reports whether an enabled port-forwarding rule forwards
+// traffic of the specified L4 transport ("tcp" or "udp") to internal port.
+func (p PortForward) ExposesEndpoint(port int, transport string) bool {
+	if !p.ExposesPort(port) {
+		return false
+	}
+	return p.MatchesTransport(transport)
+}
+
+// IsSourceRestricted reports whether this port forward narrows allowed WAN
+// sources away from the open internet ("any", "0.0.0.0/0", "::/0").
+func (p PortForward) IsSourceRestricted() bool {
+	s := strings.ToLower(strings.TrimSpace(p.Src))
+	return s != "" && s != "any" && s != "0.0.0.0/0" && s != "::/0"
+}
+
+// ExpandFwdPorts expands the rule's translated internal destination port spec
+// into concrete port numbers (skipping ranges wider than maxRange).
+func (p PortForward) ExpandFwdPorts(maxRange int) []int {
+	if maxRange <= 0 {
+		maxRange = 64
+	}
+	return expandPortSpec(p.FwdPort, maxRange)
+}
+
+// ExpandDstPorts expands the rule's external WAN port spec into concrete port
+// numbers (skipping ranges wider than maxRange).
+func (p PortForward) ExpandDstPorts(maxRange int) []int {
+	if maxRange <= 0 {
+		maxRange = 64
+	}
+	return expandPortSpec(p.DstPort, maxRange)
 }
 
 // portMatchesSpec checks whether port falls inside a UniFi port specification
@@ -643,25 +866,26 @@ type apiEnvelope[T any] struct {
 
 // rawClient maps the wire fields returned by /api/s/<site>/stat/sta.
 type rawClient struct {
-	MAC          string     `json:"mac"`
-	IP           string     `json:"ip"`
-	Hostname     string     `json:"hostname"`
-	Name         string     `json:"name"`
-	OUI          string     `json:"oui"`
-	NetworkID    string     `json:"network_id"`
-	Network      string     `json:"network"`
-	VLAN         flexString `json:"vlan"`
-	IsWired      bool       `json:"is_wired"`
-	ESSID        string     `json:"essid"`
-	SwMAC        string     `json:"sw_mac"`
-	SwPort       int        `json:"sw_port"`
-	APMAC        string     `json:"ap_mac"`
-	TxBytes      int64      `json:"tx_bytes"`
-	RxBytes      int64      `json:"rx_bytes"`
-	WiredTxBytes int64      `json:"wired-tx_bytes"`
-	WiredRxBytes int64      `json:"wired-rx_bytes"`
-	FirstSeen    int64      `json:"first_seen"`
-	LastSeen     int64      `json:"last_seen"`
+	MAC           string     `json:"mac"`
+	IP            string     `json:"ip"`
+	IPv6Addresses []string   `json:"ipv6_addresses"`
+	Hostname      string     `json:"hostname"`
+	Name          string     `json:"name"`
+	OUI           string     `json:"oui"`
+	NetworkID     string     `json:"network_id"`
+	Network       string     `json:"network"`
+	VLAN          flexString `json:"vlan"`
+	IsWired       bool       `json:"is_wired"`
+	ESSID         string     `json:"essid"`
+	SwMAC         string     `json:"sw_mac"`
+	SwPort        int        `json:"sw_port"`
+	APMAC         string     `json:"ap_mac"`
+	TxBytes       int64      `json:"tx_bytes"`
+	RxBytes       int64      `json:"rx_bytes"`
+	WiredTxBytes  int64      `json:"wired-tx_bytes"`
+	WiredRxBytes  int64      `json:"wired-rx_bytes"`
+	FirstSeen     int64      `json:"first_seen"`
+	LastSeen      int64      `json:"last_seen"`
 }
 
 // rawDevice maps the wire fields returned by /api/s/<site>/stat/device.
@@ -749,19 +973,31 @@ type rawNetwork struct {
 	Purpose                 string     `json:"purpose"`
 	VLAN                    flexString `json:"vlan"`
 	IPSubnet                string     `json:"ip_subnet"`
+	IPv6Subnet              string     `json:"ipv6_subnet"`
 	NetworkIsolationEnabled bool       `json:"network_isolation_enabled"`
+	GatewayType             string     `json:"gateway_type"`
+	GatewayDevice           string     `json:"gateway_device"`
+	DHCPDStart              string     `json:"dhcpd_start"`
+	DHCPDStop               string     `json:"dhcpd_stop"`
+	DHCPGuardEnabled        *bool      `json:"dhcpguard_enabled"`
+	MDNSEnabled             *bool      `json:"mdns_enabled"`
+	IGMPSnooping            *bool      `json:"igmp_snooping"`
+	DHCPDDNS1               string     `json:"dhcpd_dns_1"`
+	DHCPDDNS2               string     `json:"dhcpd_dns_2"`
 }
 
 // rawPortForward maps the wire fields returned by /api/s/<site>/rest/portforward.
 type rawPortForward struct {
-	ID      string     `json:"_id"`
-	Name    string     `json:"name"`
-	Enabled bool       `json:"enabled"`
-	Proto   string     `json:"proto"`
-	DstPort flexString `json:"dst_port"`
-	Fwd     string     `json:"fwd"`
-	FwdPort flexString `json:"fwd_port"`
-	Src     string     `json:"src"`
+	ID            string     `json:"_id"`
+	Name          string     `json:"name"`
+	Enabled       bool       `json:"enabled"`
+	Proto         string     `json:"proto"`
+	DstPort       flexString `json:"dst_port"`
+	Fwd           string     `json:"fwd"`
+	FwdPort       flexString `json:"fwd_port"`
+	Src           string     `json:"src"`
+	PfwdInterface string     `json:"pfwd_interface"`
+	IPVersion     string     `json:"ip_version"`
 }
 
 // integrationPage matches the standard pagination envelope returned by all
@@ -783,11 +1019,12 @@ type integrationSite struct {
 
 // integrationClient maps a client entry returned by GET /integration/v1/sites/{id}/clients.
 type integrationClient struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	MACAddress string `json:"macAddress"`
-	IPAddress  string `json:"ipAddress"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"`
+	MACAddress    string   `json:"macAddress"`
+	IPAddress     string   `json:"ipAddress"`
+	IPv6Addresses []string `json:"ipv6Addresses"`
 }
 
 // integrationDevice maps a device entry returned by GET /integration/v1/sites/{id}/devices.
@@ -810,12 +1047,34 @@ type integrationNetwork struct {
 	Management        string     `json:"management"`
 	VLANID            flexString `json:"vlanId"`
 	Subnet            string     `json:"subnet"`
+	IPv6Subnet        string     `json:"ipv6Subnet"`
 	IsolationEnabled  bool       `json:"isolationEnabled"`
 	ZoneID            string     `json:"zoneId"`
+	RouterDeviceMAC   string     `json:"routerDeviceMac"`
+	GatewayDevice     string     `json:"gatewayDevice"`
+	DHCPStart         string     `json:"dhcpStart"`
+	DHCPEnd           string     `json:"dhcpEnd"`
+	DHCPGuardEnabled  *bool      `json:"dhcpGuardEnabled"`
+	MDNSEnabled       *bool      `json:"mdnsEnabled"`
+	IGMPSnooping      *bool      `json:"igmpSnooping"`
+	DNSServers        []string   `json:"dnsServers"`
 	IPv4Configuration *struct {
+		HostIPAddress     string `json:"hostIpAddress"`
+		PrefixLength      int    `json:"prefixLength"`
+		DHCPConfiguration *struct {
+			IPAddressRange *struct {
+				Start string `json:"start"`
+				Stop  string `json:"stop"`
+			} `json:"ipAddressRange"`
+			DNSServerIPAddresses []string `json:"dnsServerIpAddresses"`
+		} `json:"dhcpConfiguration"`
+	} `json:"ipv4Configuration"`
+	IPv6Configuration *struct {
+		Subnet        string `json:"subnet"`
+		Prefix        string `json:"prefix"`
 		HostIPAddress string `json:"hostIpAddress"`
 		PrefixLength  int    `json:"prefixLength"`
-	} `json:"ipv4Configuration"`
+	} `json:"ipv6Configuration"`
 }
 
 // integrationFirewallZone maps a zone entry returned by GET /integration/v1/sites/{id}/firewall/zones.
@@ -833,11 +1092,19 @@ type integrationFirewallPolicy struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
 	Enabled bool   `json:"enabled"`
+	Index   int    `json:"index"`
 	Action  struct {
-		Type string `json:"type"`
+		Type               string `json:"type"`
+		AllowReturnTraffic bool   `json:"allowReturnTraffic"`
 	} `json:"action"`
-	Source          integrationPolicyEndpoint `json:"source"`
-	Destination     integrationPolicyEndpoint `json:"destination"`
+	Source                integrationPolicyEndpoint `json:"source"`
+	Destination           integrationPolicyEndpoint `json:"destination"`
+	ConnectionStateFilter []string                  `json:"connectionStateFilter"`
+	MatchReturnTraffic    bool                      `json:"matchReturnTraffic"`
+	Schedule              *struct {
+		Mode string `json:"mode"`
+		Name string `json:"name"`
+	} `json:"schedule"`
 	IPProtocolScope *struct {
 		IPVersion      string `json:"ipVersion"`
 		ProtocolFilter *struct {
@@ -879,10 +1146,38 @@ type integrationPolicyEndpoint struct {
 			} `json:"items"`
 		} `json:"portFilter"`
 		NetworkFilter *struct {
-			NetworkIDs []string `json:"networkIds"`
+			MatchOpposite bool     `json:"matchOpposite"`
+			NetworkIDs    []string `json:"networkIds"`
 		} `json:"networkFilter"`
-		MACAddressFilter *struct {
-			MACAddresses []string `json:"macAddresses"`
-		} `json:"macAddressFilter"`
+		MACAddressFilter *flexMACFilter `json:"macAddressFilter"`
 	} `json:"trafficFilter"`
+}
+
+// flexMACFilter decodes UniFi Integration API v1's macAddressFilter, which may
+// be emitted either as a single MAC string ("aa:bb:cc:dd:ee:ff") or as a
+// structured object ({macAddresses: [...], matchOpposite: bool}).
+type flexMACFilter struct {
+	MatchOpposite bool     `json:"matchOpposite"`
+	MACAddresses  []string `json:"macAddresses"`
+}
+
+func (f *flexMACFilter) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		if norm := strings.TrimSpace(single); norm != "" {
+			f.MACAddresses = []string{norm}
+		}
+		return nil
+	}
+	type alias flexMACFilter
+	var obj alias
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return err
+	}
+	*f = flexMACFilter(obj)
+	return nil
 }

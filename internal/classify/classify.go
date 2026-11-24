@@ -178,13 +178,13 @@ func (c *Classifier) ClassifyAll(snap *unifi.Snapshot, profiles []probe.HostProf
 		}
 	}
 
-	// Track internal IPs that receive active WAN HTTP/HTTPS forwards (80/443).
+	// Track internal IPs that receive active WAN TCP HTTP/HTTPS forwards (80/443).
 	wanWebIPs := make(map[string]bool)
 	for _, pf := range snap.PortForwards {
 		if !pf.Enabled || pf.FwdIP == "" {
 			continue
 		}
-		if pf.ExposesPort(80) || pf.ExposesPort(443) {
+		if pf.ExposesEndpoint(80, "tcp") || pf.ExposesEndpoint(443, "tcp") {
 			wanWebIPs[pf.FwdIP] = true
 		}
 	}
@@ -420,6 +420,11 @@ func classifyByProtocol(hp *probe.HostProfile, isWANWeb bool, vendor string) (Re
 		}, true
 	}
 
+	// Passive mDNS / SSDP / WS-Discovery signals (high-confidence protocol proof).
+	if res, ok := classifyByDiscovery(hp, vendor); ok {
+		return res, true
+	}
+
 	// Building automation / IoT control protocols.
 	if hp.HasPort(502) || hp.HasPort(1883) || hp.HasPort(56747) ||
 		containsAny(titlesLower, "tasmota", "shelly", "esphome") {
@@ -433,6 +438,144 @@ func classifyByProtocol(hp *probe.HostProfile, isWANWeb bool, vendor string) (Re
 	}
 
 	return Result{}, false
+}
+
+// classifyByDiscovery classifies devices cleanly from typed DNS-SD, SSDP/UPnP,
+// and WS-Discovery announcements without sending extra TCP probes.
+func classifyByDiscovery(hp *probe.HostProfile, vendor string) (Result, bool) {
+	for _, ws := range hp.WSDiscovery {
+		for _, t := range ws.Types {
+			if strings.Contains(strings.ToLower(t), "networkvideotransmitter") {
+				return Result{
+					Category:   CategoryCamera,
+					Role:       "ONVIF IP Camera / NVR",
+					Vendor:     vendor,
+					Confidence: ConfidenceHigh,
+					Signals:    []string{"WS-Discovery " + t},
+				}, true
+			}
+		}
+	}
+	for _, md := range hp.MDNSServices {
+		if md.Withdrawn {
+			continue
+		}
+		switch strings.ToLower(md.Type) {
+		case "_matter._tcp", "_matterc._udp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Matter Accessory / Bridge",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS " + md.Type},
+			}, true
+		case "_meshcop._udp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Thread Border Router",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _meshcop._udp"},
+			}, true
+		case "_ipp._tcp", "_ipps._tcp", "_pdl-datastream._tcp", "_printer._tcp":
+			return Result{
+				Category:   CategoryPrinter,
+				Role:       "Network Printer (IPP/IPPS)",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS " + md.Type},
+			}, true
+		case "_nut._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "UPS Power Monitor (NUT)",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _nut._tcp"},
+			}, true
+		case "_lutron._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Lutron Lighting Bridge",
+				Vendor:     firstNonEmptyVendor(vendor, "Lutron"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _lutron._tcp"},
+			}, true
+		case "_powerview._tcp", "_powerview-g3._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "PowerView Shade Hub",
+				Vendor:     firstNonEmptyVendor(vendor, "Hunter Douglas"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS " + md.Type},
+			}, true
+		case "_shelly._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Shelly Smart Device",
+				Vendor:     firstNonEmptyVendor(vendor, "Shelly"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _shelly._tcp"},
+			}, true
+		case "_enphase-envoy._tcp", "_solaredge-modbus._tcp", "_solarman._tcp", "_mypv._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Solar / Energy Gateway",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS " + md.Type},
+			}, true
+		case "_openevse._tcp", "_nrgkick._tcp", "_technove-stations._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "EV Charger",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS " + md.Type},
+			}, true
+		case "_axis-video._tcp":
+			for _, kv := range md.TXT {
+				lowKV := strings.ToLower(kv)
+				if strings.HasPrefix(lowKV, "macaddress=1ccae3") || strings.HasPrefix(lowKV, "macaddress=1c:ca:e3") ||
+					strings.HasPrefix(lowKV, "mac=1ccae3") || strings.HasPrefix(lowKV, "mac=1c:ca:e3") {
+					return Result{
+						Category:   CategoryCamera,
+						Role:       "DoorBird Video Intercom",
+						Vendor:     firstNonEmptyVendor(vendor, "DoorBird"),
+						Confidence: ConfidenceHigh,
+						Signals:    []string{"mDNS _axis-video._tcp (DoorBird OUI)"},
+					}, true
+				}
+			}
+			return Result{
+				Category:   CategoryCamera,
+				Role:       "Axis IP Camera",
+				Vendor:     firstNonEmptyVendor(vendor, "Axis Communications"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _axis-video._tcp"},
+			}, true
+		}
+	}
+	for _, u := range hp.UPnPDevices {
+		comb := strings.ToLower(u.Manufacturer + " " + u.ModelName + " " + u.DeviceType)
+		if strings.Contains(comb, "victron") {
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Victron GX Energy Controller",
+				Vendor:     firstNonEmptyVendor(vendor, "Victron Energy"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"SSDP/UPnP Victron GX"},
+			}, true
+		}
+	}
+	return Result{}, false
+}
+
+func firstNonEmptyVendor(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 // resolveVendor picks the cleanest non-placeholder vendor name, preferring the

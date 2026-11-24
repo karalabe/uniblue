@@ -151,10 +151,12 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 
 	if *jsonOut {
 		return writeJSON(stdout, map[string]any{
-			"report":         report,
-			"cve_correlated": cveLoaded,
-			"exact_cves":     exactCVEs,
-			"potential_cves": potentialCVEs,
+			"report":           report,
+			"profiles":         profiles,
+			"service_coverage": probe.ComputeServiceCoverage(profiles),
+			"cve_correlated":   cveLoaded,
+			"exact_cves":       exactCVEs,
+			"potential_cves":   potentialCVEs,
 		})
 	}
 	printReport(stdout, snap, report, exactCVEs, potentialCVEs, cveLoaded)
@@ -291,7 +293,14 @@ func runInventory(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
 		fp.SetHostPortHints(snap.PortHintsByIP())
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
+	} else {
+		// Create stub profiles for configured bridge/flow enrichment even without active probing.
+		profiles = make([]probe.HostProfile, len(snap.Clients))
+		for i, cl := range snap.Clients {
+			profiles[i] = probe.HostProfile{Client: cl}
+		}
 	}
+	enrichSiteAndProfiles(snap, profiles, cfg.Network)
 
 	ouiDB := oui.New("")
 	_ = ouiDB.Load()
@@ -303,8 +312,10 @@ func runInventory(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 	if *jsonOut {
 		return writeJSON(stdout, map[string]any{
-			"snapshot":        snap,
-			"classifications": classes,
+			"snapshot":         snap,
+			"profiles":         profiles,
+			"service_coverage": probe.ComputeServiceCoverage(profiles),
+			"classifications":  classes,
 		})
 	}
 	printInventory(stdout, snap, classes)
@@ -444,6 +455,10 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
+	// Attach owner-supplied site supplement, bridge/NVR inventories, and passive
+	// service/flow records through the same helper used across all CLI modes.
+	enrichSiteAndProfiles(snap, profiles, cfg.Network)
+
 	runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
 	rawFindings := runner.RunAll(ctx, profiles)
 
@@ -454,6 +469,44 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 
 	report := risk.Evaluate(snap, rawFindings, cfg.Network)
 	return snap, profiles, report, nil
+}
+
+// enrichSiteAndProfiles merges owner-supplied site supplements (switch ACLs,
+// proxy routes, tunnels, dynamic NAT mappings, backups), bridge/NVR child
+// inventories, and passive service/flow observations onto snap and profiles.
+// Load errors are surfaced in snap.Visibility.MissingFeeds rather than ignored.
+func enrichSiteAndProfiles(snap *unifi.Snapshot, profiles []probe.HostProfile, netCfg config.NetworkConfig) {
+	if snap != nil && strings.TrimSpace(netCfg.SiteSupplementPath) != "" {
+		_ = unifi.ApplySiteSupplement(snap, netCfg.SiteSupplementPath)
+	}
+	for _, bi := range netCfg.BridgeInventories {
+		if strings.TrimSpace(bi.Path) == "" {
+			continue
+		}
+		children, err := probe.LoadBridgeInventory(probe.BridgeInventorySpec{
+			Format:       bi.Format,
+			Path:         bi.Path,
+			ParentIP:     bi.ParentIP,
+			ParentMAC:    bi.ParentMAC,
+			ParentRole:   bi.ParentRole,
+			ObservedFrom: bi.ObservedFrom,
+		})
+		if err != nil {
+			unifi.RecordMissingFeed(snap, fmt.Sprintf("bridge-inventory (%s: %v)", bi.Path, err))
+			continue
+		}
+		if len(children) > 0 {
+			probe.AttachBridgeChildren(profiles, children)
+		}
+	}
+	if strings.TrimSpace(netCfg.PassiveFlowsPath) != "" {
+		flows, err := probe.LoadPassiveFlows(netCfg.PassiveFlowsPath)
+		if err != nil {
+			unifi.RecordMissingFeed(snap, fmt.Sprintf("passive-flows (%s: %v)", netCfg.PassiveFlowsPath, err))
+		} else if len(flows) > 0 {
+			probe.ApplyPassiveFlows(profiles, flows)
+		}
+	}
 }
 
 // correlateLocalCVEs checks whether the local NVD+KEV cache exists and, if so,
@@ -521,6 +574,9 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVE
 	var activeChecks []checks.Finding
 	var firmwareFindings []checks.Finding
 	for _, f := range report.Findings {
+		if f.IsInventoryOnly() {
+			continue
+		}
 		switch f.CheckID {
 		case "UB-UNIFI-PORTFWD":
 			// Shown cleanly in the dedicated WAN Surface section below.
@@ -1157,9 +1213,16 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
 		fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
+		enrichSiteAndProfiles(snap, profiles, cfg.Network)
 		runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
 		rawFindings = runner.RunAll(ctx, profiles)
 		rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
+	} else {
+		profiles = make([]probe.HostProfile, len(snap.Clients))
+		for i, cl := range snap.Clients {
+			profiles[i] = probe.HostProfile{Client: cl}
+		}
+		enrichSiteAndProfiles(snap, profiles, cfg.Network)
 	}
 
 	ouiDB := oui.New("")

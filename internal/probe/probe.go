@@ -102,12 +102,29 @@ type HTTPBanner struct {
 // Service summarizes one application-layer service identified on an open port
 // by UniBlue's embedded Nerva fingerprinter (covering 170+ TCP/UDP protocols).
 type Service struct {
-	// Port is the open TCP port where the service responded.
+	// Port is the open TCP or UDP port where the service responded.
 	Port int `json:"port"`
+
+	// Transport is the L4 transport ("tcp", "udp", or "sctp"), defaulting to "tcp".
+	Transport string `json:"transport,omitempty"`
 
 	// Protocol is the canonical protocol name detected by Nerva (e.g., "ssh",
 	// "smb", "http", "https", "nfs", "dns", "vnc").
 	Protocol string `json:"protocol"`
+
+	// State records how this service was established ("observed-protocol",
+	// "advertised-service", "owner-declared", "candidate-port", "tls-unknown-app",
+	// or "unknown").
+	State string `json:"state,omitempty"`
+
+	// AddressFamily records "ipv4" or "ipv6".
+	AddressFamily string `json:"address_family,omitempty"`
+
+	// Observer records the observer network or vantage point, when known.
+	Observer string `json:"observer,omitempty"`
+
+	// ObservedAt records when this service observation was recorded.
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
 
 	// TLS reports whether the service spoke TLS on this port.
 	TLS bool `json:"tls,omitempty"`
@@ -181,8 +198,110 @@ type HostProfile struct {
 	// WSDiscovery lists WS-Discovery (ONVIF / WSD) announcements from this host.
 	WSDiscovery []WSDiscoveryRecord `json:"ws_discovery,omitempty"`
 
+	// Children lists enrolled downstream devices managed by this host when it
+	// acts as an NVR, Zigbee/Z-Wave/Matter coordinator, bridge, or BLE proxy.
+	Children []ChildDevice `json:"children,omitempty"`
+
+	// OutboundDependencies records observed or configured external internet
+	// services used by this host, kept strictly separate from hosted LAN services.
+	OutboundDependencies []OutboundDependency `json:"outbound_dependencies,omitempty"`
+
+	// RawPrintPorts records TCP ports on this host known to be raw print sinks
+	// (9100, 515, or advertised via _pdl-datastream._tcp / _printer._tcp) where
+	// UniBlue enforces a strict zero-byte connect-only guard.
+	RawPrintPorts []int `json:"raw_print_ports,omitempty"`
+
 	// ScannedAt records when fingerprinting finished for this host.
 	ScannedAt time.Time `json:"scanned_at"`
+}
+
+// IsRawPrintPort reports whether port on this host is protected by the raw
+// print sink zero-byte guard.
+func (h HostProfile) IsRawPrintPort(port int) bool {
+	if port == 9100 || port == 515 {
+		return true
+	}
+	for _, p := range h.RawPrintPorts {
+		if p == port {
+			return true
+		}
+	}
+	for _, md := range h.MDNSServices {
+		if !md.Withdrawn && md.Port == port && isMDNSRawPrintSink(md.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+// Clone returns a deep copy of HostProfile so concurrent enrichment and live
+// publishing never mutate or race on shared slices or maps.
+func (h HostProfile) Clone() HostProfile {
+	cp := h
+	if len(h.Client.IPv6) > 0 {
+		cp.Client.IPv6 = append([]string(nil), h.Client.IPv6...)
+	}
+	if len(h.OpenPorts) > 0 {
+		cp.OpenPorts = append([]int(nil), h.OpenPorts...)
+	}
+	if len(h.RawPrintPorts) > 0 {
+		cp.RawPrintPorts = append([]int(nil), h.RawPrintPorts...)
+	}
+	if len(h.HTTP) > 0 {
+		cp.HTTP = make(map[int]HTTPBanner, len(h.HTTP))
+		for k, v := range h.HTTP {
+			cp.HTTP[k] = v
+		}
+	}
+	if len(h.Services) > 0 {
+		cp.Services = make([]Service, len(h.Services))
+		for i, s := range h.Services {
+			if len(s.CPEs) > 0 {
+				s.CPEs = append([]string(nil), s.CPEs...)
+			}
+			if len(s.Findings) > 0 {
+				s.Findings = append([]ServiceFinding(nil), s.Findings...)
+			}
+			cp.Services[i] = s
+		}
+	}
+	if len(h.MDNSServices) > 0 {
+		cp.MDNSServices = make([]MDNSService, len(h.MDNSServices))
+		for i, m := range h.MDNSServices {
+			if len(m.TXT) > 0 {
+				m.TXT = append([]string(nil), m.TXT...)
+			}
+			if len(m.TargetIPs) > 0 {
+				m.TargetIPs = append([]string(nil), m.TargetIPs...)
+			}
+			cp.MDNSServices[i] = m
+		}
+	}
+	if len(h.UPnPDevices) > 0 {
+		cp.UPnPDevices = append([]UPnPDevice(nil), h.UPnPDevices...)
+	}
+	if len(h.WSDiscovery) > 0 {
+		cp.WSDiscovery = make([]WSDiscoveryRecord, len(h.WSDiscovery))
+		for i, w := range h.WSDiscovery {
+			if len(w.Types) > 0 {
+				w.Types = append([]string(nil), w.Types...)
+			}
+			if len(w.Scopes) > 0 {
+				w.Scopes = append([]string(nil), w.Scopes...)
+			}
+			if len(w.Ports) > 0 {
+				w.Ports = append([]int(nil), w.Ports...)
+			}
+			cp.WSDiscovery[i] = w
+		}
+	}
+	if len(h.Children) > 0 {
+		cp.Children = append([]ChildDevice(nil), h.Children...)
+	}
+	if len(h.OutboundDependencies) > 0 {
+		cp.OutboundDependencies = append([]OutboundDependency(nil), h.OutboundDependencies...)
+	}
+	return cp
 }
 
 // HasPort reports whether port was observed open on the host.
@@ -374,6 +493,12 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		profile.MDNSServices = f.discovery.MDNS[cl.IP]
 		profile.UPnPDevices = f.discovery.UPnP[cl.IP]
 		profile.WSDiscovery = f.discovery.WSDiscovery[cl.IP]
+		if rawSet := f.discovery.RawPrintIPs[cl.IP]; len(rawSet) > 0 {
+			for rp := range rawSet {
+				profile.RawPrintPorts = append(profile.RawPrintPorts, rp)
+			}
+			sort.Ints(profile.RawPrintPorts)
+		}
 	}
 
 	dialTimeout := f.timeout
@@ -416,14 +541,26 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 		consecutiveTimeouts = 0
 
+		rawPrint := isRawPrintSinkPort(port, f.discovery, cl.IP)
+		if rawPrint && !profile.IsRawPrintPort(port) {
+			profile.RawPrintPorts = append(profile.RawPrintPorts, port)
+			sort.Ints(profile.RawPrintPorts)
+		}
+
 		// On SSH (port 22), passively read the server's initial identification
 		// banner before closing so version-based CVE checks have exact OpenSSH
 		// or Dropbear versions without sending any auth packets.
-		if port == 22 && profile.SSHBanner == "" {
+		if !rawPrint && port == 22 && profile.SSHBanner == "" {
 			profile.SSHBanner = readSSHBanner(conn, f.timeout)
 		}
 		_ = conn.Close()
 		profile.OpenPorts = append(profile.OpenPorts, port)
+
+		// Hard raw-printer zero-byte safety guard: never send HTTP or other
+		// application bytes to a raw print sink even if it overlaps a web port.
+		if rawPrint {
+			continue
+		}
 
 		// For well-known HTTP/HTTPS ports, grab a single read-only banner so
 		// HTTP checks and CVE fingerprinters can match headers, titles, and TLS

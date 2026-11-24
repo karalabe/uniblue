@@ -1,0 +1,38 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0071
+title: Lutron Caséta / RadioRA Smart Bridge Discovered
+cve: null
+category: service-inventory
+claim: service-advertised
+property: lutron-bridge-identity
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Lutron
+  product: Lutron Smart Bridge / LEAP Gateway
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://www.home-assistant.io/integrations/lutron_caseta/
+
+preconditions:
+  mdns_type_any: ["_lutron._tcp"]
+  discovery_only: true
+
+probe:
+  type: observe
+  match:
+    evidence_summary: "Lutron lighting bridge advertised on _lutron._tcp (paired LEAP/LIP control bridge)"
+
+remediation:
+  summary: >
+    Lutron lighting bridge inventory record. Keep bridge control access
+    restricted to approved home-automation controllers and isolated from guests.
+  unifi_actions:
+    - restrict_bridge_to_controllers

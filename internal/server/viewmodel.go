@@ -8,6 +8,7 @@ package server
 
 import (
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -53,15 +54,17 @@ type Reason struct {
 }
 
 // ServiceView represents one discovered network service on a host along with
-// its computed reachability boundary.
+// its computed reachability boundary and evidence provenance.
 type ServiceView struct {
-	Port      int    `json:"port"`
-	Proto     string `json:"proto"` // "tcp" | "udp"
-	Name      string `json:"name,omitempty"`
-	Reachable string `json:"reachable"` // "wan" | "lan" | "vlan-only" | "unknown"
-	Exposed   bool   `json:"exposed,omitempty"`
-	Severity  string `json:"severity,omitempty"`
-	Label     string `json:"label,omitempty"`
+	Port             int    `json:"port"`
+	Proto            string `json:"proto"` // "tcp" | "udp"
+	Name             string `json:"name,omitempty"`
+	Reachable        string `json:"reachable"` // "wan" | "wan-restricted" | "wan-cgnat" | "lan" | "vlan-only" | "advertised" | "unknown"
+	State            string `json:"state,omitempty"`
+	SourceRestricted bool   `json:"source_restricted,omitempty"`
+	Exposed          bool   `json:"exposed,omitempty"`
+	Severity         string `json:"severity,omitempty"`
+	Label            string `json:"label,omitempty"`
 }
 
 // Entity is a stably-identified node shared across both lenses, the Inventory
@@ -97,6 +100,7 @@ type Entity struct {
 	APID          string               `json:"ap_id,omitempty"`
 	ESSID         string               `json:"essid,omitempty"`
 	IP            string               `json:"ip,omitempty"`
+	IPv6          []string             `json:"ipv6,omitempty"`
 	MAC           string               `json:"mac,omitempty"`
 	Vendor        string               `json:"vendor,omitempty"`
 	Model         string               `json:"model,omitempty"`
@@ -108,6 +112,13 @@ type Entity struct {
 	Services      []ServiceView        `json:"services,omitempty"`
 	ExactCVEs     []cve.ProductSummary `json:"exact_cves,omitempty"`
 	PotentialCVEs []cve.ProductSummary `json:"potential_cves,omitempty"`
+
+	// Bridge-to-child and outbound dependency metadata.
+	ParentID              string                     `json:"parent_id,omitempty"`
+	ChildIDs              []string                   `json:"child_ids,omitempty"`
+	IdentitySource        string                     `json:"identity_source,omitempty"`
+	DirectLANReachability string                     `json:"direct_lan_reachability,omitempty"`
+	OutboundDependencies  []probe.OutboundDependency `json:"outbound_dependencies,omitempty"`
 
 	// Port telemetry (Kind == "port")
 	PortIdx       int      `json:"port_idx,omitempty"`
@@ -225,18 +236,20 @@ type Census struct {
 
 // PresentationModel is the complete single-source-of-truth UI model built in Go.
 type PresentationModel struct {
-	Headline  string             `json:"headline"`
-	Census    Census             `json:"census"`
-	GatewayID string             `json:"gateway_id,omitempty"`
-	Entities  map[string]*Entity `json:"entities"`
-	Queue     []QueueItem        `json:"queue,omitempty"`
-	Physical  []PhysicalRow      `json:"physical,omitempty"`
-	WallGates []WallGate         `json:"wall_gates,omitempty"`
-	Logical   []LogicalLane      `json:"logical,omitempty"`
-	WANFlows  []WANFlow          `json:"wan_flows,omitempty"`
-	Copyright string             `json:"copyright"`
-	License   string             `json:"license"`
-	RepoURL   string             `json:"repo_url"`
+	Headline        string                       `json:"headline"`
+	Census          Census                       `json:"census"`
+	GatewayID       string                       `json:"gateway_id,omitempty"`
+	Entities        map[string]*Entity           `json:"entities"`
+	Queue           []QueueItem                  `json:"queue,omitempty"`
+	Physical        []PhysicalRow                `json:"physical,omitempty"`
+	WallGates       []WallGate                   `json:"wall_gates,omitempty"`
+	Logical         []LogicalLane                `json:"logical,omitempty"`
+	WANFlows        []WANFlow                    `json:"wan_flows,omitempty"`
+	Isolation       *risk.IsolationMatrix        `json:"isolation,omitempty"`
+	ServiceCoverage *probe.ServiceCoverageReport `json:"service_coverage,omitempty"`
+	Copyright       string                       `json:"copyright"`
+	License         string                       `json:"license"`
+	RepoURL         string                       `json:"repo_url"`
 }
 
 func devEntityID(mac string) string { return "dev:" + strings.ToLower(strings.TrimSpace(mac)) }
@@ -524,6 +537,7 @@ func BuildPresentationModel(
 			APID:        apID,
 			ESSID:       cl.ESSID,
 			IP:          cl.IP,
+			IPv6:        cl.IPv6,
 			MAC:         mac,
 			Vendor:      firstStr(cv.Class.Vendor, cl.OUI),
 			IsWired:     cl.IsWired,
@@ -583,7 +597,50 @@ func BuildPresentationModel(
 		}
 
 		// Build structured Services[] with computed reachability!
-		ent.Services = buildHostServices(cv, profileByIP[cl.IP], wanByIP[cl.IP], netIsolated[strings.ToLower(cl.NetworkName)])
+		hp := profileByIP[cl.IP]
+		behindCGNAT := isSnapshotWANBehindCGNAT(snap)
+		ent.Services = buildHostServices(cv, hp, wanByIP[cl.IP], netIsolated[strings.ToLower(cl.NetworkName)], behindCGNAT)
+		if len(hp.OutboundDependencies) > 0 {
+			ent.OutboundDependencies = hp.OutboundDependencies
+		}
+
+		// Register enrolled child devices managed behind bridges/NVRs/coordinators
+		// (e.g., cameras on an NVR's private PoE network) with explicit provenance
+		// and DirectLANReachability ("unknown" when behind private PoE).
+		for _, ch := range hp.Children {
+			cid := fmt.Sprintf("child:%s/%s", hid, ch.ID)
+			reach := ch.DirectLANReachability
+			if reach == "" {
+				reach = "unknown"
+			}
+			chState := VerdictOK
+			chLabel := "Child inventory"
+			if reach == "unknown" {
+				chState = VerdictUnknown
+				chLabel = "Direct LAN reachability unknown"
+			}
+			ent.ChildIDs = append(ent.ChildIDs, cid)
+			pm.Entities[cid] = &Entity{
+				ID:                    cid,
+				Kind:                  "child",
+				Label:                 firstStr(ch.Name, ch.Model, ch.ID),
+				Subtitle:              firstStr(ch.Role, "Bridged Child Device"),
+				Role:                  firstStr(ch.Category, "iot"),
+				Side:                  side,
+				Weight:                1,
+				State:                 chState,
+				MaxSeverity:           "ok",
+				StateLabel:            chLabel,
+				ParentID:              hid,
+				NetworkID:             ent.NetworkID,
+				NetworkName:           ent.NetworkName,
+				Vendor:                ch.Vendor,
+				Model:                 ch.Model,
+				Firmware:              ch.Firmware,
+				IdentitySource:        ch.IdentitySource,
+				DirectLANReachability: reach,
+			}
+		}
 
 		pm.Entities[hid] = ent
 	}
@@ -841,6 +898,34 @@ func BuildPresentationModel(
 				})
 			}
 
+		case strings.HasPrefix(f.CheckID, "UB-UNIFI-ISO-"):
+			// Effective isolation policy violations attach to their target host
+			// (e.g. BMC or Printer) when known, falling back to Gateway.
+			hid := hostIDByIP[f.Client.IP]
+			if hid == "" {
+				hid = hostIDByMAC[strings.ToLower(f.Client.MAC)]
+			}
+			target := pm.Entities[hid]
+			if target == nil {
+				target = pm.Entities[pm.GatewayID]
+			}
+			if target != nil {
+				target.Reasons = append(target.Reasons, Reason{
+					ID:          fid,
+					State:       VerdictExposed,
+					Kind:        "policy",
+					Ref:         f.CheckID,
+					Title:       f.Title,
+					Severity:    sev,
+					Expected:    "Deny untrusted cross-zone path",
+					Observed:    f.Evidence,
+					Evidence:    f.Evidence,
+					Remediation: f.Remediation.Summary,
+					Source:      "unifi-isolation",
+					Port:        f.Port,
+				})
+			}
+
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-"):
 			// Site-level controller / SSH / UPnP / Honeypot / Wi-Fi findings attach to Gateway!
 			if gw, ok := pm.Entities[pm.GatewayID]; ok {
@@ -873,6 +958,13 @@ func BuildPresentationModel(
 					if he.Weight < 3 {
 						he.Weight = 3
 					}
+				}
+				// Pure inventory observations (asset-identity / service-advertised /
+				// service-observed at Info severity) enrich service and device
+				// identity without turning an otherwise compliant host into Exposed.
+				if f.IsInventoryOnly() {
+					recordObservedService(he, f)
+					continue
 				}
 				he.Reasons = append(he.Reasons, Reason{
 					ID:          fid,
@@ -924,7 +1016,17 @@ func BuildPresentationModel(
 
 	// 6. Finalize Verdict State & Label for EVERY Entity (Single Source of Truth!).
 	for _, ent := range pm.Entities {
+		if ent.Kind == "child" {
+			continue
+		}
 		finalizeEntityVerdict(ent)
+	}
+
+	// Attach effective isolation matrix and measurable service coverage metrics.
+	pm.Isolation = report.Isolation
+	if len(profiles) > 0 {
+		sc := probe.ComputeServiceCoverage(profiles)
+		pm.ServiceCoverage = &sc
 	}
 
 	// Propagate WallGate states from their backing Port entities.
@@ -1390,19 +1492,53 @@ func buildLogicalLanes(
 	return lanes
 }
 
-func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureAssessment, vlanIsolated bool) []ServiceView {
-	wanPorts := make(map[int]bool)
-	for _, a := range wan {
-		var p int
-		_, _ = fmt.Sscanf(a.Forward.FwdPort, "%d", &p)
-		if p > 0 {
-			wanPorts[p] = true
+func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureAssessment, vlanIsolated, behindCGNAT bool) []ServiceView {
+	type wanPortInfo struct {
+		restricted bool
+	}
+	wanTCPPorts := make(map[int]wanPortInfo)
+	wanUDPPorts := make(map[int]wanPortInfo)
+	recordWAN := func(m map[int]wanPortInfo, port int, restricted bool) {
+		if cur, exists := m[port]; exists {
+			// If ANY matching forward is unrestricted (src=any), the endpoint is unrestricted.
+			m[port] = wanPortInfo{restricted: cur.restricted && restricted}
+		} else {
+			m[port] = wanPortInfo{restricted: restricted}
 		}
 	}
-	protoByPort := make(map[int]string)
+	for _, a := range wan {
+		if !a.Forward.Enabled {
+			continue
+		}
+		ports := a.Forward.ExpandFwdPorts(64)
+		restricted := a.Forward.IsSourceRestricted()
+		for _, p := range ports {
+			if a.Forward.MatchesTransport("tcp") {
+				recordWAN(wanTCPPorts, p, restricted)
+			}
+			if a.Forward.MatchesTransport("udp") {
+				recordWAN(wanUDPPorts, p, restricted)
+			}
+		}
+	}
+	wanReachLabel := func(info wanPortInfo) string {
+		if behindCGNAT {
+			return "wan-cgnat"
+		}
+		if info.restricted {
+			return "wan-restricted"
+		}
+		return "wan"
+	}
+
+	protoByKey := make(map[string]probe.Service)
 	for _, svc := range hp.Services {
-		if svc.Port > 0 && svc.Protocol != "" {
-			protoByPort[svc.Port] = svc.Protocol
+		if svc.Port > 0 {
+			t := strings.ToLower(strings.TrimSpace(svc.Transport))
+			if t == "" {
+				t = "tcp"
+			}
+			protoByKey[fmt.Sprintf("%s:%d", t, svc.Port)] = svc
 		}
 	}
 	defaultReach := "lan"
@@ -1411,37 +1547,149 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 	}
 
 	var out []ServiceView
-	seen := make(map[int]bool)
+	seen := make(map[string]bool)
 	for _, p := range cv.OpenPorts {
-		if seen[p] {
+		key := fmt.Sprintf("tcp:%d", p)
+		if seen[key] {
 			continue
 		}
-		seen[p] = true
+		seen[key] = true
 		reach := defaultReach
-		if wanPorts[p] {
-			reach = "wan"
+		srcRestricted := false
+		if info, ok := wanTCPPorts[p]; ok {
+			reach = wanReachLabel(info)
+			srcRestricted = info.restricted
 		}
-		name := protoByPort[p]
+		svcMeta := protoByKey[key]
+		name := svcMeta.Protocol
 		if name == "" {
 			name = commonPortLabel(p)
 		}
 		out = append(out, ServiceView{
-			Port:      p,
-			Proto:     "tcp",
-			Name:      name,
-			Reachable: reach,
-			Label:     fmt.Sprintf("%s :%d", strings.ToUpper(firstStr(name, "tcp")), p),
+			Port:             p,
+			Proto:            "tcp",
+			Name:             name,
+			Reachable:        reach,
+			State:            firstStr(svcMeta.State, probe.ServiceStateCandidatePort),
+			SourceRestricted: srcRestricted,
+			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(firstStr(name, "tcp")), p),
+		})
+	}
+	// Include observed UDP or passive services from hp.Services that were not in TCP OpenPorts.
+	for _, svc := range hp.Services {
+		if svc.Port <= 0 {
+			continue
+		}
+		t := strings.ToLower(strings.TrimSpace(svc.Transport))
+		if t == "" {
+			t = "tcp"
+		}
+		key := fmt.Sprintf("%s:%d", t, svc.Port)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		reach := defaultReach
+		srcRestricted := false
+		if t == "tcp" {
+			if info, ok := wanTCPPorts[svc.Port]; ok {
+				reach = wanReachLabel(info)
+				srcRestricted = info.restricted
+			}
+		} else if t == "udp" {
+			if info, ok := wanUDPPorts[svc.Port]; ok {
+				reach = wanReachLabel(info)
+				srcRestricted = info.restricted
+			}
+		}
+		name := firstStr(svc.Protocol, commonPortLabel(svc.Port))
+		out = append(out, ServiceView{
+			Port:             svc.Port,
+			Proto:            t,
+			Name:             name,
+			Reachable:        reach,
+			State:            firstStr(svc.State, probe.ServiceStateObservedProtocol),
+			SourceRestricted: srcRestricted,
+			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(firstStr(name, t)), svc.Port),
+		})
+	}
+	// Also record UDP-only WAN forwards as distinct UDP endpoints so a UDP forward
+	// never conflates with a TCP service sharing the same port number.
+	for p, info := range wanUDPPorts {
+		key := fmt.Sprintf("udp:%d", p)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		name := firstStr(commonPortLabel(p), "udp")
+		out = append(out, ServiceView{
+			Port:             p,
+			Proto:            "udp",
+			Name:             name,
+			Reachable:        wanReachLabel(info),
+			State:            "configured-forward",
+			SourceRestricted: info.restricted,
+			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(name), p),
 		})
 	}
 	return out
+}
+
+func isSnapshotWANBehindCGNAT(snap *unifi.Snapshot) bool {
+	if snap == nil || snap.Health == nil || snap.Health.WANIP == "" {
+		return false
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(snap.Health.WANIP))
+	if err != nil {
+		return false
+	}
+	if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
+		return true
+	}
+	cgnat := netip.MustParsePrefix("100.64.0.0/10")
+	return cgnat.Contains(addr)
+}
+
+func recordObservedService(ent *Entity, f checks.Finding) {
+	if f.Port <= 0 {
+		return
+	}
+	proto := f.EffectiveTransport()
+	obsState := probe.ServiceStateObservedProtocol
+	if f.ClaimKind == checks.ClaimServiceAdvertised {
+		obsState = probe.ServiceStateAdvertisedService
+	}
+	for i := range ent.Services {
+		if ent.Services[i].Port == f.Port && strings.EqualFold(ent.Services[i].Proto, proto) {
+			ent.Services[i].Label = compactCheckChip(f)
+			if obsState == probe.ServiceStateObservedProtocol {
+				ent.Services[i].State = obsState
+			}
+			return
+		}
+	}
+	reach := "lan"
+	if f.ClaimKind == checks.ClaimServiceAdvertised {
+		reach = "advertised"
+	}
+	ent.Services = append(ent.Services, ServiceView{
+		Port:      f.Port,
+		Proto:     proto,
+		Name:      commonPortLabel(f.Port),
+		Reachable: reach,
+		State:     obsState,
+		Exposed:   false,
+		Label:     compactCheckChip(f),
+	})
 }
 
 func markServiceExposed(ent *Entity, f checks.Finding) {
 	if f.Port <= 0 {
 		return
 	}
+	proto := f.EffectiveTransport()
 	for i := range ent.Services {
-		if ent.Services[i].Port == f.Port {
+		if ent.Services[i].Port == f.Port && strings.EqualFold(ent.Services[i].Proto, proto) {
 			ent.Services[i].Exposed = true
 			if sevStrRank(f.EffectiveSeverity.String()) > sevStrRank(ent.Services[i].Severity) {
 				ent.Services[i].Severity = f.EffectiveSeverity.String()
@@ -1449,10 +1697,6 @@ func markServiceExposed(ent *Entity, f checks.Finding) {
 			ent.Services[i].Label = compactCheckChip(f)
 			return
 		}
-	}
-	proto := "tcp"
-	if f.Port == 623 || f.Port == 161 || f.Port == 5351 || f.Port == 5683 {
-		proto = "udp"
 	}
 	ent.Services = append(ent.Services, ServiceView{
 		Port:      f.Port,

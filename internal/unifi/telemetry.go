@@ -115,6 +115,7 @@ type rawAdminActivityEntry struct {
 // concurrently alongside core topology.
 type siteTelemetry struct {
 	wlans      []rawWLAN
+	wlansOK    bool
 	rogueAPs   []rawRogueAP
 	settings   *SiteSecuritySettings
 	health     *SystemHealth
@@ -127,8 +128,12 @@ type siteTelemetry struct {
 // controller security/admin logs. Every sub-call is best-effort so older
 // controllers or restricted permissions never break core snapshot collection.
 func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
+	type wlanRes struct {
+		items []rawWLAN
+		ok    bool
+	}
 	var (
-		wlanCh    = make(chan []rawWLAN, 1)
+		wlanCh    = make(chan wlanRes, 1)
 		rogueCh   = make(chan []rawRogueAP, 1)
 		settingCh = make(chan *SiteSecuritySettings, 1)
 		healthCh  = make(chan *SystemHealth, 1)
@@ -139,10 +144,10 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	go func() {
 		var env apiEnvelope[rawWLAN]
 		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/wlanconf", c.site), &env); err == nil {
-			wlanCh <- env.Data
+			wlanCh <- wlanRes{items: env.Data, ok: true}
 			return
 		}
-		wlanCh <- nil
+		wlanCh <- wlanRes{}
 	}()
 	go func() {
 		var env apiEnvelope[rawRogueAP]
@@ -223,8 +228,10 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 		logsCh <- logs
 	}()
 
+	wr := <-wlanCh
 	return siteTelemetry{
-		wlans:      <-wlanCh,
+		wlans:      wr.items,
+		wlansOK:    wr.ok,
 		rogueAPs:   <-rogueCh,
 		settings:   <-settingCh,
 		health:     <-healthCh,

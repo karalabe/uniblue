@@ -5,10 +5,12 @@
 # license that can be found in the LICENSE file.
 
 id: UB-2026-0061
-title: Out-of-Band BMC Redfish API Exposed on Non-Isolated Network
+title: Out-of-Band BMC Redfish Service Root Discovered
 cve: null
 category: oob-bmc
-severity: medium
+claim: service-observed
+property: bmc-redfish-identity
+severity: info
 safety: read-only
 
 metadata:
@@ -35,6 +37,7 @@ probe:
     body_contains_any:
       - '"RedfishVersion"'
       - '"#ServiceRoot'
+    evidence_summary: "Redfish BMC service root discovered (public metadata endpoint; verify OOB VLAN isolation and authentication)"
 
 remediation:
   summary: >

@@ -23,14 +23,18 @@ import (
 // duplicate entries, while independent properties on the same port (such as an
 // expired TLS certificate alongside an HTTP product finding) are preserved.
 func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Finding {
-	coveredNonTLS := make(map[string]struct{}, len(existing))
-	coveredTLS := make(map[string]struct{}, len(existing))
+	// Key deduplication strictly by (hostIP, port, transport, property) so
+	// independent security properties on the same endpoint (e.g., an HTTP
+	// product check vs. an expired TLS cert, or SMBv1 vs. SMB signing) never
+	// suppress each other.
+	coveredProp := make(map[string]struct{}, len(existing))
 	for _, f := range existing {
-		key := fmt.Sprintf("%s|%d", f.Client.IP, f.Port)
-		coveredNonTLS[key] = struct{}{}
-		if f.CheckID == "UB-0020" || strings.Contains(strings.ToLower(f.CheckID), "tls") {
-			coveredTLS[key] = struct{}{}
+		prop := existingFindingProperty(f)
+		if prop == "" {
+			continue
 		}
+		key := fmt.Sprintf("%s|%d|%s|%s", f.Client.IP, f.Port, f.EffectiveTransport(), prop)
+		coveredProp[key] = struct{}{}
 	}
 
 	var out []Finding
@@ -39,24 +43,19 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 			if len(svc.Findings) == 0 {
 				continue
 			}
+			transport := strings.ToLower(strings.TrimSpace(svc.Transport))
+			if transport == "" {
+				transport = "tcp"
+			}
 
 			for _, sf := range svc.Findings {
-				key := fmt.Sprintf("%s|%d", hp.Client.IP, svc.Port)
-				isTLS := strings.HasPrefix(strings.ToLower(sf.ID), "tls-")
-				isTLSCert := strings.Contains(strings.ToLower(sf.ID), "cert")
-				// Never suppress an independent TLS certificate finding (e.g., expired
-				// cert) because of an HTTP app check or deprecated-TLS protocol check.
-				if isTLS {
-					if !isTLSCert {
-						if _, ok := coveredTLS[key]; ok {
-							continue
-						}
-					}
-				} else {
-					if _, ok := coveredNonTLS[key]; ok {
-						continue
-					}
+				prop := nervaFindingProperty(sf.ID)
+				key := fmt.Sprintf("%s|%d|%s|%s", hp.Client.IP, svc.Port, transport, prop)
+				if _, ok := coveredProp[key]; ok {
+					continue
 				}
+				coveredProp[key] = struct{}{}
+
 				sev, err := ParseSeverity(sf.Severity)
 				if err != nil {
 					sev = SeverityLow
@@ -64,13 +63,16 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 				title, summary, actions := describeNervaFinding(sf, svc)
 				evidence := sf.Evidence
 				if evidence == "" {
-					evidence = fmt.Sprintf("detected on %s port %d (%s)", svc.Protocol, svc.Port, sf.ID)
+					evidence = fmt.Sprintf("detected on %s %s/%d (%s)", svc.Protocol, transport, svc.Port, sf.ID)
 				}
 
 				out = append(out, Finding{
 					CheckID:           normalizeNervaCheckID(sf.ID),
 					Title:             title,
 					Category:          nervaCategory(sf.ID),
+					ClaimKind:         nervaClaimKind(sf.ID),
+					Property:          prop,
+					Transport:         transport,
 					BaseSeverity:      sev,
 					EffectiveSeverity: sev,
 					Client:            hp.Client,
@@ -85,6 +87,66 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 		}
 	}
 	return out
+}
+
+func existingFindingProperty(f Finding) string {
+	if p := strings.ToLower(strings.TrimSpace(f.Property)); p != "" {
+		return p
+	}
+	if f.IsInventoryOnly() {
+		return "service-identity"
+	}
+	id := strings.ToUpper(f.CheckID)
+	switch id {
+	case "UB-0002", "UB-0003", "UB-0004", "UB-0005", "UB-0006", "UB-0007",
+		"UB-0008", "UB-0009", "UB-0010", "UB-0011", "UB-0012", "UB-0014",
+		"UB-0015", "UB-0018", "UB-0023", "UB-0024", "UB-0025", "UB-0026":
+		return "auth-anon"
+	}
+	switch {
+	case id == "UB-0020" || strings.Contains(id, "TLS-LEGACY"):
+		return "tls-protocol"
+	case strings.Contains(id, "TLS-CERT") || strings.Contains(id, "CERTIFICATE"):
+		return "tls-cert"
+	case strings.Contains(id, "SMB-V1"):
+		return "smb-v1"
+	case strings.Contains(id, "SMB-SIGNING"):
+		return "smb-signing"
+	case strings.EqualFold(f.Category, "unauth-control") || strings.Contains(id, "UNAUTH") || strings.Contains(id, "ANON"):
+		return "auth-anon"
+	default:
+		return strings.ToLower(f.CheckID)
+	}
+}
+
+func nervaFindingProperty(rawID string) string {
+	id := strings.ToLower(strings.TrimSpace(rawID))
+	switch {
+	case strings.Contains(id, "cert"):
+		return "tls-cert"
+	case strings.Contains(id, "weak-key") || strings.Contains(id, "key-size"):
+		return "tls-weak-key"
+	case strings.HasPrefix(id, "tls-"):
+		return "tls-protocol"
+	case id == "smb-v1-enabled":
+		return "smb-v1"
+	case id == "smb-signing-not-required":
+		return "smb-signing"
+	case strings.Contains(id, "anon") || strings.Contains(id, "no-auth") || strings.HasSuffix(id, "-none"):
+		return "auth-anon"
+	default:
+		return id
+	}
+}
+
+func nervaClaimKind(rawID string) ClaimKind {
+	id := strings.ToLower(strings.TrimSpace(rawID))
+	switch {
+	case strings.Contains(id, "anon") || strings.Contains(id, "no-auth"):
+		return ClaimConfirmedPermission
+	default:
+		return ClaimServiceObserved
+	}
 }
 
 // normalizeNervaCheckID creates a concise, uppercase check identifier (e.g.,

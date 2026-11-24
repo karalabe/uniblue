@@ -65,6 +65,10 @@ type Report struct {
 	// UniFiPosture summarizes gateway security controls, Wi-Fi SSID posture,
 	// neighboring AP/evil-twin counts, WAN/VPN health, and recent controller logs.
 	UniFiPosture *UniFiPostureSummary `json:"unifi_posture,omitempty"`
+
+	// Isolation holds the effective boundary evaluation matrix across zones,
+	// IPv4/IPv6 families, gateway vs. L3-switch routing, and L2 Wi-Fi/wired paths.
+	Isolation *IsolationMatrix `json:"isolation,omitempty"`
 }
 
 // State captures the minimal baseline persisted to disk between consecutive
@@ -147,13 +151,9 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	classifier, _ := LoadExposureClassifier(rules.BuiltinFS)
 
 	scored := make([]checks.Finding, 0, len(rawFindings)+len(snap.PortForwards))
-	affectedClientIPs := make(map[string]struct{})
 	for _, f := range rawFindings {
 		f = scoreFinding(f, forwardsByIP[f.Client.IP], trustedSet, isolatedSet)
 		scored = append(scored, f)
-		if f.Client.IP != "" {
-			affectedClientIPs[f.Client.IP] = struct{}{}
-		}
 	}
 
 	// Classify every enabled WAN port forward using declarative exposure rules
@@ -221,8 +221,15 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 
 	// Audit Wi-Fi SSIDs, Evil-Twin/Rogue APs, UniFi device SSH, UPnP, IDS/IPS,
 	// Honeypot, DNS Shield, and recent controller security logs.
-	unifiPosture, postureFindings, unifiNotes := AnalyzeUniFiPosture(snap, trustedSet, isolatedSet)
+	unifiPosture, postureFindings, unifiNotes := AnalyzeUniFiPosture(snap, trustedSet, isolatedSet, netCfg.IsolationPolicy.ManagementVLANs...)
 	scored = append(scored, postureFindings...)
+
+	// Evaluate effective inter-zone, IPv4/IPv6, gateway/switch-routed, and L2
+	// isolation boundaries, plus extended infrastructure and health checks.
+	isoMatrix, isoFindings, isoNotes := EvaluateIsolation(snap, rawFindings, netCfg)
+	scored = append(scored, isoFindings...)
+	extFindings, extNotes := AnalyzeExtendedNetworkChecks(snap, netCfg)
+	scored = append(scored, extFindings...)
 
 	// Emit a low-severity posture finding for UniFi infrastructure gear running
 	// outdated firmware reported as upgradable by the controller.
@@ -265,9 +272,25 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		return scored[i].Port < scored[j].Port
 	})
 
+	affectedClientIPs := make(map[string]struct{})
+	affectedClientMACs := make(map[string]struct{})
+	for _, f := range scored {
+		if f.IsInventoryOnly() {
+			continue
+		}
+		if f.Client.IP != "" {
+			affectedClientIPs[f.Client.IP] = struct{}{}
+		}
+		if m := strings.ToLower(strings.TrimSpace(f.Client.MAC)); m != "" && !strings.HasPrefix(m, "fw:") && !strings.HasPrefix(m, "gw:") {
+			affectedClientMACs[m] = struct{}{}
+		}
+	}
+
 	cleanClients := 0
 	for _, cl := range snap.Clients {
-		if _, bad := affectedClientIPs[cl.IP]; !bad {
+		_, badIP := affectedClientIPs[cl.IP]
+		_, badMAC := affectedClientMACs[strings.ToLower(strings.TrimSpace(cl.MAC))]
+		if !badIP && !badMAC {
 			cleanClients++
 		}
 	}
@@ -275,6 +298,8 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	postureNotes := AnalyzePosture(snap, scored, netCfg)
 	postureNotes = append(postureNotes, portNotes...)
 	postureNotes = append(postureNotes, unifiNotes...)
+	postureNotes = append(postureNotes, isoNotes...)
+	postureNotes = append(postureNotes, extNotes...)
 
 	return Report{
 		GeneratedAt:       time.Now().UTC(),
@@ -288,23 +313,53 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		PostureNotes:      postureNotes,
 		SwitchPorts:       switchPorts,
 		UniFiPosture:      unifiPosture,
+		Isolation:         isoMatrix,
 	}
 }
 
 // scoreFinding adjusts a finding's EffectiveSeverity based on whether the
-// vulnerable port is WAN-exposed or placed on a trusted vs. isolated VLAN.
+// vulnerable port is WAN-exposed (matching L4 transport, translated destination
+// port, and WAN source restrictions) or placed on a trusted vs. isolated VLAN.
+// Pure inventory observations (asset-identity / service-advertised /
+// service-observed at Info severity) are preserved as Info without escalation.
 func scoreFinding(f checks.Finding, forwards []unifi.PortForward, trustedSet, isolatedSet map[string]struct{}) checks.Finding {
 	f.EffectiveSeverity = f.BaseSeverity
 	f.RiskReasons = nil
 
-	// Check WAN exposure first: a vulnerable service reachable directly from the
-	// internet is always treated as Critical regardless of internal VLAN.
+	if f.IsInventoryOnly() {
+		return f
+	}
+
+	transport := f.EffectiveTransport()
+	// Check WAN exposure across ALL matching forwards (worst severity wins so an
+	// earlier source-restricted forward never hides a later open src=any forward).
+	matchedWAN := false
+	bestSev := f.BaseSeverity
 	for _, pf := range forwards {
-		if pf.ExposesPort(f.Port) {
-			f.EffectiveSeverity = checks.SeverityCritical
-			f.RiskReasons = append(f.RiskReasons, fmt.Sprintf("exposed to WAN via port forward %q (WAN:%s)", pf.Name, pf.DstPort))
-			return f
+		if !pf.ExposesEndpoint(f.Port, transport) {
+			continue
 		}
+		matchedWAN = true
+		if pf.IsSourceRestricted() {
+			cand := f.BaseSeverity.Bump(1)
+			if cand > bestSev {
+				bestSev = cand
+			}
+			f.RiskReasons = append(f.RiskReasons, fmt.Sprintf(
+				"exposed via source-restricted %s WAN forward %q (WAN:%s -> %s:%s, src=%s)",
+				strings.ToUpper(transport), pf.Name, pf.DstPort, pf.FwdIP, pf.FwdPort, pf.Src,
+			))
+		} else {
+			bestSev = checks.SeverityCritical
+			f.RiskReasons = append(f.RiskReasons, fmt.Sprintf(
+				"exposed to WAN via %s port forward %q (WAN:%s -> %s:%s, src=any)",
+				strings.ToUpper(transport), pf.Name, pf.DstPort, pf.FwdIP, pf.FwdPort,
+			))
+		}
+	}
+	if matchedWAN {
+		f.EffectiveSeverity = bestSev
+		return f
 	}
 
 	if matchesVLAN(f.Client, trustedSet) {
@@ -329,6 +384,9 @@ func BuildState(snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig
 		PortForwards:   make(map[string]string),
 	}
 	for _, f := range report.Findings {
+		if f.IsInventoryOnly() {
+			continue
+		}
 		st.Findings[f.Key()] = f.EffectiveSeverity
 	}
 	for _, cl := range snap.Clients {
@@ -353,12 +411,19 @@ func ComputeDiff(prev *State, snap *unifi.Snapshot, report Report, netCfg config
 	trustedSet, _ := resolveVLANTiers(snap, netCfg)
 
 	if prev == nil {
-		diff.NewFindings = append(diff.NewFindings, report.Findings...)
+		for _, f := range report.Findings {
+			if !f.IsInventoryOnly() {
+				diff.NewFindings = append(diff.NewFindings, f)
+			}
+		}
 		return diff
 	}
 
 	currentKeys := make(map[string]struct{}, len(report.Findings))
 	for _, f := range report.Findings {
+		if f.IsInventoryOnly() {
+			continue
+		}
 		key := f.Key()
 		currentKeys[key] = struct{}{}
 		oldSev, existed := prev.Findings[key]

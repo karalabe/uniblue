@@ -281,10 +281,10 @@ func Build(snap *unifi.Snapshot, classes map[string]classify.Result, netCfg conf
 		m.VLANs = append(m.VLANs, g)
 	}
 
-	// Track which internal IPs receive public WAN HTTP/HTTPS forwards.
+	// Track which internal IPs receive public WAN TCP HTTP/HTTPS forwards.
 	wanWebIPs := make(map[string]bool)
 	for _, pf := range snap.PortForwards {
-		if pf.Enabled && pf.FwdIP != "" && (pf.ExposesPort(80) || pf.ExposesPort(443)) {
+		if pf.Enabled && pf.FwdIP != "" && (pf.ExposesEndpoint(80, "tcp") || pf.ExposesEndpoint(443, "tcp")) {
 			wanWebIPs[pf.FwdIP] = true
 		}
 	}
@@ -324,7 +324,8 @@ func Build(snap *unifi.Snapshot, classes map[string]classify.Result, netCfg conf
 		}
 
 		vg := &m.VLANs[idx]
-		placement, reason := evaluatePlacement(cl, cls, vg.Isolated, hasIsolatedVLAN, hasDMZZone, wanWebIPs[cl.IP])
+		inMgmt := isManagementVLAN(vg.Name, vg.ZoneName, netCfg.IsolationPolicy.ManagementVLANs)
+		placement, reason := evaluatePlacement(cl, cls, vg.Isolated, inMgmt, hasIsolatedVLAN, hasDMZZone, wanWebIPs[cl.IP])
 		if !vg.Isolated && wanWebIPs[cl.IP] {
 			wanProxyInInternal = true
 		}
@@ -373,7 +374,7 @@ func Build(snap *unifi.Snapshot, classes map[string]classify.Result, netCfg conf
 // evaluatePlacement assesses whether a client's current network placement is
 // structurally sound using only generic category, zone-isolation, and WAN-route
 // facts (never per-device CVEs or personal VLAN names).
-func evaluatePlacement(cl unifi.Client, cls classify.Result, inIsolated, hasIsolatedVLAN, hasDMZZone, isWANWeb bool) (Placement, string) {
+func evaluatePlacement(cl unifi.Client, cls classify.Result, inIsolated, inManagement, hasIsolatedVLAN, hasDMZZone, isWANWeb bool) (Placement, string) {
 	if inIsolated {
 		return PlacementOK, ""
 	}
@@ -388,6 +389,9 @@ func evaluatePlacement(cl unifi.Client, cls classify.Result, inIsolated, hasIsol
 
 	switch cls.Category {
 	case classify.CategoryBMC:
+		if inManagement {
+			return PlacementOK, ""
+		}
 		return PlacementReview, "Out-of-band BMC/IPMI — restrict to admin/management access"
 
 	case classify.CategoryCamera:
@@ -421,6 +425,21 @@ func evaluatePlacement(cl unifi.Client, cls classify.Result, inIsolated, hasIsol
 	}
 
 	return PlacementOK, ""
+}
+
+func isManagementVLAN(name, zone string, configured []string) bool {
+	for _, c := range configured {
+		if strings.EqualFold(strings.TrimSpace(c), strings.TrimSpace(name)) {
+			return true
+		}
+	}
+	comb := strings.ToLower(name + " " + zone)
+	for _, kw := range []string{"oob", "mgmt", "management", "bmc", "ipmi"} {
+		if strings.Contains(comb, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildWANRoutes extracts concise, operator-readable WAN ingress summaries from

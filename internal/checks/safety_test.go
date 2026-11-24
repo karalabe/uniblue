@@ -1,0 +1,210 @@
+// uniblue: blue-team security engine for UniFi networks
+// Copyright 2026 Péter Szilágyi. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package checks
+
+import (
+	"context"
+	"net"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	builtinchecks "github.com/karalabe/uniblue/checks"
+	"github.com/karalabe/uniblue/internal/probe"
+	"github.com/karalabe/uniblue/internal/unifi"
+)
+
+func TestNewChecksAddZeroGlobalPortsAndZeroConnectionsToUnrelatedHosts(t *testing.T) {
+	all, err := LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatalf("LoadFromFS: %v", err)
+	}
+
+	var newChecks []*Check
+	for _, c := range all {
+		if c.ID >= "UB-2026-0066" {
+			newChecks = append(newChecks, c)
+		}
+	}
+	if len(newChecks) == 0 {
+		t.Fatal("expected new coverage checks >= UB-2026-0066")
+	}
+
+	// 1. Planner invariant: adding inventory + protocol-specific checks must add
+	// ZERO ports to the global TCP baseline sweep.
+	base := []int{80, 443}
+	planned := PlanGlobalPorts(base, newChecks)
+	if len(planned) != 2 || planned[0] != 80 || planned[1] != 443 {
+		t.Fatalf("new checks must add ZERO global TCP ports, got %v", planned)
+	}
+
+	// 2. Socket-level invariant: running all new checks against an unrelated host
+	// with a listening TCP socket must make ZERO connections to that host.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	var connCount atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connCount.Add(1)
+			_ = c.Close()
+		}
+	}()
+
+	unrelated := probe.HostProfile{
+		Client:    unifi.Client{IP: "127.0.0.1", Name: "regular-laptop"},
+		OpenPorts: []int{port},
+	}
+	r := NewRunner(newChecks, 1)
+	if got := r.RunHost(context.Background(), unrelated); len(got) != 0 {
+		t.Fatalf("expected 0 findings on unrelated host, got %+v", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := connCount.Load(); n != 0 {
+		t.Fatalf("new checks made %d unexpected TCP connection(s) to unrelated host", n)
+	}
+}
+
+func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *testing.T) {
+	all, err := LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatalf("LoadFromFS: %v", err)
+	}
+	r := NewRunner(all, 1)
+
+	// 1. Matter cm=1 (active commissioning) fires UB-2026-0067 at Info severity;
+	// cm=0 (extended discovery outside commissioning window) MUST NOT fire!
+	matterActive := probe.HostProfile{
+		Client:       unifi.Client{IP: "192.0.2.10"},
+		MDNSServices: []probe.MDNSService{{Type: "_matterc._udp", Port: 5540, TXT: []string{"cm=1", "d=3840"}}},
+	}
+	matterExtended := probe.HostProfile{
+		Client:       unifi.Client{IP: "192.0.2.11"},
+		MDNSServices: []probe.MDNSService{{Type: "_matterc._udp", Port: 5540, TXT: []string{"cm=0", "d=3840"}}},
+	}
+	gotActive := r.RunHost(context.Background(), matterActive)
+	if len(gotActive) != 1 || gotActive[0].CheckID != "UB-2026-0067" || gotActive[0].BaseSeverity != SeverityInfo {
+		t.Fatalf("expected Info UB-2026-0067 on cm=1 Matter device, got %+v", gotActive)
+	}
+	if got := r.RunHost(context.Background(), matterExtended); len(got) != 0 {
+		t.Fatalf("Matter cm=0 extended discovery must NOT fire commissioning check, got %+v", got)
+	}
+
+	// 2. DoorBird (_axis-video._tcp + real wire key macaddress=1c:ca:e3...) vs Axis camera.
+	doorbird := probe.HostProfile{
+		Client:       unifi.Client{IP: "192.0.2.12"},
+		MDNSServices: []probe.MDNSService{{Type: "_axis-video._tcp", Port: 80, TXT: []string{"macaddress=1ccae3010203"}}},
+	}
+	axisCam := probe.HostProfile{
+		Client:       unifi.Client{IP: "192.0.2.13"},
+		MDNSServices: []probe.MDNSService{{Type: "_axis-video._tcp", Port: 80, TXT: []string{"macaddress=accc8e010203"}}},
+	}
+	if got := r.RunHost(context.Background(), doorbird); len(got) != 1 || got[0].CheckID != "UB-2026-0076" {
+		t.Fatalf("expected DoorBird match UB-2026-0076 on macaddress=1ccae3..., got %+v", got)
+	}
+	if got := r.RunHost(context.Background(), axisCam); len(got) != 0 {
+		t.Fatalf("Axis camera must NOT match DoorBird UB-2026-0076, got %+v", got)
+	}
+
+	// 3. Raw printer zero-byte guard in Runner: even if a raw print sink overlaps
+	// an HTTP check port, Runner must NOT write any bytes to that socket!
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	_, pStr, _ := net.SplitHostPort(ln.Addr().String())
+	rawPort, _ := strconv.Atoi(pStr)
+	var bytesWritten atomic.Int64
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+				buf := make([]byte, 256)
+				n, _ := conn.Read(buf)
+				bytesWritten.Add(int64(n))
+			}(c)
+		}
+	}()
+	httpChk := &Check{
+		ID:       "UB-2026-9999",
+		Title:    "Test HTTP Probe",
+		Safety:   "read-only",
+		Severity: SeverityLow,
+		Preconditions: Preconditions{
+			PortsAny:      []int{rawPort},
+			DiscoveryOnly: true,
+		},
+		Probe: ProbeSpec{Type: "http", Method: "GET", Path: "/", Scheme: "http"},
+	}
+	if err := httpChk.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	rawPrinter := probe.HostProfile{
+		Client:        unifi.Client{IP: "127.0.0.1", Name: "Raw-Printer"},
+		OpenPorts:     []int{rawPort},
+		RawPrintPorts: []int{rawPort},
+	}
+	NewRunner([]*Check{httpChk}, 1).RunHost(context.Background(), rawPrinter)
+	time.Sleep(50 * time.Millisecond)
+	if n := bytesWritten.Load(); n != 0 {
+		t.Fatalf("SAFETY VIOLATION: Runner sent %d bytes to raw print port %d", n, rawPort)
+	}
+}
+
+func TestPropertyKeyedNervaDeduplicationPreservesIndependentFindings(t *testing.T) {
+	hp := probe.HostProfile{
+		Client: unifi.Client{IP: "192.0.2.50", MAC: "aa:bb:cc:dd:ee:50"},
+		Services: []probe.Service{
+			{
+				Port:      445,
+				Transport: "tcp",
+				Protocol:  "smb",
+				Findings: []probe.ServiceFinding{
+					{ID: "smb-v1-enabled", Severity: "high", Evidence: "SMBv1 negotiated"},
+					{ID: "smb-signing-not-required", Severity: "medium", Evidence: "signing optional"},
+				},
+			},
+			{
+				Port:      443,
+				Transport: "tcp",
+				Protocol:  "https",
+				Findings: []probe.ServiceFinding{
+					{ID: "tls-weak-version-10", Severity: "medium", Evidence: "TLS 1.0"},
+					{ID: "tls-weak-key", Severity: "medium", Evidence: "1024-bit RSA"},
+				},
+			},
+		},
+	}
+	existing := []Finding{
+		{CheckID: "UB-CUSTOM-SMBV1", Property: "smb-v1", Transport: "tcp", Client: hp.Client, Port: 445},
+		{CheckID: "UB-0020", Property: "tls-protocol", Transport: "tcp", Client: hp.Client, Port: 443},
+	}
+	got := FindingsFromProfiles([]probe.HostProfile{hp}, existing)
+	gotIDs := make(map[string]bool)
+	for _, f := range got {
+		gotIDs[f.CheckID] = true
+	}
+	if !gotIDs["NERVA-SMB-SIGNING-NOT-REQUIRED"] || !gotIDs["NERVA-TLS-WEAK-KEY"] || len(got) != 2 {
+		t.Fatalf("expected smb-signing and tls-weak-key to survive dedup while suppressing smb-v1 and tls-10, got %+v", got)
+	}
+}

@@ -282,6 +282,8 @@
   .tag.neutral { background: var(--surface-2); border-color: var(--border); color: var(--muted); }
   .tag.click { cursor: pointer; transition: border-color .12s, transform .1s; }
   .tag.click:hover { border-color: var(--blue); color: var(--blue); }
+  .chk-row.click { cursor: pointer; border-radius: 8px; transition: background .12s; }
+  .chk-row.click:hover { background: var(--surface-2); }
 
   /* Cards */
   .card {
@@ -1228,6 +1230,81 @@ function humanReason(r) {
       title: "Smart-home or media device is on your main home network",
       why: "Keeping cameras, TVs, and smart gadgets on a separate isolated network protects your personal computers and files if a gadget gets hacked.",
       fix: r.remediation || "Move this device to your isolated Smart Home / IoT Wi-Fi or network."
+    },
+    "UB-UNIFI-ISO-BMC-IPV6": {
+      title: "Guest or isolated network can reach server hardware control over IPv6",
+      why: "An IPv6 firewall rule allows untrusted devices to reach this server's hardware control panel.",
+      fix: r.remediation || "Narrow or remove the IPv6 firewall rule so only trusted admin workstations can reach this BMC."
+    },
+    "UB-UNIFI-ISO-BMC-PATH": {
+      title: "Guest or isolated network can reach server hardware control",
+      why: "A firewall rule permits an untrusted network to reach this server's out-of-band hardware control panel.",
+      fix: r.remediation || "Restrict this firewall rule to approved admin workstations only."
+    },
+    "UB-UNIFI-ISO-PRINTER-ADMIN": {
+      title: "Guests can reach the printer's admin settings page",
+      why: "Guests should only be able to print — not open the printer's web admin panel or change its settings.",
+      fix: r.remediation || "Allow guests only on TCP 631 (IPPS printing) and block TCP 80/443 (and CUPS /admin)."
+    },
+    "UB-UNIFI-ISO-GW-ADMIN": {
+      title: "Untrusted network can reach the router's admin login",
+      why: "Guest or IoT devices should only get internet, DHCP, and DNS from your router — never its admin interface.",
+      fix: r.remediation || "Block TCP 443 and SSH (22) from this zone to the Gateway while keeping DNS (53) and DHCP (67) allowed."
+    },
+    "UB-UNIFI-ISO-TRUSTED-TRANSIT": {
+      title: "Isolated network can initiate connections into your main home network",
+      why: "A firewall or L3 switch rule lets devices on an isolated network reach your trusted devices directly.",
+      fix: r.remediation || "Block new connections from this isolated network into your main network (keep return traffic allowed)."
+    },
+    "UB-UNIFI-ISO-SAME-VLAN": {
+      title: "Devices on this isolated network can talk directly to each other",
+      why: "Same-network peer isolation is off or not enforced across switches/APs, letting one compromised gadget scan others on the same network.",
+      fix: r.remediation || "Enable Client Device Isolation on Wi-Fi and Port Isolation or switch ACLs on wired ports."
+    },
+    "UB-UNIFI-DYNAMIC-NAT-MAPPING": {
+      title: "A device opened an automatic internet port (UPnP / NAT-PMP / PCP)",
+      why: "An active dynamic port mapping forwards internet traffic to a local device without a manual router rule.",
+      fix: r.remediation || "Confirm this lease belongs to an expected game console or app, or disable UPnP on untrusted networks."
+    },
+    "UB-UNIFI-PROXY-ADMIN-PUBLIC": {
+      title: "Internal admin page is published online without proxy login",
+      why: "Your reverse proxy exposes an internal admin panel publicly with frontend authentication turned off.",
+      fix: r.remediation || "Enable authentication on the reverse proxy or unpublish this internal admin hostname."
+    },
+    "UB-UNIFI-TUNNEL-ADMIN-PUBLIC": {
+      title: "Outbound tunnel publishes an internal admin panel publicly",
+      why: "A Cloudflare/Tailscale/ngrok tunnel exposes an internal admin service without an authenticated access policy.",
+      fix: r.remediation || "Require SSO/Zero-Trust authentication on this tunnel route or remove the admin route."
+    },
+    "UB-UNIFI-OVERLAPPING-SUBNETS": {
+      title: "Two networks use overlapping IP address ranges",
+      why: "Overlapping subnets can break routing and make firewall rules match the wrong devices.",
+      fix: r.remediation || "Renumber one of the overlapping networks so every VLAN has a unique subnet."
+    },
+    "UB-UNIFI-NATIVE-VLAN-MISMATCH": {
+      title: "Switch cable has mismatched default networks on each end",
+      why: "The two UniFi switches at opposite ends of a trunk cable disagree on the untagged native network.",
+      fix: r.remediation || "Set both ends of the switch-to-switch uplink port to the same native VLAN."
+    },
+    "UB-UNIFI-IPV6-BLANKET-ICMPV6-BLOCK": {
+      title: "Blanket ICMPv6 block may break IPv6 connectivity",
+      why: "IPv6 relies on ICMPv6 (Neighbor Discovery and Packet Too Big) to discover devices and size packets properly.",
+      fix: r.remediation || "Allow essential RFC 4890 ICMPv6 types while keeping unwanted inbound connections blocked."
+    },
+    "UB-2026-0083": {
+      title: "Bitcoin node control API (RPC) has no password",
+      why: "Anyone on the network can query or control this Bitcoin node without credentials.",
+      fix: r.remediation || "Bind Bitcoin RPC to 127.0.0.1 and require rpcauth credentials."
+    },
+    "UB-2026-0084": {
+      title: "Ethereum Engine API is missing JWT authentication",
+      why: "The Ethereum consensus-to-execution port (8551) accepted an unauthenticated request.",
+      fix: r.remediation || "Bind --authrpc.addr to 127.0.0.1 and enforce --authrpc.jwtsecret."
+    },
+    "UB-2026-0087": {
+      title: "Network projector control (PJLink) has no password",
+      why: "Anyone on this network can power on/off or switch inputs on this projector.",
+      fix: r.remediation || "Set a PJLink password in the projector menu and place it on an isolated IoT network."
     }
   };
   if (map[ref]) return map[ref];
@@ -1281,7 +1358,9 @@ function switchTab(tab, updateHash = true) {
 }
 
 function openEntity(id) {
-  if (!id || !state?.view?.entities?.[id]) return;
+  if (!id) return;
+  const isPanel = id.startsWith("panel:");
+  if (!isPanel && !state?.view?.entities?.[id]) return;
   if (currentDrawerID() !== id) drawerStack.push(id);
   syncHash();
   renderDrawer();
@@ -1329,7 +1408,7 @@ function applyHash() {
     document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
     document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
   }
-  if (ent && state?.view?.entities?.[ent]) {
+  if (ent && (ent.startsWith("panel:") || state?.view?.entities?.[ent])) {
     drawerStack = [ent];
     renderDrawer();
     document.getElementById("drawer").classList.add("open");
@@ -1340,6 +1419,24 @@ function applyHash() {
 document.querySelectorAll(".nav-btn").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 document.addEventListener("keydown", e => { if (e.key === "Escape" && drawerStack.length) closeDrawer(); });
 window.addEventListener("hashchange", () => { applyHash(); renderActiveTab(); });
+// Safe delegated click handler for entity/panel navigation (prevents quote/script injection in dynamic IDs).
+document.addEventListener("click", e => {
+  const portEl = e.target.closest("[data-stop-entity-id]");
+  if (portEl) {
+    e.stopPropagation();
+    openEntity(portEl.getAttribute("data-stop-entity-id"));
+    return;
+  }
+  const entEl = e.target.closest("[data-entity-id]");
+  if (entEl) {
+    openEntity(entEl.getAttribute("data-entity-id"));
+    return;
+  }
+  const panEl = e.target.closest("[data-panel-id]");
+  if (panEl) {
+    openEntity(panEl.getAttribute("data-panel-id"));
+  }
+});
 
 /* ============================================================================
    HEADER & NAV COUNTS
@@ -1740,12 +1837,49 @@ function renderCheckup() {
     html += `<details class="tech" style="margin-top:0">
       <summary>Good to know (${notes.length} note${notes.length === 1 ? "" : "s"})</summary>
       <div class="tech-body">
-        ${notes.slice(0, 6).map(n => `<div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
+        ${notes.slice(0, 8).map(n => `<div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
           <div style="font-weight:700;font-size:13px">${esc(n.title)}</div>
           <div class="small" style="margin-top:2px">${esc(n.detail)}</div>
         </div>`).join("")}
       </div>
     </details>`;
+  }
+
+  // Clickable Isolation Boundaries & Service Visibility cards
+  const iso = vm.isolation;
+  if (iso && iso.cells && iso.cells.length) {
+    html += `<div class="card" style="margin-top:16px">
+      <div class="card-hd">
+        <div class="card-title">Network Isolation Boundaries</div>
+        <button class="btn sm ghost" data-panel-id="panel:isolation:all">${iso.cells.length} checked →</button>
+      </div>
+      <div class="checklist">
+        <div class="chk-row click" data-panel-id="panel:isolation:blocked-ok"><div class="chk-l"><span class="chk-dot ok"></span><div><div class="chk-name">Blocked as intended</div><div class="chk-hint">Isolated zones stay separated</div></div></div><div class="chk-val ok">${iso.blocked_ok_count || 0} →</div></div>
+        <div class="chk-row click" data-panel-id="panel:isolation:approved"><div class="chk-l"><span class="chk-dot ok"></span><div><div class="chk-name">Approved shared services</div><div class="chk-hint">e.g. Guest printing</div></div></div><div class="chk-val ok">${iso.approved_count || 0} →</div></div>
+        <div class="chk-row click" data-panel-id="panel:isolation:violation"><div class="chk-l"><span class="chk-dot ${(iso.violation_count || 0) ? "crit" : "ok"}"></span><div><div class="chk-name">Policy violations</div><div class="chk-hint">Paths needing narrower rules</div></div></div><div class="chk-val ${(iso.violation_count || 0) ? "crit" : "ok"}">${iso.violation_count || 0} →</div></div>
+        ${(iso.broken_dep_count || 0) ? `<div class="chk-row click" data-panel-id="panel:isolation:broken-dependency"><div class="chk-l"><span class="chk-dot warn"></span><div><div class="chk-name">Broken dependencies</div><div class="chk-hint">Approved DNS / printing blocked</div></div></div><div class="chk-val warn">${iso.broken_dep_count} →</div></div>` : ""}
+        <div class="chk-row click" data-panel-id="panel:isolation:unknown"><div class="chk-l"><span class="chk-dot ${(iso.unknown_count || 0) ? "warn" : "neutral"}"></span><div><div class="chk-name">Unknown (missing ACL/data)</div><div class="chk-hint">Controller omitted evidence</div></div></div><div class="chk-val ${(iso.unknown_count || 0) ? "warn" : "neutral"}">${iso.unknown_count || 0} →</div></div>
+      </div>
+    </div>`;
+  }
+
+  const sc = vm.service_coverage;
+  if (sc && (sc.total_observed_endpoints > 0 || sc.outbound_dependencies > 0)) {
+    const byS = sc.by_state || {};
+    const identified = (byS["observed-protocol"] || 0) + (byS["owner-declared"] || 0);
+    const tlsUnk = byS["tls-unknown-app"] || 0;
+    const cand = byS["candidate-port"] || 0;
+    html += `<div class="card" style="margin-top:16px">
+      <div class="card-hd">
+        <div class="card-title">Service Visibility</div>
+        <button class="btn sm ghost" data-panel-id="panel:coverage">Details →</button>
+      </div>
+      <div class="checklist">
+        <div class="chk-row click" data-panel-id="panel:coverage"><div class="chk-l"><span class="chk-dot ok"></span><div><div class="chk-name">Identified services</div><div class="chk-hint">Protocol verified on the wire</div></div></div><div class="chk-val ok">${identified}</div></div>
+        <div class="chk-row click" data-panel-id="panel:coverage"><div class="chk-l"><span class="chk-dot neutral"></span><div><div class="chk-name">Encrypted / unidentified</div><div class="chk-hint">TLS-only or open port without app proof</div></div></div><div class="chk-val neutral">${tlsUnk + cand}</div></div>
+        ${sc.outbound_dependencies ? `<div class="chk-row click" data-panel-id="panel:coverage"><div class="chk-l"><span class="chk-dot blue"></span><div><div class="chk-name">External internet links</div><div class="chk-hint">Tracked separately from local services</div></div></div><div class="chk-val blue">${sc.outbound_dependencies}</div></div>` : ""}
+      </div>
+    </div>`;
   }
 
   html += `</div></div>`;
@@ -2069,7 +2203,7 @@ function renderDevices() {
 function renderDeviceRow(vm, ent) {
   const portEnt = ent.port_id ? vm.entities[ent.port_id] : null;
   const connHTML = portEnt
-    ? `<span class="tag click ${portEnt.state === "exposed" ? humanStateTone(portEnt) : ""}" onclick="event.stopPropagation(); openEntity('${esc(portEnt.id)}')">${ICONS.plug} ${esc(portEnt.label)}</span>`
+    ? `<span class="tag click ${portEnt.state === "exposed" ? humanStateTone(portEnt) : ""}" data-stop-entity-id="${esc(portEnt.id)}">${ICONS.plug} ${esc(portEnt.label)}</span>`
     : (ent.essid
       ? `<span class="tag neutral">${ICONS.wifi} ${esc(ent.essid)}</span>`
       : `<span class="small">${ent.is_wired ? "Wired cable" : "Wi-Fi"}</span>`);
@@ -2078,15 +2212,20 @@ function renderDeviceRow(vm, ent) {
   if (ent.exact_cve_count) {
     pills.push(`<span class="tag ${humanStateTone(ent)}">${ent.exact_cve_count} security bug${ent.exact_cve_count === 1 ? "" : "s"}</span>`);
   }
+  if (ent.child_ids && ent.child_ids.length) {
+    pills.push(`<span class="tag blue">+${ent.child_ids.length} managed</span>`);
+  }
   for (const svc of (ent.services || [])) {
     if (svc.exposed) pills.push(`<span class="tag ${humanStateTone(svc.severity)}">${esc(humanServiceChip(svc))}</span>`);
     else if (svc.reachable === "wan") pills.push(`<span class="tag blue">Internet :${svc.port}</span>`);
+    else if (svc.reachable === "wan-restricted") pills.push(`<span class="tag blue">Internet (restricted) :${svc.port}</span>`);
+    else if (svc.reachable === "wan-cgnat") pills.push(`<span class="tag neutral">Forward (CGNAT) :${svc.port}</span>`);
   }
   if (!pills.length) {
     pills.push(`<span class="tag ${humanStateTone(ent)}">${esc(humanStateLabel(ent))}</span>`);
   }
 
-  return `<div class="dev-row" onclick="openEntity('${esc(ent.id)}')">
+  return `<div class="dev-row" data-entity-id="${esc(ent.id)}">
     <div class="dev-id">
       <div class="dev-ico">
         ${roleIcon(ent.role, ent.is_bmc)}
@@ -2195,6 +2334,10 @@ function plainSummaryForEntity(vm, ent) {
     }
     return `<strong>${esc(ent.label)}</strong> looks healthy — we checked its open services and software versions and found no active problems.`;
   }
+  if (ent.kind === "child") {
+    const parent = ent.parent_id ? vm.entities[ent.parent_id] : null;
+    return `<strong>${esc(ent.label)}</strong> is a downstream device reported by ${parent ? `<strong>${esc(parent.label)}</strong>` : "its parent bridge/recorder"} (source: ${esc(ent.identity_source || "bridge inventory")}). Direct reachability from the reporting LAN is <strong>${esc(ent.direct_lan_reachability || "unknown")}</strong>.`;
+  }
   if (ent.kind === "device") {
     const count = (ent.reasons || []).length;
     return count
@@ -2207,7 +2350,16 @@ function plainSummaryForEntity(vm, ent) {
 function renderDrawer() {
   const vm = state?.view;
   const id = currentDrawerID();
-  if (!vm || !id || !vm.entities[id]) return;
+  if (!vm || !id) return;
+  if (id.startsWith("panel:isolation:")) {
+    renderIsolationPanelDrawer(vm, id.slice("panel:isolation:".length));
+    return;
+  }
+  if (id === "panel:coverage") {
+    renderCoveragePanelDrawer(vm);
+    return;
+  }
+  if (!vm.entities[id]) return;
   const ent = vm.entities[id];
   const tone = humanStateTone(ent);
 
@@ -2284,11 +2436,20 @@ function renderDrawer() {
       const peer = vm.entities[pid];
       if (peer) links.push({ id: peer.id, icon: roleIcon(peer.role, peer.is_bmc), title: peer.label, sub: `Connected device · ${humanStateLabel(peer)}` });
     }
+  } else if (ent.kind === "child" && ent.parent_id && vm.entities[ent.parent_id]) {
+    const par = vm.entities[ent.parent_id];
+    links.push({ id: par.id, icon: roleIcon(par.role, par.is_bmc), title: `Managed by ${par.label}`, sub: `Parent bridge / recorder · ${esc(ent.identity_source || "inventory")}` });
+  }
+  if (ent.child_ids && ent.child_ids.length) {
+    for (const cid of ent.child_ids) {
+      const ch = vm.entities[cid];
+      if (ch) links.push({ id: ch.id, icon: roleIcon(ch.role, false), title: ch.label, sub: `${ch.model || ch.subtitle || "Child device"} · Direct LAN: ${ch.direct_lan_reachability || "unknown"}` });
+    }
   }
   if (links.length) {
     b += `<div class="dsec"><div class="dsec-t">Connections</div>`;
     for (const lk of links) {
-      b += `<div class="link-card" onclick="openEntity('${esc(lk.id)}')">
+      b += `<div class="link-card" data-entity-id="${esc(lk.id)}">
         <div style="display:flex;align-items:center;gap:11px;min-width:0">
           <span class="muted">${lk.icon}</span>
           <div style="min-width:0">
@@ -2323,11 +2484,18 @@ function renderDrawer() {
   b += `</div>`;
 
   if (ent.services && ent.services.length) {
-    const reachMap = { wan: "Internet", lan: "Whole Home", "vlan-only": "This Network Only" };
-    b += `<div class="dsec-t" style="margin-top:8px">Open Network Ports (${ent.services.length})</div>
+    const reachMap = {
+      wan: "Internet",
+      "wan-restricted": "Internet (Restricted Source)",
+      "wan-cgnat": "Configured Forward (Behind CGNAT)",
+      lan: "Whole Home",
+      "vlan-only": "This Network Only",
+      advertised: "Advertised (mDNS/Discovery)"
+    };
+    b += `<div class="dsec-t" style="margin-top:8px">Network Services &amp; Ports (${ent.services.length})</div>
       <div class="pills" style="margin-bottom:12px">
-        ${ent.services.map(svc => `<span class="tag ${svc.exposed ? humanStateTone(svc.severity) : (svc.reachable === "wan" ? "blue" : "neutral")}">
-          <span class="mono">${esc(svc.label || (svc.proto + ":" + svc.port))}</span> · ${esc(reachMap[svc.reachable] || svc.reachable)}
+        ${ent.services.map(svc => `<span class="tag ${svc.exposed ? humanStateTone(svc.severity) : (svc.reachable === "wan" || svc.reachable === "wan-restricted" ? "blue" : "neutral")}">
+          <span class="mono">${esc(svc.label || (svc.proto + ":" + svc.port))}</span> · ${esc(reachMap[svc.reachable] || svc.reachable)}${svc.state && svc.state !== "observed-protocol" ? ` (${esc(svc.state)})` : ""}
         </span>`).join("")}
       </div>`;
   }
@@ -2344,6 +2512,16 @@ function renderDrawer() {
     }
   }
 
+  if (ent.outbound_dependencies && ent.outbound_dependencies.length) {
+    b += `<div class="dsec-t" style="margin-top:8px">Outbound Internet Dependencies (${ent.outbound_dependencies.length})</div>`;
+    for (const dep of ent.outbound_dependencies) {
+      b += `<div style="padding:9px 11px;border-radius:9px;background:var(--surface);border:1px solid var(--border);margin-bottom:8px;font-size:12px">
+        <strong>${esc(dep.service_name)}</strong> <span class="small">(${esc(dep.category)} · ${esc(dep.attribution_level)})</span>
+        <div class="small mono" style="margin-top:2px">${esc(dep.destination_host || dep.destination_ip || "-")}${dep.port ? ":" + dep.port : ""} (${esc(dep.transport || "tcp")})</div>
+      </div>`;
+    }
+  }
+
   if (ent.potential_cves && ent.potential_cves.length) {
     b += `<div class="dsec-t" style="margin-top:8px">Unverified Patch Advisories (${ent.potential_cves.length})</div>`;
     for (const s of ent.potential_cves) {
@@ -2355,6 +2533,134 @@ function renderDrawer() {
   }
 
   b += `</div></details>`;
+  document.getElementById("drawer-body").innerHTML = b;
+}
+
+function renderIsolationPanelDrawer(vm, filter) {
+  const iso = vm.isolation || { cells: [] };
+  const allCells = iso.cells || [];
+  const cells = filter === "all" ? allCells : allCells.filter(c => c.verdict === filter);
+
+  const verdictInfo = {
+    approved: { label: "Approved ✓", tone: "ok" },
+    "blocked-ok": { label: "Blocked ✓", tone: "ok" },
+    violation: { label: "Needs narrower rule", tone: "crit" },
+    "broken-dependency": { label: "Broken dependency", tone: "warn" },
+    unknown: { label: "Unknown (missing data)", tone: "warn" }
+  };
+  const fnLabel = {
+    "ipps-printing": "IPPS Printing",
+    "printer-admin": "Printer Admin Settings",
+    "printer-admin-shared-ipp": "CUPS Admin (Shared Port)",
+    "bmc-redfish-admin": "Server Hardware Control (Redfish)",
+    "bmc-ipmi": "Server Hardware Control (IPMI)",
+    "trusted-lan-transit": "Trusted Home Network",
+    "gateway-admin": "Router Admin Login",
+    "gateway-dns": "Router DNS",
+    "gateway-dhcp": "Router DHCP",
+    "same-vlan-wifi-peers": "Same-AP Wi-Fi Peers",
+    "cross-ap-wifi-peers": "Cross-AP Wi-Fi Peers",
+    "same-vlan-wired-peers": "Wired Same-Network Peers",
+    "same-vlan-mixed-peers": "Wired ↔ Wi-Fi Peers"
+  };
+
+  document.getElementById("drawer-hd-content").innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      ${drawerStack.length > 1 ? `<button class="btn sm" onclick="popDrawer()">← Back</button>` : ""}
+      <span class="tag blue">Isolation Policy Check</span>
+    </div>
+    <div style="font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.2">Network Isolation Boundaries</div>
+    <div class="small" style="margin-top:3px">Shows which network paths are blocked, approved, violating policy, or missing controller evidence.</div>`;
+
+  const filters = [
+    { key: "all", label: `All (${allCells.length})` },
+    { key: "violation", label: `Violations (${iso.violation_count || 0})` },
+    { key: "approved", label: `Approved (${iso.approved_count || 0})` },
+    { key: "blocked-ok", label: `Blocked (${iso.blocked_ok_count || 0})` },
+    { key: "unknown", label: `Unknown (${iso.unknown_count || 0})` }
+  ];
+  let b = `<div class="pills" style="margin-bottom:14px">
+    ${filters.map(f => `<button class="btn sm ${filter === f.key ? "primary" : ""}" data-panel-id="panel:isolation:${f.key}">${esc(f.label)}</button>`).join("")}
+  </div>`;
+
+  if (!cells.length) {
+    b += `<div class="summary-box ok">No boundary checks match this filter.</div>`;
+    document.getElementById("drawer-body").innerHTML = b;
+    return;
+  }
+
+  // Index hosts by IPv4, all IPv6 addresses, and label for clickable "Inspect device ->" jumps.
+  const hostByAddr = {};
+  const hostByLabel = {};
+  for (const e of Object.values(vm.entities || {})) {
+    if (e.kind !== "host") continue;
+    if (e.ip) hostByAddr[e.ip.toLowerCase()] = e.id;
+    for (const v6 of (e.ipv6 || [])) {
+      if (v6) hostByAddr[v6.toLowerCase()] = e.id;
+    }
+    if (e.label) hostByLabel[e.label.toLowerCase()] = e.id;
+  }
+
+  for (const c of cells) {
+    const vi = verdictInfo[c.verdict] || { label: c.verdict, tone: "neutral" };
+    const dst = c.dest_host || c.dest_network || c.dest_zone;
+    const fn = fnLabel[c.dest_function] || c.dest_function;
+    const hostID = (c.dest_ip && hostByAddr[c.dest_ip.toLowerCase()]) || (c.dest_host && hostByLabel[c.dest_host.toLowerCase()]) || "";
+    b += `<div class="fix-card ${vi.tone}">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong style="font-size:14px">${esc(c.source_network || c.source_zone)} → ${esc(dst)}</strong>
+        <span class="tag ${vi.tone}">${esc(vi.label)}</span>
+      </div>
+      <div class="pills" style="margin-top:6px">
+        <span class="tag neutral">${esc(fn)}</span>
+        <span class="tag neutral mono">${esc((c.ip_family || "ipv4").toUpperCase())}${c.port ? " · " + esc((c.transport || "tcp").toUpperCase()) + "/" + c.port : ""}</span>
+        <span class="tag neutral">${esc(c.enforcer || c.path_kind)}</span>
+      </div>
+      ${c.decisive_rule_name ? `<div class="small" style="margin-top:6px"><strong>Decisive rule:</strong> ${esc(c.decisive_rule_name)}</div>` : ""}
+      ${c.missing_input ? `<div class="small" style="margin-top:6px;color:var(--warn)"><strong>Missing evidence:</strong> ${esc(c.missing_input)}</div>` : ""}
+      ${c.recommended_fix ? `<div class="fix-step"><strong>How to fix:</strong> ${esc(c.recommended_fix)}</div>` : ""}
+      ${hostID ? `<div style="margin-top:8px"><button class="btn sm ghost" data-entity-id="${esc(hostID)}">Inspect ${esc(dst)} →</button></div>` : ""}
+    </div>`;
+  }
+  document.getElementById("drawer-body").innerHTML = b;
+}
+
+function renderCoveragePanelDrawer(vm) {
+  const sc = vm.service_coverage || {};
+  const byS = sc.by_state || {};
+  const byT = sc.by_transport || {};
+  const byF = sc.by_address_family || {};
+
+  document.getElementById("drawer-hd-content").innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      ${drawerStack.length > 1 ? `<button class="btn sm" onclick="popDrawer()">← Back</button>` : ""}
+      <span class="tag blue">Service Visibility</span>
+    </div>
+    <div style="font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.2">How Services Were Identified</div>
+    <div class="small" style="margin-top:3px">Separates wire-verified services from advertisements, encrypted TLS-only sockets, and external internet dependencies.</div>`;
+
+  let b = `<div class="summary-box blue">
+    UniBlue inspected <strong>${sc.total_observed_endpoints || 0}</strong> unique local service endpoint${(sc.total_observed_endpoints || 0) === 1 ? "" : "s"} and tracked <strong>${sc.outbound_dependencies || 0}</strong> external internet dependenc${(sc.outbound_dependencies || 0) === 1 ? "y" : "ies"} separately.
+  </div>`;
+
+  const stateRows = [
+    ["Observed on the wire", "Protocol handshake verified", byS["observed-protocol"] || 0, "ok"],
+    ["Owner-declared", "Supplied via passive/config feed", byS["owner-declared"] || 0, "ok"],
+    ["Advertised (mDNS/UPnP)", "Announced locally, not actively verified", byS["advertised-service"] || 0, "blue"],
+    ["Encrypted TLS (app unknown)", "TLS verified; inner app kept unknown", byS["tls-unknown-app"] || 0, "neutral"],
+    ["Open port (app unknown)", "Port responded without protocol match", byS["candidate-port"] || 0, "warn"]
+  ];
+  b += `<div class="dsec"><div class="dsec-t">Local Endpoint Evidence</div><div class="card"><div class="checklist">
+    ${stateRows.map(([n, h, v, tone]) => `<div class="chk-row"><div class="chk-l"><span class="chk-dot ${tone}"></span><div><div class="chk-name">${esc(n)}</div><div class="chk-hint">${esc(h)}</div></div></div><div class="chk-val ${tone}">${v}</div></div>`).join("")}
+  </div></div></div>`;
+
+  b += `<details class="tech"><summary>Technical breakdown (transports &amp; Nerva plugins)</summary><div class="tech-body"><div class="kv-grid">
+    <div class="kv"><div class="k">TCP Endpoints</div><div class="v mono">${byT.tcp || 0}</div></div>
+    <div class="kv"><div class="k">UDP Endpoints</div><div class="v mono">${byT.udp || 0}</div></div>
+    <div class="kv"><div class="k">IPv4 / IPv6</div><div class="v mono">${byF.ipv4 || 0} / ${byF.ipv6 || 0}</div></div>
+    <div class="kv"><div class="k">Pinned Recognizers</div><div class="v mono">${sc.pinned_nerva_tcp_capable || 0} TCP/TLS · ${sc.pinned_nerva_udp_only || 0} UDP</div></div>
+  </div></div></details>`;
+
   document.getElementById("drawer-body").innerHTML = b;
 }
 

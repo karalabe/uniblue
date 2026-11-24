@@ -46,6 +46,7 @@ type UniFiPostureSummary struct {
 func AnalyzeUniFiPosture(
 	snap *unifi.Snapshot,
 	trustedSet, isolatedSet map[string]struct{},
+	mgmtVLANs ...string,
 ) (*UniFiPostureSummary, []checks.Finding, []PostureNote) {
 	if snap == nil {
 		return nil, nil, nil
@@ -386,7 +387,9 @@ func AnalyzeUniFiPosture(
 		if !bmcIdentityPattern.MatchString(cl.Name) && !bmcIdentityPattern.MatchString(cl.Hostname) {
 			continue
 		}
-		if oobVLANPattern.MatchString(cl.NetworkName) {
+		if oobVLANPattern.MatchString(cl.NetworkName) ||
+			containsFold(mgmtVLANs, cl.NetworkName) ||
+			(cl.VLAN != "" && containsFold(mgmtVLANs, cl.VLAN)) {
 			continue
 		}
 		findings = append(findings, checks.Finding{

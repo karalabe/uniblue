@@ -115,6 +115,44 @@ func (s *Severity) UnmarshalText(text []byte) error {
 	return nil
 }
 
+// ClaimKind separates what a check or finding actually establishes so pure
+// inventory observations never open false security incidents while configured
+// paths and confirmed permissions remain clearly distinguished.
+type ClaimKind string
+
+const (
+	// ClaimAssetIdentity establishes the identity or role of a host or child device.
+	ClaimAssetIdentity ClaimKind = "asset-identity"
+	// ClaimServiceAdvertised records a service announcement (mDNS/SSDP/WS-D).
+	ClaimServiceAdvertised ClaimKind = "service-advertised"
+	// ClaimServiceObserved records a protocol-aware observed service endpoint.
+	ClaimServiceObserved ClaimKind = "service-observed"
+	// ClaimConfiguredAccess records a policy, route, ACL, or NAT configured path.
+	ClaimConfiguredAccess ClaimKind = "configured-access"
+	// ClaimConfirmedPermission records an evidenced anonymous or excess permission/exposure.
+	ClaimConfirmedPermission ClaimKind = "confirmed-permission"
+)
+
+// ParseClaimKind validates and normalizes a YAML claim string.
+func ParseClaimKind(s string) (ClaimKind, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return "", nil
+	case string(ClaimAssetIdentity):
+		return ClaimAssetIdentity, nil
+	case string(ClaimServiceAdvertised):
+		return ClaimServiceAdvertised, nil
+	case string(ClaimServiceObserved):
+		return ClaimServiceObserved, nil
+	case string(ClaimConfiguredAccess):
+		return ClaimConfiguredAccess, nil
+	case string(ClaimConfirmedPermission):
+		return ClaimConfirmedPermission, nil
+	default:
+		return "", fmt.Errorf("unknown claim %q", s)
+	}
+}
+
 // Check defines a single declarative, community-submittable LAN/IoT check.
 type Check struct {
 	// ID uniquely identifies the check (e.g., "UB-0001" or "UB-2026-0042").
@@ -128,6 +166,16 @@ type Check struct {
 
 	// Category classifies the bug (e.g., "unauth-control", "exposed-protocol").
 	Category string `yaml:"category"`
+
+	// Claim declares the semantic evidence level established when this check
+	// matches (asset-identity, service-advertised, service-observed,
+	// configured-access, or confirmed-permission).
+	Claim ClaimKind `yaml:"claim,omitempty"`
+
+	// Property optionally names the specific security property proven (e.g.,
+	// "tls-protocol", "auth-anon", "smb-v1") so independent properties on the
+	// same endpoint are never deduplicated against one another.
+	Property string `yaml:"property,omitempty"`
 
 	// Severity is the base impact before UniFi VLAN/WAN blast-radius scoring.
 	Severity Severity `yaml:"severity"`
@@ -459,6 +507,15 @@ func (c *Check) Validate() error {
 	if strings.TrimSpace(c.Safety) != "read-only" {
 		return fmt.Errorf("safety must be %q (got %q)", "read-only", c.Safety)
 	}
+	if c.Claim != "" {
+		parsedClaim, err := ParseClaimKind(string(c.Claim))
+		if err != nil {
+			return err
+		}
+		c.Claim = parsedClaim
+	} else {
+		c.Claim = inferDefaultClaim(c)
+	}
 	hasSelector := len(c.Preconditions.PortsAny) > 0 ||
 		len(c.Preconditions.PortsAll) > 0 ||
 		len(c.Preconditions.MDNSTypeAny) > 0 ||
@@ -488,7 +545,9 @@ func (c *Check) Validate() error {
 	case "observe", "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr",
 		"comfoconnect", "eth-rpc", "adb", "rdp-nla", "ftp-anon", "esfile",
 		"redis", "snmp", "tls-legacy", "memcached", "rsync", "mpd", "kasa",
-		"coap", "natpmp", "ipp", "ipmi":
+		"coap", "natpmp", "ipp", "ipmi",
+		"bitcoin-p2p", "bitcoin-rpc", "eth-engine", "nut", "lifx",
+		"pjlink", "nbns", "pcp", "dns-recursion", "ntp", "stun":
 	case "http":
 		method := strings.ToUpper(strings.TrimSpace(c.Probe.Method))
 		if method == "" {
@@ -607,4 +666,46 @@ func (c *Check) httpPaths() []string {
 		}
 	}
 	return out
+}
+
+// DefaultTransport returns the L4 transport ("tcp" or "udp") exercised by this check.
+func (c *Check) DefaultTransport() string {
+	switch strings.ToLower(strings.TrimSpace(c.Probe.Type)) {
+	case "snmp", "coap", "natpmp", "ipmi", "lifx", "nbns", "pcp", "dns-recursion", "ntp", "stun":
+		return "udp"
+	case "observe":
+		for _, t := range c.Preconditions.MDNSTypeAny {
+			if strings.Contains(strings.ToLower(t), "._udp") || strings.EqualFold(t, "_matter._tcp") {
+				return "udp"
+			}
+		}
+		if len(c.Preconditions.PortsAny) == 0 && len(c.Preconditions.PortsAll) == 0 &&
+			(c.Preconditions.WSTypeRegex != "" || c.Preconditions.UPnPDeviceRegex != "" || c.Preconditions.UPnPServiceRegex != "") {
+			return "udp"
+		}
+		return "tcp"
+	default:
+		return "tcp"
+	}
+}
+
+func inferDefaultClaim(c *Check) ClaimKind {
+	cat := strings.ToLower(strings.TrimSpace(c.Category))
+	pt := strings.ToLower(strings.TrimSpace(c.Probe.Type))
+	switch {
+	case cat == "service-inventory" || cat == "device-inventory":
+		if pt == "observe" {
+			if len(c.Preconditions.MDNSTypeAny) > 0 {
+				return ClaimServiceAdvertised
+			}
+			return ClaimAssetIdentity
+		}
+		return ClaimServiceObserved
+	case cat == "firewall-policy" || cat == "isolation-policy":
+		return ClaimConfiguredAccess
+	case pt == "tls-legacy" || pt == "telnet" || pt == "tcp" || pt == "bitcoin-p2p" || pt == "nbns" || pt == "ntp" || pt == "stun" || pt == "lifx" || cat == "oob-bmc":
+		return ClaimServiceObserved
+	default:
+		return ClaimConfirmedPermission
+	}
 }

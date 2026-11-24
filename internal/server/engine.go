@@ -216,6 +216,7 @@ type Engine struct {
 	mu             sync.RWMutex
 	snap           *unifi.Snapshot
 	profilesByMAC  map[string]probe.HostProfile
+	findingsByMAC  map[string][]checks.Finding
 	missingClients map[string]missingClient
 	lastPorts      map[string]portLiveState
 	anomalies      *anomalyTracker
@@ -293,6 +294,7 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 		logger:         opts.Logger,
 		startedAt:      time.Now().UTC(),
 		profilesByMAC:  make(map[string]probe.HostProfile),
+		findingsByMAC:  make(map[string][]checks.Finding),
 		missingClients: make(map[string]missingClient),
 		lastPorts:      make(map[string]portLiveState),
 		anomalies:      newAnomalyTracker(),
@@ -763,9 +765,14 @@ func (e *Engine) scanSingleHost(ctx context.Context, cl unifi.Client) {
 		return
 	}
 	hp := profiles[0]
+	enrichedSingle := []probe.HostProfile{hp.Clone()}
+	attachConfiguredEnrichments(nil, enrichedSingle, e.cfg.Network)
+	runner := checks.NewRunner(e.checkList, 1)
+	hostCheckFindings := runner.RunHost(ctx, enrichedSingle[0])
 
 	e.mu.Lock()
 	e.profilesByMAC[clientKey(cl)] = hp
+	e.findingsByMAC[clientKey(cl)] = hostCheckFindings
 	e.mu.Unlock()
 
 	e.recomputeAndPublish(ctx, false)
@@ -776,7 +783,7 @@ func (e *Engine) scanSingleHost(ctx context.Context, cl unifi.Client) {
 	var hostFindings int
 	maxSev := checks.SeverityInfo
 	for _, f := range published.Report.Findings {
-		if f.Client.IP == cl.IP && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" {
+		if f.Client.IP == cl.IP && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" && !f.IsInventoryOnly() {
 			hostFindings++
 			if f.EffectiveSeverity > maxSev {
 				maxSev = f.EffectiveSeverity
@@ -815,6 +822,22 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
+	// Run Stage 2 active/passive checks once per full scan on deep-cloned enriched
+	// profiles and cache per-host results so subsequent topology/policy-only
+	// recomputations require ZERO device network I/O.
+	enriched := make([]probe.HostProfile, len(profiles))
+	for i, hp := range profiles {
+		enriched[i] = hp.Clone()
+	}
+	attachConfiguredEnrichments(snap, enriched, e.cfg.Network)
+	runner := checks.NewRunner(e.checkList, e.cfg.Scan.Concurrency)
+	freshFindings := runner.RunAll(ctx, enriched)
+	byMAC := make(map[string][]checks.Finding, len(profiles))
+	for _, f := range freshFindings {
+		k := clientKey(f.Client)
+		byMAC[k] = append(byMAC[k], f)
+	}
+
 	e.mu.Lock()
 	e.snap = snap
 	e.lastFwdSig = portForwardSignature(snap.PortForwards)
@@ -824,6 +847,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	for _, hp := range profiles {
 		e.profilesByMAC[clientKey(hp.Client)] = hp
 	}
+	e.findingsByMAC = byMAC
 	e.missingClients = make(map[string]missingClient)
 	e.mu.Unlock()
 
@@ -844,14 +868,27 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 // snapshot and host profiles.
 func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 	e.mu.RLock()
-	snap := e.snap
-	if snap == nil {
+	snapPtr := e.snap
+	if snapPtr == nil {
 		e.mu.RUnlock()
 		return
 	}
+	// Shallow-copy Snapshot header so site-supplement enrichment never mutates shared pointers.
+	snapCopy := *snapPtr
+	if snapPtr.Visibility != nil {
+		visCopy := *snapPtr.Visibility
+		visCopy.MissingFeeds = append([]string(nil), snapPtr.Visibility.MissingFeeds...)
+		snapCopy.Visibility = &visCopy
+	}
+	snap := &snapCopy
+
 	profiles := make([]probe.HostProfile, 0, len(e.profilesByMAC))
-	for _, hp := range e.profilesByMAC {
-		profiles = append(profiles, hp)
+	var cachedFindings []checks.Finding
+	for k, hp := range e.profilesByMAC {
+		profiles = append(profiles, hp.Clone())
+		if fl := e.findingsByMAC[k]; len(fl) > 0 {
+			cachedFindings = append(cachedFindings, fl...)
+		}
 	}
 	prevRisk := e.prevRiskState
 	e.mu.RUnlock()
@@ -859,9 +896,9 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 	sort.Slice(profiles, func(i, j int) bool {
 		return profiles[i].Client.IP < profiles[j].Client.IP
 	})
+	attachConfiguredEnrichments(snap, profiles, e.cfg.Network)
 
-	runner := checks.NewRunner(e.checkList, e.cfg.Scan.Concurrency)
-	rawFindings := runner.RunAll(ctx, profiles)
+	rawFindings := append([]checks.Finding(nil), cachedFindings...)
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 	report := risk.Evaluate(snap, rawFindings, e.cfg.Network)
 
@@ -894,7 +931,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 	}
 	findingsByIP := make(map[string][]checks.Finding)
 	for _, f := range report.Findings {
-		if f.Client.IP != "" && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" {
+		if f.Client.IP != "" && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" && !f.IsInventoryOnly() {
 			findingsByIP[f.Client.IP] = append(findingsByIP[f.Client.IP], f)
 		}
 	}
@@ -1023,6 +1060,43 @@ func clientKey(cl unifi.Client) string {
 	return cl.IP
 }
 
+// attachConfiguredEnrichments merges any owner-provided read-only bridge/NVR
+// inventories, passive flow records, and site supplement telemetry without
+// network I/O, recording any load errors into snap.Visibility.MissingFeeds.
+func attachConfiguredEnrichments(snap *unifi.Snapshot, profiles []probe.HostProfile, netCfg config.NetworkConfig) {
+	if snap != nil && strings.TrimSpace(netCfg.SiteSupplementPath) != "" {
+		_ = unifi.ApplySiteSupplement(snap, netCfg.SiteSupplementPath)
+	}
+	for _, bi := range netCfg.BridgeInventories {
+		if strings.TrimSpace(bi.Path) == "" {
+			continue
+		}
+		children, err := probe.LoadBridgeInventory(probe.BridgeInventorySpec{
+			Format:       bi.Format,
+			Path:         bi.Path,
+			ParentIP:     bi.ParentIP,
+			ParentMAC:    bi.ParentMAC,
+			ParentRole:   bi.ParentRole,
+			ObservedFrom: bi.ObservedFrom,
+		})
+		if err != nil {
+			unifi.RecordMissingFeed(snap, fmt.Sprintf("bridge-inventory (%s: %v)", bi.Path, err))
+			continue
+		}
+		if len(children) > 0 {
+			probe.AttachBridgeChildren(profiles, children)
+		}
+	}
+	if strings.TrimSpace(netCfg.PassiveFlowsPath) != "" {
+		flows, err := probe.LoadPassiveFlows(netCfg.PassiveFlowsPath)
+		if err != nil {
+			unifi.RecordMissingFeed(snap, fmt.Sprintf("passive-flows (%s: %v)", netCfg.PassiveFlowsPath, err))
+		} else if len(flows) > 0 {
+			probe.ApplyPassiveFlows(profiles, flows)
+		}
+	}
+}
+
 func fallbackVLAN(name string) string {
 	if name == "" {
 		return "unknown VLAN"
@@ -1042,12 +1116,14 @@ func portForwardSignature(pfs []unifi.PortForward) string {
 func firewallPolicySignature(pols []unifi.FirewallPolicy) string {
 	parts := make([]string, 0, len(pols))
 	for _, p := range pols {
-		if strings.EqualFold(p.Origin, "SYSTEM_DEFINED") {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s|%s|%v|%s|%s|%s->%s", p.ID, p.Name, p.Enabled, p.Action, p.Protocol, p.Source.ZoneName, p.Destination.ZoneName))
+		parts = append(parts, fmt.Sprintf(
+			"%d|%s|%s|%s|%v|%s|%s|%s|%v|%v|%s|%s(%v,%v,%v,%v)->%s(%v,%v,%v,%v)",
+			p.Index, p.Origin, p.ID, p.Name, p.Enabled, p.Action, p.IPVersion, p.Protocol,
+			p.ConnectionStates, p.MatchReturnTraffic, p.Schedule,
+			p.Source.ZoneName, p.Source.IPs, p.Source.NetworkIDs, p.Source.Ports, p.Source.NegateTarget,
+			p.Destination.ZoneName, p.Destination.IPs, p.Destination.NetworkIDs, p.Destination.Ports, p.Destination.NegateTarget,
+		))
 	}
-	sort.Strings(parts)
 	return strings.Join(parts, ";")
 }
 

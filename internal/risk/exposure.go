@@ -178,13 +178,13 @@ func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client) Exp
 // matches evaluates whether a PortForward satisfies an ExposureRule's protocol,
 // port list, or optional rule-name regex.
 func (r *ExposureRule) matches(pf unifi.PortForward) bool {
-	if r.Proto != "" && !strings.Contains(strings.ToLower(pf.Proto), strings.ToLower(r.Proto)) {
+	if r.Proto != "" && !pf.MatchesTransport(r.Proto) {
 		return false
 	}
 
 	portHit := false
 	for _, p := range r.Ports {
-		if pf.ExposesPort(p) || portSpecMatches(pf.DstPort, p) {
+		if pf.ExposesPort(p) {
 			portHit = true
 			break
 		}
@@ -276,7 +276,7 @@ func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg conf
 	// non-isolated (trusted/internal) network.
 	exposedInternalHosts := make(map[string]struct{})
 	for _, f := range findings {
-		if f.Port > 0 && matchesVLAN(f.Client, trustedSet) {
+		if f.Port > 0 && !f.IsInventoryOnly() && matchesVLAN(f.Client, trustedSet) {
 			exposedInternalHosts[f.Client.DisplayName()] = struct{}{}
 		}
 	}
@@ -359,14 +359,56 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 	isoZones := isolatedZoneSet(snap)
 	gwName, gwIP := findGatewayIdentity(snap)
 
+	// Sort policies by Index so we can detect when an earlier broad BLOCK/REJECT
+	// rule already shadows a later ALLOW policy on the same zone pair.
+	sorted := make([]unifi.FirewallPolicy, len(snap.FirewallPolicies))
+	copy(sorted, snap.FirewallPolicies)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Index != sorted[j].Index {
+			return sorted[i].Index < sorted[j].Index
+		}
+		return i < j
+	})
+
+	isShadowedByEarlierDeny := func(pos int, pol unifi.FirewallPolicy) bool {
+		for k := 0; k < pos; k++ {
+			earlier := sorted[k]
+			if !earlier.Enabled {
+				continue
+			}
+			act := strings.ToUpper(strings.TrimSpace(earlier.Action))
+			if act != "BLOCK" && act != "REJECT" && act != "DROP" {
+				continue
+			}
+			if !strings.EqualFold(earlier.Source.ZoneName, pol.Source.ZoneName) ||
+				!strings.EqualFold(earlier.Destination.ZoneName, pol.Destination.ZoneName) {
+				continue
+			}
+			if !matchesIPFamily(earlier.IPVersion, firstNonEmptyStr(pol.IPVersion, "both")) &&
+				!strings.EqualFold(earlier.IPVersion, "both") && earlier.IPVersion != "" {
+				continue
+			}
+			if earlier.Source.AnyTarget && earlier.Destination.AnyTarget && earlier.Destination.AnyPort &&
+				(earlier.Protocol == "" || strings.EqualFold(earlier.Protocol, "all") || strings.EqualFold(earlier.Protocol, pol.Protocol)) &&
+				len(earlier.ConnectionStates) == 0 && earlier.Schedule == "" &&
+				!earlier.Source.NegateTarget && !earlier.Destination.NegateTarget && !earlier.Destination.NegatePort {
+				return true
+			}
+		}
+		return false
+	}
+
 	var findings []checks.Finding
-	for _, pol := range snap.FirewallPolicies {
+	for pos, pol := range sorted {
 		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
 			continue
 		}
 		// Skip UniFi built-in system policies (port-forward auto-rules, DHCPv6,
 		// WireGuard listener, etc.); port forwards are audited separately via WANSurface.
 		if strings.EqualFold(pol.Origin, "SYSTEM_DEFINED") {
+			continue
+		}
+		if isShadowedByEarlierDeny(pos, pol) {
 			continue
 		}
 

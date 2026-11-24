@@ -1,0 +1,38 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0077
+title: EV Charging Station Local Service Discovered via DNS-SD
+cve: null
+category: service-inventory
+claim: service-advertised
+property: ev-charger-identity
+severity: info
+safety: read-only
+
+metadata:
+  vendor: OpenEVSE / NRGkick / TechnoVE
+  product: Networked EV Charger
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://openchargealliance.org/protocols/open-charge-point-protocol/
+
+preconditions:
+  mdns_type_any: ["_openevse._tcp", "_nrgkick._tcp", "_technove-stations._tcp"]
+  discovery_only: true
+
+probe:
+  type: observe
+  match:
+    evidence_summary: "EV charging station local control interface advertised via DNS-SD"
+
+remediation:
+  summary: >
+    EV charger inventory record. Keep charger administration and OCPP endpoints
+    isolated from guest networks and verify OCPP TLS/authentication profile.
+  unifi_actions:
+    - move_to_iot_vlan

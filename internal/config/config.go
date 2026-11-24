@@ -133,6 +133,81 @@ type NetworkConfig struct {
 	// PhysicalPorts assigns explicit physical-perimeter zones ("external",
 	// "internal", or "unused") and optional allowed MACs to specific switch ports.
 	PhysicalPorts []PhysicalPortRule `yaml:"physical_ports,omitempty"`
+
+	// BridgeInventories lists optional owner-provided read-only bridge, NVR,
+	// Zigbee2MQTT, Z-Wave JS, Matter, or BLE proxy inventory files.
+	BridgeInventories []BridgeInventoryConfig `yaml:"bridge_inventories,omitempty"`
+
+	// PassiveFlowsPath optionally points to an owner-supplied passive service /
+	// flow log file (Zeek known_services, IPFIX summary, or JSON/YAML manifest).
+	PassiveFlowsPath string `yaml:"passive_flows_path,omitempty"`
+
+	// SiteSupplementPath optionally points to an owner-supplied YAML/JSON file
+	// supplying controller-omitted telemetry (switch ACLs, dynamic NAT leases,
+	// reverse proxy routes, published tunnels, and backup freshness).
+	SiteSupplementPath string `yaml:"site_supplement_path,omitempty"`
+
+	// IsolationPolicy declares optional site isolation intent and explicitly
+	// approved cross-zone workflows (e.g., Guest -> Printer IPPS TCP 631 allowed,
+	// Admin Workstation -> BMC allowed) so UniBlue preserves legitimate
+	// dependencies and leaves approved paths out of the action queue.
+	IsolationPolicy IsolationIntent `yaml:"isolation_policy,omitempty"`
+}
+
+// BridgeInventoryConfig points to one owner-supplied bridge/recorder inventory file.
+type BridgeInventoryConfig struct {
+	Format       string `yaml:"format"`
+	Path         string `yaml:"path"`
+	ParentIP     string `yaml:"parent_ip,omitempty"`
+	ParentMAC    string `yaml:"parent_mac,omitempty"`
+	ParentRole   string `yaml:"parent_role,omitempty"`
+	ObservedFrom string `yaml:"observed_from,omitempty"`
+}
+
+// ApprovedPath declares one explicitly intended cross-zone service workflow
+// (such as Guest -> Printer IPPS on TCP 631 or NVR -> Camera RTSP on TCP 554).
+type ApprovedPath struct {
+	Name        string `yaml:"name" json:"name"`
+	SourceZone  string `yaml:"source_zone" json:"source_zone"`
+	DestRole    string `yaml:"dest_role,omitempty" json:"dest_role,omitempty"`
+	DestIP      string `yaml:"dest_ip,omitempty" json:"dest_ip,omitempty"`
+	DestZone    string `yaml:"dest_zone,omitempty" json:"dest_zone,omitempty"`
+	Function    string `yaml:"function" json:"function"` // e.g., "ipps-printing", "bmc-admin", "camera-recording"
+	Transport   string `yaml:"transport" json:"transport"`
+	Port        int    `yaml:"port" json:"port"`
+	IPVersion   string `yaml:"ip_version,omitempty" json:"ip_version,omitempty"` // "ipv4" | "ipv6" | "both"
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+}
+
+// IsolationIntent captures declared site segmentation goals and approved workflows.
+type IsolationIntent struct {
+	// ManagementVLANs lists VLAN/network names reserved for OOB/BMC/admin gear.
+	ManagementVLANs []string `yaml:"management_vlans,omitempty" json:"management_vlans,omitempty"`
+
+	// CameraVLANs lists VLAN/network names dedicated to IP cameras/NVRs.
+	CameraVLANs []string `yaml:"camera_vlans,omitempty" json:"camera_vlans,omitempty"`
+
+	// GuestVLANs lists VLAN/network names reserved for guests/visitors.
+	GuestVLANs []string `yaml:"guest_vlans,omitempty" json:"guest_vlans,omitempty"`
+
+	// AdminSourceIPs lists explicitly approved administrator workstation/jump-host IPs.
+	AdminSourceIPs []string `yaml:"admin_source_ips,omitempty" json:"admin_source_ips,omitempty"`
+
+	// ApprovedPaths lists explicitly permitted cross-zone service paths.
+	ApprovedPaths []ApprovedPath `yaml:"approved_paths,omitempty" json:"approved_paths,omitempty"`
+
+	// RequireSameVLANIsolation lists network/VLAN names where same-VLAN peer
+	// isolation is required by policy (triggering switch ACL / AP isolation checks).
+	RequireSameVLANIsolation []string `yaml:"require_same_vlan_isolation,omitempty" json:"require_same_vlan_isolation,omitempty"`
+
+	// ApprovedDHCPServers lists authorized DHCPv4 server IPs on the site.
+	ApprovedDHCPServers []string `yaml:"approved_dhcp_servers,omitempty" json:"approved_dhcp_servers,omitempty"`
+
+	// ApprovedMDNSServices lists service types intentionally reflected across VLANs (e.g., "_ipps._tcp").
+	ApprovedMDNSServices []string `yaml:"approved_mdns_services,omitempty" json:"approved_mdns_services,omitempty"`
+
+	// VPNOnlyVLANs lists VLANs that must fail closed if a VPN uplink drops.
+	VPNOnlyVLANs []string `yaml:"vpn_only_vlans,omitempty" json:"vpn_only_vlans,omitempty"`
 }
 
 // ScanConfig controls probing concurrency, timeouts, and check loading.

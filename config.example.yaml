@@ -43,6 +43,35 @@ unifi:
 #       zone: "external"       # external | internal | unused
 #       label: "Driveway PoE camera drop"
 #       allowed_macs: ["aa:bb:cc:dd:ee:ff"]
+#
+#   # Optional read-only bridge/NVR/coordinator child device inventories.
+#   bridge_inventories:
+#     - format: "nvr"          # generic | nvr | zigbee2mqtt | zwave-js | matter | ble | energy
+#       path: "nvr-cameras.json"
+#       parent_ip: "192.168.30.10"
+#       parent_mac: "aa:bb:cc:dd:ee:01"
+#
+#   # Optional passive service/flow metadata (Zeek known_services, IPFIX, JSON/YAML).
+#   passive_flows_path: "passive-flows.json"
+#
+#   # Optional site supplement for controller-omitted telemetry (switch ACLs,
+#   # reverse proxy routes, published tunnels, dynamic NAT mappings, backups).
+#   site_supplement_path: "site-supplement.yaml"
+#
+#   # Optional site isolation intent and explicitly approved cross-zone workflows.
+#   isolation_policy:
+#     management_vlans: ["Management"]
+#     guest_vlans: ["Guest"]
+#     camera_vlans: ["Cameras"]
+#     require_same_vlan_isolation: ["Guest", "IoT"]
+#     approved_paths:
+#       - name: "Guest IPPS Printing"
+#         source_zone: "Hotspot"
+#         dest_role: "printer"
+#         dest_ip: "192.168.10.50"
+#         function: "ipps-printing"
+#         transport: "tcp"
+#         port: 631
 
 # scan:
 #   extra_ports: []        # Added on top of UniBlue's curated port list
