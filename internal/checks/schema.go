@@ -488,7 +488,7 @@ func (c *Check) Validate() error {
 	case "observe", "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr",
 		"comfoconnect", "eth-rpc", "adb", "rdp-nla", "ftp-anon", "esfile",
 		"redis", "snmp", "tls-legacy", "memcached", "rsync", "mpd", "kasa",
-		"coap", "natpmp", "ipp":
+		"coap", "natpmp", "ipp", "ipmi":
 	case "http":
 		method := strings.ToUpper(strings.TrimSpace(c.Probe.Method))
 		if method == "" {

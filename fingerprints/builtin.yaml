@@ -174,3 +174,34 @@
   ports_any: [11434]
   vendors: ["ollama"]
   products: ["ollama"]
+
+- name: AMI MegaRAC / ASUS ASMB BMC
+  hostname_regex: "(?i)(megarac|asmb|management console|ipmi|bmc)"
+  http_title_regex: "(?i)(megarac|asmb|american megatrends|ikvm)"
+  ports_any: [623, 5120, 5123, 7578]
+  vendors: ["ami", "asus"]
+  products: ["*megarac*", "*asmb*"]
+
+- name: Supermicro IPMI / BMC
+  hostname_regex: "(?i)(supermicro|ipmi)"
+  http_title_regex: "(?i)(supermicro|aten)"
+  vendors: ["supermicro"]
+  products: ["*bmc*", "*ipmi*", "*x10*", "*x11*", "*x12*"]
+
+- name: Dell iDRAC
+  hostname_regex: "(?i)idrac"
+  http_title_regex: "(?i)idrac|integrated dell remote access"
+  vendors: ["dell"]
+  products: ["*idrac*"]
+
+- name: HPE iLO
+  hostname_regex: "(?i)(^|[-_.])ilo([0-9]|$)"
+  http_title_regex: "(?i)ilo\\s*[0-9]|integrated lights-out"
+  vendors: ["hp", "hpe"]
+  products: ["*integrated_lights-out*", "*ilo*"]
+
+- name: Intel AMT / vPro
+  ports_any: [16992, 16993]
+  http_title_regex: "(?i)intel.*active management"
+  vendors: ["intel"]
+  products: ["*active_management_technology*"]

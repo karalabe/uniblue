@@ -20,6 +20,14 @@ import (
 // intend them to be segmented off the Trusted/Internal LAN.
 var isolatedSSIDPattern = regexp.MustCompile(`(?i)\b(iot|guest|visitor|smart|camera|cam|things|untrusted|dmz|kids|external)\b`)
 
+// bmcIdentityPattern identifies out-of-band server management consoles (BMCs)
+// from their UniFi alias or hostname so UniBlue can flag shared-VLAN placement
+// even before active IPMI/Redfish probing runs.
+var bmcIdentityPattern = regexp.MustCompile(`(?i)(^|[-_.\s(])(ipmi|idrac|ilo[0-9]?|ikvm|bmc|asmb[0-9]?|megarac|mgmt[-_]?console|management\s+console|openbmc)($|[-_.\s)])`)
+
+// oobVLANPattern matches dedicated out-of-band management VLAN names.
+var oobVLANPattern = regexp.MustCompile(`(?i)\b(oob|mgmt|management|bmc|ipmi|idrac|ilo)\b`)
+
 // UniFiPostureSummary packages site-wide UniFi controller security settings,
 // Wi-Fi SSID inventory, neighboring AP counts, WAN/VPN health, and recent
 // controller security/admin log highlights for JSON reports and the Web UI.
@@ -370,6 +378,34 @@ func AnalyzeUniFiPosture(
 			Severity: checks.SeverityInfo,
 			Title:    fmt.Sprintf("%d UniFi admin console access event(s) in the last 24h", adminCount),
 			Detail:   "Live admin logins and configuration edits are streamed in real time by `uniblue serve`.",
+		})
+	}
+
+	// 5. Audit Out-of-Band Server Management Consoles (BMCs) placed on shared VLANs.
+	for _, cl := range snap.Clients {
+		if !bmcIdentityPattern.MatchString(cl.Name) && !bmcIdentityPattern.MatchString(cl.Hostname) {
+			continue
+		}
+		if oobVLANPattern.MatchString(cl.NetworkName) {
+			continue
+		}
+		findings = append(findings, checks.Finding{
+			CheckID:           "UB-UNIFI-BMC-SHARED-VLAN",
+			Title:             fmt.Sprintf("Server Management Console (BMC) on Shared VLAN (%s)", cl.DisplayName()),
+			Category:          "oob-bmc",
+			BaseSeverity:      checks.SeverityHigh,
+			EffectiveSeverity: checks.SeverityHigh,
+			RiskReasons:       []string{fmt.Sprintf("ring-(-3) bare-metal BMC shares VLAN %q with regular hosts", cl.NetworkName)},
+			Client:            cl,
+			Evidence:          fmt.Sprintf("Out-of-band server management interface %s (%s) is attached to shared network %q instead of an isolated OOB Management VLAN", cl.DisplayName(), cl.IP, cl.NetworkName),
+			Remediation: checks.Remediation{
+				Summary: "Server BMCs (IPMI/iDRAC/iLO/ASMB/MegaRAC) run long-lived embedded firmware with bare-metal power, BIOS, virtual-USB boot, and KVM control. Place BMCs on a dedicated, firewall-isolated Out-of-Band Management VLAN reachable only from administrator IPs/VPN, and audit BMC firmware updates.",
+				UniFiActions: []string{
+					"move_bmc_to_dedicated_oob_mgmt_vlan",
+					"restrict_bmc_access_to_admin_ips",
+					"update_bmc_firmware",
+				},
+			},
 		})
 	}
 

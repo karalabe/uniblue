@@ -474,9 +474,24 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		}
 	}
 
+	telem := <-telemetryCh
+
+	// Index rest/user friendly names by fixed_ip so active hosts with ephemeral
+	// MACs (e.g. Docker macvlan containers) or static BMCs retain UniFi aliases.
+	userNameByFixedIP := make(map[string]string)
+	for _, u := range telem.knownUsers {
+		if ip := strings.TrimSpace(u.FixedIP); ip != "" && strings.TrimSpace(u.Name) != "" {
+			userNameByFixedIP[ip] = strings.TrimSpace(u.Name)
+		}
+	}
+
+	seenMAC := make(map[string]struct{}, len(cr.items))
 	clients := make([]Client, 0, len(cr.items))
 	for _, rc := range cr.items {
 		mac := strings.ToLower(strings.TrimSpace(rc.MACAddress))
+		if mac != "" {
+			seenMAC[mac] = struct{}{}
+		}
 		cl := Client{
 			MAC:      mac,
 			IP:       strings.TrimSpace(rc.IPAddress),
@@ -487,6 +502,9 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		if lc, ok := legacyClientByMAC[mac]; ok {
 			if h := strings.TrimSpace(lc.Hostname); h != "" {
 				cl.Hostname = h
+			}
+			if n := strings.TrimSpace(lc.Name); n != "" && cl.Name == "" {
+				cl.Name = n
 			}
 			if o := strings.TrimSpace(lc.OUI); o != "" {
 				cl.OUI = o
@@ -500,9 +518,54 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			cl.FirstSeen = lc.FirstSeen
 			cl.LastSeen = lc.LastSeen
 		}
+		if (cl.Name == "" || strings.EqualFold(cl.Name, cl.MAC)) && cl.IP != "" {
+			if alias, ok := userNameByFixedIP[cl.IP]; ok {
+				cl.Name = alias
+			}
+		}
 		if addr, err := netip.ParseAddr(cl.IP); err == nil {
 			// Pick the most specific matching CIDR (longest prefix) in case
 			// overlapping subnets exist.
+			bestBits := -1
+			for _, se := range subnets {
+				if se.prefix.Contains(addr) && se.prefix.Bits() > bestBits {
+					bestBits = se.prefix.Bits()
+					cl.NetworkID = se.net.ID
+					cl.NetworkName = se.net.Name
+					cl.VLAN = se.net.VLAN
+				}
+			}
+		}
+		clients = append(clients, cl)
+	}
+	// Merge any active clients visible in legacy stat/sta that Integration v1
+	// omitted (commonly static-IP BMCs or shared-NIC management interfaces).
+	for mac, lc := range legacyClientByMAC {
+		if _, dup := seenMAC[mac]; dup {
+			continue
+		}
+		ip := strings.TrimSpace(lc.IP)
+		name := strings.TrimSpace(lc.Name)
+		if name == "" && ip != "" {
+			name = userNameByFixedIP[ip]
+		}
+		cl := Client{
+			MAC:        mac,
+			IP:         ip,
+			Hostname:   strings.TrimSpace(lc.Hostname),
+			Name:       name,
+			OUI:        strings.TrimSpace(lc.OUI),
+			IsWired:    lc.IsWired,
+			ESSID:      strings.TrimSpace(lc.ESSID),
+			SwitchMAC:  strings.ToLower(strings.TrimSpace(lc.SwMAC)),
+			SwitchPort: lc.SwPort,
+			APMAC:      strings.ToLower(strings.TrimSpace(lc.APMAC)),
+			TxBytes:    lc.TxBytes + lc.WiredTxBytes,
+			RxBytes:    lc.RxBytes + lc.WiredRxBytes,
+			FirstSeen:  lc.FirstSeen,
+			LastSeen:   lc.LastSeen,
+		}
+		if addr, err := netip.ParseAddr(cl.IP); err == nil {
 			bestBits := -1
 			for _, se := range subnets {
 				if se.prefix.Contains(addr) && se.prefix.Bits() > bestBits {
@@ -565,7 +628,6 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	}
 
 	forwards := convertPortForwards(fr.items)
-	telem := <-telemetryCh
 
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),

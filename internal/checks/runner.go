@@ -516,6 +516,8 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 		return probeNATPMP(probeCtx, ip, port)
 	case "ipp":
 		return r.probeIPP(probeCtx, ip, port)
+	case "ipmi":
+		return probeIPMI(probeCtx, ip, port)
 	default:
 		return "", false
 	}

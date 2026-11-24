@@ -59,6 +59,7 @@ type rawHealth struct {
 // rawHistoricalUser maps /api/s/<site>/rest/user entries.
 type rawHistoricalUser struct {
 	MAC                     string `json:"mac"`
+	FixedIP                 string `json:"fixed_ip"`
 	Name                    string `json:"name"`
 	Hostname                string `json:"hostname"`
 	IsWired                 bool   `json:"is_wired"`

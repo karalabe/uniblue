@@ -68,6 +68,13 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 				IsWired:     true,
 				NetworkName: "Default",
 			},
+			{
+				Name:        "Compute Server Management Console",
+				MAC:         "aa:bb:cc:dd:ee:99",
+				IP:          "192.168.2.5",
+				IsWired:     true,
+				NetworkName: "Servers",
+			},
 		},
 		WLANs: []unifi.WLANConfig{
 			{
@@ -161,6 +168,7 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 		"UB-UNIFI-SSH-PASSWORD":         checks.SeverityHigh,
 		"UB-UNIFI-UPNP-ENABLED":         checks.SeverityHigh,
 		"UB-UNIFI-HONEYPOT-HIT":         checks.SeverityCritical,
+		"UB-UNIFI-BMC-SHARED-VLAN":      checks.SeverityHigh,
 	}
 	for id, wantSev := range want {
 		sev, ok := got[id]
