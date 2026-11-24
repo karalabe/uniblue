@@ -9,7 +9,7 @@ metadata:
   vendor: Generic
   product: Telnet Server
   affected_versions: any
-  author: "@uniblue"
+  author: "@karalabe"
   references:
     - https://cwe.mitre.org/data/definitions/319.html
 

@@ -9,7 +9,7 @@ metadata:
   vendor: Denon / Marantz (D&M Holdings)
   product: Network AV Receiver
   affected_versions: any
-  author: "@uniblue"
+  author: "@karalabe"
   references:
     - https://cwe.mitre.org/data/definitions/306.html
 

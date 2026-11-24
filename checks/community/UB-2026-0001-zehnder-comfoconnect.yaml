@@ -9,7 +9,7 @@ metadata:
   vendor: Zehnder
   product: ComfoConnect LAN C Ventilation Bridge
   affected_versions: any
-  author: "@uniblue"
+  author: "@karalabe"
   references:
     - https://github.com/michaelarnauts/aiocomfoconnect
 
