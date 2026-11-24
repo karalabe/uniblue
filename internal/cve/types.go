@@ -1,3 +1,9 @@
+// uniblue: blue-team security engine for UniFi networks
+// Copyright 2026 Péter Szilágyi. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Package cve manages a local vendor-sharded cache of the full NVD JSON 2.0
 // vulnerability database enriched with CISA's Known Exploited Vulnerabilities
 // (KEV) catalog, plus deterministic device-to-CVE matching and offline search.

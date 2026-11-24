@@ -1,3 +1,9 @@
+// uniblue: blue-team security engine for UniFi networks
+// Copyright 2026 Péter Szilágyi. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Package config loads and validates UniBlue runtime configuration from YAML
 // files and environment variable overrides.
 package config

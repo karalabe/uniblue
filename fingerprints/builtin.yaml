@@ -1,3 +1,9 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 # Declarative fingerprint rules mapping observed LAN host signals to exact NVD
 # CPE vendor/product tokens. Patterns without "*" require exact equality so
 # generic names (e.g., "nginx") never bleed into unrelated products like

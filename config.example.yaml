@@ -1,3 +1,9 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
 # Minimal UniBlue configuration.
 # Everything except your UniFi URL and credentials is derived automatically
 # from UniFi's own networks, firewall zones, isolation flags, and policies.

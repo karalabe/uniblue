@@ -1,3 +1,9 @@
+// uniblue: blue-team security engine for UniFi networks
+// Copyright 2026 Péter Szilágyi. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Package topology builds a structural, vendor-agnostic network topology model
 // from a UniFi Snapshot and deterministic device classifications, and renders
 // it as a clean, self-contained SVG diagram without mixing in per-device CVEs.

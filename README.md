@@ -126,3 +126,7 @@ UniBlue automatically detects how your UniFi console authenticates:
 - **Classic Network Controller** (older Cloud Key Gen2 / standalone Network App) via `/api/login` + `/api/s/<site>/...`
 
 Generate a local API key in **Settings → Control Plane → Integrations** (`UNIBLUE_UNIFI_API_KEY`), or create a **Local-Only View-Only admin** account (`UNIBLUE_UNIFI_PASSWORD`).
+
+## License
+
+UniBlue is licensed under the [BSD 3-Clause License](LICENSE).

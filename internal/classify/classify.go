@@ -1,3 +1,9 @@
+// uniblue: blue-team security engine for UniFi networks
+// Copyright 2026 Péter Szilágyi. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Package classify deterministically categorizes LAN hosts into operational
 // device classes (server, vm, bmc, netservice, camera, printer, media, iot,
 // personal, network) by combining observed protocol/port signals, official IEEE

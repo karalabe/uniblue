@@ -1,3 +1,9 @@
+// uniblue: blue-team security engine for UniFi networks
+// Copyright 2026 Péter Szilágyi. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Package server runs UniBlue as a live, event-driven security daemon with a
 // lightweight built-in web UI, Server-Sent Events (SSE) stream, and targeted
 // per-host live scanning whenever clients join, move, or policies change.

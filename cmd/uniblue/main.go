@@ -1,3 +1,9 @@
+// uniblue: blue-team security engine for UniFi networks
+// Copyright 2026 Péter Szilágyi. All rights reserved.
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Command uniblue is a blue-team security engine for UniFi networks.
 // It pulls live topology from a local UniFi controller, gently fingerprints
 // LAN hosts, runs declarative community-submitted checks, and scores risk by
