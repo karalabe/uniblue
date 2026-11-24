@@ -30,6 +30,7 @@ import (
 	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
+	"github.com/karalabe/uniblue/internal/topology"
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
@@ -58,6 +59,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runWatch(ctx, args[1:], stdout, stderr)
 	case "inventory":
 		return runInventory(ctx, args[1:], stdout, stderr)
+	case "topology":
+		return runTopology(ctx, args[1:], stdout, stderr)
 	case "check":
 		return runCheck(ctx, args[1:], stdout, stderr)
 	case "cve":
@@ -84,6 +87,7 @@ Commands:
   scan        Run a single UniFi + LAN security scan and print prioritized findings
   watch       Continuously scan on an interval and notify only on new/escalated changes
   inventory   Fetch and display UniFi clients, devices, VLANs, and port forwards
+  topology    Generate a network topology SVG or JSON diagram with device placement
   check       Validate or test declarative YAML checks against a single host
   cve         Sync, search, and match a local NVD + CISA KEV cache against your LAN
   oui         Sync and query the official IEEE MAC OUI registries (MA-L, MA-M, MA-S)`)
@@ -1109,4 +1113,100 @@ func runOUI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	default:
 		return fmt.Errorf("unknown oui subcommand %q (want sync or lookup)", args[0])
 	}
+}
+
+// runTopology builds a deterministic network topology model from UniFi zones,
+// VLANs, LLDP uplinks, IEEE OUI data, and (unless -no-probe is set) gentle
+// service fingerprinting, then outputs either an SVG diagram (-out), JSON, or
+// a concise terminal placement summary.
+func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("topology", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
+	outPath := fs.String("out", "", "path to write SVG topology diagram (use '-' for stdout)")
+	jsonOut := fs.Bool("json", false, "output topology model as JSON")
+	noProbe := fs.Bool("no-probe", false, "skip active LAN port probing (classify from UniFi + IEEE OUI only)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	ctrl, err := unifi.New(cfg.UniFi)
+	if err != nil {
+		return err
+	}
+	if err := ctrl.Login(ctx); err != nil {
+		return err
+	}
+	snap, err := ctrl.FetchSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
+	var profiles []probe.HostProfile
+	if !*noProbe {
+		checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
+		if err != nil {
+			return err
+		}
+		scanPorts := mergePorts(cfg.Scan.Ports, checkList)
+		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+		fp.SetHostPortHints(snap.PortHintsByIP())
+		profiles = fp.FingerprintAll(ctx, snap.Clients)
+	}
+
+	ouiDB := oui.New("")
+	_ = ouiDB.Load()
+	classifier, err := classify.Load(classifydata.BuiltinFS, ouiDB)
+	if err != nil {
+		return err
+	}
+	classes := classifier.ClassifyAll(snap, profiles)
+	model := topology.Build(snap, classes, cfg.Network)
+
+	if *jsonOut {
+		return writeJSON(stdout, model)
+	}
+	if *outPath != "" {
+		if *outPath == "-" {
+			return topology.RenderSVG(stdout, model)
+		}
+		var buf strings.Builder
+		if err := topology.RenderSVG(&buf, model); err != nil {
+			return err
+		}
+		if err := os.WriteFile(*outPath, []byte(buf.String()), 0o644); err != nil {
+			return fmt.Errorf("write topology svg %q: %w", *outPath, err)
+		}
+		fmt.Fprintf(stdout, "Wrote network topology diagram to %s (%d VLANs, %d clients, %d UniFi devices)\n",
+			*outPath, len(model.VLANs), model.ClientCount, model.DeviceCount)
+		return nil
+	}
+
+	// Print a compact terminal topology placement summary when -out is omitted.
+	fmt.Fprintf(stdout, "UniFi Topology | Site: %s | VLANs: %d | Clients: %d | Devices: %d\n\n",
+		model.Site, len(model.VLANs), model.ClientCount, model.DeviceCount)
+	for _, vg := range model.VLANs {
+		fmt.Fprintf(stdout, "%s (VLAN %s · %s · zone=%s · %d client(s))\n",
+			vg.Name, vg.VLAN, vg.Subnet, vg.ZoneName, len(vg.Clients))
+		if len(vg.Clients) == 0 {
+			fmt.Fprintln(stdout, "  (empty)")
+			continue
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
+		for _, cl := range vg.Clients {
+			note := cl.PlacementReason
+			if note == "" {
+				note = cl.Class.Role
+			}
+			fmt.Fprintf(tw, "  %-8s\t%-10s\t%s\t%s\t%s\n",
+				strings.ToUpper(string(cl.Placement)), cl.Class.Category, cl.Name, cl.IP, note)
+		}
+		_ = tw.Flush()
+	}
+	fmt.Fprintln(stdout, "\nTip: pass -out topology.svg to render a visual SVG diagram.")
+	return nil
 }
