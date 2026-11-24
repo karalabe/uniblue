@@ -72,6 +72,21 @@
   .ev-item:last-child { border-bottom: 0; }
   .ev-time { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
   .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
+  .port-strip { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--bg); }
+  .ptile { min-width: 60px; padding: 6px 8px; border-radius: 7px; border: 1.5px solid var(--border); background: var(--surface); text-align: center; font-size: 11px; line-height: 1.3; }
+  .ptile .pnum { font-weight: 700; font-size: 12.5px; display: flex; align-items: center; justify-content: center; gap: 3px; }
+  .ptile .pmeta { font-size: 10px; color: var(--muted); margin-top: 2px; white-space: nowrap; }
+  .ptile.st-active-ok { background: var(--ok-bg); border-color: var(--ok-bd); color: var(--ok); }
+  .ptile.st-active-uplink { background: var(--blue-bg); border-color: var(--blue); color: var(--blue); }
+  .ptile.st-active-warn { background: var(--high-bg); border-color: var(--high-bd); color: var(--high); }
+  .ptile.st-active-crit { background: var(--crit-bg); border-color: var(--crit-bd); color: var(--crit); }
+  .ptile.st-inactive-ok { border-style: dashed; color: var(--muted); }
+  .ptile.st-inactive-warn { border-style: dashed; background: var(--high-bg); border-color: var(--high-bd); color: var(--high); }
+  .ptile.st-disabled { opacity: 0.48; background: var(--surface-alt); color: var(--muted); }
+  .zone-pill { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; border: 1px solid var(--border); background: var(--surface-alt); color: var(--muted); }
+  .zone-external, .zone-external_uplink { color: var(--crit); background: var(--crit-bg); border-color: var(--crit-bd); }
+  .zone-uplink, .zone-wan { color: var(--blue); background: var(--blue-bg); border-color: var(--blue); }
+  .zone-unused { color: var(--high); background: var(--high-bg); border-color: var(--high-bd); }
 </style>
 </head>
 <body>
@@ -95,12 +110,14 @@
 
   <div class="tabs">
     <button class="tab active" data-tab="findings">Findings &amp; CVEs</button>
+    <button class="tab" data-tab="ports">Switch Ports</button>
     <button class="tab" data-tab="topology">Network Topology</button>
     <button class="tab" data-tab="clients">Clients &amp; Inventory</button>
     <button class="tab" data-tab="events">Live Event Stream</button>
   </div>
 
   <section id="panel-findings" class="panel active"></section>
+  <section id="panel-ports" class="panel"></section>
   <section id="panel-topology" class="panel"></section>
   <section id="panel-clients" class="panel"></section>
   <section id="panel-events" class="panel"></section>
@@ -165,14 +182,23 @@ function renderAll() {
   const exactCVEs = state.exact_cves || [];
   const wanSurface = state.report?.wan_surface || [];
 
+  const switches = state.report?.switch_ports || [];
+  let totalPorts = 0, activePorts = 0, atRiskPorts = 0;
+  for (const sw of switches) {
+    totalPorts += sw.total_ports || 0;
+    activePorts += sw.active_ports || 0;
+    atRiskPorts += sw.at_risk_ports || 0;
+  }
+
   document.getElementById("kpis").innerHTML = `
     <div class="kpi"><div class="lbl">Confirmed Exposures</div><div class="val">${findings.length}</div><div class="sub">${critCount} critical · ${highCount} high · ${exactCVEs.length} exact CVE rollups</div></div>
     <div class="kpi"><div class="lbl">Active LAN Clients</div><div class="val">${state.report?.client_count || 0}</div><div class="sub">${state.report?.clean_clients || 0} clean · ${(state.topology?.vlans || []).length} VLANs</div></div>
     <div class="kpi"><div class="lbl">WAN Surface</div><div class="val">${wanSurface.length}</div><div class="sub">${wanSurface.filter(w => w.severity !== "info").length} review/high · ${wanSurface.filter(w => w.severity === "info").length} expected P2P</div></div>
-    <div class="kpi"><div class="lbl">UniFi Infrastructure</div><div class="val">${state.report?.clean_unifi_devices || 0}/${state.report?.unifi_device_count || 0}</div><div class="sub">devices up to date</div></div>
+    <div class="kpi"><div class="lbl">Switch Ports &amp; Gear</div><div class="val">${activePorts}/${totalPorts}</div><div class="sub">${atRiskPorts} at risk · ${state.report?.clean_unifi_devices || 0}/${state.report?.unifi_device_count || 0} devices up to date</div></div>
   `;
 
   renderFindings(findings, exactCVEs, state.potential_cves || [], wanSurface, state.report?.posture_notes || []);
+  renderPorts(switches);
   renderTopology();
   renderClients();
   renderEvents();
@@ -253,6 +279,97 @@ function renderFindings(findings, exactCVEs, potentialCVEs, wanSurface, postureN
   }
 
   document.getElementById("panel-findings").innerHTML = html;
+}
+
+function portTileClass(p) {
+  if (p.state === "disabled") return "st-disabled";
+  if (p.state === "inactive_enabled") {
+    return p.status === "warn" || p.status === "critical" ? "st-inactive-warn" : "st-inactive-ok";
+  }
+  if (p.status === "critical") return "st-active-crit";
+  if (p.status === "warn") return "st-active-warn";
+  if (p.zone === "uplink" || p.zone === "wan") return "st-active-uplink";
+  return "st-active-ok";
+}
+
+function fmtSpeed(speed) {
+  if (!speed) return "-";
+  if (speed >= 1000) return (speed / 1000) + "G";
+  return speed + "M";
+}
+
+function renderPorts(switches) {
+  const el = document.getElementById("panel-ports");
+  if (!switches || !switches.length) {
+    el.innerHTML = '<div class="card"><div class="empty">No physical switch port telemetry reported by UniFi.</div></div>';
+    return;
+  }
+  let html = "";
+  for (const sw of switches) {
+    const extBadge = sw.external_device
+      ? ' <span class="sev sev-critical">EXTERNAL EQUIPMENT (' + esc(sw.zone_source || "auto") + ')</span>'
+      : '';
+    const uplink = sw.uplink_name
+      ? 'Uplink: ' + esc(sw.uplink_name) + (sw.uplink_port ? ' Port ' + sw.uplink_port : '')
+      : 'Root Gateway';
+    const summary = `${sw.active_ports} active · ${sw.inactive_enabled_ports} unused-open · ${sw.disabled_ports} disabled` +
+      (sw.at_risk_ports ? ` · ${sw.at_risk_ports} at risk` : '');
+
+    html += `<div class="card">
+      <div class="card-hd">
+        <div><strong>${esc(sw.name)}</strong> <span class="mono" style="font-weight:400;color:var(--muted)">(${esc(sw.model)} · ${esc(sw.ip)})</span>${extBadge}</div>
+        <div class="proof" style="margin:0">${uplink} · ${summary}</div>
+      </div>
+      <div class="port-strip">`;
+
+    for (const p of (sw.ports || [])) {
+      const peersTxt = (p.peers || []).map(x => x.name).join(", ") || (p.up ? "active link" : p.state);
+      const tip = `Port ${p.port_idx} (${p.name}) | Zone: ${p.zone} | VLAN: ${p.native_vlan || "-"} | Tagged: ${p.tagged_policy} | Peer: ${peersTxt}` +
+        ((p.issues && p.issues.length) ? " | Issues: " + p.issues.join("; ") : "");
+      const poeMark = p.poe_enabled ? "⚡" : "";
+      const meta = p.up ? fmtSpeed(p.speed) : (p.enabled ? "open" : "off");
+      html += `<div class="ptile ${portTileClass(p)}" title="${esc(tip)}">
+        <div class="pnum">#${p.port_idx}${poeMark}</div>
+        <div class="pmeta">${esc(meta)}</div>
+      </div>`;
+    }
+
+    html += `</div><table><thead><tr>
+      <th>Port</th><th>State</th><th>Zone</th><th>Native VLAN</th><th>Tagged VLANs</th><th>MAC Lock</th><th>PoE</th><th>Connected Peer(s)</th><th>Security Status</th>
+    </tr></thead><tbody>`;
+
+    for (const p of (sw.ports || [])) {
+      const stateTxt = p.state === "active"
+        ? `UP (${fmtSpeed(p.speed)})`
+        : (p.state === "disabled" ? "DISABLED" : "INACTIVE (open)");
+      const zoneLabel = p.zone === "external_uplink" ? "EXT UPLINK" : p.zone;
+      const peersHtml = (p.peers || []).length
+        ? p.peers.map(x => `<div><strong>${esc(x.name)}</strong>${x.ip ? ' <span class="mono">(' + esc(x.ip) + ')</span>' : ''}</div>`).join("")
+        : (p.label ? `<span class="proof">${esc(p.label)}</span>` : '<span class="proof">-</span>');
+      const poeTxt = p.poe_enabled ? (p.poe_power ? p.poe_power + "W" : "ON") : "-";
+      const macLock = p.port_security ? '<span class="sev sev-clean">ON</span>' : '<span class="proof">off</span>';
+      const statusBadge = p.status === "critical"
+        ? sevBadge("critical")
+        : (p.status === "warn" ? sevBadge("high") : sevBadge("clean"));
+      const issuesHtml = (p.issues || []).length
+        ? '<div class="proof">' + p.issues.map(esc).join("; ") + '</div>'
+        : '';
+
+      html += `<tr>
+        <td class="mono"><strong>#${p.port_idx}</strong> <span class="proof">${esc(p.name)}</span></td>
+        <td class="mono">${esc(stateTxt)}</td>
+        <td><span class="zone-pill zone-${esc(p.zone)}">${esc(zoneLabel)}</span></td>
+        <td>${esc(p.native_vlan || "-")}</td>
+        <td class="mono">${esc(p.tagged_policy)}</td>
+        <td>${macLock}</td>
+        <td class="mono">${esc(poeTxt)}</td>
+        <td>${peersHtml}</td>
+        <td>${statusBadge}${issuesHtml}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+  el.innerHTML = html;
 }
 
 function renderTopology() {

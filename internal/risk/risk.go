@@ -50,6 +50,11 @@ type Report struct {
 	// PostureNotes captures network-wide architectural observations (such as an
 	// unused isolated IoT VLAN or unnamed WAN-exposed hosts).
 	PostureNotes []PostureNote `json:"posture_notes,omitempty"`
+
+	// SwitchPorts holds physical Ethernet/SFP port allocation, perimeter zoning,
+	// connected peers, and port-security status for every UniFi switch, gateway,
+	// and In-Wall AP.
+	SwitchPorts []SwitchDeviceView `json:"switch_ports,omitempty"`
 }
 
 // State captures the minimal baseline persisted to disk between consecutive
@@ -199,6 +204,11 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	// WAN-to-Gateway, WAN-to-LAN, or isolated-zone-to-Internal ALLOW rules.
 	scored = append(scored, auditFirewallPolicies(snap)...)
 
+	// Analyze physical switch/gateway/In-Wall AP port allocations and external
+	// cable perimeter security (including LLDP parent feeder ports).
+	switchPorts, portFindings, portNotes := AnalyzeSwitchPorts(snap, netCfg, trustedSet, isolatedSet)
+	scored = append(scored, portFindings...)
+
 	// Emit a low-severity posture finding for UniFi infrastructure gear running
 	// outdated firmware reported as upgradable by the controller.
 	cleanUniFi := 0
@@ -248,6 +258,7 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	}
 
 	postureNotes := AnalyzePosture(snap, scored, netCfg)
+	postureNotes = append(postureNotes, portNotes...)
 
 	return Report{
 		GeneratedAt:       time.Now().UTC(),
@@ -259,6 +270,7 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		Findings:          scored,
 		WANSurface:        wanSurface,
 		PostureNotes:      postureNotes,
+		SwitchPorts:       switchPorts,
 	}
 }
 

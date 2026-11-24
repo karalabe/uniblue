@@ -24,6 +24,19 @@ unifi:
 #   trusted_vlans: ["Default"]
 #   isolated_vlans: ["IoT", "Guest"]
 #   exclude_ips: []
+#
+#   # Assign entire switches/APs outside your secured physical building perimeter
+#   # (by UniFi device name or MAC). UniBlue automatically flags unrestricted
+#   # ports on these devices AND traces their indoor parent-switch feeder cable!
+#   external_devices: ["Garage Switch"]
+#
+#   # Optional per-port physical perimeter overrides & MAC allowlists.
+#   physical_ports:
+#     - device: "Main Switch"
+#       port: 12
+#       zone: "external"       # external | internal | unused
+#       label: "Driveway PoE camera drop"
+#       allowed_macs: ["aa:bb:cc:dd:ee:ff"]
 
 # scan:
 #   extra_ports: []        # Added on top of UniBlue's curated port list

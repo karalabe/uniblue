@@ -161,6 +161,21 @@ type missingClient struct {
 	since  time.Time
 }
 
+// portLiveState captures the previous link and security configuration of a
+// single physical switch port so pollDelta can emit real-time link/config events.
+type portLiveState struct {
+	DeviceName   string
+	DeviceIP     string
+	PortIdx      int
+	PortName     string
+	Zone         string
+	Up           bool
+	Enabled      bool
+	NativeVLAN   string
+	TaggedPolicy string
+	PortSecurity bool
+}
+
 // Engine coordinates UniFi event ingestion, targeted single-host live checks,
 // periodic full reconciliation, webhook alerting, and SSE broadcasting.
 type Engine struct {
@@ -185,6 +200,7 @@ type Engine struct {
 	snap           *unifi.Snapshot
 	profilesByMAC  map[string]probe.HostProfile
 	missingClients map[string]missingClient
+	lastPorts      map[string]portLiveState
 	lastPolicySig  string
 	lastFwdSig     string
 	prevRiskState  *risk.State
@@ -259,6 +275,7 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 		startedAt:      time.Now().UTC(),
 		profilesByMAC:  make(map[string]probe.HostProfile),
 		missingClients: make(map[string]missingClient),
+		lastPorts:      make(map[string]portLiveState),
 		prevRiskState:  prevState,
 		fullRescanCh:   make(chan string, 1),
 		hostScanCh:     make(chan unifi.Client, 64),
@@ -297,6 +314,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.snap = snap
 	e.lastFwdSig = portForwardSignature(snap.PortForwards)
 	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
+	e.lastPorts = snapshotPortStates(snap, e.cfg.Network)
 	e.mu.Unlock()
 	e.recomputeAndPublish(ctx, false)
 
@@ -578,9 +596,68 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		})
 	}
 
+	// Detect live physical switch port link & security configuration changes.
+	currPorts := snapshotPortStates(snap, e.cfg.Network)
+	if len(e.lastPorts) > 0 {
+		for pk, curr := range currPorts {
+			prev, existed := e.lastPorts[pk]
+			if !existed {
+				continue
+			}
+			isSensitive := curr.Zone == "external" || curr.Zone == "external_uplink" || curr.Zone == "unused"
+			if !prev.Up && curr.Up {
+				changed = true
+				sev := "info"
+				if isSensitive {
+					sev = "critical"
+				}
+				e.emitLocked(LiveEvent{
+					Type:     "port_link_up",
+					Severity: sev,
+					Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
+					IP:       curr.DeviceIP,
+					Summary:  fmt.Sprintf("Physical link UP on %s Port %d (%s, zone=%s, VLAN=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone, fallbackVLAN(curr.NativeVLAN)),
+				})
+			} else if prev.Up && !curr.Up {
+				changed = true
+				sev := "info"
+				if curr.Zone == "external" || curr.Zone == "external_uplink" {
+					sev = "high"
+				}
+				e.emitLocked(LiveEvent{
+					Type:     "port_link_down",
+					Severity: sev,
+					Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
+					IP:       curr.DeviceIP,
+					Summary:  fmt.Sprintf("Physical link DOWN on %s Port %d (%s, zone=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone),
+				})
+			}
+			if prev.Enabled != curr.Enabled || prev.NativeVLAN != curr.NativeVLAN || prev.TaggedPolicy != curr.TaggedPolicy || prev.PortSecurity != curr.PortSecurity {
+				changed = true
+				sev := "medium"
+				if isSensitive {
+					sev = "high"
+				}
+				e.emitLocked(LiveEvent{
+					Type:     "port_config_changed",
+					Severity: sev,
+					Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
+					IP:       curr.DeviceIP,
+					Summary: fmt.Sprintf("Port config changed on %s Port %d (zone=%s): enabled=%v->%v, VLAN=%s->%s, tagged=%s->%s, mac_lock=%v->%v",
+						curr.DeviceName, curr.PortIdx, curr.Zone,
+						prev.Enabled, curr.Enabled,
+						fallbackVLAN(prev.NativeVLAN), fallbackVLAN(curr.NativeVLAN),
+						prev.TaggedPolicy, curr.TaggedPolicy,
+						prev.PortSecurity, curr.PortSecurity),
+				})
+			}
+		}
+	}
+
 	e.snap = snap
 	e.lastFwdSig = fwdSig
 	e.lastPolicySig = polSig
+	e.lastPorts = currPorts
 	e.mu.Unlock()
 
 	if changed {
@@ -701,6 +778,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	e.snap = snap
 	e.lastFwdSig = portForwardSignature(snap.PortForwards)
 	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
+	e.lastPorts = snapshotPortStates(snap, e.cfg.Network)
 	e.profilesByMAC = make(map[string]probe.HostProfile, len(profiles))
 	for _, hp := range profiles {
 		e.profilesByMAC[clientKey(hp.Client)] = hp
@@ -927,4 +1005,27 @@ func firewallPolicySignature(pols []unifi.FirewallPolicy) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ";")
+}
+
+func snapshotPortStates(snap *unifi.Snapshot, netCfg config.NetworkConfig) map[string]portLiveState {
+	views, _, _ := risk.AnalyzeSwitchPorts(snap, netCfg, nil, nil)
+	out := make(map[string]portLiveState)
+	for _, sw := range views {
+		for _, p := range sw.Ports {
+			key := fmt.Sprintf("%s|%d", sw.MAC, p.PortIdx)
+			out[key] = portLiveState{
+				DeviceName:   sw.Name,
+				DeviceIP:     sw.IP,
+				PortIdx:      p.PortIdx,
+				PortName:     p.Name,
+				Zone:         p.Zone,
+				Up:           p.Up,
+				Enabled:      p.Enabled,
+				NativeVLAN:   p.NativeVLAN,
+				TaggedPolicy: p.TaggedPolicy,
+				PortSecurity: p.PortSecurity,
+			}
+		}
+	}
+	return out
 }

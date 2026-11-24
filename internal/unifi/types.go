@@ -222,6 +222,75 @@ type Device struct {
 
 	// UplinkPort is the remote port number on the parent switch/gateway.
 	UplinkPort int `json:"uplink_port,omitempty"`
+
+	// Ports holds the physical Ethernet/SFP port table (merged with port_overrides)
+	// for UniFi switches, gateways, and In-Wall APs.
+	Ports []SwitchPort `json:"ports,omitempty"`
+}
+
+// SwitchPort describes one physical Ethernet or SFP port on a UniFi switch,
+// gateway, or In-Wall AP, combining live link telemetry with configured VLAN,
+// PoE, isolation, and MAC port-security settings.
+type SwitchPort struct {
+	// PortIdx is the 1-based physical port number.
+	PortIdx int `json:"port_idx"`
+
+	// Name is the user-assigned or default port label (e.g., "Port 1", "SFP+ 2").
+	Name string `json:"name"`
+
+	// Enabled reports whether the port is administratively enabled (not disabled/off).
+	Enabled bool `json:"enabled"`
+
+	// Up reports whether a physical Ethernet/SFP link is currently active.
+	Up bool `json:"up"`
+
+	// Speed is the negotiated link rate in Mbps (0 when link is down).
+	Speed int `json:"speed"`
+
+	// Media is the physical port type (e.g., "GE", "2.5GE", "SFP", "SFP+").
+	Media string `json:"media,omitempty"`
+
+	// IsUplink reports whether UniFi marks this port as the device's upstream link.
+	IsUplink bool `json:"is_uplink,omitempty"`
+
+	// IsWAN reports whether this port serves a WAN internet interface.
+	IsWAN bool `json:"is_wan,omitempty"`
+
+	// OpMode is the UniFi port operation mode ("switch", "off", "mirror", "aggregate").
+	OpMode string `json:"op_mode,omitempty"`
+
+	// Forward is the UniFi VLAN forwarding mode ("all", "native", "customize", "disabled").
+	Forward string `json:"forward,omitempty"`
+
+	// TaggedVLANMgmt is UniFi's explicit tagged-VLAN mode ("auto", "block_all", "custom").
+	TaggedVLANMgmt string `json:"tagged_vlan_mgmt,omitempty"`
+
+	// NativeNetworkID is the configured native/untagged network ID (empty = default LAN).
+	NativeNetworkID string `json:"native_network_id,omitempty"`
+
+	// NativeNetworkName is the resolved human-readable native VLAN/network name.
+	NativeNetworkName string `json:"native_network_name,omitempty"`
+
+	// PoEEnabled reports whether PoE power is currently being delivered on this port.
+	PoEEnabled bool `json:"poe_enabled,omitempty"`
+
+	// PoEMode is the configured PoE mode ("auto", "off", "passthrough", etc.).
+	PoEMode string `json:"poe_mode,omitempty"`
+
+	// PoEPower is the live power draw in watts when PoE is active.
+	PoEPower string `json:"poe_power,omitempty"`
+
+	// PortSecurityEnabled reports whether MAC address allowlisting is enforced.
+	PortSecurityEnabled bool `json:"port_security_enabled,omitempty"`
+
+	// PortSecurityMACs lists explicitly allowed MAC addresses when port security is enabled.
+	PortSecurityMACs []string `json:"port_security_macs,omitempty"`
+
+	// Isolation reports whether L2 port isolation is enabled on this port.
+	Isolation bool `json:"isolation,omitempty"`
+
+	// MACTableCount is the number of active MAC addresses learned on this port.
+	MACTableCount int `json:"mac_table_count,omitempty"`
 }
 
 // Network describes a UniFi LAN or VLAN segment along with its structural
@@ -449,6 +518,31 @@ type rawDevice struct {
 		UplinkDeviceName string `json:"uplink_device_name"`
 		UplinkRemotePort int    `json:"uplink_remote_port"`
 	} `json:"uplink"`
+	PortTable     []rawPort `json:"port_table"`
+	PortOverrides []rawPort `json:"port_overrides"`
+}
+
+// rawPort maps a single port entry in UniFi's port_table or port_overrides array.
+type rawPort struct {
+	PortIdx             int        `json:"port_idx"`
+	Name                string     `json:"name"`
+	Enable              *bool      `json:"enable"`
+	Up                  bool       `json:"up"`
+	Speed               int        `json:"speed"`
+	Media               string     `json:"media"`
+	IsUplink            bool       `json:"is_uplink"`
+	NetworkName         string     `json:"network_name"`
+	OpMode              string     `json:"op_mode"`
+	Forward             string     `json:"forward"`
+	TaggedVLANMgmt      string     `json:"tagged_vlan_mgmt"`
+	NativeNetworkConfID string     `json:"native_networkconf_id"`
+	PoEEnable           bool       `json:"poe_enable"`
+	PoEMode             string     `json:"poe_mode"`
+	PoEPower            flexString `json:"poe_power"`
+	PortSecurityEnabled *bool      `json:"port_security_enabled"`
+	PortSecurityMACs    []string   `json:"port_security_mac_address"`
+	Isolation           *bool      `json:"isolation"`
+	MACTableCount       int        `json:"mac_table_count"`
 }
 
 // rawNetwork maps the wire fields returned by /api/s/<site>/rest/networkconf.

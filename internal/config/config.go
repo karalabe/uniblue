@@ -81,6 +81,27 @@ type UniFiConfig struct {
 	Timeout time.Duration `yaml:"timeout"`
 }
 
+// PhysicalPortRule assigns an explicit physical-security zone and optional MAC
+// allowlist to a single switch, gateway, or In-Wall AP port.
+type PhysicalPortRule struct {
+	// Device matches the UniFi switch/gateway/AP name (case-insensitive) or MAC address.
+	Device string `yaml:"device"`
+
+	// Port is the 1-based physical port number (port_idx) on Device.
+	Port int `yaml:"port"`
+
+	// Zone classifies the physical exposure of this cable drop:
+	// "external" (outside secured perimeter), "internal" (inside secured room),
+	// or "unused" (expected unplugged and administratively disabled).
+	Zone string `yaml:"zone"`
+
+	// Label is an optional human-readable description (e.g., "Driveway Camera").
+	Label string `yaml:"label,omitempty"`
+
+	// AllowedMACs optionally pins expected hardware MAC address(es) on this jack.
+	AllowedMACs []string `yaml:"allowed_macs,omitempty"`
+}
+
 // NetworkConfig defines local network segmentation hints so UniBlue can weigh
 // findings by where a device actually lives.
 type NetworkConfig struct {
@@ -95,6 +116,17 @@ type NetworkConfig struct {
 
 	// ExcludeIPs lists IP addresses that UniBlue must never actively probe.
 	ExcludeIPs []string `yaml:"exclude_ips"`
+
+	// ExternalDevices lists UniFi switch/AP names (case-insensitive) or MAC
+	// addresses physically installed outside the secured perimeter (e.g., a
+	// garage, outbuilding, or outdoor PoE switch). Every port on a listed device
+	// is treated as "external", and the indoor parent switch port feeding it via
+	// LLDP is automatically audited as "external_uplink".
+	ExternalDevices []string `yaml:"external_devices,omitempty"`
+
+	// PhysicalPorts assigns explicit physical-perimeter zones ("external",
+	// "internal", or "unused") and optional allowed MACs to specific switch ports.
+	PhysicalPorts []PhysicalPortRule `yaml:"physical_ports,omitempty"`
 }
 
 // ScanConfig controls probing concurrency, timeouts, and check loading.
@@ -272,6 +304,16 @@ func (c *Config) Validate() error {
 	case "json", "discord", "slack", "ntfy":
 	default:
 		return fmt.Errorf("config: unsupported notify.format %q (want json, discord, slack, or ntfy)", c.Notify.Format)
+	}
+	for _, pr := range c.Network.PhysicalPorts {
+		if strings.TrimSpace(pr.Device) == "" || pr.Port < 1 {
+			return fmt.Errorf("config: physical_ports entry requires device and port >= 1 (got device=%q port=%d)", pr.Device, pr.Port)
+		}
+		switch strings.ToLower(strings.TrimSpace(pr.Zone)) {
+		case "external", "internal", "unused":
+		default:
+			return fmt.Errorf("config: unsupported physical_ports zone %q for %s port %d (want external, internal, or unused)", pr.Zone, pr.Device, pr.Port)
+		}
 	}
 	return nil
 }

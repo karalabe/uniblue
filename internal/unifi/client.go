@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -402,8 +403,10 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	}
 
 	// Enrich each network with its IPv4 subnet, isolation flag, zone ID, and
-	// legacy purpose (since the Integration v1 list omits ipv4Configuration and purpose).
-	c.enrichIntegrationNetworks(ctx, siteBase, nr.items)
+	// legacy purpose (since the Integration v1 list omits ipv4Configuration and purpose),
+	// and retain legacy rest/networkconf records so switch port_table native_networkconf_id
+	// values resolve to human-readable VLAN names.
+	legacyNets := c.enrichIntegrationNetworks(ctx, siteBase, nr.items)
 
 	type subnetEntry struct {
 		prefix netip.Prefix
@@ -495,6 +498,28 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		clients = append(clients, cl)
 	}
 
+	netByID := make(map[string]Network, len(networks)+len(legacyNets))
+	defaultNetName := defaultLANName(networks)
+	for _, n := range networks {
+		if n.ID != "" {
+			netByID[n.ID] = n
+		}
+	}
+	for _, ln := range legacyNets {
+		if ln.ID != "" && ln.Name != "" {
+			if _, exists := netByID[ln.ID]; !exists {
+				netByID[ln.ID] = Network{
+					ID:               ln.ID,
+					Name:             ln.Name,
+					Purpose:          strings.ToLower(strings.TrimSpace(ln.Purpose)),
+					VLAN:             string(ln.VLAN),
+					Subnet:           ln.IPSubnet,
+					IsolationEnabled: ln.NetworkIsolationEnabled,
+				}
+			}
+		}
+	}
+
 	devices := make([]Device, 0, len(dr.items))
 	for _, rd := range dr.items {
 		mac := strings.ToLower(strings.TrimSpace(rd.MACAddress))
@@ -507,10 +532,16 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			Version:    rd.FirmwareVersion,
 			Upgradable: rd.FirmwareUpdatable,
 		}
-		if ld, ok := legacyDevByMAC[mac]; ok && ld.Uplink != nil {
-			dev.UplinkMAC = strings.ToLower(strings.TrimSpace(ld.Uplink.UplinkMAC))
-			dev.UplinkName = strings.TrimSpace(ld.Uplink.UplinkDeviceName)
-			dev.UplinkPort = ld.Uplink.UplinkRemotePort
+		if ld, ok := legacyDevByMAC[mac]; ok {
+			if ld.Type != "" {
+				dev.Type = strings.ToLower(ld.Type)
+			}
+			if ld.Uplink != nil {
+				dev.UplinkMAC = strings.ToLower(strings.TrimSpace(ld.Uplink.UplinkMAC))
+				dev.UplinkName = strings.TrimSpace(ld.Uplink.UplinkDeviceName)
+				dev.UplinkPort = ld.Uplink.UplinkRemotePort
+			}
+			dev.Ports = convertSwitchPorts(ld, netByID, defaultNetName)
 		}
 		devices = append(devices, dev)
 	}
@@ -643,6 +674,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		clients = append(clients, cl)
 	}
 
+	defaultNetName := defaultLANName(networks)
 	devices := make([]Device, 0, len(dr.items))
 	for _, rd := range dr.items {
 		dev := Device{
@@ -653,6 +685,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			Type:       rd.Type,
 			Version:    rd.Version,
 			Upgradable: rd.Upgradable,
+			Ports:      convertSwitchPorts(rd, netByID, defaultNetName),
 		}
 		if rd.Uplink != nil {
 			dev.UplinkMAC = strings.ToLower(strings.TrimSpace(rd.Uplink.UplinkMAC))
@@ -691,6 +724,153 @@ func fetchAllPages[T any](ctx context.Context, c *Controller, path string) ([]T,
 		offset += len(page.Data)
 	}
 	return all, nil
+}
+
+// defaultLANName returns the site's primary untagged management/LAN network
+// name (VLAN empty or "1", corporate/default) used as the fallback native VLAN
+// when a UniFi switch port has no explicit native_networkconf_id override.
+func defaultLANName(networks []Network) string {
+	for _, n := range networks {
+		if strings.EqualFold(n.Purpose, "wan") || strings.EqualFold(n.Purpose, "wan2") {
+			continue
+		}
+		if n.VLAN == "" || n.VLAN == "0" || n.VLAN == "1" {
+			return n.Name
+		}
+	}
+	if len(networks) > 0 {
+		return networks[0].Name
+	}
+	return "Default"
+}
+
+// convertSwitchPorts normalizes a UniFi device's port_table merged with
+// port_overrides into sorted SwitchPort entries with resolved native VLAN names.
+func convertSwitchPorts(rd rawDevice, netByID map[string]Network, defaultNetName string) []SwitchPort {
+	if len(rd.PortTable) == 0 {
+		return nil
+	}
+	ovByIdx := make(map[int]rawPort, len(rd.PortOverrides))
+	for _, ov := range rd.PortOverrides {
+		if ov.PortIdx > 0 {
+			ovByIdx[ov.PortIdx] = ov
+		}
+	}
+
+	ports := make([]SwitchPort, 0, len(rd.PortTable))
+	for _, rp := range rd.PortTable {
+		if rp.PortIdx <= 0 {
+			continue
+		}
+		// Merge any explicit port_override fields onto the live port_table record.
+		if ov, ok := ovByIdx[rp.PortIdx]; ok {
+			if ov.Name != "" {
+				rp.Name = ov.Name
+			}
+			if ov.OpMode != "" {
+				rp.OpMode = ov.OpMode
+			}
+			if ov.Forward != "" {
+				rp.Forward = ov.Forward
+			}
+			if ov.TaggedVLANMgmt != "" {
+				rp.TaggedVLANMgmt = ov.TaggedVLANMgmt
+			}
+			if ov.NativeNetworkConfID != "" {
+				rp.NativeNetworkConfID = ov.NativeNetworkConfID
+			}
+			if ov.PoEMode != "" {
+				rp.PoEMode = ov.PoEMode
+			}
+			if ov.PortSecurityEnabled != nil {
+				rp.PortSecurityEnabled = ov.PortSecurityEnabled
+			}
+			if len(ov.PortSecurityMACs) > 0 {
+				rp.PortSecurityMACs = ov.PortSecurityMACs
+			}
+			if ov.Isolation != nil {
+				rp.Isolation = ov.Isolation
+			}
+		}
+
+		enabled := true
+		if rp.Enable != nil {
+			enabled = *rp.Enable
+		}
+		opMode := strings.ToLower(strings.TrimSpace(rp.OpMode))
+		fwd := strings.ToLower(strings.TrimSpace(rp.Forward))
+		if opMode == "off" || fwd == "disabled" {
+			enabled = false
+		}
+
+		isWAN := strings.HasPrefix(strings.ToLower(strings.TrimSpace(rp.NetworkName)), "wan")
+		nativeName := ""
+		if isWAN {
+			nativeName = strings.ToUpper(strings.TrimSpace(rp.NetworkName))
+		} else if rp.NativeNetworkConfID != "" {
+			if n, ok := netByID[rp.NativeNetworkConfID]; ok {
+				nativeName = n.Name
+			} else {
+				nativeName = rp.NativeNetworkConfID
+			}
+		} else if enabled {
+			nativeName = defaultNetName
+		}
+
+		tagged := strings.ToLower(strings.TrimSpace(rp.TaggedVLANMgmt))
+		if tagged == "" {
+			switch fwd {
+			case "native":
+				tagged = "block_all"
+			case "customize":
+				tagged = "custom"
+			case "disabled":
+				tagged = "disabled"
+			default:
+				if enabled {
+					tagged = "auto"
+				} else {
+					tagged = "disabled"
+				}
+			}
+		}
+
+		psec := rp.PortSecurityEnabled != nil && *rp.PortSecurityEnabled
+		iso := rp.Isolation != nil && *rp.Isolation
+		var psecMACs []string
+		for _, m := range rp.PortSecurityMACs {
+			if norm := strings.ToLower(strings.TrimSpace(m)); norm != "" {
+				psecMACs = append(psecMACs, norm)
+			}
+		}
+
+		ports = append(ports, SwitchPort{
+			PortIdx:             rp.PortIdx,
+			Name:                strings.TrimSpace(rp.Name),
+			Enabled:             enabled,
+			Up:                  rp.Up,
+			Speed:               rp.Speed,
+			Media:               strings.TrimSpace(rp.Media),
+			IsUplink:            rp.IsUplink,
+			IsWAN:               isWAN,
+			OpMode:              opMode,
+			Forward:             fwd,
+			TaggedVLANMgmt:      tagged,
+			NativeNetworkID:     rp.NativeNetworkConfID,
+			NativeNetworkName:   nativeName,
+			PoEEnabled:          rp.PoEEnable,
+			PoEMode:             strings.ToLower(strings.TrimSpace(rp.PoEMode)),
+			PoEPower:            strings.TrimSpace(string(rp.PoEPower)),
+			PortSecurityEnabled: psec,
+			PortSecurityMACs:    psecMACs,
+			Isolation:           iso,
+			MACTableCount:       rp.MACTableCount,
+		})
+	}
+	sort.Slice(ports, func(i, j int) bool {
+		return ports[i].PortIdx < ports[j].PortIdx
+	})
+	return ports
 }
 
 // convertPortForwards normalizes wire port-forward rules into domain PortForward values.
@@ -816,8 +996,9 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 // enrichIntegrationNetworks fills in missing IPv4 subnets, isolation flags,
 // zone IDs, and network purposes on networks returned by the Integration v1
 // list endpoint. It concurrently queries each network's detail endpoint over a
-// channel and opportunistically pulls purpose/isolation from legacy rest/networkconf.
-func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase string, items []integrationNetwork) {
+// channel and opportunistically pulls legacy rest/networkconf records (returning
+// them so switch port native_networkconf_id references resolve cleanly).
+func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase string, items []integrationNetwork) []rawNetwork {
 	type detailRes struct {
 		idx       int
 		subnet    string
@@ -828,8 +1009,18 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 	}
 
 	if len(items) == 0 {
-		return
+		return nil
 	}
+
+	legacyCh := make(chan []rawNetwork, 1)
+	go func() {
+		var env apiEnvelope[rawNetwork]
+		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &env); err == nil {
+			legacyCh <- env.Data
+			return
+		}
+		legacyCh <- nil
+	}()
 
 	ch := make(chan detailRes, len(items))
 	for i := range items {
@@ -873,27 +1064,14 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 		}
 	}
 
-	// Opportunistically pull legacy rest/networkconf to fill missing subnet or
-	// UniFi purpose ("corporate" vs "guest") / network_isolation_enabled metadata.
-	needsLegacy := false
-	for _, rn := range items {
-		if extractIntegrationSubnet(rn) == "" || rn.Purpose == "" {
-			needsLegacy = true
-			break
-		}
-	}
-	if !needsLegacy {
-		return
+	legacyNets := <-legacyCh
+	if len(legacyNets) == 0 {
+		return nil
 	}
 
-	var env apiEnvelope[rawNetwork]
-	if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &env); err != nil {
-		return
-	}
-
-	byName := make(map[string]rawNetwork, len(env.Data))
-	byVLAN := make(map[string]rawNetwork, len(env.Data))
-	for _, rn := range env.Data {
+	byName := make(map[string]rawNetwork, len(legacyNets))
+	byVLAN := make(map[string]rawNetwork, len(legacyNets))
+	for _, rn := range legacyNets {
 		if rn.Name != "" {
 			byName[strings.ToLower(rn.Name)] = rn
 		}
@@ -919,6 +1097,7 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 			items[i].IsolationEnabled = true
 		}
 	}
+	return legacyNets
 }
 
 // httpStatusError preserves the HTTP status code on failed controller requests

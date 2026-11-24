@@ -62,6 +62,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runServe(ctx, args[1:], stdout, stderr)
 	case "inventory":
 		return runInventory(ctx, args[1:], stdout, stderr)
+	case "ports":
+		return runPorts(ctx, args[1:], stdout, stderr)
 	case "topology":
 		return runTopology(ctx, args[1:], stdout, stderr)
 	case "check":
@@ -91,6 +93,7 @@ Commands:
   watch       Continuously scan on an interval and notify only on new/escalated changes
   serve       Run live event-driven monitor (5s poll / WebSocket) with built-in web UI
   inventory   Fetch and display UniFi clients, devices, VLANs, and port forwards
+  ports       Map physical switch ports, external equipment, and perimeter security
   topology    Generate a network topology SVG or JSON diagram with device placement
   check       Validate or test declarative YAML checks against a single host
   cve         Sync, search, and match a local NVD + CISA KEV cache against your LAN
@@ -1242,4 +1245,149 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 	return eng.Serve(ctx)
+}
+
+// runPorts connects to UniFi, maps every switch/gateway/In-Wall AP physical
+// port (link state, VLAN tagging, PoE, MAC lock, connected peers, and
+// external-world perimeter zoning), and prints a security-annotated port table.
+func runPorts(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("ports", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
+	jsonOut := fs.Bool("json", false, "output physical port analysis as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	ctrl, err := unifi.New(cfg.UniFi)
+	if err != nil {
+		return err
+	}
+	if err := ctrl.Login(ctx); err != nil {
+		return err
+	}
+	snap, err := ctrl.FetchSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
+	report := risk.Evaluate(snap, nil, cfg.Network)
+	var portFindings []checks.Finding
+	for _, f := range report.Findings {
+		if strings.HasPrefix(f.CheckID, "UB-UNIFI-PORT-") {
+			portFindings = append(portFindings, f)
+		}
+	}
+
+	if *jsonOut {
+		return writeJSON(stdout, map[string]any{
+			"site":          snap.Site,
+			"switches":      report.SwitchPorts,
+			"findings":      portFindings,
+			"posture_notes": report.PostureNotes,
+		})
+	}
+	printSwitchPorts(stdout, snap.Site, report.SwitchPorts, portFindings)
+	return nil
+}
+
+// printSwitchPorts renders a concise physical port allocation & security table
+// for every UniFi switch, gateway, and In-Wall AP.
+func printSwitchPorts(w io.Writer, site string, switches []risk.SwitchDeviceView, findings []checks.Finding) {
+	var total, active, inactiveOpen, disabled, external, atRisk int
+	for _, sw := range switches {
+		total += sw.TotalPorts
+		active += sw.ActivePorts
+		inactiveOpen += sw.InactiveEnabledPorts
+		disabled += sw.DisabledPorts
+		external += sw.ExternalPorts
+		atRisk += sw.AtRiskPorts
+	}
+	fmt.Fprintf(w, "UniBlue Switch Port Map | Site: %s | Devices: %d | Ports: %d total (%d active, %d unused-open, %d disabled) | External: %d | At-Risk: %d\n\n",
+		site, len(switches), total, active, inactiveOpen, disabled, external, atRisk)
+
+	for _, sw := range switches {
+		extTag := ""
+		if sw.ExternalDevice {
+			extTag = fmt.Sprintf(" [EXTERNAL EQUIPMENT (%s)]", sw.ZoneSource)
+		}
+		uplink := "Root Gateway"
+		if sw.UplinkName != "" {
+			uplink = sw.UplinkName
+			if sw.UplinkPort > 0 {
+				uplink = fmt.Sprintf("%s Port %d", sw.UplinkName, sw.UplinkPort)
+			}
+		}
+		fmt.Fprintf(w, "%s (%s · %s)%s — Uplink: %s | %d active, %d unused-open, %d disabled\n",
+			sw.Name, sw.Model, sw.IP, extTag, uplink, sw.ActivePorts, sw.InactiveEnabledPorts, sw.DisabledPorts)
+
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "  PORT\tSTATE\tZONE\tNATIVE VLAN\tTAGGED\tMAC LOCK\tPOE\tPEER(S)\tSTATUS")
+		for _, p := range sw.Ports {
+			state := "INACTIVE"
+			switch p.State {
+			case "active":
+				if p.Speed >= 1000 {
+					state = fmt.Sprintf("UP %dG", p.Speed/1000)
+				} else if p.Speed > 0 {
+					state = fmt.Sprintf("UP %dM", p.Speed)
+				} else {
+					state = "UP"
+				}
+			case "disabled":
+				state = "DISABLED"
+			}
+			vlan := p.NativeVLAN
+			if vlan == "" {
+				vlan = "-"
+			}
+			macLock := "off"
+			if p.PortSecurity {
+				macLock = "ON"
+			}
+			poe := "-"
+			if p.PoEEnabled {
+				if p.PoEPower != "" {
+					poe = p.PoEPower + "W"
+				} else {
+					poe = "ON"
+				}
+			}
+			peerStr := "-"
+			if len(p.Peers) > 0 {
+				parts := make([]string, 0, len(p.Peers))
+				for _, peer := range p.Peers {
+					if peer.IP != "" {
+						parts = append(parts, fmt.Sprintf("%s (%s)", peer.Name, peer.IP))
+					} else {
+						parts = append(parts, peer.Name)
+					}
+				}
+				peerStr = strings.Join(parts, ", ")
+			} else if p.Label != "" {
+				peerStr = p.Label
+			}
+			status := strings.ToUpper(p.Status)
+			if len(p.Issues) > 0 {
+				status = fmt.Sprintf("%s: %s", status, strings.Join(p.Issues, "; "))
+			}
+			fmt.Fprintf(tw, "  #%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				p.PortIdx, state, strings.ToUpper(p.Zone), vlan, p.TaggedPolicy, macLock, poe, peerStr, status)
+		}
+		_ = tw.Flush()
+		fmt.Fprintln(w)
+	}
+
+	if len(findings) > 0 {
+		fmt.Fprintf(w, "Physical Port Security Alerts (%d):\n", len(findings))
+		for _, f := range findings {
+			fmt.Fprintf(w, "  - [%s] %s: %s\n", strings.ToUpper(f.EffectiveSeverity.String()), f.CheckID, f.Title)
+			fmt.Fprintf(w, "    Proof:  %s\n", f.Evidence)
+			fmt.Fprintf(w, "    Action: %s\n", f.Remediation.Summary)
+		}
+	}
 }

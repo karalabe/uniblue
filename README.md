@@ -63,12 +63,24 @@ export UNIBLUE_UNIFI_API_KEY="your-local-integration-api-key"
 # 4. Run a full scan
 ./uniblue scan -config config.yaml
 
-# 5. Run live event-driven monitor + built-in web UI (polls every 5s or WebSocket)
+# 5. Audit physical switch port allocations, external switches, and feeder cables
+./uniblue ports -config config.yaml
+
+# 6. Run live event-driven monitor + built-in web UI (polls every 5s or WebSocket)
 ./uniblue serve -config config.yaml -listen 127.0.0.1:8080
 
 # Or run headless continuous alerting with webhooks
 ./uniblue watch -config config.yaml
 ```
+
+## Physical Switch Port & Perimeter Security
+
+UniBlue inspects live `port_table` and `port_overrides` on every UniFi switch, gateway, and In-Wall AP to map active, inactive-enabled, and disabled ports alongside VLAN tagging (`Block All` vs `Allow All`), PoE draw, connected wired peers, and MAC Port Security:
+
+- **External equipment zoning (`network.external_devices`):** Mark entire switches or APs installed outside your secured building (e.g., a garage or outdoor switch). UniBlue automatically flags unused live ports and unrestricted active ports on them **and traces their LLDP uplink back to the indoor parent switch feeder port** (`external_uplink`) so you know if an unrestricted trunk cable leaves the building.
+- **Per-port perimeter rules (`network.physical_ports`):** Pin specific wall/exterior drops as `external`, `internal`, or `unused` with optional `allowed_macs` enforcement.
+- **Zero-config inference:** Even without editing `config.yaml`, UniBlue infers outdoor/garage device names, camera/doorbell PoE drops, and isolated-VLAN access ports left on `Tagged VLAN Management = All` (VLAN-hopping risk).
+- **Live alerting:** `uniblue serve` streams real-time events when a link comes up/down on an external or unused switch port or when port VLAN/MAC security settings change, and displays a visual switch-frontplate map in the **Switch Ports** tab.
 
 ## Working with Declarative Checks
 
