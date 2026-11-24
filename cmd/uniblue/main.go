@@ -1,4 +1,4 @@
-// Command uniblue is a blue-team security agent for UniFi networks.
+// Command uniblue is a blue-team security engine for UniFi networks.
 // It pulls live topology from a local UniFi controller, gently fingerprints
 // LAN hosts, runs declarative community-submitted checks, and scores risk by
 // VLAN and WAN blast radius.
@@ -66,7 +66,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 // printUsage writes top-level command help to w.
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, `UniBlue - Blue-Team Security Agent for UniFi Networks
+	fmt.Fprintln(w, `UniBlue - Blue-Team Security Engine for UniFi Networks
 
 Usage:
   uniblue <command> [flags]
