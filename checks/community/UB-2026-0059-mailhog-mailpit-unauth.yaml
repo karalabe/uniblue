@@ -1,0 +1,43 @@
+id: UB-2026-0059
+title: Unauthenticated MailHog / Mailpit Email Inbox Exposed on LAN
+cve: null
+category: info-disclosure
+severity: high
+safety: read-only
+
+metadata:
+  vendor: MailHog / Mailpit
+  product: Local SMTP Catcher Web UI (Port 8025)
+  affected_versions: any (without UI basic auth)
+  author: "@karalabe"
+  references:
+    - https://github.com/mailhog/MailHog
+
+preconditions:
+  ports_any: [8025]
+
+probe:
+  type: http
+  method: GET
+  paths:
+    - /api/v2/messages
+    - /api/v1/messages
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_any:
+      - '"total":'
+      - '"messages":'
+    evidence_summary: "MailHog/Mailpit API exposed captured email inbox without authentication"
+    redact_body: true
+
+remediation:
+  summary: >
+    A MailHog or Mailpit SMTP testing inbox is reachable on LAN port 8025
+    without authentication, exposing captured emails (often including password
+    reset links and tokens) to every host on the network. Bind the UI to
+    127.0.0.1 or enable HTTP authentication.
+  unifi_actions:
+    - bind_mail_catcher_to_localhost
+    - restrict_inter_vlan_access

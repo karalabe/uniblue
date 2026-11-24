@@ -1,0 +1,43 @@
+id: UB-2026-0058
+title: Unauthenticated ComfyUI AI Workflow Server Exposed on LAN
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: ComfyOrg
+  product: ComfyUI Server
+  affected_versions: any (launched with --listen 0.0.0.0 without reverse-proxy auth)
+  author: "@karalabe"
+  references:
+    - https://docs.comfy.org/development/comfyui-server/comms_routes
+
+preconditions:
+  ports_any: [8188]
+
+probe:
+  type: http
+  method: GET
+  path: /system_stats
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    json_match:
+      - path: "$.system"
+        exists: true
+      - path: "$.devices"
+        exists: true
+    evidence_summary: "ComfyUI /system_stats responded on LAN port 8188 without authentication"
+    redact_body: true
+
+remediation:
+  summary: >
+    ComfyUI is listening on LAN port 8188 without authentication. Unauthenticated
+    ComfyUI instances allow arbitrary workflow execution (and arbitrary Python
+    code execution if ComfyUI-Manager or custom nodes are installed). Bind
+    ComfyUI to 127.0.0.1 or place it behind an authenticated reverse proxy.
+  unifi_actions:
+    - bind_comfyui_to_localhost
+    - restrict_inter_vlan_access

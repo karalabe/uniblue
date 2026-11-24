@@ -1,0 +1,30 @@
+id: UB-2026-0046
+title: Android Wireless Debugging (ADB over TLS) Active on LAN
+cve: null
+category: exposed-protocol
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Google / Android
+  product: Android 11+ Wireless Debugging (ADB TLS)
+  affected_versions: Android phones, tablets, and TVs with Wireless Debugging enabled
+  author: "@karalabe"
+  references:
+    - https://developer.android.com/tools/adb#connect-to-a-device-over-wi-fi
+
+preconditions:
+  mdns_type_any: ["_adb-tls-connect._tcp", "_adb-tls-pairing._tcp"]
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    An Android phone, tablet, or TV is actively advertising Wireless Debugging
+    (ADB over TLS) on this Wi-Fi network. While TLS pairing requires a PIN,
+    leaving Wireless Debugging enabled permanently expands attack surface for
+    previously paired hosts or misconfigured Wi-Fi networks. Disable Wireless
+    Debugging in Developer Options when not actively debugging.
+  unifi_actions:
+    - disable_android_wireless_debugging

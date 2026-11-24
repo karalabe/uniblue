@@ -1,0 +1,30 @@
+id: UB-2026-0042
+title: ONVIF IP Camera / NVR Discovered via WS-Discovery
+cve: null
+category: service-inventory
+severity: low
+safety: read-only
+
+metadata:
+  vendor: Generic (ONVIF)
+  product: ONVIF Network Video Transmitter / IP Camera
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://www.onvif.org/onvif/specs/core/ONVIF-Core-Specification.pdf
+
+preconditions:
+  ws_type_regex: "(?i)NetworkVideoTransmitter"
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    An ONVIF IP camera or NVR answered WS-Discovery on UDP 3702. Verify that
+    anonymous viewer roles are disabled, isolate all cameras on a dedicated
+    no-WAN Camera VLAN, and restrict ONVIF/RTSP access strictly to your NVR.
+  unifi_actions:
+    - move_to_camera_vlan
+    - block_wan_egress
+    - restrict_camera_access_to_nvr

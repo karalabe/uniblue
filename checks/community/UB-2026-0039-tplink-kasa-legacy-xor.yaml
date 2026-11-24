@@ -1,0 +1,34 @@
+id: UB-2026-0039
+title: TP-Link Kasa Legacy Unencrypted XOR Control Protocol
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: TP-Link
+  product: Kasa Smart Plug / Switch / Power Strip (Legacy Protocol)
+  affected_versions: Kasa devices exposing legacy TCP 9999 XOR API
+  author: "@karalabe"
+  references:
+    - https://python-kasa.readthedocs.io/
+
+preconditions:
+  ports_any: [9999]
+  hostname_regex: "(?i)(kasa|hs100|hs103|hs105|hs110|hs200|hs220|hs300|kp115|kp125|ep10|ep25|kl110|kl130)"
+
+probe:
+  type: kasa
+  port: 9999
+  timeout: 3s
+
+remediation:
+  summary: >
+    TP-Link Kasa device answered a read-only get_sysinfo query over its legacy
+    unauthenticated XOR-obfuscated TCP 9999 protocol. Any host on the LAN can
+    toggle mains relays without credentials. Move Kasa devices to an isolated
+    IoT VLAN and allow port 9999 strictly from your Home Assistant host.
+  unifi_actions:
+    - move_to_iot_vlan
+    - restrict_port_9999_to_controller
+    - block_wan_egress

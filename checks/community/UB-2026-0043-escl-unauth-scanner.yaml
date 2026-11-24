@@ -1,0 +1,40 @@
+id: UB-2026-0043
+title: Network Scanner Exposes Unauthenticated eSCL / AirScan Interface
+cve: null
+category: info-disclosure
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Generic (Mopria / Apple AirScan)
+  product: Multifunction Printer / Network Scanner (eSCL)
+  affected_versions: MFPs advertising _uscan._tcp or _uscans._tcp without auth
+  author: "@karalabe"
+  references:
+    - https://mopria.org/specifications
+
+preconditions:
+  mdns_type_any: ["_uscan._tcp", "_uscans._tcp"]
+
+probe:
+  type: http
+  method: GET
+  path: /eSCL/ScannerCapabilities
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - "ScannerCapabilities"
+    evidence_summary: "MFP exposed unauthenticated eSCL/AirScan ScannerCapabilities endpoint"
+    redact_body: true
+
+remediation:
+  summary: >
+    Multifunction printer exposes its unauthenticated eSCL/AirScan interface
+    over the LAN. Any host on the same VLAN may be able to trigger a remote
+    scan of documents left on the scanner glass. Isolate printers/MFPs onto a
+    dedicated VLAN and restrict access to trusted workstations.
+  unifi_actions:
+    - move_to_printer_or_iot_vlan
+    - restrict_inter_vlan_access

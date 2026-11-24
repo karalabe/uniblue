@@ -57,6 +57,13 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 		}
 		idxByIP[hp.Client.IP] = i
 		for _, port := range hp.OpenPorts {
+			// Hard raw-printer safety guard: NEVER send application-layer probe
+			// bytes to JetDirect (9100), LPD (515), or any port advertised via
+			// mDNS _pdl-datastream._tcp, because non-PJL printers can print raw
+			// probe bytes onto physical paper.
+			if isRawPrintSinkPort(port, f.discovery, hp.Client.IP) {
+				continue
+			}
 			targets = append(targets, plugins.Target{
 				Address:    netip.AddrPortFrom(addr, uint16(port)),
 				Host:       hp.Client.IP,
@@ -194,6 +201,22 @@ func shouldKeepNervaFinding(sf plugins.SecurityFinding) bool {
 		return false
 	}
 	return true
+}
+
+// isRawPrintSinkPort returns true for raw printer data-stream ports that must
+// remain strictly connect-only (zero application bytes written).
+func isRawPrintSinkPort(port int, disc *LANDiscovery, ip string) bool {
+	if port == 9100 || port == 515 {
+		return true
+	}
+	if disc != nil {
+		if m := disc.RawPrintIPs[ip]; m != nil {
+			if _, ok := m[port]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // firstHeader looks up a header name case-insensitively in Nerva's response_headers map.

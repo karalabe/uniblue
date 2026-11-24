@@ -1,0 +1,42 @@
+id: UB-0027
+title: Exposed Node.js V8 Inspector Debugger (LAN RCE)
+cve: null
+category: unauth-rce
+severity: critical
+safety: read-only
+
+metadata:
+  vendor: OpenJS Foundation
+  product: Node.js Inspector (--inspect)
+  affected_versions: any (bound outside 127.0.0.1)
+  author: "@karalabe"
+  references:
+    - https://nodejs.org/en/learn/getting-started/debugging
+
+preconditions:
+  ports_any: [9229]
+
+probe:
+  type: http
+  method: GET
+  path: /json/version
+  timeout: 3s
+  match:
+    status: [200]
+    json_match:
+      - path: "$.Browser"
+        regex: "(?i)^node\\.js/"
+      - path: "$.Protocol-Version"
+        exists: true
+    evidence_summary: "Node.js V8 Inspector /json/version exposed on LAN without authentication"
+    redact_body: true
+
+remediation:
+  summary: >
+    A workstation or container is running Node.js with --inspect=0.0.0.0:9229.
+    Any host on the LAN can attach to the inspector WebSocket and execute
+    arbitrary JavaScript/shell commands in the Node.js process. Bind --inspect
+    strictly to 127.0.0.1 and never publish port 9229 on LAN interfaces.
+  unifi_actions:
+    - bind_nodejs_inspector_to_localhost
+    - restrict_inter_vlan_access

@@ -12,12 +12,19 @@ import (
 // values so they flow through UniBlue's UniFi blast-radius scoring, state
 // diffing, and webhook alerting alongside declarative YAML checks.
 //
-// Any Nerva finding on a (host, port) already reported by an existing UniBlue
-// check is skipped so operators never see duplicate entries.
+// Any Nerva finding on a (host, port) whose security property is already
+// reported by an existing UniBlue check is skipped so operators never see
+// duplicate entries, while independent properties on the same port (such as an
+// expired TLS certificate alongside an HTTP product finding) are preserved.
 func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Finding {
-	covered := make(map[string]struct{}, len(existing))
+	coveredNonTLS := make(map[string]struct{}, len(existing))
+	coveredTLS := make(map[string]struct{}, len(existing))
 	for _, f := range existing {
-		covered[fmt.Sprintf("%s|%d", f.Client.IP, f.Port)] = struct{}{}
+		key := fmt.Sprintf("%s|%d", f.Client.IP, f.Port)
+		coveredNonTLS[key] = struct{}{}
+		if f.CheckID == "UB-0020" || strings.Contains(strings.ToLower(f.CheckID), "tls") {
+			coveredTLS[key] = struct{}{}
+		}
 	}
 
 	var out []Finding
@@ -26,13 +33,24 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 			if len(svc.Findings) == 0 {
 				continue
 			}
-			// Skip if a dedicated UniBlue YAML check already produced a verified
-			// finding on this exact (IP, port).
-			if _, ok := covered[fmt.Sprintf("%s|%d", hp.Client.IP, svc.Port)]; ok {
-				continue
-			}
 
 			for _, sf := range svc.Findings {
+				key := fmt.Sprintf("%s|%d", hp.Client.IP, svc.Port)
+				isTLS := strings.HasPrefix(strings.ToLower(sf.ID), "tls-")
+				isTLSCert := strings.Contains(strings.ToLower(sf.ID), "cert")
+				// Never suppress an independent TLS certificate finding (e.g., expired
+				// cert) because of an HTTP app check or deprecated-TLS protocol check.
+				if isTLS {
+					if !isTLSCert {
+						if _, ok := coveredTLS[key]; ok {
+							continue
+						}
+					}
+				} else {
+					if _, ok := coveredNonTLS[key]; ok {
+						continue
+					}
+				}
 				sev, err := ParseSeverity(sf.Severity)
 				if err != nil {
 					sev = SeverityLow

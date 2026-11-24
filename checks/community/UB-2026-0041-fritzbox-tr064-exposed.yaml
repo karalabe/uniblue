@@ -1,0 +1,28 @@
+id: UB-2026-0041
+title: FRITZ!Box TR-064 LAN Management Service Advertised
+cve: null
+category: exposed-protocol
+severity: low
+safety: read-only
+
+metadata:
+  vendor: AVM
+  product: FRITZ!Box Router / Repeater (TR-064)
+  affected_versions: FRITZ!OS with TR-064 enabled
+  author: "@karalabe"
+  references:
+    - https://fritz.com/pages/schnittstellen
+
+preconditions:
+  upnp_device_regex: "(?i)(fritzbox|dslforum-org)"
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    FRITZ!Box advertises its TR-064 LAN management interface over SSDP/UPnP.
+    Ensure strong authentication is required for TR-064 apps and that guest
+    or IoT VLANs cannot reach TCP ports 49000/49443 on the router.
+  unifi_actions:
+    - restrict_tr064_to_trusted_vlan

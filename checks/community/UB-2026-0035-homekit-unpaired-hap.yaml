@@ -1,0 +1,31 @@
+id: UB-2026-0035
+title: Unpaired HomeKit HAP Accessory Advertised on LAN
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Generic (HomeKit / Matter / Homebridge)
+  product: HomeKit Accessory Protocol (HAP) Device
+  affected_versions: Any HAP accessory advertising sf=1 (unpaired)
+  author: "@karalabe"
+  references:
+    - https://developer.apple.com/homekit/
+
+preconditions:
+  mdns_type_any: ["_hap._tcp"]
+  mdns_txt_regex: "(?i)^sf=1$"
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    Device is advertising an unpaired HomeKit HAP status flag (sf=1) over mDNS.
+    Any user on the same Wi-Fi network can pair with and claim administrative
+    control over an unpaired smart lock, camera, bridge, or switch. Complete
+    pairing immediately or move the device to an isolated IoT VLAN.
+  unifi_actions:
+    - pair_homekit_accessory_or_disable_hap
+    - move_to_iot_vlan

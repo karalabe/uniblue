@@ -1,0 +1,31 @@
+id: UB-2026-0036
+title: Zigbee Ethernet Coordinator Raw Radio Bridge Advertised on LAN
+cve: null
+category: exposed-protocol
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Generic (SMLIGHT / UZG / ZigStar)
+  product: Network Zigbee Coordinator (SLZB-06 / UZG-01)
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://github.com/home-assistant/core/blob/dev/homeassistant/components/zha/manifest.json
+
+preconditions:
+  mdns_type_any: ["_slzb-06._tcp", "_uzg-01._tcp", "_zigbee-coordinator._tcp"]
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    An Ethernet Zigbee coordinator is advertising its raw TCP serial radio
+    bridge via mDNS. Unauthenticated TCP access to a Zigbee coordinator allows
+    any LAN host to hijack the mesh network, toggle switches, or unlock Zigbee
+    locks. Move the coordinator to an isolated IoT VLAN and restrict its TCP
+    bridge port strictly to your Home Assistant / Zigbee2MQTT host IP.
+  unifi_actions:
+    - move_to_iot_vlan
+    - restrict_coordinator_port_to_controller

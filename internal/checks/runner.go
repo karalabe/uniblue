@@ -198,7 +198,14 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 			if ctx.Err() != nil {
 				break
 			}
-			if evidence, matched := r.executeProbe(ctx, chk, hp.Client.IP, port); matched {
+			var evidence string
+			var matched bool
+			if chk.Probe.Type == "observe" {
+				evidence, matched = probeObserve(chk, hp, port)
+			} else {
+				evidence, matched = r.executeProbe(ctx, chk, hp.Client.IP, port)
+			}
+			if matched {
 				for _, supID := range chk.Supersedes {
 					superseded[fmt.Sprintf("%s|%d", supID, port)] = struct{}{}
 				}
@@ -322,9 +329,129 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 		matchedPorts = webPorts
 	}
 
+	// Match passive mDNS / DNS-SD service preconditions.
+	var discoveredPorts []int
+	if len(chk.Preconditions.MDNSTypeAny) > 0 {
+		mdnsMatched := false
+		for _, svc := range hp.MDNSServices {
+			typeOK := false
+			for _, want := range chk.Preconditions.MDNSTypeAny {
+				if strings.EqualFold(svc.Type, want) {
+					typeOK = true
+					break
+				}
+			}
+			if !typeOK {
+				continue
+			}
+			if chk.compiled.mdnsTXT != nil {
+				txtOK := false
+				for _, kv := range svc.TXT {
+					if chk.compiled.mdnsTXT.MatchString(kv) {
+						txtOK = true
+						break
+					}
+				}
+				if !txtOK {
+					continue
+				}
+			}
+			mdnsMatched = true
+			if svc.Port > 0 {
+				discoveredPorts = append(discoveredPorts, svc.Port)
+			}
+		}
+		if !mdnsMatched {
+			return nil, false
+		}
+	}
+
+	// Match passive SSDP / UPnP device and service preconditions.
+	if chk.compiled.upnpDevice != nil || chk.compiled.upnpService != nil {
+		upnpMatched := false
+		for _, dev := range hp.UPnPDevices {
+			if chk.compiled.upnpDevice != nil {
+				combined := strings.Join([]string{dev.ST, dev.DeviceType, dev.Manufacturer, dev.ModelName, dev.ModelNumber, dev.Server}, " ")
+				if !chk.compiled.upnpDevice.MatchString(combined) {
+					continue
+				}
+			}
+			if chk.compiled.upnpService != nil {
+				svcOK := false
+				for _, st := range dev.ServiceTypes {
+					if chk.compiled.upnpService.MatchString(st) {
+						svcOK = true
+						break
+					}
+				}
+				if !svcOK && !chk.compiled.upnpService.MatchString(dev.ST) {
+					continue
+				}
+			}
+			upnpMatched = true
+			if dev.Port > 0 {
+				discoveredPorts = append(discoveredPorts, dev.Port)
+			}
+		}
+		if !upnpMatched {
+			return nil, false
+		}
+	}
+
+	// Match passive WS-Discovery (ONVIF / WSD) preconditions.
+	if chk.compiled.wsType != nil {
+		wsMatched := false
+		for _, rec := range hp.WSDiscovery {
+			combined := strings.Join(append(append([]string(nil), rec.Types...), rec.Scopes...), " ")
+			if !chk.compiled.wsType.MatchString(combined) {
+				continue
+			}
+			wsMatched = true
+			discoveredPorts = append(discoveredPorts, rec.Ports...)
+		}
+		if !wsMatched {
+			return nil, false
+		}
+	}
+
+	// Match Nerva-detected application-layer protocol names.
+	if len(chk.Preconditions.ServiceProtoAny) > 0 {
+		svcMatched := false
+		for _, svc := range hp.Services {
+			for _, want := range chk.Preconditions.ServiceProtoAny {
+				if strings.EqualFold(svc.Protocol, want) {
+					svcMatched = true
+					if svc.Port > 0 {
+						discoveredPorts = append(discoveredPorts, svc.Port)
+					}
+					break
+				}
+			}
+		}
+		if !svcMatched {
+			return nil, false
+		}
+	}
+
+	if len(matchedPorts) == 0 && len(discoveredPorts) > 0 {
+		seen := make(map[int]struct{}, len(discoveredPorts))
+		for _, p := range discoveredPorts {
+			if _, dup := seen[p]; !dup {
+				seen[p] = struct{}{}
+				matchedPorts = append(matchedPorts, p)
+			}
+		}
+	}
+
 	// Allow probe.port to pin a single specific port once preconditions pass.
 	if chk.Probe.Port > 0 {
 		return []int{chk.Probe.Port}, true
+	}
+	if len(matchedPorts) == 0 && (chk.Probe.Type == "observe" || isNonTCPProbe(chk.Probe.Type)) {
+		return []int{0}, true
+	}
+	if len(matchedPorts) == 0 {
+		return nil, false
 	}
 	return matchedPorts, true
 }
@@ -365,6 +492,24 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 		return r.probeESFileExplorer(probeCtx, ip, port)
 	case "redis":
 		return probeRedisUnauth(probeCtx, ip, port)
+	case "snmp":
+		return probeSNMPReadOnly(probeCtx, ip, port, chk.Probe.Community)
+	case "tls-legacy":
+		return probeTLSLegacy(probeCtx, ip, port)
+	case "memcached":
+		return probeMemcached(probeCtx, ip, port)
+	case "rsync":
+		return probeRsync(probeCtx, ip, port)
+	case "mpd":
+		return probeMPD(probeCtx, ip, port)
+	case "kasa":
+		return probeKasa(probeCtx, ip, port)
+	case "coap":
+		return probeCoAP(probeCtx, ip, port)
+	case "natpmp":
+		return probeNATPMP(probeCtx, ip, port)
+	case "ipp":
+		return r.probeIPP(probeCtx, ip, port)
 	default:
 		return "", false
 	}
@@ -396,56 +541,80 @@ func probeTCP(ctx context.Context, ip string, port int, chk *Check) (string, boo
 	return fmt.Sprintf("TCP port %d banner matched check signature", port), true
 }
 
-// probeHTTP executes a strictly read-only, target-IP-only HTTP request and
-// evaluates status, header, and body matchers.
+// probeHTTP executes strictly read-only, target-IP-only HTTP request(s) across
+// Path / Paths and evaluates status, header, body, negative, and JSONPath matchers.
 func (r *Runner) probeHTTP(ctx context.Context, ip string, port int, chk *Check) (string, bool) {
 	scheme := chk.Probe.Scheme
 	if scheme == "" {
-		if port == 443 || port == 8443 {
+		if port == 443 || port == 8443 || port == 9443 || port == 10443 {
 			scheme = "https"
 		} else {
 			scheme = "http"
 		}
 	}
 
-	targetURL := fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(ip, strconv.Itoa(port)), chk.Probe.Path)
-	req, err := http.NewRequestWithContext(ctx, chk.Probe.Method, targetURL, nil)
-	if err != nil {
-		return "", false
-	}
-	req.Header.Set("User-Agent", "UniBlue-Checker/0.1")
+	for _, path := range chk.httpPaths() {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		targetURL := fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(ip, strconv.Itoa(port)), path)
+		req, err := http.NewRequestWithContext(ctx, chk.Probe.Method, targetURL, nil)
+		if err != nil {
+			return "", false
+		}
+		req.Header.Set("User-Agent", "UniBlue-Checker/0.1")
+		for hk, hv := range chk.Probe.RequestHeaders {
+			req.Header.Set(hk, hv)
+		}
 
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		return "", false
-	}
-	defer resp.Body.Close()
+		resp, err := r.httpClient.Do(req)
+		if err != nil {
+			return "", false
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxProbeBodyBytes))
+		_ = resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxProbeBodyBytes))
+		// Stop trying alternate paths if the service explicitly challenged authentication.
+		if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) &&
+			!intInSlice(resp.StatusCode, chk.Probe.Match.Status) {
+			return "", false
+		}
+		if !matchHTTPResponse(resp, bodyBytes, chk) {
+			continue
+		}
+		if chk.Probe.Match.EvidenceSummary != "" {
+			return fmt.Sprintf("%s (%s %s -> HTTP %d)", chk.Probe.Match.EvidenceSummary, chk.Probe.Method, path, resp.StatusCode), true
+		}
+		return fmt.Sprintf("%s %s returned HTTP %d without required authentication", chk.Probe.Method, path, resp.StatusCode), true
+	}
+	return "", false
+}
+
+func matchHTTPResponse(resp *http.Response, bodyBytes []byte, chk *Check) bool {
 	body := string(bodyBytes)
 	m := chk.Probe.Match
 
 	if len(m.Status) > 0 && !intInSlice(resp.StatusCode, m.Status) {
-		return "", false
+		return false
 	}
 	for _, h := range m.HeadersAbsent {
 		if resp.Header.Get(h) != "" {
-			return "", false
+			return false
 		}
 	}
 	for _, h := range m.HeadersPresent {
 		if resp.Header.Get(h) == "" {
-			return "", false
+			return false
 		}
 	}
 	for h, substr := range m.HeaderContains {
 		if !strings.Contains(strings.ToLower(resp.Header.Get(h)), strings.ToLower(substr)) {
-			return "", false
+			return false
 		}
 	}
 	for _, needle := range m.BodyContainsAll {
 		if !strings.Contains(body, needle) {
-			return "", false
+			return false
 		}
 	}
 	if len(m.BodyContainsAny) > 0 {
@@ -457,14 +626,21 @@ func (r *Runner) probeHTTP(ctx context.Context, ip string, port int, chk *Check)
 			}
 		}
 		if !found {
-			return "", false
+			return false
+		}
+	}
+	for _, forbid := range m.BodyNotContains {
+		if strings.Contains(body, forbid) {
+			return false
 		}
 	}
 	if chk.compiled.body != nil && !chk.compiled.body.MatchString(body) {
-		return "", false
+		return false
 	}
-
-	return fmt.Sprintf("%s %s returned HTTP %d without required authentication", chk.Probe.Method, chk.Probe.Path, resp.StatusCode), true
+	if !matchJSONPredicates(bodyBytes, m.JSONMatch) {
+		return false
+	}
+	return true
 }
 
 // probeMQTT sends a minimal MQTT 3.1.1 CONNECT packet with no credentials and
@@ -477,21 +653,20 @@ func probeMQTT(ctx context.Context, ip string, port int) (string, bool) {
 	}
 	defer conn.Close()
 
-	// Construct a minimal MQTT 3.1.1 CONNECT packet:
-	//   Fixed header:  0x10 (CONNECT), remaining length 19 (0x13)
-	//   Protocol name: 0x00 0x04 "MQTT"
-	//   Protocol lvl:  0x04 (3.1.1)
-	//   Connect flags: 0x02 (Clean Session, no username/password)
-	//   Keep alive:    0x00 0x0A (10s)
-	//   Client ID:     0x00 0x07 "uniblue"
-	connectPkt := []byte{
-		0x10, 0x13,
+	// Unique 12-byte ephemeral client ID: "uniblue-" + 4 random hex chars
+	// so UniBlue never evicts an active client sharing a static ID.
+	clientID := "uniblue-" + randomShortHex()
+	remLen := byte(10 + 2 + len(clientID))
+	connectPkt := make([]byte, 0, int(remLen)+2)
+	connectPkt = append(connectPkt,
+		0x10, remLen,
 		0x00, 0x04, 'M', 'Q', 'T', 'T',
-		0x04,
-		0x02,
-		0x00, 0x0A,
-		0x00, 0x07, 'u', 'n', 'i', 'b', 'l', 'u', 'e',
-	}
+		0x04,       // Protocol level 3.1.1
+		0x02,       // Clean Session, no username/password
+		0x00, 0x0A, // Keep alive 10s
+		0x00, byte(len(clientID)),
+	)
+	connectPkt = append(connectPkt, []byte(clientID)...)
 	if _, err := conn.Write(connectPkt); err != nil {
 		return "", false
 	}

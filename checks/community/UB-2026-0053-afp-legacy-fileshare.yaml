@@ -1,0 +1,28 @@
+id: UB-2026-0053
+title: Legacy Apple Filing Protocol (AFP) File Sharing Advertised
+cve: null
+category: exposed-protocol
+severity: low
+safety: read-only
+
+metadata:
+  vendor: Apple / Netatalk
+  product: AFP File Server (Port 548)
+  affected_versions: Deprecated AFP / Netatalk services
+  author: "@karalabe"
+  references:
+    - https://support.apple.com/guide/mac-help/mh14107/mac
+
+preconditions:
+  mdns_type_any: ["_afpovertcp._tcp"]
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    Host advertises the deprecated Apple Filing Protocol (AFP, TCP 548) over
+    mDNS. Apple deprecated AFP in favor of SMB3 (including for Time Machine).
+    Disable AFP/Netatalk on your NAS or Mac and migrate shares to encrypted SMB3.
+  unifi_actions:
+    - disable_legacy_afp_use_smb3

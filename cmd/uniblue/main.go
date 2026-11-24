@@ -429,9 +429,10 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
 	fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
-	// Seed per-host port hints discovered from UniFi port forwards and firewall
-	// policies so custom routed ports are probed automatically without config.
-	fp.SetHostPortHints(snap.PortHintsByIP())
+	// Seed per-host port hints from UniFi port forwards, firewall policies, and
+	// identity-gated checks (MAC/hostname) so specialty ports are only dialed on
+	// matching hosts instead of every host on the LAN.
+	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
 	runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
@@ -476,32 +477,11 @@ func correlateLocalCVEs(cfg *config.Config, snap *unifi.Snapshot, profiles []pro
 	return exact, potential, true
 }
 
-// mergePorts returns the deduplicated union of basePorts and every port
-// referenced in loaded check preconditions.
+// mergePorts returns the bounded global baseline TCP port list combining
+// basePorts with only those loaded checks that require global TCP probing
+// (excluding passive, UDP-only, discovery-only, and identity-gated checks).
 func mergePorts(basePorts []int, list []*checks.Check) []int {
-	seen := make(map[int]struct{}, len(basePorts))
-	merged := make([]int, 0, len(basePorts))
-	for _, p := range basePorts {
-		if _, ok := seen[p]; !ok {
-			seen[p] = struct{}{}
-			merged = append(merged, p)
-		}
-	}
-	for _, chk := range list {
-		for _, p := range chk.Preconditions.PortsAny {
-			if _, ok := seen[p]; !ok {
-				seen[p] = struct{}{}
-				merged = append(merged, p)
-			}
-		}
-		for _, p := range chk.Preconditions.PortsAll {
-			if _, ok := seen[p]; !ok {
-				seen[p] = struct{}{}
-				merged = append(merged, p)
-			}
-		}
-	}
-	return merged
+	return checks.PlanGlobalPorts(basePorts, list)
 }
 
 // loadAllChecks loads the embedded built-in checks and optionally merges checks

@@ -28,11 +28,16 @@ const (
 	// perPortPause inserts a brief breather between consecutive port dials on
 	// the same host so fragile embedded TCP stacks (HVAC controllers, inverters,
 	// older cameras) are never hit with a rapid burst of SYNs.
-	perPortPause = 15 * time.Millisecond
+	perPortPause = 8 * time.Millisecond
 
 	// maxPortDialTimeout caps the initial TCP connect check on a local LAN so
-	// sleeping or firewalled hosts never stall a scan across 30+ ports.
-	maxPortDialTimeout = 600 * time.Millisecond
+	// sleeping or firewalled hosts never stall a scan across 40+ ports.
+	maxPortDialTimeout = 350 * time.Millisecond
+
+	// maxConsecutiveSilentTimeouts stops dialing additional ports on a host that
+	// has neither opened a single port nor returned a single TCP RST (e.g., a
+	// sleeping phone or stealth-firewalled workstation silently dropping SYNs).
+	maxConsecutiveSilentTimeouts = 8
 
 	// vncMaxDisplayPort caps the adaptive sequential VNC display walk (5900..5919)
 	// triggered only on hosts that already expose a VNC listener.
@@ -74,6 +79,18 @@ type HTTPBanner struct {
 
 	// TLSSubjectOrg is the leaf TLS certificate Organization observed on HTTPS ports.
 	TLSSubjectOrg string `json:"tls_subject_org,omitempty"`
+
+	// TLSVersion records the negotiated TLS protocol version (e.g., "TLS 1.3").
+	TLSVersion string `json:"tls_version,omitempty"`
+
+	// TLSNotAfter records the leaf certificate's expiration timestamp, if present.
+	TLSNotAfter *time.Time `json:"tls_not_after,omitempty"`
+
+	// TLSExpired reports whether the leaf TLS certificate is past its NotAfter date.
+	TLSExpired bool `json:"tls_expired,omitempty"`
+
+	// TLSSelfSigned reports whether the leaf certificate is cryptographically self-signed.
+	TLSSelfSigned bool `json:"tls_self_signed,omitempty"`
 }
 
 // Service summarizes one application-layer service identified on an open port
@@ -149,6 +166,15 @@ type HostProfile struct {
 	// ports by Nerva's embedded protocol fingerprinters.
 	Services []Service `json:"services,omitempty"`
 
+	// MDNSServices lists DNS-SD services advertised by this host on UDP 5353.
+	MDNSServices []MDNSService `json:"mdns_services,omitempty"`
+
+	// UPnPDevices lists SSDP/UPnP device descriptions advertised by this host.
+	UPnPDevices []UPnPDevice `json:"upnp_devices,omitempty"`
+
+	// WSDiscovery lists WS-Discovery (ONVIF / WSD) announcements from this host.
+	WSDiscovery []WSDiscoveryRecord `json:"ws_discovery,omitempty"`
+
 	// ScannedAt records when fingerprinting finished for this host.
 	ScannedAt time.Time `json:"scanned_at"`
 }
@@ -179,8 +205,15 @@ type Fingerprinter struct {
 	excludeIPs map[string]struct{}
 
 	// hostPortHints maps specific client IPs to extra TCP ports discovered from
-	// UniFi port forwards or firewall policies so custom ports are probed automatically.
+	// UniFi port forwards, firewall policies, or per-host LAN discovery.
 	hostPortHints map[string][]int
+
+	// discovery holds optional LAN-wide multicast observations (mDNS, SSDP,
+	// WS-Discovery) collected once per FingerprintAll sweep.
+	discovery *LANDiscovery
+
+	// skipDiscovery disables multicast discovery (used by isolated unit tests).
+	skipDiscovery bool
 
 	// httpClient is configured with redirects disabled and self-signed TLS
 	// accepted so local LAN devices can be fingerprinted without leaking requests
@@ -252,7 +285,24 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	if len(targets) < workers {
 		workers = len(targets)
 	}
+
+	// Run one bounded LAN multicast discovery sweep (mDNS, SSDP/UPnP, WS-Discovery)
+	// when profiling non-loopback LAN hosts so per-host port hints and passive
+	// service metadata enrich every matching HostProfile with zero blind dials.
+	if !f.skipDiscovery && hasNonLoopbackTarget(targets) {
+		f.discovery = DiscoverLAN(ctx, f.httpClient)
+	}
 	return f.collectProfiles(ctx, targets, workers)
+}
+
+func hasNonLoopbackTarget(targets []unifi.Client) bool {
+	for _, cl := range targets {
+		ip := net.ParseIP(cl.IP)
+		if ip != nil && !ip.IsLoopback() {
+			return true
+		}
+	}
+	return false
 }
 
 // collectProfiles runs the channel pipeline cleanly so the exact number of
@@ -314,6 +364,11 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		HTTP:      make(map[int]HTTPBanner),
 		ScannedAt: time.Now().UTC(),
 	}
+	if f.discovery != nil {
+		profile.MDNSServices = f.discovery.MDNS[cl.IP]
+		profile.UPnPDevices = f.discovery.UPnP[cl.IP]
+		profile.WSDiscovery = f.discovery.WSDiscovery[cl.IP]
+	}
 
 	dialTimeout := f.timeout
 	if dialTimeout > maxPortDialTimeout {
@@ -322,6 +377,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	dialer := net.Dialer{Timeout: dialTimeout}
 
 	ports := f.portsForHost(cl.IP)
+	consecutiveTimeouts := 0
 	for i, port := range ports {
 		if ctx.Err() != nil {
 			break
@@ -341,8 +397,18 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		addr := net.JoinHostPort(cl.IP, strconv.Itoa(port))
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				consecutiveTimeouts++
+				if len(profile.OpenPorts) == 0 && consecutiveTimeouts >= maxConsecutiveSilentTimeouts {
+					break
+				}
+			} else {
+				// Received an active TCP RST / ECONNREFUSED: host is awake and reachable.
+				consecutiveTimeouts = 0
+			}
 			continue
 		}
+		consecutiveTimeouts = 0
 
 		// On SSH (port 22), passively read the server's initial identification
 		// banner before closing so version-based CVE checks have exact OpenSSH
@@ -376,28 +442,34 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 }
 
 // portsForHost returns the deduplicated, sorted list of TCP ports to probe on
-// ip, merging UniBlue's base port list with any UniFi-derived host port hints.
+// ip, merging UniBlue's base port list with UniFi-derived port hints and
+// per-host ports dynamically discovered via mDNS/SSDP/WS-Discovery.
 func (f *Fingerprinter) portsForHost(ip string) []int {
 	hints := f.hostPortHints[ip]
-	if len(hints) == 0 {
+	var discPorts []int
+	if f.discovery != nil {
+		discPorts = f.discovery.PortsByIP[ip]
+	}
+	if len(hints) == 0 && len(discPorts) == 0 {
 		return f.ports
 	}
-	seen := make(map[int]struct{}, len(f.ports)+len(hints))
-	out := make([]int, 0, len(f.ports)+len(hints))
-	for _, p := range f.ports {
-		seen[p] = struct{}{}
-		out = append(out, p)
-	}
-	for _, p := range hints {
-		if p < 1 || p > 65535 {
-			continue
+	seen := make(map[int]struct{}, len(f.ports)+len(hints)+len(discPorts))
+	out := make([]int, 0, len(f.ports)+len(hints)+len(discPorts))
+	add := func(list []int) {
+		for _, p := range list {
+			if p < 1 || p > 65535 {
+				continue
+			}
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
 		}
-		if _, dup := seen[p]; dup {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
 	}
+	add(f.ports)
+	add(hints)
+	add(discPorts)
 	sort.Ints(out)
 	return out
 }
@@ -488,14 +560,38 @@ func (f *Fingerprinter) fetchHTTPBanner(ctx context.Context, scheme, ip string, 
 		Title:           extractTitle(string(body)),
 		WWWAuthenticate: strings.TrimSpace(resp.Header.Get("WWW-Authenticate")),
 	}
-	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
-		cert := resp.TLS.PeerCertificates[0]
-		banner.TLSSubjectCN = strings.TrimSpace(cert.Subject.CommonName)
-		if len(cert.Subject.Organization) > 0 {
-			banner.TLSSubjectOrg = strings.TrimSpace(cert.Subject.Organization[0])
+	if resp.TLS != nil {
+		banner.TLSVersion = tlsVersionString(resp.TLS.Version)
+		if len(resp.TLS.PeerCertificates) > 0 {
+			cert := resp.TLS.PeerCertificates[0]
+			banner.TLSSubjectCN = strings.TrimSpace(cert.Subject.CommonName)
+			if len(cert.Subject.Organization) > 0 {
+				banner.TLSSubjectOrg = strings.TrimSpace(cert.Subject.Organization[0])
+			}
+			exp := cert.NotAfter.UTC()
+			banner.TLSNotAfter = &exp
+			banner.TLSExpired = time.Now().UTC().After(exp)
+			if cert.Subject.String() == cert.Issuer.String() {
+				banner.TLSSelfSigned = cert.CheckSignatureFrom(cert) == nil
+			}
 		}
 	}
 	return banner, true
+}
+
+func tlsVersionString(v uint16) string {
+	switch v {
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	default:
+		return ""
+	}
 }
 
 // extractTitle pulls a compact single-line title from raw HTML, returning an

@@ -639,7 +639,7 @@ func (e *Engine) scanSingleHost(ctx context.Context, cl unifi.Client) {
 	e.mu.RUnlock()
 
 	fp := probe.NewFingerprinter(e.scanPorts, 1, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
-	fp.SetHostPortHints(hints)
+	fp.SetHostPortHints(checks.PlanHostPorts([]unifi.Client{cl}, e.checkList, hints))
 	profiles := fp.FingerprintAll(ctx, []unifi.Client{cl})
 	if len(profiles) == 0 {
 		return
@@ -694,7 +694,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	}
 
 	fp := probe.NewFingerprinter(e.scanPorts, e.cfg.Scan.Concurrency, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
-	fp.SetHostPortHints(snap.PortHintsByIP())
+	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
 	e.mu.Lock()

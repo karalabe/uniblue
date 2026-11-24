@@ -1,0 +1,43 @@
+id: UB-0025
+title: Unauthenticated Elasticsearch / OpenSearch Cluster API
+cve: null
+category: info-disclosure
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Elastic / OpenSearch
+  product: Elasticsearch / OpenSearch HTTP API
+  affected_versions: any (security disabled on LAN interface)
+  author: "@karalabe"
+  references:
+    - https://www.elastic.co/guide/en/elasticsearch/reference/current/security-minimal-setup.html
+
+preconditions:
+  ports_any: [9200]
+
+probe:
+  type: http
+  method: GET
+  path: /
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    json_match:
+      - path: "$.cluster_name"
+        exists: true
+      - path: "$.version.number"
+        exists: true
+    evidence_summary: "Elasticsearch/OpenSearch root endpoint returned cluster metadata without authentication"
+    redact_body: true
+
+remediation:
+  summary: >
+    Elasticsearch/OpenSearch responded on port 9200 without authentication.
+    Unauthenticated clusters expose indexed logs, documents, and write/delete
+    operations to every host on the LAN. Enable xpack.security / OpenSearch
+    Security or bind the node strictly to localhost.
+  unifi_actions:
+    - enable_elasticsearch_security
+    - bind_to_localhost_or_restrict_vlan

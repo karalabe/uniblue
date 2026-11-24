@@ -1,0 +1,27 @@
+id: UB-2026-0051
+title: Philips JointSpace Smart TV Control RPC Advertised
+cve: null
+category: exposed-protocol
+severity: low
+safety: read-only
+
+metadata:
+  vendor: Philips
+  product: Philips JointSpace TV
+  affected_versions: TVs advertising _philipstv_rpc._tcp or _philipstv_s_rpc._tcp
+  author: "@karalabe"
+  references:
+    - https://github.com/home-assistant/core/blob/dev/homeassistant/components/philips_js/manifest.json
+
+preconditions:
+  mdns_type_any: ["_philipstv_rpc._tcp", "_philipstv_s_rpc._tcp"]
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    Philips Smart TV advertises its local JointSpace RPC control interface
+    (port 1925/1926) on the LAN. Place smart TVs on an isolated IoT/Media VLAN.
+  unifi_actions:
+    - move_to_iot_vlan

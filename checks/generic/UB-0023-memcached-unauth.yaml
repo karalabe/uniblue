@@ -1,0 +1,32 @@
+id: UB-0023
+title: Unauthenticated Memcached Server Exposed on LAN
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Memcached
+  product: Memcached In-Memory Object Cache
+  affected_versions: any (bound to LAN interface without SASL)
+  author: "@karalabe"
+  references:
+    - https://github.com/memcached/memcached/wiki/ConfiguringServer
+
+preconditions:
+  ports_any: [11211]
+
+probe:
+  type: memcached
+  port: 11211
+  timeout: 3s
+
+remediation:
+  summary: >
+    Memcached responded to an unauthenticated version query on TCP port 11211.
+    Any host on the LAN can read cached session data or poison application
+    caches. Bind Memcached strictly to 127.0.0.1 (-l 127.0.0.1) and disable
+    UDP (-U 0).
+  unifi_actions:
+    - bind_memcached_to_localhost
+    - restrict_inter_vlan_access

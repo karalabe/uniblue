@@ -205,18 +205,43 @@ type Preconditions struct {
 
 	// HTTPStatusAny requires an open web port to have returned one of these status codes.
 	HTTPStatusAny []int `yaml:"http_status_any"`
+
+	// MDNSTypeAny matches hosts advertising any of these DNS-SD service types
+	// (e.g., "_esphomelib._tcp", "_hap._tcp", "_ipp._tcp").
+	MDNSTypeAny []string `yaml:"mdns_type_any"`
+
+	// MDNSTXTRegex matches allowlisted DNS-SD TXT key=value pairs on matched services.
+	MDNSTXTRegex string `yaml:"mdns_txt_regex"`
+
+	// UPnPDeviceRegex matches SSDP/UPnP deviceType, ST, manufacturer, model, or Server.
+	UPnPDeviceRegex string `yaml:"upnp_device_regex"`
+
+	// UPnPServiceRegex matches advertised UPnP XML serviceType URNs.
+	UPnPServiceRegex string `yaml:"upnp_service_regex"`
+
+	// WSTypeRegex matches WS-Discovery Types or Scopes (e.g., "NetworkVideoTransmitter").
+	WSTypeRegex string `yaml:"ws_type_regex"`
+
+	// ServiceProtoAny matches Nerva-detected protocol names (e.g., "smb", "mongodb").
+	ServiceProtoAny []string `yaml:"service_proto_any"`
+
+	// DiscoveryOnly prevents this check's ports from being added to the global
+	// TCP baseline sweep; the check runs only when its port is already open via
+	// DefaultPorts, UniFi hints, or per-host LAN discovery.
+	DiscoveryOnly bool `yaml:"discovery_only"`
 }
 
 // ProbeSpec defines the target-only verification probe executed when a host
 // satisfies a check's Preconditions.
 type ProbeSpec struct {
-	// Type selects the probe protocol: "tcp", "telnet", "http", "mqtt",
-	// "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc", "adb",
-	// "rdp-nla", "ftp-anon", "esfile", or "redis".
+	// Type selects the probe protocol: "observe", "tcp", "telnet", "http",
+	// "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc", "adb",
+	// "rdp-nla", "ftp-anon", "esfile", "redis", "snmp", "tls-legacy",
+	// "memcached", "rsync", "mpd", "kasa", "coap", "natpmp", or "ipp".
 	Type string `yaml:"type"`
 
 	// Port optionally pins the target port. When 0, the runner tests whichever
-	// ports from Preconditions.PortsAny were observed open on the host.
+	// ports from Preconditions were observed open on the host.
 	Port int `yaml:"port"`
 
 	// Scheme optionally forces "http" or "https" for HTTP probes; inferred from
@@ -230,11 +255,43 @@ type ProbeSpec struct {
 	// Path is the relative request path for HTTP probes (must begin with "/").
 	Path string `yaml:"path"`
 
+	// Paths optionally supplies an ordered list of relative HTTP paths to try
+	// sequentially, stopping on the first conclusive match or 401/403 challenge.
+	Paths []string `yaml:"paths"`
+
+	// RequestHeaders optionally sets strictly allowlisted read-only HTTP request
+	// headers (e.g., Accept). Host, Authorization, Cookie, and forwarding headers
+	// are rejected by Validate().
+	RequestHeaders map[string]string `yaml:"request_headers"`
+
+	// Community sets the single read-only SNMP community string for "snmp" probes.
+	Community string `yaml:"community"`
+
 	// Timeout bounds how long the probe waits for a response from the target.
 	Timeout time.Duration `yaml:"timeout"`
 
 	// Match configures response matching rules for HTTP and TCP banner probes.
 	Match MatchSpec `yaml:"match"`
+}
+
+// JSONPredicate tests a bounded JSONPath field (e.g., "$.auth_en") in a JSON body.
+type JSONPredicate struct {
+	// Path is a bounded dot/index JSONPath expression starting with "$.".
+	Path string `yaml:"path"`
+
+	// Exists asserts whether Path is present (true) or absent (false).
+	Exists *bool `yaml:"exists,omitempty"`
+
+	// Equals requires the scalar string representation at Path to equal this value.
+	Equals string `yaml:"equals,omitempty"`
+
+	// NotEquals requires the scalar string representation at Path not to equal this value.
+	NotEquals string `yaml:"not_equals,omitempty"`
+
+	// Regex matches the scalar string value at Path against a Go RE2 pattern.
+	Regex string `yaml:"regex,omitempty"`
+
+	compiled *regexp.Regexp
 }
 
 // MatchSpec defines deterministic conditions that confirm a finding.
@@ -248,8 +305,14 @@ type MatchSpec struct {
 	// BodyContainsAny requires at least one substring to appear in the body.
 	BodyContainsAny []string `yaml:"body_contains_any"`
 
+	// BodyNotContains rejects the match if any of these substrings appear in the body.
+	BodyNotContains []string `yaml:"body_not_contains"`
+
 	// BodyRegex matches a regular expression against the response body.
 	BodyRegex string `yaml:"body_regex"`
+
+	// JSONMatch evaluates typed JSONPath predicates against a JSON response body.
+	JSONMatch []JSONPredicate `yaml:"json_match"`
 
 	// HeadersAbsent requires none of these header names to be present.
 	HeadersAbsent []string `yaml:"headers_absent"`
@@ -263,6 +326,10 @@ type MatchSpec struct {
 
 	// BannerRegex matches against the initial bytes read from a TCP banner probe.
 	BannerRegex string `yaml:"banner_regex"`
+
+	// EvidenceSummary optionally overrides the generic probe evidence string
+	// with an exact, factual description of what the check proved.
+	EvidenceSummary string `yaml:"evidence_summary"`
 
 	// RedactBody ensures raw response content is never copied into evidence strings.
 	RedactBody bool `yaml:"redact_body"`
@@ -279,11 +346,15 @@ type Remediation struct {
 
 // compiledPatterns caches compiled regular expressions validated at load time.
 type compiledPatterns struct {
-	hostname   *regexp.Regexp
-	httpTitle  *regexp.Regexp
-	httpServer *regexp.Regexp
-	body       *regexp.Regexp
-	banner     *regexp.Regexp
+	hostname    *regexp.Regexp
+	httpTitle   *regexp.Regexp
+	httpServer  *regexp.Regexp
+	mdnsTXT     *regexp.Regexp
+	upnpDevice  *regexp.Regexp
+	upnpService *regexp.Regexp
+	wsType      *regexp.Regexp
+	body        *regexp.Regexp
+	banner      *regexp.Regexp
 }
 
 // LoadFromFS walks an embedded or virtual filesystem, parsing and validating
@@ -382,8 +453,15 @@ func (c *Check) Validate() error {
 	if strings.TrimSpace(c.Safety) != "read-only" {
 		return fmt.Errorf("safety must be %q (got %q)", "read-only", c.Safety)
 	}
-	if len(c.Preconditions.PortsAny) == 0 && len(c.Preconditions.PortsAll) == 0 {
-		return errors.New("preconditions.ports_any or preconditions.ports_all must specify at least one port")
+	hasSelector := len(c.Preconditions.PortsAny) > 0 ||
+		len(c.Preconditions.PortsAll) > 0 ||
+		len(c.Preconditions.MDNSTypeAny) > 0 ||
+		c.Preconditions.UPnPDeviceRegex != "" ||
+		c.Preconditions.UPnPServiceRegex != "" ||
+		c.Preconditions.WSTypeRegex != "" ||
+		len(c.Preconditions.ServiceProtoAny) > 0
+	if !hasSelector {
+		return errors.New("preconditions must specify at least one port, mDNS, UPnP, WS-Discovery, or service selector")
 	}
 	for _, p := range c.Preconditions.PortsAny {
 		if p < 1 || p > 65535 {
@@ -401,7 +479,10 @@ func (c *Check) Validate() error {
 	// mutate device state.
 	c.Probe.Type = strings.ToLower(strings.TrimSpace(c.Probe.Type))
 	switch c.Probe.Type {
-	case "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc", "adb", "rdp-nla", "ftp-anon", "esfile", "redis":
+	case "observe", "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr",
+		"comfoconnect", "eth-rpc", "adb", "rdp-nla", "ftp-anon", "esfile",
+		"redis", "snmp", "tls-legacy", "memcached", "rsync", "mpd", "kasa",
+		"coap", "natpmp", "ipp":
 	case "http":
 		method := strings.ToUpper(strings.TrimSpace(c.Probe.Method))
 		if method == "" {
@@ -412,13 +493,26 @@ func (c *Check) Validate() error {
 		}
 		c.Probe.Method = method
 
-		// Paths must be strictly relative so a check can never direct traffic to
-		// an external host or trigger an SSRF callback.
-		if !strings.HasPrefix(c.Probe.Path, "/") || strings.Contains(c.Probe.Path, "://") || strings.HasPrefix(c.Probe.Path, "//") {
-			return fmt.Errorf("http probe path %q must be a relative path starting with /", c.Probe.Path)
+		allPaths := c.httpPaths()
+		if len(allPaths) == 0 {
+			return errors.New("http probe requires path or paths")
+		}
+		for _, p := range allPaths {
+			// Paths must be strictly relative so a check can never direct traffic to
+			// an external host or trigger an SSRF callback.
+			if !strings.HasPrefix(p, "/") || strings.Contains(p, "://") || strings.HasPrefix(p, "//") {
+				return fmt.Errorf("http probe path %q must be a relative path starting with /", p)
+			}
 		}
 		if c.Probe.Scheme != "" && c.Probe.Scheme != "http" && c.Probe.Scheme != "https" {
 			return fmt.Errorf("http probe scheme %q must be http or https", c.Probe.Scheme)
+		}
+		for hk := range c.Probe.RequestHeaders {
+			switch strings.ToLower(strings.TrimSpace(hk)) {
+			case "accept", "accept-language", "cache-control":
+			default:
+				return fmt.Errorf("http probe request header %q is not in the read-only allowlist (Accept, Accept-Language, Cache-Control)", hk)
+			}
 		}
 	default:
 		return fmt.Errorf("unsupported probe.type %q", c.Probe.Type)
@@ -451,6 +545,26 @@ func (c *Check) Validate() error {
 			return fmt.Errorf("preconditions.http_server_regex: %w", err)
 		}
 	}
+	if c.Preconditions.MDNSTXTRegex != "" {
+		if c.compiled.mdnsTXT, err = regexp.Compile(c.Preconditions.MDNSTXTRegex); err != nil {
+			return fmt.Errorf("preconditions.mdns_txt_regex: %w", err)
+		}
+	}
+	if c.Preconditions.UPnPDeviceRegex != "" {
+		if c.compiled.upnpDevice, err = regexp.Compile(c.Preconditions.UPnPDeviceRegex); err != nil {
+			return fmt.Errorf("preconditions.upnp_device_regex: %w", err)
+		}
+	}
+	if c.Preconditions.UPnPServiceRegex != "" {
+		if c.compiled.upnpService, err = regexp.Compile(c.Preconditions.UPnPServiceRegex); err != nil {
+			return fmt.Errorf("preconditions.upnp_service_regex: %w", err)
+		}
+	}
+	if c.Preconditions.WSTypeRegex != "" {
+		if c.compiled.wsType, err = regexp.Compile(c.Preconditions.WSTypeRegex); err != nil {
+			return fmt.Errorf("preconditions.ws_type_regex: %w", err)
+		}
+	}
 	if c.Probe.Match.BodyRegex != "" {
 		if c.compiled.body, err = regexp.Compile(c.Probe.Match.BodyRegex); err != nil {
 			return fmt.Errorf("probe.match.body_regex: %w", err)
@@ -461,6 +575,30 @@ func (c *Check) Validate() error {
 			return fmt.Errorf("probe.match.banner_regex: %w", err)
 		}
 	}
+	for i := range c.Probe.Match.JSONMatch {
+		if c.Probe.Match.JSONMatch[i].Regex != "" {
+			re, err := regexp.Compile(c.Probe.Match.JSONMatch[i].Regex)
+			if err != nil {
+				return fmt.Errorf("probe.match.json_match[%d].regex: %w", i, err)
+			}
+			c.Probe.Match.JSONMatch[i].compiled = re
+		}
+	}
 
 	return nil
+}
+
+// httpPaths returns the ordered deduplicated list of relative paths configured
+// on an HTTP probe (combining Path and Paths).
+func (c *Check) httpPaths() []string {
+	var out []string
+	if c.Probe.Path != "" {
+		out = append(out, c.Probe.Path)
+	}
+	for _, p := range c.Probe.Paths {
+		if p != "" && p != c.Probe.Path {
+			out = append(out, p)
+		}
+	}
+	return out
 }
