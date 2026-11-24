@@ -1,4 +1,10 @@
-# UniBlue
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-horizontal-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/logo-horizontal-light.svg">
+    <img alt="UniBlue" src="docs/logo-horizontal-light.svg" width="320">
+  </picture>
+</p>
 
 UniBlue is a **blue-team security engine for UniFi networks**.
 
@@ -90,6 +96,9 @@ UniBlue can sync the full NVD JSON 2.0 database alongside CISA's Known Exploited
 # for deterministic offline hardware vendor & device-category classification
 ./uniblue oui sync
 ./uniblue inventory -config config.yaml -probe
+
+# Generate a self-contained SVG network topology & placement diagram
+./uniblue topology -config config.yaml -out topology.svg
 ```
 
 ## Controller Compatibility
