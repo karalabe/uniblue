@@ -6,9 +6,9 @@
   </picture>
 </p>
 
-UniBlue is a **blue-team security engine for UniFi networks**.
+<h3 align="center">Blue-team security engine for UniFi networks</h3>
 
-It combines your UniFi gateway's live network topology (clients, VLANs, firmware, and WAN port forwards) with gentle LAN host probing and a declarative, community-submittable library of read-only IoT/LAN security checks.
+UniBlue combines your UniFi gateway's live network topology (clients, VLANs, firmware, and WAN port forwards) with gentle LAN host probing and a declarative, community-submittable library of read-only IoT/LAN security checks.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
