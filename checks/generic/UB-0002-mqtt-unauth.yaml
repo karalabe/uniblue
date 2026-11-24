@@ -1,0 +1,32 @@
+id: UB-0002
+title: Unauthenticated MQTT Broker
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: MQTT Broker
+  affected_versions: any
+  author: "@uniblue"
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+
+preconditions:
+  ports_any: [1883]
+
+probe:
+  type: mqtt
+  port: 1883
+  timeout: 3s
+
+remediation:
+  summary: >
+    MQTT broker accepts anonymous connections without credentials. Any host
+    that can reach port 1883 can subscribe to sensor/state topics or publish
+    control commands to connected smart-home and IoT devices.
+  unifi_actions:
+    - enable_mqtt_authentication
+    - restrict_inter_vlan_access
+    - block_wan_egress

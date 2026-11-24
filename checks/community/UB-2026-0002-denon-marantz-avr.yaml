@@ -1,0 +1,36 @@
+id: UB-2026-0002
+title: Denon / Marantz AVR Unauthenticated Telnet Control Interface
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Denon / Marantz (D&M Holdings)
+  product: Network AV Receiver
+  affected_versions: any
+  author: "@uniblue"
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+
+preconditions:
+  ports_any: [23]
+  mac_prefix: ["00:05:cd"]
+  hostname_regex: "(?i)(marantz|denon|avr|sr[0-9]{4})"
+
+probe:
+  type: tcp
+  port: 23
+  timeout: 3s
+
+remediation:
+  summary: >
+    Denon and Marantz AV receivers expose an unauthenticated cleartext Telnet
+    control protocol on port 23. Any reachable device on the network can power
+    on the amplifier, switch inputs, or set maximum volume without credentials.
+    Isolate the receiver on a Smart Devices / IoT VLAN and restrict port 23
+    access to trusted home-automation controllers.
+  unifi_actions:
+    - move_to_iot_vlan
+    - restrict_inter_vlan_access
+    - block_wan_egress

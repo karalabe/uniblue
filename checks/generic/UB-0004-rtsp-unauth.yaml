@@ -1,0 +1,32 @@
+id: UB-0004
+title: Unauthenticated RTSP Media Stream Server
+cve: null
+category: exposed-protocol
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: IP Camera / NVR RTSP Service
+  affected_versions: any
+  author: "@uniblue"
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+
+preconditions:
+  ports_any: [554]
+
+probe:
+  type: rtsp
+  port: 554
+  timeout: 3s
+
+remediation:
+  summary: >
+    RTSP service on port 554 responded successfully without requiring
+    authentication. Verify that video feeds require credentials and isolate
+    cameras from untrusted networks and the internet.
+  unifi_actions:
+    - enable_rtsp_authentication
+    - move_to_iot_vlan
+    - block_wan_egress

@@ -1,0 +1,11 @@
+# Compiled binaries
+/uniblue
+
+# Local credentials and runtime state
+config.yaml
+uniblue-state.json
+*.tmp
+
+# Editor and OS files
+.idea/
+.DS_Store

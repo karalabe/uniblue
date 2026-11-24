@@ -1,0 +1,31 @@
+id: UB-0005
+title: Unauthenticated VNC Remote Desktop
+cve: null
+category: unauth-control
+severity: critical
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: VNC / RFB Server
+  affected_versions: any
+  author: "@uniblue"
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+
+preconditions:
+  ports_any: [5900]
+
+probe:
+  type: vnc
+  port: 5900
+  timeout: 3s
+
+remediation:
+  summary: >
+    VNC server advertises RFB security type "None", granting full remote
+    graphical control without a password to any reachable host.
+  unifi_actions:
+    - require_vnc_authentication_or_disable
+    - restrict_inter_vlan_access
+    - block_wan_egress

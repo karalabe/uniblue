@@ -1,0 +1,68 @@
+# UniBlue configuration example.
+# Copy to config.yaml and adjust for your UniFi deployment.
+# Sensitive fields can also be provided via environment variables:
+#   UNIBLUE_UNIFI_PASSWORD
+#   UNIBLUE_UNIFI_API_KEY
+#   UNIBLUE_WEBHOOK_URL
+
+unifi:
+  # Base URL of your UniFi gateway or controller.
+  # UDM Pro / Cloud Gateway (UniFi OS): https://192.168.1.1
+  # Older Cloud Key / standalone controller: https://192.168.1.2:8443
+  url: "https://192.168.1.1"
+  site: "default"
+
+  # Recommended (works with 2FA enabled on your UI.com account):
+  # Generate a local API key in UniFi Network -> Settings -> Control Plane -> Integrations
+  # and pass it via UNIBLUE_UNIFI_API_KEY (or set api_key below).
+  api_key: ""
+
+  # Alternatively, use a Local-Only View-Only admin account (required for older
+  # Cloud Key controllers without Integration API v1 or to inspect legacy port forwards).
+  username: ""
+  password: ""
+
+  # Most local UniFi gateways use self-signed TLS certificates.
+  insecure_skip_verify: true
+  timeout: 10s
+
+network:
+  # VLAN names or numeric IDs considered high-trust (findings here get escalated).
+  trusted_vlans:
+    - "Default"
+    - "LAN"
+
+  # VLAN names or numeric IDs isolated for IoT gear (findings here get de-escalated
+  # when not WAN-exposed, since lateral movement is already restricted).
+  isolated_vlans:
+    - "IoT"
+    - "NoT"
+
+  # Optional IP addresses to skip during active probing (e.g., fragile medical/OT gear).
+  exclude_ips: []
+
+scan:
+  # Number of hosts probed concurrently. Keep modest to stay gentle on the network.
+  concurrency: 8
+  # Timeout per individual port or HTTP probe.
+  timeout: 3s
+  # Curated high-signal ports checked during host fingerprinting.
+  ports: [23, 80, 443, 502, 554, 1883, 5900, 8080, 8443, 47808]
+  # Optional directory of extra local or community YAML checks loaded in addition
+  # to the built-in checks.
+  checks_dir: ""
+  # Polling interval used by `uniblue watch`.
+  interval: 15m
+
+state:
+  # Local JSON file tracking previous findings, devices, and port forwards for diffing.
+  path: "uniblue-state.json"
+
+notify:
+  # Optional webhook endpoint for `uniblue watch` alerts.
+  webhook_url: ""
+  # Payload format: "json", "discord", "slack", or "ntfy".
+  format: "json"
+  # Minimum adjusted severity required to trigger a notification:
+  # "info", "low", "medium", "high", or "critical".
+  min_severity: "medium"

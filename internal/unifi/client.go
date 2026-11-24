@@ -1,0 +1,727 @@
+package unifi
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/netip"
+	"strings"
+	"time"
+
+	"github.com/karalabe/uniblue/internal/config"
+)
+
+const (
+	// controllerIntegrationV1 identifies consoles accessed via the official
+	// UniFi Network Integration API v1 using an X-API-Key token.
+	controllerIntegrationV1 = "integration-v1"
+
+	// controllerUniFiOS identifies modern UniFi OS consoles (UDM Pro, Cloud
+	// Gateways, newer Cloud Keys) using local cookie auth under /proxy/network.
+	controllerUniFiOS = "unifi-os"
+
+	// controllerClassic identifies legacy standalone Network controllers and
+	// older Cloud Key firmware serving API calls directly at /api/s/<site>.
+	controllerClassic = "classic"
+
+	// integrationV1Prefix is the local console mount path for UniFi's official
+	// Network Integration API v1.
+	integrationV1Prefix = "/proxy/network/integration/v1"
+
+	// integrationPageLimit requests up to 200 items per page to minimize round
+	// trips on medium-to-large home and SMB networks.
+	integrationPageLimit = 200
+
+	// maxControllerBodyBytes caps JSON payloads read from the controller so a
+	// misconfigured URL cannot exhaust memory.
+	maxControllerBodyBytes = 16 << 20
+)
+
+// Controller is a read-only client for a single UniFi controller or gateway.
+type Controller struct {
+	// baseURL is the trimmed controller URL without a trailing slash.
+	baseURL string
+
+	// site is the UniFi site name or reference configured by the user (typically "default").
+	site string
+
+	// siteID stores the resolved site UUID when speaking the Integration v1 API.
+	siteID string
+
+	// username and password are used when cookie-based login is active.
+	username string
+	password string
+
+	// apiKey is sent via X-API-Key when token-based authentication is configured.
+	apiKey string
+
+	// httpClient carries TLS configuration, timeouts, and the session cookie jar.
+	httpClient *http.Client
+
+	// apiPrefix is "/proxy/network" for UniFi OS consoles or "" for classic
+	// controllers, discovered automatically during Login.
+	apiPrefix string
+
+	// controllerType records which API flavor was detected during Login.
+	controllerType string
+
+	// csrfToken stores the X-CSRF-Token returned by UniFi OS during login.
+	csrfToken string
+}
+
+// New constructs a Controller from the user's UniFi configuration. Call Login
+// before FetchSnapshot (or let FetchSnapshot call it automatically).
+func New(cfg config.UniFiConfig) (*Controller, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("init cookie jar: %w", err)
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec // local gateways typically serve self-signed certs
+		},
+	}
+
+	return &Controller{
+		baseURL:  strings.TrimRight(cfg.URL, "/"),
+		site:     cfg.Site,
+		username: cfg.Username,
+		password: cfg.Password,
+		apiKey:   cfg.APIKey,
+		httpClient: &http.Client{
+			Timeout:   cfg.Timeout,
+			Jar:       jar,
+			Transport: transport,
+		},
+	}, nil
+}
+
+// Login authenticates against the controller and auto-detects the appropriate
+// API flavor:
+//   - If an API key is configured, it prefers the official Integration v1 API
+//     (/proxy/network/integration/v1) and resolves the site UUID.
+//   - Otherwise it authenticates with local credentials against UniFi OS
+//     (/api/auth/login) and falls back to classic controllers (/api/login).
+func (c *Controller) Login(ctx context.Context) error {
+	if c.apiKey != "" {
+		return c.loginWithAPIKey(ctx)
+	}
+
+	// Attempt UniFi OS authentication first (UDM Pro / Cloud Gateway / modern
+	// Cloud Key). A 404 signals an older standalone/Cloud Key controller that
+	// uses the classic /api/login endpoint instead.
+	status, err := c.postLogin(ctx, "/api/auth/login")
+	if err == nil {
+		c.apiPrefix = "/proxy/network"
+		c.controllerType = controllerUniFiOS
+		return nil
+	}
+	if status != http.StatusNotFound {
+		return fmt.Errorf("unifi-os login failed: %w", err)
+	}
+
+	if _, err := c.postLogin(ctx, "/api/login"); err != nil {
+		return fmt.Errorf("classic unifi login failed: %w", err)
+	}
+	c.apiPrefix = ""
+	c.controllerType = controllerClassic
+	return nil
+}
+
+// loginWithAPIKey resolves the configured site against UniFi's official Network
+// Integration API v1 (/proxy/network/integration/v1/sites). If that endpoint is
+// unavailable (e.g., an older controller behind an API key proxy), it falls
+// back to probing legacy REST prefixes.
+func (c *Controller) loginWithAPIKey(ctx context.Context) error {
+	sites, err := fetchAllPages[integrationSite](ctx, c, integrationV1Prefix+"/sites")
+	if err == nil {
+		site, resolveErr := resolveIntegrationSite(sites, c.site)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		c.siteID = site.ID
+		c.controllerType = controllerIntegrationV1
+		c.apiPrefix = "/proxy/network"
+		return nil
+	}
+
+	// Fall back to legacy site REST endpoints only if the official integration
+	// endpoint is absent (404); surface auth errors directly so bad keys are obvious.
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) && httpErr.status != http.StatusNotFound {
+		return fmt.Errorf("unifi integration api login failed: %w", err)
+	}
+
+	probes := []struct {
+		prefix string
+		kind   string
+	}{
+		{prefix: "/proxy/network", kind: controllerUniFiOS},
+		{prefix: "", kind: controllerClassic},
+	}
+	var lastErr error
+	for _, p := range probes {
+		c.apiPrefix = p.prefix
+		c.controllerType = p.kind
+		var out apiEnvelope[rawNetwork]
+		if probeErr := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &out); probeErr == nil {
+			return nil
+		} else {
+			lastErr = probeErr
+		}
+	}
+	return fmt.Errorf("unifi api key probe failed: %w", errors.Join(err, lastErr))
+}
+
+// resolveIntegrationSite matches the user's configured site string against a
+// site's UUID, internalReference (typically "default"), or display name.
+func resolveIntegrationSite(sites []integrationSite, wanted string) (integrationSite, error) {
+	if len(sites) == 0 {
+		return integrationSite{}, errors.New("unifi integration api returned no sites")
+	}
+	want := strings.ToLower(strings.TrimSpace(wanted))
+	for _, s := range sites {
+		if strings.ToLower(s.ID) == want ||
+			strings.ToLower(s.InternalReference) == want ||
+			strings.ToLower(s.Name) == want {
+			return s, nil
+		}
+	}
+	// Single-site consoles often name their sole site something custom while
+	// users leave config.yaml at the default "default".
+	if len(sites) == 1 && (want == "" || want == "default") {
+		return sites[0], nil
+	}
+	names := make([]string, 0, len(sites))
+	for _, s := range sites {
+		names = append(names, fmt.Sprintf("%s (ref=%s, id=%s)", s.Name, s.InternalReference, s.ID))
+	}
+	return integrationSite{}, fmt.Errorf("site %q not found; available sites: %s", wanted, strings.Join(names, ", "))
+}
+
+// postLogin submits local credentials to path and stores any CSRF token
+// returned by the controller. It returns the HTTP status code so callers can
+// distinguish 404 (wrong controller flavor) from credential errors.
+func (c *Controller) postLogin(ctx context.Context, path string) (int, error) {
+	payload, err := json.Marshal(map[string]string{
+		"username": c.username,
+		"password": c.password,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, fmt.Errorf("HTTP %d from %s", resp.StatusCode, path)
+	}
+	if token := resp.Header.Get("X-CSRF-Token"); token != "" {
+		c.csrfToken = token
+	}
+	return resp.StatusCode, nil
+}
+
+// FetchSnapshot retrieves active clients, UniFi devices, networks, and WAN port
+// forwards concurrently, then cross-links client records with resolved VLAN
+// names so downstream risk scoring has complete topology context.
+func (c *Controller) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
+	if c.controllerType == "" {
+		if err := c.Login(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if c.controllerType == controllerIntegrationV1 {
+		return c.fetchIntegrationSnapshot(ctx)
+	}
+	return c.fetchLegacySnapshot(ctx)
+}
+
+// fetchIntegrationSnapshot queries UniFi's official Network Integration API v1
+// endpoints concurrently with full pagination and resolves client VLANs via
+// subnet CIDR matching when the client record omits network metadata.
+func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, error) {
+	type clientsRes struct {
+		items []integrationClient
+		err   error
+	}
+	type devicesRes struct {
+		items []integrationDevice
+		err   error
+	}
+	type networksRes struct {
+		items []integrationNetwork
+		err   error
+	}
+	type forwardsRes struct {
+		items []rawPortForward
+	}
+
+	clientsCh := make(chan clientsRes, 1)
+	devicesCh := make(chan devicesRes, 1)
+	networksCh := make(chan networksRes, 1)
+	forwardsCh := make(chan forwardsRes, 1)
+
+	siteBase := fmt.Sprintf("%s/sites/%s", integrationV1Prefix, c.siteID)
+
+	go func() {
+		items, err := fetchAllPages[integrationClient](ctx, c, siteBase+"/clients")
+		clientsCh <- clientsRes{items: items, err: err}
+	}()
+	go func() {
+		items, err := fetchAllPages[integrationDevice](ctx, c, siteBase+"/devices")
+		devicesCh <- devicesRes{items: items, err: err}
+	}()
+	go func() {
+		// Older Network 9.0 consoles may not expose /networks yet; treat 404 as
+		// empty rather than failing the whole snapshot.
+		items, err := fetchAllPages[integrationNetwork](ctx, c, siteBase+"/networks")
+		var httpErr *httpStatusError
+		if errors.As(err, &httpErr) && httpErr.status == http.StatusNotFound {
+			err = nil
+		}
+		networksCh <- networksRes{items: items, err: err}
+	}()
+	go func() {
+		// Port forwards are not yet exposed under /integration/v1 on all versions;
+		// opportunistically attempt the legacy endpoint and ignore auth/404 denials.
+		var env apiEnvelope[rawPortForward]
+		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/portforward", c.site), &env); err == nil {
+			forwardsCh <- forwardsRes{items: env.Data}
+			return
+		}
+		forwardsCh <- forwardsRes{}
+	}()
+
+	cr := <-clientsCh
+	dr := <-devicesCh
+	nr := <-networksCh
+	fr := <-forwardsCh
+
+	if err := errors.Join(cr.err, dr.err, nr.err); err != nil {
+		return nil, fmt.Errorf("fetch unifi integration snapshot: %w", err)
+	}
+
+	// Parse each network's IPv4 CIDR so we can map clients to VLANs reliably by
+	// IP address even though /integration/v1/sites/{id}/clients omits networkId.
+	// The list endpoint often omits ipv4Configuration, so fetch individual
+	// network details concurrently for any network missing a subnet, then fall
+	// back to legacy rest/networkconf if any remain unresolved.
+	c.enrichIntegrationNetworkSubnets(ctx, siteBase, nr.items)
+
+	type subnetEntry struct {
+		prefix netip.Prefix
+		net    Network
+	}
+	networks := make([]Network, 0, len(nr.items))
+	var subnets []subnetEntry
+	for _, rn := range nr.items {
+		subnet := extractIntegrationSubnet(rn)
+		purpose := rn.Purpose
+		if purpose == "" {
+			purpose = strings.ToLower(rn.Management)
+		}
+		n := Network{
+			ID:      rn.ID,
+			Name:    rn.Name,
+			Purpose: purpose,
+			VLAN:    string(rn.VLANID),
+			Subnet:  subnet,
+		}
+		networks = append(networks, n)
+
+		if pfx, err := parseNetworkPrefix(subnet); err == nil {
+			subnets = append(subnets, subnetEntry{prefix: pfx, net: n})
+		}
+	}
+
+	clients := make([]Client, 0, len(cr.items))
+	for _, rc := range cr.items {
+		cl := Client{
+			MAC:      strings.ToLower(strings.TrimSpace(rc.MACAddress)),
+			IP:       strings.TrimSpace(rc.IPAddress),
+			Hostname: strings.TrimSpace(rc.Name),
+			Name:     strings.TrimSpace(rc.Name),
+			IsWired:  strings.EqualFold(rc.Type, "WIRED"),
+		}
+		if addr, err := netip.ParseAddr(cl.IP); err == nil {
+			// Pick the most specific matching CIDR (longest prefix) in case
+			// overlapping subnets exist.
+			bestBits := -1
+			for _, se := range subnets {
+				if se.prefix.Contains(addr) && se.prefix.Bits() > bestBits {
+					bestBits = se.prefix.Bits()
+					cl.NetworkID = se.net.ID
+					cl.NetworkName = se.net.Name
+					cl.VLAN = se.net.VLAN
+				}
+			}
+		}
+		clients = append(clients, cl)
+	}
+
+	devices := make([]Device, 0, len(dr.items))
+	for _, rd := range dr.items {
+		devices = append(devices, Device{
+			MAC:        strings.ToLower(strings.TrimSpace(rd.MACAddress)),
+			IP:         strings.TrimSpace(rd.IPAddress),
+			Name:       strings.TrimSpace(rd.Name),
+			Model:      rd.Model,
+			Type:       strings.ToLower(rd.State),
+			Version:    rd.FirmwareVersion,
+			Upgradable: rd.FirmwareUpdatable,
+		})
+	}
+
+	forwards := convertPortForwards(fr.items)
+
+	return &Snapshot{
+		CollectedAt:    time.Now().UTC(),
+		Site:           c.site,
+		ControllerType: c.controllerType,
+		Clients:        clients,
+		Devices:        devices,
+		Networks:       networks,
+		PortForwards:   forwards,
+	}, nil
+}
+
+// fetchLegacySnapshot queries the classic /api/s/<site>/... endpoints (proxied
+// under /proxy/network on UniFi OS consoles) concurrently over typed channels.
+func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error) {
+	type clientsRes struct {
+		items []rawClient
+		err   error
+	}
+	type devicesRes struct {
+		items []rawDevice
+		err   error
+	}
+	type networksRes struct {
+		items []rawNetwork
+		err   error
+	}
+	type forwardsRes struct {
+		items []rawPortForward
+		err   error
+	}
+
+	clientsCh := make(chan clientsRes, 1)
+	devicesCh := make(chan devicesRes, 1)
+	networksCh := make(chan networksRes, 1)
+	forwardsCh := make(chan forwardsRes, 1)
+
+	go func() {
+		var env apiEnvelope[rawClient]
+		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/sta", c.site), &env)
+		clientsCh <- clientsRes{items: env.Data, err: err}
+	}()
+	go func() {
+		var env apiEnvelope[rawDevice]
+		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/device", c.site), &env)
+		devicesCh <- devicesRes{items: env.Data, err: err}
+	}()
+	go func() {
+		var env apiEnvelope[rawNetwork]
+		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &env)
+		networksCh <- networksRes{items: env.Data, err: err}
+	}()
+	go func() {
+		var env apiEnvelope[rawPortForward]
+		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/portforward", c.site), &env)
+		forwardsCh <- forwardsRes{items: env.Data, err: err}
+	}()
+
+	cr := <-clientsCh
+	dr := <-devicesCh
+	nr := <-networksCh
+	fr := <-forwardsCh
+
+	if err := errors.Join(cr.err, dr.err, nr.err, fr.err); err != nil {
+		return nil, fmt.Errorf("fetch unifi snapshot: %w", err)
+	}
+
+	// Build lookup maps from networkconf so each active client carries both its
+	// friendly VLAN name and numeric VLAN tag even when stat/sta omits one.
+	networks := make([]Network, 0, len(nr.items))
+	netByID := make(map[string]Network, len(nr.items))
+	netByName := make(map[string]Network, len(nr.items))
+	for _, rn := range nr.items {
+		n := Network{
+			ID:      rn.ID,
+			Name:    rn.Name,
+			Purpose: rn.Purpose,
+			VLAN:    string(rn.VLAN),
+			Subnet:  rn.IPSubnet,
+		}
+		networks = append(networks, n)
+		if n.ID != "" {
+			netByID[n.ID] = n
+		}
+		if n.Name != "" {
+			netByName[strings.ToLower(n.Name)] = n
+		}
+	}
+
+	clients := make([]Client, 0, len(cr.items))
+	for _, rc := range cr.items {
+		cl := Client{
+			MAC:         strings.ToLower(strings.TrimSpace(rc.MAC)),
+			IP:          strings.TrimSpace(rc.IP),
+			Hostname:    strings.TrimSpace(rc.Hostname),
+			Name:        strings.TrimSpace(rc.Name),
+			OUI:         strings.TrimSpace(rc.OUI),
+			NetworkID:   rc.NetworkID,
+			NetworkName: rc.Network,
+			VLAN:        string(rc.VLAN),
+			IsWired:     rc.IsWired,
+		}
+
+		// Fill missing network name or VLAN tag from the site's network table.
+		if net, ok := netByID[cl.NetworkID]; ok {
+			if cl.NetworkName == "" {
+				cl.NetworkName = net.Name
+			}
+			if cl.VLAN == "" {
+				cl.VLAN = net.VLAN
+			}
+		} else if net, ok := netByName[strings.ToLower(cl.NetworkName)]; ok {
+			if cl.VLAN == "" {
+				cl.VLAN = net.VLAN
+			}
+		}
+
+		clients = append(clients, cl)
+	}
+
+	devices := make([]Device, 0, len(dr.items))
+	for _, rd := range dr.items {
+		devices = append(devices, Device{
+			MAC:        strings.ToLower(strings.TrimSpace(rd.MAC)),
+			IP:         strings.TrimSpace(rd.IP),
+			Name:       strings.TrimSpace(rd.Name),
+			Model:      rd.Model,
+			Type:       rd.Type,
+			Version:    rd.Version,
+			Upgradable: rd.Upgradable,
+		})
+	}
+
+	return &Snapshot{
+		CollectedAt:    time.Now().UTC(),
+		Site:           c.site,
+		ControllerType: c.controllerType,
+		Clients:        clients,
+		Devices:        devices,
+		Networks:       networks,
+		PortForwards:   convertPortForwards(fr.items),
+	}, nil
+}
+
+// fetchAllPages walks a paginated Integration v1 list endpoint using offset and
+// limit query parameters until all items reported by totalCount are collected.
+func fetchAllPages[T any](ctx context.Context, c *Controller, path string) ([]T, error) {
+	var all []T
+	offset := 0
+	for {
+		pagePath := fmt.Sprintf("%s?offset=%d&limit=%d", path, offset, integrationPageLimit)
+		var page integrationPage[T]
+		if err := c.getJSON(ctx, pagePath, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page.Data...)
+		if len(page.Data) == 0 || offset+len(page.Data) >= page.TotalCount {
+			break
+		}
+		offset += len(page.Data)
+	}
+	return all, nil
+}
+
+// convertPortForwards normalizes wire port-forward rules into domain PortForward values.
+func convertPortForwards(raw []rawPortForward) []PortForward {
+	forwards := make([]PortForward, 0, len(raw))
+	for _, rf := range raw {
+		forwards = append(forwards, PortForward{
+			ID:      rf.ID,
+			Name:    rf.Name,
+			Enabled: rf.Enabled,
+			Proto:   strings.ToLower(rf.Proto),
+			DstPort: string(rf.DstPort),
+			FwdIP:   strings.TrimSpace(rf.Fwd),
+			FwdPort: string(rf.FwdPort),
+			Src:     strings.TrimSpace(rf.Src),
+		})
+	}
+	return forwards
+}
+
+// parseNetworkPrefix parses a UniFi gateway CIDR such as "192.168.20.1/24" and
+// returns its masked network prefix ("192.168.20.0/24") for containment checks.
+func parseNetworkPrefix(cidr string) (netip.Prefix, error) {
+	pfx, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return pfx.Masked(), nil
+}
+
+// extractIntegrationSubnet returns the CIDR string from an integrationNetwork,
+// checking both the direct subnet field and nested ipv4Configuration.
+func extractIntegrationSubnet(rn integrationNetwork) string {
+	if rn.Subnet != "" {
+		return rn.Subnet
+	}
+	if rn.IPv4Configuration != nil && rn.IPv4Configuration.HostIPAddress != "" && rn.IPv4Configuration.PrefixLength > 0 {
+		return fmt.Sprintf("%s/%d", rn.IPv4Configuration.HostIPAddress, rn.IPv4Configuration.PrefixLength)
+	}
+	return ""
+}
+
+// enrichIntegrationNetworkSubnets fills in missing IPv4 subnets on networks
+// returned by the Integration v1 list endpoint. It concurrently queries each
+// network's detail endpoint over a channel, and if any subnets are still empty
+// (for example on older Network versions), falls back to rest/networkconf.
+func (c *Controller) enrichIntegrationNetworkSubnets(ctx context.Context, siteBase string, items []integrationNetwork) {
+	type detailRes struct {
+		idx    int
+		subnet string
+	}
+
+	var missing []int
+	for i, rn := range items {
+		if extractIntegrationSubnet(rn) == "" && rn.ID != "" {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+
+	ch := make(chan detailRes, len(missing))
+	for _, idx := range missing {
+		id := items[idx].ID
+		go func(i int, netID string) {
+			var detail integrationNetwork
+			if err := c.getJSON(ctx, fmt.Sprintf("%s/networks/%s", siteBase, netID), &detail); err == nil {
+				ch <- detailRes{idx: i, subnet: extractIntegrationSubnet(detail)}
+				return
+			}
+			ch <- detailRes{idx: i}
+		}(idx, id)
+	}
+	for range missing {
+		res := <-ch
+		if res.subnet != "" {
+			items[res.idx].Subnet = res.subnet
+		}
+	}
+
+	// Check if any network still lacks a subnet and opportunistically match
+	// against legacy rest/networkconf by network name or VLAN tag.
+	stillMissing := false
+	for _, rn := range items {
+		if extractIntegrationSubnet(rn) == "" {
+			stillMissing = true
+			break
+		}
+	}
+	if !stillMissing {
+		return
+	}
+
+	var env apiEnvelope[rawNetwork]
+	if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &env); err != nil {
+		return
+	}
+
+	byName := make(map[string]string, len(env.Data))
+	byVLAN := make(map[string]string, len(env.Data))
+	for _, rn := range env.Data {
+		if rn.IPSubnet == "" {
+			continue
+		}
+		if rn.Name != "" {
+			byName[strings.ToLower(rn.Name)] = rn.IPSubnet
+		}
+		if vlan := string(rn.VLAN); vlan != "" {
+			byVLAN[vlan] = rn.IPSubnet
+		}
+	}
+	for i := range items {
+		if extractIntegrationSubnet(items[i]) != "" {
+			continue
+		}
+		if sub, ok := byName[strings.ToLower(items[i].Name)]; ok {
+			items[i].Subnet = sub
+		} else if sub, ok := byVLAN[string(items[i].VLANID)]; ok {
+			items[i].Subnet = sub
+		}
+	}
+}
+
+// httpStatusError preserves the HTTP status code on failed controller requests
+// so callers can distinguish missing endpoints (404) from auth errors (401/403).
+type httpStatusError struct {
+	path   string
+	status int
+}
+
+// Error formats a concise description of the non-2xx HTTP status.
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("GET %s returned HTTP %d", e.path, e.status)
+}
+
+// getJSON performs a read-only GET request against a full controller path and
+// decodes its JSON response into dst.
+func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) error {
+	fullURL := c.baseURL + fullPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("X-API-Key", c.apiKey)
+	}
+	if c.csrfToken != "" {
+		req.Header.Set("X-CSRF-Token", c.csrfToken)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", fullPath, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxControllerBodyBytes))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", fullPath, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &httpStatusError{path: fullPath, status: resp.StatusCode}
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		return fmt.Errorf("decode %s: %w", fullPath, err)
+	}
+	return nil
+}

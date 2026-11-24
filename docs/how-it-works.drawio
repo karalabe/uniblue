@@ -1,0 +1,146 @@
+<mxfile host="app.diagrams.net" modified="2026-11-24T11:32:00.000Z" agent="UniBlue" version="24.0.0" type="device">
+  <diagram id="uniblue-how-it-works" name="How UniBlue Works">
+    <mxGraphModel dx="1240" dy="480" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1240" pageHeight="480" background="#FFFFFF" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Clean Light Canvas Card (looks crisp on both GitHub Light & Dark themes) -->
+        <mxCell id="canvas" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=4;fillColor=#FFFFFF;strokeColor=#E2E8F0;strokeWidth=1.5;" vertex="1" parent="1">
+          <mxGeometry x="8" y="8" width="1224" height="464" as="geometry" />
+        </mxCell>
+
+        <!-- Header -->
+        <mxCell id="hdr-title" value="How UniBlue Protects Your UniFi Network" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=20;fontStyle=1;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="38" y="24" width="560" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="hdr-sub" value="Live UniFi topology + safe community IoT checks — alerting you only when something actually matters." style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=12;fontColor=#64748B;" vertex="1" parent="1">
+          <mxGeometry x="38" y="54" width="700" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="hdr-pill" value="Read-Only  ·  Local LAN  ·  Open Source" style="rounded=1;whiteSpace=wrap;html=1;arcSize=50;fillColor=#EFF6FF;strokeColor=#93C5FD;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontStyle=1;fontColor=#1D4ED8;" vertex="1" parent="1">
+          <mxGeometry x="942" y="30" width="258" height="32" as="geometry" />
+        </mxCell>
+
+        <!-- ==================== CARD 1: SYNC UNIFI ==================== -->
+        <mxCell id="c1" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F8FAFC;strokeColor=#CBD5E1;strokeWidth=1.2;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="38" y="102" width="254" height="296" as="geometry" />
+        </mxCell>
+        <mxCell id="c1-bar" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=50;fillColor=#2563EB;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="56" y="118" width="44" height="6" as="geometry" />
+        </mxCell>
+        <mxCell id="c1-step" value="01 · UNIFI TOPOLOGY" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=10;fontStyle=1;fontColor=#2563EB;" vertex="1" parent="1">
+          <mxGeometry x="56" y="130" width="218" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="c1-title" value="Map Your Network" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=16;fontStyle=1;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="56" y="148" width="218" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="c1-desc" value="Connects read-only to your UDM Pro or Cloud Key to learn every device and boundary." style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontFamily=Helvetica;fontSize=11;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="56" y="178" width="218" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="c1-p1" value="&lt;b&gt;Active Clients&lt;/b&gt; &lt;font color='#64748B'&gt;· IPs &amp;amp; MACs&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFFFF;strokeColor=#DBEAFE;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="56" y="236" width="218" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c1-p2" value="&lt;b&gt;VLANs &amp;amp; Subnets&lt;/b&gt; &lt;font color='#64748B'&gt;· Trust Tiers&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFFFF;strokeColor=#DBEAFE;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="56" y="284" width="218" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c1-p3" value="&lt;b&gt;WAN Forwards&lt;/b&gt; &lt;font color='#64748B'&gt;· Firmware&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFFFF;strokeColor=#DBEAFE;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="56" y="332" width="218" height="38" as="geometry" />
+        </mxCell>
+
+        <!-- ==================== CARD 2: SAFE CHECKS ==================== -->
+        <mxCell id="c2" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F8FAFC;strokeColor=#CBD5E1;strokeWidth=1.2;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="340" y="102" width="254" height="296" as="geometry" />
+        </mxCell>
+        <mxCell id="c2-bar" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=50;fillColor=#7C3AED;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="358" y="118" width="44" height="6" as="geometry" />
+        </mxCell>
+        <mxCell id="c2-step" value="02 · COMMUNITY CHECKS" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=10;fontStyle=1;fontColor=#7C3AED;" vertex="1" parent="1">
+          <mxGeometry x="358" y="130" width="218" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="c2-title" value="Probe LAN Safely" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=16;fontStyle=1;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="358" y="148" width="218" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="c2-desc" value="Catches real IoT &amp; LAN flaws — even niche bugs that never get a formal CVE." style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontFamily=Helvetica;fontSize=11;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="358" y="178" width="218" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="c2-p1" value="&lt;b&gt;Exposed Protocols&lt;/b&gt; &lt;font color='#64748B'&gt;· VNC, Telnet, MQTT&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFFFF;strokeColor=#E9D5FF;strokeWidth=1;fontFamily=Helvetica;fontSize=10.5;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="358" y="236" width="218" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c2-p2" value="&lt;b&gt;IoT &amp;amp; HVAC Gear&lt;/b&gt; &lt;font color='#64748B'&gt;· Community YAML&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFFFF;strokeColor=#E9D5FF;strokeWidth=1;fontFamily=Helvetica;fontSize=10.5;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="358" y="284" width="218" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c2-p3" value="&lt;b&gt;Sandboxed&lt;/b&gt; &lt;font color='#6D28D9'&gt;· Read-Only &amp;amp; Gentle&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#F5F3FF;strokeColor=#C4B5FD;strokeWidth=1;fontFamily=Helvetica;fontSize=10.5;fontColor=#5B21B6;" vertex="1" parent="1">
+          <mxGeometry x="358" y="332" width="218" height="38" as="geometry" />
+        </mxCell>
+
+        <!-- ==================== CARD 3: BLAST RADIUS ==================== -->
+        <mxCell id="c3" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F8FAFC;strokeColor=#CBD5E1;strokeWidth=1.2;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="642" y="102" width="254" height="296" as="geometry" />
+        </mxCell>
+        <mxCell id="c3-bar" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=50;fillColor=#D97706;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="660" y="118" width="44" height="6" as="geometry" />
+        </mxCell>
+        <mxCell id="c3-step" value="03 · BLAST RADIUS" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=10;fontStyle=1;fontColor=#D97706;" vertex="1" parent="1">
+          <mxGeometry x="660" y="130" width="218" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="c3-title" value="Weigh Real Impact" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=16;fontStyle=1;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="660" y="148" width="218" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="c3-desc" value="Scores every bug by where the device actually sits on your UniFi network." style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontFamily=Helvetica;fontSize=11;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="660" y="178" width="218" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="c3-p1" value="&lt;b&gt;WAN Port Forward&lt;/b&gt;  →  &lt;font color='#DC2626'&gt;&lt;b&gt;CRITICAL&lt;/b&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FEF2F2;strokeColor=#FCA5A5;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontColor=#7F1D1D;" vertex="1" parent="1">
+          <mxGeometry x="660" y="236" width="218" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c3-p2" value="&lt;b&gt;Trusted VLAN&lt;/b&gt;  →  &lt;font color='#B45309'&gt;&lt;b&gt;Escalated +1&lt;/b&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFBEB;strokeColor=#FCD34D;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontColor=#78350F;" vertex="1" parent="1">
+          <mxGeometry x="660" y="284" width="218" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c3-p3" value="&lt;b&gt;Isolated IoT VLAN&lt;/b&gt;  →  &lt;font color='#15803D'&gt;&lt;b&gt;Contained -1&lt;/b&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#F0FDF4;strokeColor=#86EFAC;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontColor=#14532D;" vertex="1" parent="1">
+          <mxGeometry x="660" y="332" width="218" height="38" as="geometry" />
+        </mxCell>
+
+        <!-- ==================== CARD 4: ALERT ON DRIFT ==================== -->
+        <mxCell id="c4" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F8FAFC;strokeColor=#CBD5E1;strokeWidth=1.2;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="944" y="102" width="256" height="296" as="geometry" />
+        </mxCell>
+        <mxCell id="c4-bar" value="" style="rounded=1;whiteSpace=wrap;html=1;arcSize=50;fillColor=#059669;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="962" y="118" width="44" height="6" as="geometry" />
+        </mxCell>
+        <mxCell id="c4-step" value="04 · ZERO-NOISE ALERTS" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=10;fontStyle=1;fontColor=#059669;" vertex="1" parent="1">
+          <mxGeometry x="962" y="130" width="220" height="18" as="geometry" />
+        </mxCell>
+        <mxCell id="c4-title" value="Act on What Changes" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=16;fontStyle=1;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="962" y="148" width="220" height="26" as="geometry" />
+        </mxCell>
+        <mxCell id="c4-desc" value="Diffs against your baseline so you only get pinged on new or worsened exposure." style="text;html=1;align=left;verticalAlign=top;whiteSpace=wrap;fontFamily=Helvetica;fontSize=11;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="962" y="178" width="220" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="c4-p1" value="&lt;b&gt;New or Escalated Risks&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFFFF;strokeColor=#A7F3D0;strokeWidth=1;fontFamily=Helvetica;fontSize=11;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="962" y="236" width="220" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c4-p2" value="&lt;b&gt;Rogue Trusted Devices &amp;amp; Forwards&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#FFFFFF;strokeColor=#A7F3D0;strokeWidth=1;fontFamily=Helvetica;fontSize=10.5;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="962" y="284" width="220" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="c4-p3" value="&lt;b&gt;CLI · ntfy · Discord · Slack · JSON&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=24;fillColor=#ECFDF5;strokeColor=#6EE7B7;strokeWidth=1;fontFamily=Helvetica;fontSize=10.5;fontColor=#065F46;" vertex="1" parent="1">
+          <mxGeometry x="962" y="332" width="220" height="38" as="geometry" />
+        </mxCell>
+
+        <!-- ==================== FLOW ARROWS ==================== -->
+        <mxCell id="a1" value="" style="endArrow=block;endFill=1;html=1;strokeColor=#60A5FA;strokeWidth=2.5;" edge="1" parent="1" source="c1" target="c2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a2" value="" style="endArrow=block;endFill=1;html=1;strokeColor=#A78BFA;strokeWidth=2.5;" edge="1" parent="1" source="c2" target="c3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="a3" value="" style="endArrow=block;endFill=1;html=1;strokeColor=#F59E0B;strokeWidth=2.5;" edge="1" parent="1" source="c3" target="c4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ==================== FOOTER CALLOUT ==================== -->
+        <mxCell id="footer" value="&lt;b&gt;Community-Powered:&lt;/b&gt;  Found a nasty bug in a ventilation unit, inverter, camera, or smart relay?  Drop a short read-only YAML check into &lt;font face='Courier New' color='#6D28D9'&gt;checks/community/&lt;/font&gt;." style="rounded=1;whiteSpace=wrap;html=1;arcSize=28;fillColor=#F8FAFC;strokeColor=#E2E8F0;strokeWidth=1;fontFamily=Helvetica;fontSize=11.5;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="38" y="418" width="1162" height="36" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
