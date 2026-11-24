@@ -1,6 +1,6 @@
 # UniBlue
 
-UniBlue is a lightweight, deterministic **blue-team security agent for UniFi networks**.
+UniBlue is a lightweight **blue-team security agent for UniFi networks**.
 
 It combines your UniFi gateway's live network topology (clients, VLANs, firmware, and WAN port forwards) with gentle LAN host probing and a declarative, community-submittable library of read-only IoT/LAN security checks.
 
