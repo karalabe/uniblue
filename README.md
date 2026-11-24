@@ -114,8 +114,8 @@ UniBlue can sync the full NVD JSON 2.0 database alongside CISA's Known Exploited
 ./uniblue oui sync
 ./uniblue inventory -config config.yaml -probe
 
-# Generate a self-contained SVG network topology & placement diagram
-./uniblue topology -config config.yaml -out topology.svg
+# Export a self-contained offline interactive HTML security & topology report
+./uniblue topology -config config.yaml -out topology.html
 ```
 
 ## Controller Compatibility

@@ -7,8 +7,6 @@
 package topology
 
 import (
-	"bytes"
-	"strings"
 	"testing"
 
 	"github.com/karalabe/uniblue/internal/classify"
@@ -16,7 +14,7 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
-func TestBuildAndRenderSVG(t *testing.T) {
+func TestBuildTopologyPlacement(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site:           "default",
 		ControllerType: "integration-v1",
@@ -72,19 +70,5 @@ func TestBuildAndRenderSVG(t *testing.T) {
 	}
 	if placements["192.168.1.30"] != PlacementReview {
 		t.Fatalf("wan proxy placement = %q, want review", placements["192.168.1.30"])
-	}
-
-	var buf bytes.Buffer
-	if err := RenderSVG(&buf, model); err != nil {
-		t.Fatalf("RenderSVG: %v", err)
-	}
-	svg := buf.String()
-	if !strings.HasPrefix(svg, "<svg ") || !strings.HasSuffix(strings.TrimSpace(svg), "</svg>") {
-		t.Fatal("expected valid SVG wrapper")
-	}
-	for _, want := range []string{"LAN-Main", "VLAN-Isolated", "DMZ Zone (Unused)", "appliance-1", "proxy-1"} {
-		if !strings.Contains(svg, want) {
-			t.Fatalf("rendered SVG missing %q", want)
-		}
 	}
 }

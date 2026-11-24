@@ -125,26 +125,15 @@ func TestHTTPHandlers(t *testing.T) {
 		}
 	})
 
-	// GET /api/topology.svg renders the live topology SVG, or 503 before ready.
-	t.Run("topology_svg", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/topology.svg", nil))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET /api/topology.svg status = %d, want 200", rec.Code)
+	// RenderStaticHTML produces a self-contained offline HTML report with embedded state.
+	t.Run("static_html_export", func(t *testing.T) {
+		var buf strings.Builder
+		if err := RenderStaticHTML(&buf, eng.Snapshot()); err != nil {
+			t.Fatalf("RenderStaticHTML: %v", err)
 		}
-		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "image/svg+xml") {
-			t.Fatalf("GET /api/topology.svg content-type = %q", ct)
-		}
-		if !strings.Contains(rec.Body.String(), "workstation-1") {
-			t.Fatalf("topology SVG missing expected host")
-		}
-
-		// When topology is nil, return 503 Service Unavailable.
-		emptyEng := &Engine{}
-		rec503 := httptest.NewRecorder()
-		emptyEng.Handler().ServeHTTP(rec503, httptest.NewRequest(http.MethodGet, "/api/topology.svg", nil))
-		if rec503.Code != http.StatusServiceUnavailable {
-			t.Fatalf("GET /api/topology.svg when nil = %d, want 503", rec503.Code)
+		out := buf.String()
+		if !strings.Contains(out, `id="uniblue-static-state"`) || !strings.Contains(out, "workstation-1") {
+			t.Fatalf("RenderStaticHTML missing embedded state or client name")
 		}
 	})
 

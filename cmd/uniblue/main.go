@@ -100,7 +100,7 @@ Commands:
   serve       Run live event-driven monitor (5s poll / WebSocket) with built-in web UI
   inventory   Fetch and display UniFi clients, devices, VLANs, and port forwards
   ports       Map physical switch ports, external equipment, and perimeter security
-  topology    Generate a network topology SVG or JSON diagram with device placement
+  topology    Generate an interactive offline HTML topology report or JSON summary
   check       Validate or test declarative YAML checks against a single host
   cve         Sync, search, and match a local NVD + CISA KEV cache against your LAN
   oui         Sync and query the official IEEE MAC OUI registries (MA-L, MA-M, MA-S)`)
@@ -1114,15 +1114,16 @@ func runOUI(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 }
 
-// runTopology builds a deterministic network topology model from UniFi zones,
-// VLANs, LLDP uplinks, IEEE OUI data, and (unless -no-probe is set) gentle
-// service fingerprinting, then outputs either an SVG diagram (-out), JSON, or
-// a concise terminal placement summary.
+// runTopology builds a deterministic network topology & security presentation
+// model from UniFi zones, VLANs, switch ports, LLDP uplinks, IEEE OUI data, and
+// (unless -no-probe is set) gentle service fingerprinting, then outputs either
+// a self-contained offline interactive HTML snapshot (-out), JSON, or a concise
+// terminal placement summary.
 func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("topology", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
-	outPath := fs.String("out", "", "path to write SVG topology diagram (use '-' for stdout)")
+	outPath := fs.String("out", "", "path to write self-contained interactive HTML report (use '-' for stdout)")
 	jsonOut := fs.Bool("json", false, "output topology model as JSON")
 	noProbe := fs.Bool("no-probe", false, "skip active LAN port probing (classify from UniFi + IEEE OUI only)")
 	if err := fs.Parse(args); err != nil {
@@ -1146,6 +1147,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 
 	var profiles []probe.HostProfile
+	var rawFindings []checks.Finding
 	if !*noProbe {
 		checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
 		if err != nil {
@@ -1153,8 +1155,11 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		}
 		scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
-		fp.SetHostPortHints(snap.PortHintsByIP())
+		fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
+		runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
+		rawFindings = runner.RunAll(ctx, profiles)
+		rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 	}
 
 	ouiDB := oui.New("")
@@ -1170,17 +1175,66 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return writeJSON(stdout, model)
 	}
 	if *outPath != "" {
+		report := risk.Evaluate(snap, rawFindings, cfg.Network)
+		exactCVEs, potentialCVEs, cveLoaded := correlateLocalCVEs(cfg, snap, profiles)
+
+		profileByMAC := make(map[string]probe.HostProfile, len(profiles))
+		for _, hp := range profiles {
+			k := strings.ToLower(hp.Client.MAC)
+			if k == "" {
+				k = hp.Client.IP
+			}
+			profileByMAC[k] = hp
+		}
+		clientViews := make([]server.ClientView, 0, len(snap.Clients))
+		for _, cl := range snap.Clients {
+			k := strings.ToLower(cl.MAC)
+			if k == "" {
+				k = cl.IP
+			}
+			clsKey := cl.IP
+			if clsKey == "" {
+				clsKey = cl.MAC
+			}
+			cv := server.ClientView{
+				Client:      cl,
+				Class:       classes[clsKey],
+				MaxSeverity: "clean",
+			}
+			if hp, ok := profileByMAC[k]; ok {
+				cv.OpenPorts = hp.OpenPorts
+				ts := hp.ScannedAt
+				cv.LastScannedAt = &ts
+			}
+			clientViews = append(clientViews, cv)
+		}
+		now := time.Now().UTC()
+		stateSnap := server.StateSnapshot{
+			StartedAt:      now,
+			UpdatedAt:      now,
+			LastFullScanAt: now,
+			EventMode:      "static-export",
+			Site:           snap.Site,
+			ControllerType: snap.ControllerType,
+			CVELoaded:      cveLoaded,
+			Report:         report,
+			ExactCVEs:      exactCVEs,
+			PotentialCVEs:  potentialCVEs,
+			Topology:       model,
+			Clients:        clientViews,
+			View:           server.BuildPresentationModel(snap, report, model, clientViews, exactCVEs, potentialCVEs, profiles),
+		}
 		if *outPath == "-" {
-			return topology.RenderSVG(stdout, model)
+			return server.RenderStaticHTML(stdout, stateSnap)
 		}
 		var buf strings.Builder
-		if err := topology.RenderSVG(&buf, model); err != nil {
+		if err := server.RenderStaticHTML(&buf, stateSnap); err != nil {
 			return err
 		}
 		if err := os.WriteFile(*outPath, []byte(buf.String()), 0o644); err != nil {
-			return fmt.Errorf("write topology svg %q: %w", *outPath, err)
+			return fmt.Errorf("write topology html %q: %w", *outPath, err)
 		}
-		fmt.Fprintf(stdout, "Wrote network topology diagram to %s (%d VLANs, %d clients, %d UniFi devices)\n",
+		fmt.Fprintf(stdout, "Wrote interactive offline topology report to %s (%d VLANs, %d clients, %d UniFi devices)\n",
 			*outPath, len(model.VLANs), model.ClientCount, model.DeviceCount)
 		return nil
 	}
@@ -1206,7 +1260,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		}
 		_ = tw.Flush()
 	}
-	fmt.Fprintln(stdout, "\nTip: pass -out topology.svg to render a visual SVG diagram.")
+	fmt.Fprintln(stdout, "\nTip: pass -out topology.html to export a self-contained interactive HTML report.")
 	return nil
 }
 

@@ -88,6 +88,10 @@ type LiveEvent struct {
 	// IP is the host IP address, if applicable.
 	IP string `json:"ip,omitempty"`
 
+	// SubjectID links this event directly to a typed PresentationModel entity
+	// (e.g., "host:<mac>", "port:<mac>/<idx>", "dev:<mac>") for one-click drilldown.
+	SubjectID string `json:"subject_id,omitempty"`
+
 	// Summary is a concise human-readable description of the event.
 	Summary string `json:"summary"`
 }
@@ -158,6 +162,10 @@ type StateSnapshot struct {
 
 	// Events holds the most recent live events (newest first).
 	Events []LiveEvent `json:"events,omitempty"`
+
+	// View holds the pre-evaluated single-source-of-truth UI presentation model
+	// (entities, verdicts, fix-next queue, physical blueprint, logical lanes).
+	View *PresentationModel `json:"view,omitempty"`
 }
 
 // missingClient records a client that disappeared from UniFi's active list
@@ -948,6 +956,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 
 	nextState := risk.BuildState(snap, report, e.cfg.Network)
 	_ = risk.SaveState(e.cfg.State.Path, nextState)
+	viewModel := BuildPresentationModel(snap, report, topoModel, clientViews, exactCVEs, potentialCVEs, profiles)
 
 	now := time.Now().UTC()
 	e.mu.Lock()
@@ -973,6 +982,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 		Topology:       topoModel,
 		Clients:        clientViews,
 		Events:         eventsCopy,
+		View:           viewModel,
 	}
 	e.mu.Unlock()
 }

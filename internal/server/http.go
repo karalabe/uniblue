@@ -7,17 +7,20 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/karalabe/uniblue/docs"
-	"github.com/karalabe/uniblue/internal/topology"
 )
 
 // Serve starts the HTTP server for the built-in web UI, JSON API, live SVG
@@ -66,12 +69,39 @@ func (e *Engine) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", e.handleIndex)
 	mux.HandleFunc("GET /api/state", e.handleState)
-	mux.HandleFunc("GET /api/topology.svg", e.handleTopologySVG)
 	mux.HandleFunc("GET /api/events", e.handleEventsSSE)
 	mux.HandleFunc("POST /api/rescan", e.handleRescan)
 	mux.HandleFunc("GET /assets/logo-light.svg", serveEmbeddedSVG("logo-horizontal-light.svg"))
 	mux.HandleFunc("GET /assets/logo-dark.svg", serveEmbeddedSVG("logo-horizontal-dark.svg"))
 	return mux
+}
+
+// RenderStaticHTML renders a self-contained, offline interactive HTML snapshot
+// of the full UniBlue console (with embedded logos and baked JSON state) for
+// `uniblue topology -out topology.html`.
+func RenderStaticHTML(w io.Writer, snap StateSnapshot) error {
+	rawState, err := json.Marshal(snap)
+	if err != nil {
+		return fmt.Errorf("marshal static state: %w", err)
+	}
+	// Escape closing script sequences safely inside inline JSON script tag.
+	safeJSON := strings.ReplaceAll(string(rawState), "</", `<\/`)
+
+	html := string(dashboardHTML)
+	if light, err := fs.ReadFile(docs.LogoFS, "logo-horizontal-light.svg"); err == nil && len(light) > 0 {
+		uri := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(light)
+		html = strings.ReplaceAll(html, `src="/assets/logo-light.svg"`, `src="`+uri+`"`)
+	}
+	if dark, err := fs.ReadFile(docs.LogoFS, "logo-horizontal-dark.svg"); err == nil && len(dark) > 0 {
+		uri := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(dark)
+		html = strings.ReplaceAll(html, `srcset="/assets/logo-dark.svg"`, `srcset="`+uri+`"`)
+	}
+
+	tag := `<script id="uniblue-static-state" type="application/json">` + safeJSON + `</script>` + "\n<script>"
+	html = strings.Replace(html, "<script>", tag, 1)
+
+	_, err = io.Copy(w, bytes.NewBufferString(html))
+	return err
 }
 
 func (e *Engine) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -89,19 +119,6 @@ func (e *Engine) handleState(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	enc := json.NewEncoder(w)
 	_ = enc.Encode(e.Snapshot())
-}
-
-func (e *Engine) handleTopologySVG(w http.ResponseWriter, _ *http.Request) {
-	snap := e.Snapshot()
-	if snap.Topology == nil {
-		http.Error(w, "topology not ready yet", http.StatusServiceUnavailable)
-		return
-	}
-	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	if err := topology.RenderSVG(w, snap.Topology); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
 }
 
 func (e *Engine) handleEventsSSE(w http.ResponseWriter, r *http.Request) {
