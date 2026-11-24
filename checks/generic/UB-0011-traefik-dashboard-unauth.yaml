@@ -1,0 +1,41 @@
+id: UB-0011
+title: Unauthenticated Traefik Reverse Proxy API & Dashboard
+cve: null
+category: info-disclosure
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Traefik Labs
+  product: Traefik Proxy
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://doc.traefik.io/traefik/operations/api/
+
+preconditions:
+  ports_any: [8080]
+
+probe:
+  type: http
+  method: GET
+  path: /api/http/routers
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"entryPoints":'
+      - '"service":'
+      - '"rule":'
+    redact_body: true
+
+remediation:
+  summary: >
+    Traefik is running with api.insecure=true on port 8080, exposing its full
+    internal router, service, and middleware inventory without authentication.
+    Disable api.insecure and expose the dashboard only over HTTPS behind
+    authentication middleware or localhost.
+  unifi_actions:
+    - disable_traefik_api_insecure
+    - restrict_inter_vlan_access

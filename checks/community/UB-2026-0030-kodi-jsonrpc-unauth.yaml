@@ -1,0 +1,41 @@
+id: UB-2026-0030
+title: Kodi Media Center Unauthenticated JSON-RPC Control API
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: XBMC Foundation
+  product: Kodi Media Center
+  affected_versions: any (when HTTP remote control has no password)
+  author: "@karalabe"
+  references:
+    - https://kodi.wiki/view/JSON-RPC_API
+
+preconditions:
+  ports_any: [8080]
+
+probe:
+  type: http
+  method: GET
+  path: /jsonrpc?request=%7B%22jsonrpc%22%3A%222.0%22%2C%22method%22%3A%22Application.GetProperties%22%2C%22params%22%3A%7B%22properties%22%3A%5B%22name%22%5D%7D%2C%22id%22%3A1%7D
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"jsonrpc":"2.0"'
+      - '"name":"Kodi"'
+    redact_body: true
+
+remediation:
+  summary: >
+    Kodi's HTTP JSON-RPC API on port 8080 responded without HTTP Basic
+    authentication. Any host on the LAN can inspect media libraries, control
+    playback, or invoke installed add-ons. Set a username and password in
+    Settings -> Services -> Control -> Allow remote control via HTTP, or
+    disable HTTP control if unused.
+  unifi_actions:
+    - set_kodi_http_password
+    - move_to_iot_vlan

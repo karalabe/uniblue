@@ -1,0 +1,40 @@
+id: UB-2026-0018
+title: Legacy Router ZynOS /rom-0 Config & Password Disclosure (CVE-2014-4019)
+cve: CVE-2014-4019
+category: credential-disclosure
+severity: critical
+safety: read-only
+
+metadata:
+  vendor: Generic (ZyXEL / TP-Link / D-Link / OEM ZynOS)
+  product: RomPager / ZynOS Consumer Router or AP
+  affected_versions: Legacy ZynOS RomPager firmware
+  author: "@karalabe"
+  references:
+    - https://nvd.nist.gov/vuln/detail/CVE-2014-4019
+
+preconditions:
+  ports_any: [80, 8080]
+
+probe:
+  type: http
+  method: GET
+  path: /rom-0
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_any:
+      - "spt.dat"
+      - "dbgarea"
+      - "autoexec.net"
+    redact_body: true
+
+remediation:
+  summary: >
+    Device serves its raw ZynOS /rom-0 backup archive without authentication
+    (CVE-2014-4019), from which the administrator password can be trivially
+    decompressed. Retire or replace this end-of-life router/extender
+    immediately, or flash supported OpenWrt firmware if available.
+  unifi_actions:
+    - replace_eol_router_hardware
+    - isolate_or_decommission_device

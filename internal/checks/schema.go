@@ -181,6 +181,10 @@ type Preconditions struct {
 	// PortsAny requires at least one of these TCP ports to be open on the host.
 	PortsAny []int `yaml:"ports_any"`
 
+	// PortsAll requires every listed TCP port to be open on the host (useful for
+	// multi-service fingerprints such as iOS lockdownd + SSH on a jailbroken device).
+	PortsAll []int `yaml:"ports_all"`
+
 	// MACPrefix requires the client's normalized MAC address to begin with any
 	// of these colon-separated OUI prefixes (e.g., "00:11:22"). This works
 	// reliably even when UniFi Integration v1 omits the OUI vendor string.
@@ -207,7 +211,8 @@ type Preconditions struct {
 // satisfies a check's Preconditions.
 type ProbeSpec struct {
 	// Type selects the probe protocol: "tcp", "telnet", "http", "mqtt",
-	// "modbus", "rtsp", "vnc", "avr", "comfoconnect", or "eth-rpc".
+	// "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc", "adb",
+	// "rdp-nla", "ftp-anon", "esfile", or "redis".
 	Type string `yaml:"type"`
 
 	// Port optionally pins the target port. When 0, the runner tests whichever
@@ -251,6 +256,10 @@ type MatchSpec struct {
 
 	// HeadersPresent requires all of these header names to be present.
 	HeadersPresent []string `yaml:"headers_present"`
+
+	// HeaderContains requires each named HTTP response header to contain the
+	// given case-insensitive substring (e.g., Server: "Microsoft-HTTPAPI").
+	HeaderContains map[string]string `yaml:"header_contains"`
 
 	// BannerRegex matches against the initial bytes read from a TCP banner probe.
 	BannerRegex string `yaml:"banner_regex"`
@@ -373,12 +382,17 @@ func (c *Check) Validate() error {
 	if strings.TrimSpace(c.Safety) != "read-only" {
 		return fmt.Errorf("safety must be %q (got %q)", "read-only", c.Safety)
 	}
-	if len(c.Preconditions.PortsAny) == 0 {
-		return errors.New("preconditions.ports_any must specify at least one port")
+	if len(c.Preconditions.PortsAny) == 0 && len(c.Preconditions.PortsAll) == 0 {
+		return errors.New("preconditions.ports_any or preconditions.ports_all must specify at least one port")
 	}
 	for _, p := range c.Preconditions.PortsAny {
 		if p < 1 || p > 65535 {
 			return fmt.Errorf("invalid precondition port %d", p)
+		}
+	}
+	for _, p := range c.Preconditions.PortsAll {
+		if p < 1 || p > 65535 {
+			return fmt.Errorf("invalid precondition ports_all port %d", p)
 		}
 	}
 
@@ -387,7 +401,7 @@ func (c *Check) Validate() error {
 	// mutate device state.
 	c.Probe.Type = strings.ToLower(strings.TrimSpace(c.Probe.Type))
 	switch c.Probe.Type {
-	case "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc":
+	case "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc", "adb", "rdp-nla", "ftp-anon", "esfile", "redis":
 	case "http":
 		method := strings.ToUpper(strings.TrimSpace(c.Probe.Method))
 		if method == "" {

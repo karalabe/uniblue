@@ -1,0 +1,39 @@
+id: UB-2026-0023
+title: Fronius Solar Inverter Unauthenticated Local API
+cve: null
+category: info-disclosure
+severity: low
+safety: read-only
+
+metadata:
+  vendor: Fronius
+  product: Fronius Datamanager / GEN24 Solar Inverter
+  affected_versions: Solar API v1 enabled
+  author: "@karalabe"
+  references:
+    - https://www.home-assistant.io/integrations/fronius/
+
+preconditions:
+  ports_any: [80]
+
+probe:
+  type: http
+  method: GET
+  path: /solar_api/v1/GetAPIVersion.cgi
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_all:
+      - '"APIVersion":'
+      - '"/solar_api/v1/"'
+    redact_body: true
+
+remediation:
+  summary: >
+    Fronius inverter exposes its unauthenticated Solar API v1 on port 80,
+    revealing real-time household power consumption and solar generation
+    telemetry. Place the inverter on an isolated IoT/Energy VLAN and restrict
+    LAN access strictly to your Home Assistant or energy monitoring host.
+  unifi_actions:
+    - move_to_iot_vlan
+    - restrict_port_80_to_controller

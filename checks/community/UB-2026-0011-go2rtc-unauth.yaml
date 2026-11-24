@@ -1,0 +1,40 @@
+id: UB-2026-0011
+title: Unauthenticated go2rtc Camera Stream & Credential Exposure
+cve: null
+category: info-disclosure
+severity: high
+safety: read-only
+
+metadata:
+  vendor: go2rtc
+  product: go2rtc Camera Streaming Server
+  affected_versions: any (when api.listen is LAN-accessible without auth)
+  author: "@karalabe"
+  references:
+    - https://github.com/AlexxIT/go2rtc#module-api
+
+preconditions:
+  ports_any: [1984]
+
+probe:
+  type: http
+  method: GET
+  path: /api/streams
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_any:
+      - '"producers":'
+      - '"consumers":'
+    redact_body: true
+
+remediation:
+  summary: >
+    go2rtc's HTTP API on port 1984 returned active camera streams without
+    authentication. This exposes live camera feeds and frequently discloses
+    plaintext RTSP camera credentials in producer URLs. Bind go2rtc's API to
+    127.0.0.1 or configure api.username and api.password.
+  unifi_actions:
+    - bind_go2rtc_to_localhost_or_enable_auth
+    - restrict_inter_vlan_access

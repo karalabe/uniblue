@@ -1,6 +1,7 @@
 package checks
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"io"
@@ -21,8 +22,8 @@ func TestBuiltinChecksAreValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFromFS(BuiltinFS): %v", err)
 	}
-	if len(list) < 6 {
-		t.Fatalf("expected at least 6 built-in checks, got %d", len(list))
+	if len(list) < 50 {
+		t.Fatalf("expected at least 50 built-in checks, got %d", len(list))
 	}
 	if _, err := Merge(list); err != nil {
 		t.Fatalf("Merge(builtins): %v", err)
@@ -299,6 +300,301 @@ func TestProtocolProbes(t *testing.T) {
 		ev, ok := r.probeEthereumRPC(context.Background(), "127.0.0.1", port)
 		if !ok || !strings.Contains(ev, "Geth/v1.15.0") {
 			t.Fatalf("expected eth-rpc probe match with Geth version, got ok=%v ev=%q", ok, ev)
+		}
+	})
+
+	t.Run("adb unauthenticated cnxn accepted", func(t *testing.T) {
+		port, closeFn := startMockTCP(t, func(conn net.Conn) {
+			hdr := make([]byte, 24)
+			if _, err := io.ReadFull(conn, hdr); err != nil {
+				return
+			}
+			// Consume client payload.
+			pLen := binary.LittleEndian.Uint32(hdr[12:16])
+			if pLen > 0 && pLen < 1024 {
+				_, _ = io.ReadFull(conn, make([]byte, pLen))
+			}
+			banner := []byte("device::ro.product.model=SHIELD Android TV\x00")
+			var sum uint32
+			for _, b := range banner {
+				sum += uint32(b)
+			}
+			const cmdCNXN uint32 = 0x4E584E43
+			resp := make([]byte, 24+len(banner))
+			binary.LittleEndian.PutUint32(resp[0:4], cmdCNXN)
+			binary.LittleEndian.PutUint32(resp[4:8], 0x01000000)
+			binary.LittleEndian.PutUint32(resp[8:12], 0x00004000)
+			binary.LittleEndian.PutUint32(resp[12:16], uint32(len(banner)))
+			binary.LittleEndian.PutUint32(resp[16:20], sum)
+			binary.LittleEndian.PutUint32(resp[20:24], cmdCNXN^0xffffffff)
+			copy(resp[24:], banner)
+			_, _ = conn.Write(resp)
+		})
+		defer closeFn()
+
+		ev, ok := probeADB(context.Background(), "127.0.0.1", port)
+		if !ok || !strings.Contains(ev, "SHIELD Android TV") {
+			t.Fatalf("expected ADB CNXN match with device model, got ok=%v ev=%q", ok, ev)
+		}
+	})
+
+	t.Run("adb auth challenge rejected cleanly", func(t *testing.T) {
+		port, closeFn := startMockTCP(t, func(conn net.Conn) {
+			hdr := make([]byte, 24)
+			if _, err := io.ReadFull(conn, hdr); err != nil {
+				return
+			}
+			pLen := binary.LittleEndian.Uint32(hdr[12:16])
+			if pLen > 0 && pLen < 1024 {
+				_, _ = io.ReadFull(conn, make([]byte, pLen))
+			}
+			const cmdAUTH uint32 = 0x48545541 // "AUTH"
+			resp := make([]byte, 24)
+			binary.LittleEndian.PutUint32(resp[0:4], cmdAUTH)
+			binary.LittleEndian.PutUint32(resp[4:8], 1) // AUTH_TOKEN
+			binary.LittleEndian.PutUint32(resp[20:24], cmdAUTH^0xffffffff)
+			_, _ = conn.Write(resp)
+		})
+		defer closeFn()
+
+		if ev, ok := probeADB(context.Background(), "127.0.0.1", port); ok {
+			t.Fatalf("expected ADB AUTH challenge to NOT match unauth check, got ev=%q", ev)
+		}
+	})
+
+	t.Run("rdp without nla accepted vs nla enforced", func(t *testing.T) {
+		// Mock RDP server with NLA disabled (TYPE_RDP_NEG_RSP = 0x02, PROTOCOL_RDP = 0x00).
+		portOpen, closeOpen := startMockTCP(t, func(conn net.Conn) {
+			req := make([]byte, 19)
+			if _, err := io.ReadFull(conn, req); err != nil {
+				return
+			}
+			resp := []byte{
+				0x03, 0x00, 0x00, 0x13,
+				0x0e, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x02, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+			}
+			_, _ = conn.Write(resp)
+		})
+		defer closeOpen()
+
+		if _, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portOpen); !ok {
+			t.Fatal("expected RDP server with NLA disabled to match")
+		}
+
+		// Mock RDP server enforcing NLA (TYPE_RDP_NEG_FAILURE = 0x03, HYBRID_REQUIRED_BY_SERVER = 0x05).
+		portNLA, closeNLA := startMockTCP(t, func(conn net.Conn) {
+			req := make([]byte, 19)
+			if _, err := io.ReadFull(conn, req); err != nil {
+				return
+			}
+			resp := []byte{
+				0x03, 0x00, 0x00, 0x13,
+				0x0e, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x03, 0x00, 0x08, 0x00, 0x05, 0x00, 0x00, 0x00,
+			}
+			_, _ = conn.Write(resp)
+		})
+		defer closeNLA()
+
+		if ev, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portNLA); ok {
+			t.Fatalf("expected NLA-enforced RDP server NOT to match, got ev=%q", ev)
+		}
+	})
+
+	t.Run("ftp anonymous login vs auth required", func(t *testing.T) {
+		portAnon, closeAnon := startMockTCP(t, func(conn net.Conn) {
+			br := bufio.NewReader(conn)
+			_, _ = io.WriteString(conn, "220 WiFi FTP Server Ready\r\n")
+			_, _ = br.ReadString('\n')
+			_, _ = io.WriteString(conn, "331 Anonymous login ok\r\n")
+			_, _ = br.ReadString('\n')
+			_, _ = io.WriteString(conn, "230 Login successful\r\n")
+		})
+		defer closeAnon()
+
+		if _, ok := probeFTPAnonymous(context.Background(), "127.0.0.1", portAnon); !ok {
+			t.Fatal("expected anonymous FTP to match")
+		}
+
+		portAuth, closeAuth := startMockTCP(t, func(conn net.Conn) {
+			br := bufio.NewReader(conn)
+			_, _ = io.WriteString(conn, "220 Secure FTP\r\n")
+			_, _ = br.ReadString('\n')
+			_, _ = io.WriteString(conn, "530 Anonymous access denied\r\n")
+		})
+		defer closeAuth()
+
+		if ev, ok := probeFTPAnonymous(context.Background(), "127.0.0.1", portAuth); ok {
+			t.Fatalf("expected auth-only FTP NOT to match, got ev=%q", ev)
+		}
+	})
+
+	t.Run("redis pong vs noauth", func(t *testing.T) {
+		portOpen, closeOpen := startMockTCP(t, func(conn net.Conn) {
+			buf := make([]byte, 16)
+			_, _ = conn.Read(buf)
+			_, _ = io.WriteString(conn, "+PONG\r\n")
+		})
+		defer closeOpen()
+
+		if _, ok := probeRedisUnauth(context.Background(), "127.0.0.1", portOpen); !ok {
+			t.Fatal("expected unauth Redis +PONG to match")
+		}
+
+		portAuth, closeAuth := startMockTCP(t, func(conn net.Conn) {
+			buf := make([]byte, 16)
+			_, _ = conn.Read(buf)
+			_, _ = io.WriteString(conn, "-NOAUTH Authentication required.\r\n")
+		})
+		defer closeAuth()
+
+		if ev, ok := probeRedisUnauth(context.Background(), "127.0.0.1", portAuth); ok {
+			t.Fatalf("expected auth-protected Redis NOT to match, got ev=%q", ev)
+		}
+	})
+
+	t.Run("es file explorer cve-2019-6447", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `{"name":"Old Android","version":"9","model":"SM-G950F","sdk":"28"}`)
+		}))
+		defer srv.Close()
+		_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+
+		r := NewRunner(nil, 1)
+		ev, ok := r.probeESFileExplorer(context.Background(), "127.0.0.1", port)
+		if !ok || !strings.Contains(ev, "SM-G950F") {
+			t.Fatalf("expected ES File Explorer match with SM-G950F, got ok=%v ev=%q", ok, ev)
+		}
+	})
+}
+
+func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
+	allChecks, err := LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatalf("LoadFromFS: %v", err)
+	}
+	byID := make(map[string]*Check, len(allChecks))
+	for _, c := range allChecks {
+		byID[c.ID] = c
+	}
+
+	// Verify Shelly Gen2 (UB-2026-0006): matches 200 JSON, rejects 401 Digest.
+	t.Run("shelly_gen2_unauth_vs_digest", func(t *testing.T) {
+		chk := byID["UB-2026-0006"]
+		authEnabled := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/rpc/Shelly.GetConfig" {
+				http.NotFound(w, r)
+				return
+			}
+			if authEnabled {
+				w.Header().Set("WWW-Authenticate", `Digest realm="shellyplus1"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_, _ = io.WriteString(w, `{"sys":{"device":{"fw_id":"1.4.4"}},"wifi":{"sta":{"ssid":"lab"}}}`)
+		}))
+		defer srv.Close()
+		_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+		r := NewRunner(nil, 1)
+
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
+			t.Fatal("expected unauth Shelly Gen2 to match UB-2026-0006")
+		}
+		authEnabled = true
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); ok {
+			t.Fatal("expected Digest-protected Shelly Gen2 NOT to match UB-2026-0006")
+		}
+	})
+
+	// Verify Transmission RPC (UB-2026-0031): matches 409+Session-Id, rejects 401.
+	t.Run("transmission_409_vs_401", func(t *testing.T) {
+		chk := byID["UB-2026-0031"]
+		authEnabled := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/transmission/rpc" {
+				http.NotFound(w, r)
+				return
+			}
+			if authEnabled {
+				w.Header().Set("WWW-Authenticate", `Basic realm="Transmission"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("X-Transmission-Session-Id", "abc123session")
+			w.WriteHeader(http.StatusConflict)
+		}))
+		defer srv.Close()
+		_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+		r := NewRunner(nil, 1)
+
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
+			t.Fatal("expected unauth Transmission 409 to match UB-2026-0031")
+		}
+		authEnabled = true
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); ok {
+			t.Fatal("expected auth-protected Transmission 401 NOT to match UB-2026-0031")
+		}
+	})
+
+	// Verify Brother CVE-2024-51977 (UB-2026-0013) CSV disclosure.
+	t.Run("brother_cve_2024_51977", func(t *testing.T) {
+		chk := byID["UB-2026-0013"]
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/etc/mnt_info.csv" {
+				_, _ = io.WriteString(w, "\"Node Name\",\"Model Name\",\"Serial No.\"\n\"BRN001122\",\"MFC-L2750DW\",\"E12345678\"\n")
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+		_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+		r := NewRunner(nil, 1)
+
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
+			t.Fatal("expected vulnerable Brother /etc/mnt_info.csv to match UB-2026-0013")
+		}
+	})
+
+	// Verify ports_all precondition (UB-2026-0034 Jailbroken iOS SSH):
+	// requires BOTH 62078 and 22, so neither stock iOS (62078 only) nor Mac/Linux (22 only) triggers.
+	t.Run("ports_all_jailbroken_ios", func(t *testing.T) {
+		chk := byID["UB-2026-0034"]
+		stockIOS := probe.HostProfile{OpenPorts: []int{62078}}
+		normalMac := probe.HostProfile{OpenPorts: []int{22}}
+		jailbrokenIOS := probe.HostProfile{OpenPorts: []int{22, 62078}}
+
+		if _, ok := matchPreconditions(chk, stockIOS); ok {
+			t.Fatal("stock iOS (62078 only) must NOT match jailbreak SSH check")
+		}
+		if _, ok := matchPreconditions(chk, normalMac); ok {
+			t.Fatal("normal Mac/Linux (22 only) must NOT match jailbreak SSH check")
+		}
+		ports, ok := matchPreconditions(chk, jailbrokenIOS)
+		if !ok || len(ports) != 1 || ports[0] != 22 {
+			t.Fatalf("jailbroken iOS (22+62078) expected probe port [22], got ok=%v ports=%v", ok, ports)
+		}
+	})
+
+	// Verify header_contains matcher (UB-0019 Python SimpleHTTP).
+	t.Run("python_simplehttp_header_contains", func(t *testing.T) {
+		chk := byID["UB-0019"]
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Server", "SimpleHTTP/0.6 Python/3.12.2")
+			_, _ = io.WriteString(w, "<html><title>Directory listing for /</title><body><h1>Directory listing for /</h1></body></html>")
+		}))
+		defer srv.Close()
+		_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+		port, _ := strconv.Atoi(portStr)
+		r := NewRunner(nil, 1)
+
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
+			t.Fatal("expected Python SimpleHTTP to match UB-0019")
 		}
 	})
 }

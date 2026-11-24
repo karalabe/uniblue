@@ -38,11 +38,11 @@ vendor_rules:
   # --- IoT, HVAC, Appliances & Smart Home ---
   - category: iot
     role: Smart Home / Appliance
-    vendor_regex: "(?i)(irobot|roborock|ecovacs|dreame|zehnder|tuya|shelly|allterco|signify|philips lighting|aqara|lumi united|ecobee|lutron|netatmo|tado|fibaro|nanoleaf|lifx|wiz|yeelight|switchbot|meross|kasa|tapo|govee|sonoff|itead|chamberlain|myq|rachio|bsh hausgeraete|miele|dyson|whirlpool|nest labs)"
+    vendor_regex: "(?i)(irobot|roborock|ecovacs|dreame|zehnder|daikin|tuya|shelly|allterco|signify|philips lighting|aqara|lumi united|ecobee|lutron|netatmo|tado|fibaro|nanoleaf|lifx|wiz|yeelight|switchbot|meross|kasa|tapo|govee|sonoff|itead|chamberlain|myq|rachio|bsh hausgeraete|miele|dyson|whirlpool|nest labs|homewizard)"
 
   - category: iot
     role: Solar / Energy / Industrial
-    vendor_regex: "(?i)(fronius|sma solar|solaredge|enphase|victron|goodwe|sungrow|huawei digital power|schneider electric|siemens ag|wago|phoenix contact|beckhoff)"
+    vendor_regex: "(?i)(fronius|sma solar|solaredge|enphase|victron|goodwe|sungrow|huawei digital power|go-e|openevse|wallbox|easee|schneider electric|siemens ag|wago|phoenix contact|beckhoff)"
 
   # --- NAS / Dedicated Storage ---
   - category: server
@@ -85,11 +85,11 @@ hostname_rules:
 
   - category: iot
     role: Smart Home Hub
-    regex: "(?i)(home[-_\\s]?assistant|homeassistant|hassio|openhab|hubitat|homebridge|zigbee2mqtt)"
+    regex: "(?i)(home[-_\\s]?assistant|homeassistant|hassio|openhab|hubitat|homebridge|zigbee2mqtt|node-?red|frigate)"
 
   - category: iot
     role: IoT / Appliance
-    regex: "(?i)(roomba|roborock|comfoconnect|ventilation|thermostat|tasmota|shelly|esphome|wled|inverter|wallbox|charger|sensor|plug|bulb)"
+    regex: "(?i)(roomba|roborock|valetudo|comfoconnect|ventilation|daikin|thermostat|tasmota|shelly|esphome|wled|fronius|enphase|homewizard|go-?echarger|openevse|inverter|wallbox|charger|sensor|plug|bulb)"
 
   - category: netservice
     role: DNS / Ad-Blocker

@@ -108,3 +108,63 @@
   vendors: ["dropbear_ssh_project"]
   products: ["dropbear_ssh"]
   version_group: 1
+
+- name: CUPS Print Server
+  http_server_regex: "(?i)CUPS/([0-9]+\\.[0-9]+(?:\\.[0-9]+)?)"
+  vendors: ["openprinting", "apple"]
+  products: ["cups"]
+  version_group: 1
+
+- name: Node-RED
+  http_title_regex: "(?i)^node-red"
+  ports_any: [1880]
+  vendors: ["nodered", "openjsf"]
+  products: ["node-red"]
+
+- name: OctoPrint
+  http_title_regex: "(?i)octoprint"
+  vendors: ["octoprint"]
+  products: ["octoprint"]
+
+- name: Tasmota
+  http_title_regex: "(?i)tasmota"
+  vendors: ["tasmota"]
+  products: ["tasmota"]
+
+- name: Shelly
+  hostname_regex: "(?i)^shelly"
+  http_title_regex: "(?i)shelly"
+  vendors: ["shelly", "allterco"]
+  products: ["*shelly*"]
+
+- name: Brother Printer
+  hostname_regex: "(?i)^br[nw][0-9a-f]{6}"
+  http_title_regex: "(?i)brother"
+  vendors: ["brother"]
+  products: ["*mfc*", "*hl-*", "*dcp-*"]
+
+- name: Hikvision Camera
+  http_server_regex: "(?i)(App-webs|DNVRS-Webs|Hikvision)"
+  vendors: ["hikvision"]
+  products: ["*ds-*", "*ip_camera*"]
+
+- name: Kodi
+  http_title_regex: "(?i)kodi|chorus"
+  vendors: ["kodi", "xbmc"]
+  products: ["kodi"]
+
+- name: Transmission
+  http_title_regex: "(?i)transmission web interface"
+  ports_any: [9091]
+  vendors: ["transmissionbt"]
+  products: ["transmission"]
+
+- name: Traefik
+  http_title_regex: "(?i)^traefik$"
+  vendors: ["traefik"]
+  products: ["traefik"]
+
+- name: Ollama
+  ports_any: [11434]
+  vendors: ["ollama"]
+  products: ["ollama"]

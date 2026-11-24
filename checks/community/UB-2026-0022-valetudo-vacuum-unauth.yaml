@@ -1,0 +1,43 @@
+id: UB-2026-0022
+title: Valetudo Robot Vacuum Unauthenticated Control & Floorplan API
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Valetudo
+  product: Valetudo Local Robot Vacuum Firmware
+  affected_versions: Default configuration (HTTP Basic Auth disabled)
+  author: "@karalabe"
+  references:
+    - https://valetudo.cloud/pages/general/getting-started.html
+
+preconditions:
+  ports_any: [80]
+
+probe:
+  type: http
+  method: GET
+  path: /api/v2/robot
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"implementation":'
+      - '"capabilities":'
+      - "ValetudoRobot"
+    redact_body: true
+
+remediation:
+  summary: >
+    Valetudo's REST API is accessible without HTTP Basic Authentication. Any
+    LAN device can command the vacuum, trigger audio/locate alerts, download
+    the complete LiDAR floorplan of your home, or modify MQTT settings. Enable
+    HTTP Basic Auth in Valetudo Connectivity settings and isolate the robot on
+    an IoT VLAN.
+  unifi_actions:
+    - enable_valetudo_http_auth
+    - move_to_iot_vlan
+    - block_wan_egress

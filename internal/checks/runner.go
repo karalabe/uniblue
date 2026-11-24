@@ -237,6 +237,11 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	// Match open ports first since it is the cheapest filter and also selects
 	// which concrete ports Stage 2 should probe.
+	for _, p := range chk.Preconditions.PortsAll {
+		if !hp.HasPort(p) {
+			return nil, false
+		}
+	}
 	var matchedPorts []int
 	for _, p := range chk.Preconditions.PortsAny {
 		if hp.HasPort(p) {
@@ -245,6 +250,9 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	}
 	if len(chk.Preconditions.PortsAny) > 0 && len(matchedPorts) == 0 {
 		return nil, false
+	}
+	if len(matchedPorts) == 0 && len(chk.Preconditions.PortsAll) > 0 {
+		matchedPorts = append(matchedPorts, chk.Preconditions.PortsAll...)
 	}
 
 	// Match identity preconditions (MAC prefix, OUI vendor, or hostname). When
@@ -347,6 +355,16 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 		return probeComfoConnect(probeCtx, ip, port)
 	case "eth-rpc":
 		return r.probeEthereumRPC(probeCtx, ip, port)
+	case "adb":
+		return probeADB(probeCtx, ip, port)
+	case "rdp-nla":
+		return probeRDPNoNLA(probeCtx, ip, port)
+	case "ftp-anon":
+		return probeFTPAnonymous(probeCtx, ip, port)
+	case "esfile":
+		return r.probeESFileExplorer(probeCtx, ip, port)
+	case "redis":
+		return probeRedisUnauth(probeCtx, ip, port)
 	default:
 		return "", false
 	}
@@ -417,6 +435,11 @@ func (r *Runner) probeHTTP(ctx context.Context, ip string, port int, chk *Check)
 	}
 	for _, h := range m.HeadersPresent {
 		if resp.Header.Get(h) == "" {
+			return "", false
+		}
+	}
+	for h, substr := range m.HeaderContains {
+		if !strings.Contains(strings.ToLower(resp.Header.Get(h)), strings.ToLower(substr)) {
 			return "", false
 		}
 	}
@@ -889,6 +912,261 @@ func (r *Runner) probeEthereumRPC(ctx context.Context, ip string, port int) (str
 		return "", false
 	}
 	return fmt.Sprintf("confirmed unauthenticated Ethereum JSON-RPC: web3_clientVersion -> %q", compactASCII(rpcResp.Result, 96)), true
+}
+
+// probeADB sends a strictly read-only ADB CNXN handshake packet to TCP port
+// 5555 and checks whether the target accepts the session directly with CNXN
+// (no RSA key authentication required). When the device responds with AUTH,
+// the connection is closed immediately without sending any key so no on-screen
+// prompt is ever triggered on Android TV / Fire TV devices.
+func probeADB(ctx context.Context, ip string, port int) (string, bool) {
+	conn, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+
+	const (
+		adbCmdCNXN    uint32 = 0x4E584E43 // "CNXN" in little-endian
+		adbVersion    uint32 = 0x01000000
+		adbMaxPayload uint32 = 0x00004000
+	)
+	payload := []byte("host::\x00")
+	var checksum uint32
+	for _, b := range payload {
+		checksum += uint32(b)
+	}
+
+	pkt := make([]byte, 24+len(payload))
+	binary.LittleEndian.PutUint32(pkt[0:4], adbCmdCNXN)
+	binary.LittleEndian.PutUint32(pkt[4:8], adbVersion)
+	binary.LittleEndian.PutUint32(pkt[8:12], adbMaxPayload)
+	binary.LittleEndian.PutUint32(pkt[12:16], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(pkt[16:20], checksum)
+	binary.LittleEndian.PutUint32(pkt[20:24], adbCmdCNXN^0xffffffff)
+	copy(pkt[24:], payload)
+
+	if _, err := conn.Write(pkt); err != nil {
+		return "", false
+	}
+
+	hdr := make([]byte, 24)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return "", false
+	}
+	respCmd := binary.LittleEndian.Uint32(hdr[0:4])
+	respLen := binary.LittleEndian.Uint32(hdr[12:16])
+	respMagic := binary.LittleEndian.Uint32(hdr[20:24])
+	if respMagic != respCmd^0xffffffff || respCmd != adbCmdCNXN {
+		return "", false
+	}
+
+	// Read the device identity banner (e.g., "device::ro.product.model=...") if present.
+	var banner string
+	if respLen > 0 && respLen <= 4096 {
+		buf := make([]byte, respLen)
+		if _, err := io.ReadFull(conn, buf); err == nil {
+			banner = compactASCII(string(buf), 100)
+		}
+	}
+	if banner != "" {
+		return fmt.Sprintf("confirmed unauthenticated ADB shell access (CNXN accepted without AUTH: %q)", banner), true
+	}
+	return "confirmed unauthenticated ADB shell access (CNXN accepted without AUTH)", true
+}
+
+// probeRDPNoNLA sends a read-only TPKT + X.224 Connection Request with an
+// RDP_NEG_REQ offering ONLY classic PROTOCOL_RDP (0x00000000, no CredSSP/NLA).
+// Servers enforcing Network Level Authentication reply with TYPE_RDP_NEG_FAILURE
+// (0x03) and HYBRID_REQUIRED_BY_SERVER; servers with NLA disabled reply with
+// TYPE_RDP_NEG_RSP (0x02) accepting PROTOCOL_RDP or PROTOCOL_SSL without NLA.
+func probeRDPNoNLA(ctx context.Context, ip string, port int) (string, bool) {
+	conn, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+
+	// 19-byte TPKT + X.224 CR + 8-byte RDP_NEG_REQ (requestedProtocols = 0x00000000).
+	req := []byte{
+		0x03, 0x00, 0x00, 0x13, // TPKT v3, reserved 0, total length 19
+		0x0e,       // X.224 length indicator (14 bytes follow)
+		0xe0,       // X.224 Connection Request (CR)
+		0x00, 0x00, // DST-REF
+		0x00, 0x00, // SRC-REF
+		0x00,       // Class 0
+		0x01, 0x00, // TYPE_RDP_NEG_REQ (0x01), flags (0x00)
+		0x08, 0x00, // length = 8 (little-endian)
+		0x00, 0x00, 0x00, 0x00, // requestedProtocols = PROTOCOL_RDP (no NLA)
+	}
+	if _, err := conn.Write(req); err != nil {
+		return "", false
+	}
+
+	// Read TPKT 4-byte header first, then the remaining payload (bounded to 512B).
+	tpkt := make([]byte, 4)
+	if _, err := io.ReadFull(conn, tpkt); err != nil {
+		return "", false
+	}
+	if tpkt[0] != 0x03 || tpkt[1] != 0x00 {
+		return "", false
+	}
+	totalLen := int(binary.BigEndian.Uint16(tpkt[2:4]))
+	if totalLen < 11 || totalLen > 512 {
+		return "", false
+	}
+	body := make([]byte, totalLen-4)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return "", false
+	}
+	// body[1] must be X.224 Connection Confirm (0xD0).
+	if len(body) < 7 || body[1] != 0xd0 {
+		return "", false
+	}
+	// If the server omitted RDP_NEG_RSP entirely, it accepted legacy RDP security.
+	if len(body) == 7 {
+		return "RDP server accepted legacy PROTOCOL_RDP without Network Level Authentication (no RDP_NEG_RSP)", true
+	}
+	// Otherwise inspect the 8-byte RDP_NEG_RSP / RDP_NEG_FAILURE block at body[7:].
+	if len(body) < 15 {
+		return "", false
+	}
+	negType := body[7]
+	if negType != 0x02 { // 0x02 = TYPE_RDP_NEG_RSP; 0x03 = TYPE_RDP_NEG_FAILURE (NLA enforced)
+		return "", false
+	}
+	selectedProto := binary.LittleEndian.Uint32(body[11:15])
+	switch selectedProto {
+	case 0x00000000:
+		return "RDP server accepted standard PROTOCOL_RDP with Network Level Authentication (NLA) disabled", true
+	case 0x00000001:
+		return "RDP server accepted TLS-only PROTOCOL_SSL with Network Level Authentication (NLA) disabled", true
+	default:
+		return "", false
+	}
+}
+
+// probeFTPAnonymous checks whether an FTP daemon accepts anonymous login
+// ("USER anonymous" / "PASS uniblue@local") and immediately sends QUIT so no
+// files are listed or modified.
+func probeFTPAnonymous(ctx context.Context, ip string, port int) (string, bool) {
+	conn, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+
+	br := bufio.NewReader(io.LimitReader(conn, 4096))
+	code, greeting, ok := readFTPResponse(br)
+	if !ok || code != 220 {
+		return "", false
+	}
+
+	if _, err := io.WriteString(conn, "USER anonymous\r\n"); err != nil {
+		return "", false
+	}
+	code, _, ok = readFTPResponse(br)
+	if !ok {
+		return "", false
+	}
+	if code == 331 {
+		if _, err := io.WriteString(conn, "PASS uniblue@local\r\n"); err != nil {
+			return "", false
+		}
+		code, _, ok = readFTPResponse(br)
+		if !ok {
+			return "", false
+		}
+	}
+	if code != 230 {
+		return "", false
+	}
+	_, _ = io.WriteString(conn, "QUIT\r\n")
+	return fmt.Sprintf("FTP server accepted anonymous login (230 OK; banner %q)", compactASCII(greeting, 80)), true
+}
+
+// readFTPResponse reads a single-line or multi-line RFC 959 FTP reply and
+// returns its 3-digit numeric status code and final message text.
+func readFTPResponse(br *bufio.Reader) (int, string, bool) {
+	for range 16 {
+		line, err := br.ReadString('\n')
+		if err != nil && len(line) == 0 {
+			return 0, "", false
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if len(line) < 3 {
+			continue
+		}
+		code, err := strconv.Atoi(line[:3])
+		if err != nil {
+			continue
+		}
+		if len(line) == 3 || line[3] == ' ' {
+			return code, strings.TrimSpace(line[3:]), true
+		}
+	}
+	return 0, "", false
+}
+
+// probeESFileExplorer sends a strictly read-only {"command":"getDeviceInfo"}
+// request to TCP port 59777 to confirm CVE-2019-6447 (ES File Explorer's
+// unauthenticated local HTTP server on Android) without listing files or apps.
+func (r *Runner) probeESFileExplorer(ctx context.Context, ip string, port int) (string, bool) {
+	targetURL := fmt.Sprintf("http://%s/", net.JoinHostPort(ip, strconv.Itoa(port)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(`{"command":"getDeviceInfo"}`))
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "UniBlue-Checker/0.1")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var info struct {
+		Name    string `json:"name"`
+		Model   string `json:"model"`
+		Version string `json:"version"`
+		SDK     string `json:"sdk"`
+	}
+	if err := json.Unmarshal(bodyBytes, &info); err != nil {
+		return "", false
+	}
+	if info.Model == "" && info.SDK == "" {
+		return "", false
+	}
+	return fmt.Sprintf("confirmed ES File Explorer CVE-2019-6447 unauthenticated HTTP server (model=%q, android=%q)",
+		compactASCII(info.Model, 48), compactASCII(info.Version, 16)), true
+}
+
+// probeRedisUnauth sends a single read-only RESP "PING\r\n" command and checks
+// for "+PONG\r\n", confirming Redis accepts commands without authentication.
+func probeRedisUnauth(ctx context.Context, ip string, port int) (string, bool) {
+	conn, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+
+	if _, err := io.WriteString(conn, "PING\r\n"); err != nil {
+		return "", false
+	}
+	buf := make([]byte, 32)
+	n, err := conn.Read(buf)
+	if err != nil && n == 0 {
+		return "", false
+	}
+	if strings.HasPrefix(string(buf[:n]), "+PONG") {
+		return "Redis server replied +PONG to unauthenticated PING (no requirepass/ACL)", true
+	}
+	return "", false
 }
 
 // compactASCII strips control bytes, collapses whitespace, and caps length so

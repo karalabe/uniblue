@@ -1,0 +1,42 @@
+id: UB-2026-0025
+title: Roku External Control Protocol (ECP) Unauthenticated LAN Control
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Roku
+  product: Roku Streaming Player / Roku TV
+  affected_versions: Firmware with permissive "Control by mobile apps" setting
+  author: "@karalabe"
+  references:
+    - https://developer.roku.com/docs/developer-program/dev-tools/external-control-api.md
+
+preconditions:
+  ports_any: [8060]
+
+probe:
+  type: http
+  method: GET
+  path: /query/device-info
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_all:
+      - "<device-info>"
+      - "<model-name>"
+      - "<serial-number>"
+    redact_body: true
+
+remediation:
+  summary: >
+    Roku exposes its unauthenticated External Control Protocol (ECP) on port
+    8060, allowing any host on the LAN (or a browser via DNS rebinding if
+    permissive) to read device metadata, launch apps, and inject remote
+    keystrokes. Set Settings -> System -> Advanced system settings -> Control
+    by mobile apps to "Limited" or "Disabled" and isolate streaming devices on
+    an IoT/Media VLAN.
+  unifi_actions:
+    - set_roku_ecp_limited_or_disabled
+    - move_to_iot_vlan

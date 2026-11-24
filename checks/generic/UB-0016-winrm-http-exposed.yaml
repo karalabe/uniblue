@@ -1,0 +1,39 @@
+id: UB-0016
+title: Unencrypted Windows Remote Management (WinRM HTTP) Exposed
+cve: null
+category: exposed-protocol
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Microsoft
+  product: Windows Remote Management (WinRM)
+  affected_versions: Windows workstations / laptops with HTTP WinRM listener enabled
+  author: "@karalabe"
+  references:
+    - https://learn.microsoft.com/en-us/windows/win32/winrm/installation-and-configuration-for-windows-remote-management
+
+preconditions:
+  ports_any: [5985]
+
+probe:
+  type: http
+  method: GET
+  path: /wsman
+  timeout: 3s
+  match:
+    status: [401, 405]
+    header_contains:
+      Server: "Microsoft-HTTPAPI"
+    redact_body: true
+
+remediation:
+  summary: >
+    Windows Remote Management (WinRM) over unencrypted HTTP (port 5985) is
+    reachable across the LAN. On home laptops and workstations, an active WinRM
+    listener widens lateral-movement and NTLM-relay surface. Disable the WinRM
+    service (Disable-PSRemoting) unless actively needed, or restrict port 5985
+    in Windows Firewall and switch to HTTPS (5986).
+  unifi_actions:
+    - disable_winrm_http_5985
+    - restrict_inter_vlan_access

@@ -1,0 +1,43 @@
+id: UB-2026-0033
+title: Android "IP Webcam" App Unauthenticated Live Camera & Audio Stream
+cve: null
+category: info-disclosure
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Pavel Khlebovich
+  product: IP Webcam for Android
+  affected_versions: any (when Login/Password is unset)
+  author: "@karalabe"
+  references:
+    - https://www.home-assistant.io/integrations/android_ip_webcam/
+
+preconditions:
+  ports_any: [8080]
+
+probe:
+  type: http
+  method: GET
+  path: /status.json
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"curvals":'
+      - '"night_vision":'
+      - '"video_recording":'
+    redact_body: true
+
+remediation:
+  summary: >
+    An Android phone or tablet running the "IP Webcam" app exposes its live
+    video, microphone audio, and sensor endpoints on port 8080 without HTTP
+    authentication. Configure Login/Password under Connection Settings -> Local
+    broadcasting in IP Webcam and move repurposed camera phones to an isolated
+    Camera/IoT VLAN.
+  unifi_actions:
+    - enable_ip_webcam_password
+    - move_to_camera_vlan
+    - block_wan_egress

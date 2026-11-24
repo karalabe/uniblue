@@ -1,0 +1,43 @@
+id: UB-2026-0013
+title: Brother / OEM Printer Unauthenticated Maintenance Info Leak (CVE-2024-51977)
+cve: CVE-2024-51977
+category: info-disclosure
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Brother
+  product: Brother / Fujifilm / Konica Minolta / Ricoh / Toshiba MFP
+  affected_versions: Firmware prior to June 2025 security update
+  author: "@karalabe"
+  references:
+    - https://nvd.nist.gov/vuln/detail/CVE-2024-51977
+    - https://www.rapid7.com/blog/post/multiple-brother-devices-multiple-vulnerabilities-fixed/
+
+preconditions:
+  ports_any: [80, 443, 631]
+
+probe:
+  type: http
+  method: GET
+  path: /etc/mnt_info.csv
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_all:
+      - "Node Name"
+      - "Serial No."
+    redact_body: true
+
+remediation:
+  summary: >
+    Printer exposed /etc/mnt_info.csv without authentication (CVE-2024-51977),
+    leaking its serial number and network configuration. On unpatched units
+    still using factory credentials, the serial number can be chained with
+    CVE-2024-51978 to compute the default administrator password. Update the
+    printer firmware, change the admin password, and isolate printers on a
+    dedicated VLAN.
+  unifi_actions:
+    - update_printer_firmware
+    - change_printer_admin_password
+    - move_to_iot_vlan

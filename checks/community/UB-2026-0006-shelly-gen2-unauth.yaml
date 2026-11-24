@@ -1,0 +1,44 @@
+id: UB-2026-0006
+title: Shelly Gen2/Gen3 Unauthenticated RPC Config API
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+supersedes: ["UB-0006"]
+
+metadata:
+  vendor: Shelly
+  product: Shelly Plus / Pro / Gen3 Smart Relay
+  affected_versions: Gen2/Gen3 firmware without Digest authentication enabled
+  author: "@karalabe"
+  references:
+    - https://shelly-api-docs.shelly.cloud/gen2/General/Authentication/
+
+preconditions:
+  ports_any: [80]
+
+probe:
+  type: http
+  method: GET
+  path: /rpc/Shelly.GetConfig
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"sys":'
+      - '"wifi":'
+      - '"fw_id":'
+    redact_body: true
+
+remediation:
+  summary: >
+    Shelly Gen2/Gen3 device returned full system configuration from
+    /rpc/Shelly.GetConfig without a Digest 401 challenge. Any LAN host can
+    toggle switches, modify scripts/MQTT settings, or flash firmware. Set an
+    authentication password in Settings -> Authentication and move to an
+    isolated IoT VLAN.
+  unifi_actions:
+    - enable_shelly_digest_auth
+    - move_to_iot_vlan
+    - block_wan_egress

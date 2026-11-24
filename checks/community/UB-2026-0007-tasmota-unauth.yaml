@@ -1,0 +1,43 @@
+id: UB-2026-0007
+title: Tasmota Unauthenticated HTTP Command & OTA Interface
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+supersedes: ["UB-0006"]
+
+metadata:
+  vendor: Tasmota
+  product: Tasmota ESP8266 / ESP32 Firmware
+  affected_versions: any (when WebPassword is unset)
+  author: "@karalabe"
+  references:
+    - https://tasmota.github.io/docs/Commands/#management
+
+preconditions:
+  ports_any: [80]
+
+probe:
+  type: http
+  method: GET
+  path: /cm?cmnd=Status%200
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"StatusFWR":'
+      - '"StatusNET":'
+    redact_body: true
+
+remediation:
+  summary: >
+    Tasmota accepted an unauthenticated HTTP command (/cm?cmnd=Status 0),
+    confirming WebPassword is not configured. Any LAN host can toggle power
+    relays, alter MQTT settings, or reflash arbitrary firmware via OtaUrl.
+    Set a strong WebPassword (or disable WebServer after provisioning) and
+    place the device on an isolated IoT VLAN.
+  unifi_actions:
+    - set_tasmota_webpassword
+    - move_to_iot_vlan
+    - block_wan_egress

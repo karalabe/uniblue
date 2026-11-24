@@ -494,6 +494,12 @@ func mergePorts(basePorts []int, list []*checks.Check) []int {
 				merged = append(merged, p)
 			}
 		}
+		for _, p := range chk.Preconditions.PortsAll {
+			if _, ok := seen[p]; !ok {
+				seen[p] = struct{}{}
+				merged = append(merged, p)
+			}
+		}
 	}
 	return merged
 }
