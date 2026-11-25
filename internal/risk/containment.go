@@ -462,6 +462,8 @@ func evaluatePeerContainmentAxis(
 	wiredSwitches := make(map[string]struct{})
 	wiredIsoCount := 0
 	wiredOpenCount := 0
+	var wiredOpenLabels []string
+	var wiredOpenPorts []string
 	seenPort := make(map[string]struct{})
 	for _, cl := range snap.Clients {
 		if !strings.EqualFold(cl.NetworkName, n.Name) || !cl.IsWired {
@@ -479,9 +481,29 @@ func evaluatePeerContainmentAxis(
 			wiredIsoCount++
 		} else {
 			wiredOpenCount++
+			swName := deviceNameByMAC(snap, sm)
+			if swName != "" && cl.SwitchPort > 0 {
+				wiredOpenLabels = append(wiredOpenLabels, fmt.Sprintf("%s (%s Port %d)", cl.DisplayName(), swName, cl.SwitchPort))
+				wiredOpenPorts = append(wiredOpenPorts, fmt.Sprintf("%s Port %d (%s)", swName, cl.SwitchPort, cl.DisplayName()))
+			} else {
+				wiredOpenLabels = append(wiredOpenLabels, cl.DisplayName())
+			}
 		}
 	}
+	sort.Strings(wiredOpenLabels)
+	sort.Strings(wiredOpenPorts)
 	allWiredPortIsolated := len(wiredClients) > 0 && len(wiredSwitches) == 1 && wiredOpenCount == 0
+
+	var apUplinkLabels []string
+	for _, ap := range siteAPs {
+		um := strings.ToLower(strings.TrimSpace(ap.UplinkMAC))
+		if um != "" && ap.UplinkPort > 0 {
+			apUplinkLabels = append(apUplinkLabels, fmt.Sprintf("%s (%s Port %d)", firstNonEmptyStr(ap.Name, ap.Model, ap.MAC), deviceNameByMAC(snap, um), ap.UplinkPort))
+		} else {
+			apUplinkLabels = append(apUplinkLabels, firstNonEmptyStr(ap.Name, ap.Model, ap.MAC))
+		}
+	}
+	sort.Strings(apUplinkLabels)
 
 	// Evaluate switch ACL intra-VLAN peer blocking if complete ACLs are available.
 	aclBlocksPeers := false
@@ -511,6 +533,7 @@ func evaluatePeerContainmentAxis(
 
 	// Emit cross-AP violation when switch ACLs are known complete and do not isolate peers.
 	if multiAP && !crossAPIsolated && switchACLStatus == "complete" && !hasCrossAPCell {
+		apList := strings.Join(apUplinkLabels, ", ")
 		c := IsolationCell{
 			SourceZone:       zoneLabel,
 			SourceNetwork:    n.Name,
@@ -525,8 +548,8 @@ func evaluatePeerContainmentAxis(
 			Effective:        "allow",
 			Verdict:          IsolationViolation,
 			DecisiveRuleName: aclDec.ruleName,
-			DecisiveReason:   fmt.Sprintf("%d APs serve %s without switch ACL or AP uplink port isolation", len(siteAPs), n.Name),
-			RecommendedFix:   fmt.Sprintf("Add a switch L2 ACL blocking intra-VLAN peer traffic on %s or enable Port Isolation on AP switch uplinks.", n.Name),
+			DecisiveReason:   fmt.Sprintf("%d APs serve %s without switch ACL or AP uplink port isolation: %s", len(siteAPs), n.Name, apList),
+			RecommendedFix:   fmt.Sprintf("Add a switch L2 ACL blocking intra-VLAN peer traffic on %s or enable Port Isolation on AP uplinks (%s).", n.Name, apList),
 		}
 		cells = append(cells, c)
 		findings = append(findings, checks.Finding{
@@ -538,7 +561,7 @@ func evaluatePeerContainmentAxis(
 			BaseSeverity:      checks.SeverityMedium,
 			EffectiveSeverity: checks.SeverityMedium,
 			Client:            unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
-			Evidence:          fmt.Sprintf("%d APs serve %s with un-isolated AP uplinks and 0 blocking switch ACLs (%s)", len(siteAPs), n.Name, aclDec.ruleName),
+			Evidence:          fmt.Sprintf("Un-isolated AP uplinks on %s: %s; 0 blocking switch ACLs (%s)", n.Name, apList, aclDec.ruleName),
 			Remediation: checks.Remediation{
 				Summary:      c.RecommendedFix,
 				UniFiActions: []string{"add_switch_l2_isolation_acl", "enable_switch_port_isolation"},
@@ -549,6 +572,11 @@ func evaluatePeerContainmentAxis(
 	// Emit wired peer violation when wired clients sit on un-isolated ports and
 	// switch ACLs are known complete without a deny ACL.
 	if len(wiredClients) > 0 && !allWiredPortIsolated && !aclBlocksPeers && switchACLStatus == "complete" && !hasWiredCell {
+		clientSummary := strings.Join(wiredOpenLabels, ", ")
+		fixTargets := clientSummary
+		if len(wiredOpenPorts) > 0 {
+			fixTargets = strings.Join(wiredOpenPorts, ", ")
+		}
 		c := IsolationCell{
 			SourceZone:       zoneLabel,
 			SourceNetwork:    n.Name,
@@ -563,8 +591,8 @@ func evaluatePeerContainmentAxis(
 			Effective:        "allow",
 			Verdict:          IsolationViolation,
 			DecisiveRuleName: aclDec.ruleName,
-			DecisiveReason:   fmt.Sprintf("%d wired client(s) on %s lack switch port isolation and switch ACLs do not block peer traffic", wiredOpenCount, n.Name),
-			RecommendedFix:   fmt.Sprintf("Enable Switch Port Isolation on wired %s ports or add a switch L2 ACL blocking intra-VLAN peers.", n.Name),
+			DecisiveReason:   fmt.Sprintf("%d un-isolated wired port(s) on %s: %s", wiredOpenCount, n.Name, clientSummary),
+			RecommendedFix:   fmt.Sprintf("Enable Switch Port Isolation on %s, or add a switch L2 ACL blocking intra-VLAN peers on %s.", fixTargets, n.Name),
 		}
 		cells = append(cells, c)
 		findings = append(findings, checks.Finding{
@@ -576,7 +604,7 @@ func evaluatePeerContainmentAxis(
 			BaseSeverity:      checks.SeverityMedium,
 			EffectiveSeverity: checks.SeverityMedium,
 			Client:            unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
-			Evidence:          fmt.Sprintf("%d wired client(s) on %s are on un-isolated switch ports with no blocking switch ACL (%s)", wiredOpenCount, n.Name, aclDec.ruleName),
+			Evidence:          fmt.Sprintf("Un-isolated wired ports on %s: %s; switch ACLs permit intra-VLAN traffic (%s)", n.Name, clientSummary, aclDec.ruleName),
 			Remediation: checks.Remediation{
 				Summary:      c.RecommendedFix,
 				UniFiActions: []string{"enable_switch_port_isolation", "add_switch_l2_isolation_acl"},
@@ -603,7 +631,7 @@ func evaluatePeerContainmentAxis(
 			}
 			return ContainmentAxis{
 				State:  state,
-				Detail: fmt.Sprintf("%d wired port(s) not isolated; %s", wiredOpenCount, switchACLReason),
+				Detail: fmt.Sprintf("%d un-isolated wired port(s) (%s); %s", wiredOpenCount, strings.Join(wiredOpenLabels, ", "), switchACLReason),
 			}, cells, findings
 		}
 		state := "open"
@@ -612,7 +640,7 @@ func evaluatePeerContainmentAxis(
 		}
 		return ContainmentAxis{
 			State:  state,
-			Detail: fmt.Sprintf("%d wired client(s) lack port isolation and switch ACLs permit peer traffic", wiredOpenCount),
+			Detail: fmt.Sprintf("%d un-isolated wired port(s): %s", wiredOpenCount, strings.Join(wiredOpenLabels, ", ")),
 		}, cells, findings
 	case multiAP && !crossAPIsolated:
 		if switchACLStatus != "complete" {

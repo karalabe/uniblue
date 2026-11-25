@@ -1468,3 +1468,30 @@ func TestConnectOnlyPortsSurfacedOnEntityAndCoverage(t *testing.T) {
 		t.Fatalf("expected connect-only service state for port 9100, got %+v", ent.Services)
 	}
 }
+
+func TestFindingSubjectEntityIDResolvesNonHostEntities(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Networks: []unifi.Network{
+			{ID: "net-cam", Name: "Cameras"},
+		},
+		Devices: []unifi.Device{
+			{MAC: "aa:bb:cc:00:00:01", Name: "UDM Pro", Type: "udm"},
+		},
+	}
+	for _, tc := range []struct {
+		name string
+		f    checks.Finding
+		want string
+	}{
+		{"vlan", checks.Finding{Client: unifi.Client{MAC: "vlan:net-cam", NetworkName: "Cameras"}}, "net:net-cam"},
+		{"iso", checks.Finding{Client: unifi.Client{MAC: "iso:net-cam:net-def", NetworkName: "Cameras"}}, "net:net-cam"},
+		{"gw", checks.Finding{Client: unifi.Client{MAC: "gw:net-cam"}}, "dev:aa:bb:cc:00:00:01"},
+		{"wlan", checks.Finding{Client: unifi.Client{MAC: "wlan:w1", NetworkName: "Cameras"}}, "net:net-cam"},
+		{"device", checks.Finding{Client: unifi.Client{MAC: "AA:BB:CC:00:00:01"}}, "dev:aa:bb:cc:00:00:01"},
+		{"host", checks.Finding{Client: unifi.Client{MAC: "11:22:33:44:55:66"}}, "host:11:22:33:44:55:66"},
+	} {
+		if got := findingSubjectEntityID(tc.f, snap); got != tc.want {
+			t.Errorf("%s: findingSubjectEntityID = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

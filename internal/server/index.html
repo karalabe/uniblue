@@ -2960,6 +2960,8 @@ function renderDevices() {
         </div>`
       : "";
 
+    const netEnt = lane.network_id ? vm.entities?.[lane.network_id] : null;
+    const netIssueCount = netEnt ? (netEnt.reasons || []).length : 0;
     html += `<div class="zone-card">
       <div class="zone-hd" style="border-left-color:${vlanColor(lane.name)}">
         <div>
@@ -2974,7 +2976,10 @@ function renderDevices() {
           <div class="zone-desc">${esc(zoneExplain)}</div>
           ${contStrip}
         </div>
-        <div class="small"><strong>${bmcs.length + others.length}</strong> device${(bmcs.length + others.length) === 1 ? "" : "s"}${expN ? ` · <strong style="color:var(--crit)">${expN} need attention</strong>` : ""}</div>
+        <div class="small" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span><strong>${bmcs.length + others.length}</strong> device${(bmcs.length + others.length) === 1 ? "" : "s"}${expN ? ` · <strong style="color:var(--crit)">${expN} need attention</strong>` : ""}</span>
+          ${netEnt && netIssueCount ? `<button class="btn sm" data-entity-id="${esc(lane.network_id)}">Inspect (${netIssueCount})</button>` : ""}
+        </div>
       </div>`;
 
     if (lane.migration_hint && deviceFilter === "all" && !deviceSearch) {
@@ -3171,17 +3176,19 @@ function renderActivity() {
     </div>
     <div class="card">
       ${filtered.length ? filtered.map(ev => {
-        const rawTarget = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || (ev.dst_ip ? entByIP[ev.dst_ip] : "") || "";
+        let rawTarget = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || (ev.dst_ip ? entByIP[ev.dst_ip] : "") || "";
+        if (rawTarget.startsWith("host:vlan:")) rawTarget = "net:" + rawTarget.slice("host:vlan:".length);
         const target = (rawTarget && vm.entities && vm.entities[rawTarget]) ? rawTarget : "";
         const ht = humanEventType(ev.type);
         const clickAttr = target ? ` class="act-row clickable" data-entity-id="${esc(target)}"` : ` class="act-row"`;
+        const isOfflineHost = !target && rawTarget.startsWith("host:") && !/^host:(vlan|iso|gw|wlan):/i.test(rawTarget);
         return `<div${clickAttr}>
           <div class="act-l">
             <span class="act-time mono">${fmtTime(ev.time)}</span>
             <span class="tag ${ht.tone}">${esc(ht.label)}</span>
             <span style="font-weight:500">${esc(ev.summary)}</span>
           </div>
-          ${target ? `<span class="go-arrow">Inspect →</span>` : (rawTarget ? `<span class="small" style="color:var(--muted)">Offline</span>` : "")}
+          ${target ? `<span class="go-arrow">Inspect →</span>` : (isOfflineHost ? `<span class="small" style="color:var(--muted)">Offline</span>` : "")}
         </div>`;
       }).join("") : `<div class="empty">No matching activity yet.</div>`}
     </div>`;
@@ -3224,6 +3231,12 @@ function plainSummaryForEntity(vm, ent) {
   if (ent.kind === "child") {
     const parent = ent.parent_id ? vm.entities[ent.parent_id] : null;
     return `<strong>${esc(ent.label)}</strong> is a downstream device reported by ${parent ? `<strong>${esc(parent.label)}</strong>` : "its parent bridge/recorder"} (source: ${esc(ent.identity_source || "bridge inventory")}). Direct reachability from the reporting LAN is <strong>${esc(ent.direct_lan_reachability || "unknown")}</strong>.`;
+  }
+  if (ent.kind === "network") {
+    const count = (ent.reasons || []).length;
+    return count
+      ? `<strong>${esc(ent.label)}</strong> (${esc(ent.subtitle || "network")}) has ${count} isolation item${count === 1 ? "" : "s"} worth reviewing below.`
+      : `<strong>${esc(ent.label)}</strong> (${esc(ent.subtitle || "network")}) matches its configured isolation policy.`;
   }
   if (ent.kind === "device") {
     const count = (ent.reasons || []).length;

@@ -1973,7 +1973,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 					Severity:  nf.EffectiveSeverity.String(),
 					Host:      nf.Client.DisplayName(),
 					IP:        nf.Client.PrimaryIP(),
-					SubjectID: hostEntityID(nf.Client),
+					SubjectID: findingSubjectEntityID(nf, snap),
 					Summary:   fmt.Sprintf("New [%s] %s: %s", strings.ToUpper(nf.EffectiveSeverity.String()), nf.CheckID, nf.Title),
 				})
 			}

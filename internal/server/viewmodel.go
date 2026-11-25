@@ -342,6 +342,52 @@ func netEntityID(id, name string) string {
 	return "net:" + strings.ToLower(strings.TrimSpace(name))
 }
 
+// findingSubjectEntityID resolves the dashboard entity ID for a finding so
+// Activity events for VLAN, isolation, gateway, WLAN, and UniFi device findings
+// link directly to their live entity instead of appearing as offline hosts.
+func findingSubjectEntityID(f checks.Finding, snap *unifi.Snapshot) string {
+	mac := strings.ToLower(strings.TrimSpace(f.Client.MAC))
+	if id, ok := strings.CutPrefix(mac, "vlan:"); ok {
+		return netEntityID(id, f.Client.NetworkName)
+	}
+	if rest, ok := strings.CutPrefix(mac, "iso:"); ok {
+		srcID, _, _ := strings.Cut(rest, ":")
+		return netEntityID(srcID, f.Client.NetworkName)
+	}
+	if strings.HasPrefix(mac, "gw:") {
+		if snap != nil {
+			for _, d := range snap.Devices {
+				t := strings.ToLower(strings.TrimSpace(d.Type))
+				if t == "udm" || t == "ugw" || t == "uxg" {
+					return devEntityID(d.MAC)
+				}
+			}
+		}
+		return ""
+	}
+	if strings.HasPrefix(mac, "wlan:") {
+		if snap != nil {
+			for _, n := range snap.Networks {
+				if strings.EqualFold(n.Name, f.Client.NetworkName) {
+					return netEntityID(n.ID, n.Name)
+				}
+			}
+		}
+		if f.Client.NetworkName != "" {
+			return netEntityID("", f.Client.NetworkName)
+		}
+		return ""
+	}
+	if snap != nil && mac != "" {
+		for _, d := range snap.Devices {
+			if strings.EqualFold(d.MAC, mac) {
+				return devEntityID(d.MAC)
+			}
+		}
+	}
+	return hostEntityID(f.Client)
+}
+
 // BuildPresentationModel derives the entire verdict, graph, queue, physical
 // blueprint, and logical zone model once in Go so every UI widget and offline
 // HTML export agrees 100%.
@@ -1273,8 +1319,14 @@ func BuildPresentationModel(
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-ISO-"):
 			// Effective isolation policy violations attach to their target host
-			// (e.g. BMC or Printer) when known, falling back to Gateway.
+			// (e.g. BMC or Printer) or owning network entity (vlan:/iso: findings)
+			// when known, falling back to Gateway.
 			target := pm.Entities[lookupHostID(f.Client)]
+			if target == nil {
+				if subID := findingSubjectEntityID(f, snap); subID != "" {
+					target = pm.Entities[subID]
+				}
+			}
 			if target == nil {
 				target = pm.Entities[pm.GatewayID]
 			}
