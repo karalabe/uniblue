@@ -655,7 +655,7 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVE
 
 	// 3. Rolled-up Patch Verification Reminders (version unknown).
 	if cveLoaded && len(potentialCVEs) > 0 {
-		fmt.Fprintf(w, "\n3. Patch Verification — Version Unknown (%d product(s)):\n", len(potentialCVEs))
+		fmt.Fprintf(w, "\n3. Patch Verification (Version Unknown, %d product(s)):\n", len(potentialCVEs))
 		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 		fmt.Fprintln(tw, "  MAX SEV\tHOST\tVLAN\tSUMMARY\tTOP CVES")
 		for _, s := range potentialCVEs {
@@ -680,7 +680,7 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVE
 		fmt.Fprintf(w, "  - [%s] %s\n    %s\n", strings.ToUpper(n.Severity.String()), n.Title, n.Detail)
 	}
 	for _, f := range firmwareFindings {
-		fmt.Fprintf(w, "  - [LOW] %s — %s\n", f.Title, f.Evidence)
+		fmt.Fprintf(w, "  - [LOW] %s: %s\n", f.Title, f.Evidence)
 	}
 	fmt.Fprintf(w, "  - [OK] UniFi Infrastructure: %d/%d device(s) up to date\n", report.CleanUniFiDevices, report.UniFiDeviceCount)
 	fmt.Fprintf(w, "  - [OK] LAN Clients:          %d/%d active host(s) passed with zero unauthenticated services exposed\n", report.CleanClients, report.ClientCount)
@@ -955,7 +955,7 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 		printCVEMatchTable(stdout, exact, len(exact))
 	}
 
-	fmt.Fprintf(stdout, "\nPotential Product Matches — Version Unknown (%d total, showing up to %d):\n", len(potential), *limit)
+	fmt.Fprintf(stdout, "\nPotential Product Matches (Version Unknown, %d total, showing up to %d):\n", len(potential), *limit)
 	if len(potential) == 0 {
 		fmt.Fprintln(stdout, "  None.")
 	} else {
@@ -1445,7 +1445,7 @@ func printSwitchPorts(w io.Writer, site string, switches []risk.SwitchDeviceView
 				uplink = fmt.Sprintf("%s Port %d", sw.UplinkName, sw.UplinkPort)
 			}
 		}
-		fmt.Fprintf(w, "%s (%s · %s)%s — Uplink: %s | %d active, %d unused-open, %d disabled\n",
+		fmt.Fprintf(w, "%s (%s · %s)%s | Uplink: %s | %d active, %d unused-open, %d disabled\n",
 			sw.Name, sw.Model, sw.IP, extTag, uplink, sw.ActivePorts, sw.InactiveEnabledPorts, sw.DisabledPorts)
 
 		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)

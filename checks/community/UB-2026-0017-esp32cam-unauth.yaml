@@ -5,7 +5,7 @@
 # license that can be found in the LICENSE file.
 
 id: UB-2026-0017
-title: ESP32-CAM Unauthenticated Live Video & Control Interface
+title: Unauthenticated ESP32-CAM Live Video & Control Panel
 cve: null
 category: unauth-control
 severity: high

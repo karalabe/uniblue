@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0009
+title: Unauthenticated Ethereum Engine API (Missing JWT Auth)
+cve: null
+category: crypto-node
+claim: confirmed-permission
+property: eth-engine-unauth
+severity: critical
+safety: read-only
+
+metadata:
+  vendor: Ethereum Execution Clients (Geth / Nethermind / Besu / Reth)
+  product: Ethereum Engine API
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://github.com/ethereum/execution-apis/blob/main/src/engine/authentication.md
+
+preconditions:
+  ports_any: [8551]
+  discovery_only: true
+
+probe:
+  type: eth-engine
+  timeout: 3s
+
+remediation:
+  summary: >
+    The Ethereum Engine API (TCP 8551) accepted an unauthenticated JSON-RPC
+    request without requiring an HS256 JWT token. Bind --authrpc.addr to
+    127.0.0.1 and enforce --authrpc.jwtsecret immediately.
+  unifi_actions:
+    - block_rpc_port_at_firewall
+    - bind_service_to_localhost

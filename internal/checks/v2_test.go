@@ -312,7 +312,7 @@ func TestNervaDedupPreservesIndependentTLSFinding(t *testing.T) {
 		},
 	}
 	existing := []Finding{
-		{CheckID: "UB-2026-0013", Category: "info-disclosure", Client: profiles[0].Client, Port: 443},
+		{CheckID: "UB-2026-0053", Category: "info-disclosure", Client: profiles[0].Client, Port: 443},
 	}
 	got := FindingsFromProfiles(profiles, existing)
 	if len(got) != 1 || got[0].CheckID != "NERVA-TLS-CERTIFICATE-EXPIRED" {

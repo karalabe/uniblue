@@ -1,0 +1,48 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0025
+title: Unauthenticated etcd Key-Value Store API
+cve: null
+category: unauth-rce
+severity: critical
+safety: read-only
+
+metadata:
+  vendor: CNCF
+  product: etcd Distributed Key-Value Store
+  affected_versions: any (client TLS / RBAC auth disabled)
+  author: "@karalabe"
+  references:
+    - https://etcd.io/docs/latest/op-guide/authentication/
+
+preconditions:
+  ports_any: [2379]
+
+probe:
+  type: http
+  method: GET
+  path: /version
+  timeout: 3s
+  match:
+    status: [200]
+    json_match:
+      - path: "$.etcdserver"
+        exists: true
+      - path: "$.etcdcluster"
+        exists: true
+    evidence_summary: "etcd client port 2379 served version metadata without client TLS authentication"
+    redact_body: true
+
+remediation:
+  summary: >
+    etcd's client API on port 2379 answered over unauthenticated HTTP. In
+    Kubernetes and homelab clusters, unauthenticated etcd access exposes all
+    cluster secrets and grants full cluster compromise. Enable mandatory client
+    certificate authentication (--client-cert-auth) and bind to private interfaces.
+  unifi_actions:
+    - enable_etcd_client_cert_auth
+    - restrict_inter_vlan_access

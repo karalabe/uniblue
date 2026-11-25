@@ -1,0 +1,48 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0054
+title: Unauthenticated Moonraker / Klipper 3D Printer Control API
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Klipper / Moonraker
+  product: Moonraker API Server (Mainsail / Fluidd / Creality)
+  affected_versions: any (when trusted_clients grants broad LAN access)
+  author: "@karalabe"
+  references:
+    - https://moonraker.readthedocs.io/en/latest/configuration/#authorization
+
+preconditions:
+  ports_any: [7125]
+
+probe:
+  type: http
+  method: GET
+  path: /server/info
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"klippy_state":'
+      - '"moonraker_version":'
+    redact_body: true
+
+remediation:
+  summary: >
+    Moonraker accepted an unauthenticated request to /server/info on port 7125.
+    Broad trusted_clients CIDR ranges allow any LAN host to execute arbitrary
+    G-code, set extruder/bed heater temperatures (physical safety risk), or
+    upload modified macros. Set force_logins: true in moonraker.conf, narrow
+    trusted_clients to localhost, and isolate 3D printers on a dedicated VLAN.
+  unifi_actions:
+    - enable_moonraker_force_logins
+    - move_to_iot_vlan
+    - restrict_inter_vlan_access

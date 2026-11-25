@@ -1,0 +1,38 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0006
+title: Anonymous FTP Login Enabled
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: FTP Server (NAS / Router USB / Android WiFi FTP App / Camera)
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+
+preconditions:
+  ports_any: [21, 2121]
+
+probe:
+  type: ftp-anon
+  timeout: 3s
+
+remediation:
+  summary: >
+    FTP daemon accepted passwordless login as "anonymous" over cleartext TCP.
+    Anonymous FTP is frequently left enabled on Android WiFi FTP apps (port
+    2121), NAS media shares, old router USB storage, and IP cameras, exposing
+    files to every host on the LAN. Disable anonymous FTP and migrate file
+    transfers to SFTP or authenticated SMB3.
+  unifi_actions:
+    - disable_anonymous_ftp
+    - restrict_inter_vlan_access

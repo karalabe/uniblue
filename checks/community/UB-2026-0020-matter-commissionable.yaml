@@ -1,0 +1,41 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0020
+title: Matter Active Commissioning Window Advertised
+cve: null
+category: device-onboarding
+claim: service-advertised
+property: matter-commissioning-window
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Connectivity Standards Alliance (Matter)
+  product: Matter Commissionable Device
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://developers.home.google.com/matter/primer/commissionable-and-operational-discovery
+
+preconditions:
+  mdns_type_any: ["_matterc._udp"]
+  mdns_txt_regex: "(?i)^cm=(1|2)$"
+  discovery_only: true
+
+probe:
+  type: observe
+  match:
+    evidence_summary: "Matter commissionable advertisement with active commissioning mode (cm=1 or cm=2) on _matterc._udp"
+
+remediation:
+  summary: >
+    A Matter accessory is actively advertising commissioning mode (cm=1/2; note
+    that cm=0 extended discovery outside a commissioning window is ignored).
+    If no onboarding is underway, close the commissioning window or confirm
+    whether maintenance is in progress.
+  unifi_actions:
+    - close_matter_commissioning_window

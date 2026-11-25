@@ -98,13 +98,13 @@ func existingFindingProperty(f Finding) string {
 	}
 	id := strings.ToUpper(f.CheckID)
 	switch id {
-	case "UB-0002", "UB-0003", "UB-0004", "UB-0005", "UB-0006", "UB-0007",
-		"UB-0008", "UB-0009", "UB-0010", "UB-0011", "UB-0012", "UB-0014",
-		"UB-0015", "UB-0018", "UB-0023", "UB-0024", "UB-0025", "UB-0026":
+	case "UB-0026", "UB-0048", "UB-0044", "UB-0002", "UB-0040", "UB-0030",
+		"UB-0029", "UB-0005", "UB-0041", "UB-0031", "UB-0032", "UB-0006",
+		"UB-0022", "UB-0034", "UB-0023", "UB-0007", "UB-0024", "UB-0025":
 		return "auth-anon"
 	}
 	switch {
-	case id == "UB-0020" || strings.Contains(id, "TLS-LEGACY"):
+	case id == "UB-0009" || strings.Contains(id, "TLS-LEGACY"):
 		return "tls-protocol"
 	case strings.Contains(id, "TLS-CERT") || strings.Contains(id, "CERTIFICATE"):
 		return "tls-cert"

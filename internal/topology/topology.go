@@ -392,10 +392,10 @@ func evaluatePlacement(cl unifi.Client, cls classify.Result, inIsolated, inManag
 		if inManagement {
 			return PlacementOK, ""
 		}
-		return PlacementReview, "Out-of-band BMC/IPMI — restrict to admin/management access"
+		return PlacementReview, "Out-of-band BMC/IPMI: restrict to admin/management access"
 
 	case classify.CategoryCamera:
-		return PlacementReview, "Camera/doorbell on Internal LAN — consider dedicated or isolated VLAN"
+		return PlacementReview, "Camera/doorbell on Internal LAN: consider dedicated or isolated VLAN"
 
 	case classify.CategoryIoT:
 		// Smart-home hubs (e.g., Home Assistant) often orchestrate across VLANs
@@ -404,20 +404,20 @@ func evaluatePlacement(cl unifi.Client, cls classify.Result, inIsolated, inManag
 			return PlacementOK, ""
 		}
 		if hasIsolatedVLAN {
-			return PlacementIsolate, "Embedded/IoT appliance on Internal — consider isolated VLAN"
+			return PlacementIsolate, "Embedded/IoT appliance on Internal: consider isolated VLAN"
 		}
 		return PlacementReview, "Embedded/IoT appliance on flat Internal LAN"
 
 	case classify.CategoryMedia:
 		if hasIsolatedVLAN {
-			return PlacementIsolate, "AV/media appliance on Internal — consider isolated VLAN"
+			return PlacementIsolate, "AV/media appliance on Internal: consider isolated VLAN"
 		}
 		return PlacementReview, "AV/media appliance on flat Internal LAN"
 
 	case classify.CategoryPrinter:
 		if strings.Contains(strings.ToLower(cls.Role), "3d") {
 			if hasIsolatedVLAN {
-				return PlacementIsolate, "3D printer appliance on Internal — consider isolated VLAN"
+				return PlacementIsolate, "3D printer appliance on Internal: consider isolated VLAN"
 			}
 			return PlacementReview, "3D printer appliance on flat Internal LAN"
 		}

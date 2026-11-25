@@ -1,0 +1,36 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0015
+title: UPnP Internet Gateway Device (IGD) Service Advertised
+cve: null
+category: exposed-protocol
+severity: low
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: UPnP IGD Broadband Router / Gateway
+  affected_versions: Routers advertising WANIPConnection / WANPPPConnection
+  author: "@karalabe"
+  references:
+    - https://openconnectivity.org/developer/specifications/upnp-resources/upnp/
+
+preconditions:
+  upnp_device_regex: "(?i)InternetGatewayDevice"
+  upnp_service_regex: "(?i)WAN(IP|PPP)Connection"
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    A gateway on this network advertises UPnP IGD (WANIPConnection /
+    WANPPPConnection). Unless explicitly needed for gaming consoles, disable
+    UPnP IGD (or enforce secure_mode on trusted LANs only) so compromised IoT
+    devices or malware cannot silently open inbound WAN port forwards.
+  unifi_actions:
+    - disable_upnp_igd_on_untrusted_vlans

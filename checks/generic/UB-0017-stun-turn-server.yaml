@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0017
+title: STUN / TURN Signaling Service Discovered
+cve: null
+category: service-inventory
+claim: service-observed
+property: stun-server
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: RFC 5389 STUN Server
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://datatracker.ietf.org/doc/html/rfc5389
+
+preconditions:
+  service_proto_any: ["stun", "turn"]
+  discovery_only: true
+
+probe:
+  type: stun
+  port: 3478
+  timeout: 2s
+
+remediation:
+  summary: >
+    A STUN server answered a read-only RFC 5389 Binding Request on UDP 3478.
+    Confirm whether TURN relaying requires authentication and restricts private
+    RFC1918 peer destinations.
+  unifi_actions:
+    - verify_turn_peer_restrictions

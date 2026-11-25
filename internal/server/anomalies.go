@@ -136,7 +136,7 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 				Severity: sev,
 				Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
 				IP:       curr.DeviceIP,
-				Summary: fmt.Sprintf("Possible physical cable swap on %s Port %d (zone=%s): link is UP with %.2fW PoE draw (baseline %.2fW — PoE device replaced by non-PoE host?)",
+				Summary: fmt.Sprintf("Possible physical cable swap on %s Port %d (zone=%s): link is UP with %.2fW PoE draw (baseline %.2fW; PoE device replaced by non-PoE host?)",
 					curr.DeviceName, curr.PortIdx, curr.Zone, curr.PoEPowerWatts, baseW),
 			})
 		}
@@ -165,7 +165,7 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 				Severity: "high",
 				Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
 				IP:       curr.DeviceIP,
-				Summary:  fmt.Sprintf("STP blocked %s Port %d (state=%s) — Layer-2 loop or rogue BPDU detected", curr.DeviceName, curr.PortIdx, curr.STPState),
+				Summary:  fmt.Sprintf("STP blocked %s Port %d (state=%s): Layer-2 loop or rogue BPDU detected", curr.DeviceName, curr.PortIdx, curr.STPState),
 			})
 		}
 	}
@@ -423,7 +423,7 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 		events = append(events, LiveEvent{
 			Type:     "config_drift",
 			Severity: "high",
-			Summary:  "UniFi site security settings or Wi-Fi SSID configuration changed — re-auditing posture",
+			Summary:  "UniFi site security settings or Wi-Fi SSID configuration changed; re-auditing posture",
 		})
 	}
 	if secSig != "" {

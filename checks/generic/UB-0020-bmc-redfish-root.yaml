@@ -1,0 +1,52 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0020
+title: Out-of-Band BMC Redfish Service Root Discovered
+cve: null
+category: oob-bmc
+claim: service-observed
+property: bmc-redfish-identity
+severity: info
+safety: read-only
+
+metadata:
+  vendor: DMTF / Generic
+  product: Redfish BMC Management Interface
+  affected_versions: Server BMCs exposing /redfish/v1 on general LAN or server VLANs
+  author: "@karalabe"
+  references:
+    - https://www.dmtf.org/standards/redfish
+
+preconditions:
+  ports_any: [443, 80]
+  discovery_only: true
+
+probe:
+  type: http
+  method: GET
+  paths:
+    - /redfish/v1
+    - /redfish/v1/
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_any:
+      - '"RedfishVersion"'
+      - '"#ServiceRoot'
+    evidence_summary: "Redfish BMC service root discovered (public metadata endpoint; verify OOB VLAN isolation and authentication)"
+
+remediation:
+  summary: >
+    A server Baseboard Management Controller (BMC) Redfish API is directly
+    reachable from this network. BMCs run long-lived embedded firmware with
+    bare-metal root privileges over the host OS and storage. Place BMC
+    interfaces on an isolated Out-of-Band Management VLAN reachable only from
+    a hardened admin jump host or VPN, and verify BMC firmware is current.
+  unifi_actions:
+    - move_bmc_to_dedicated_oob_mgmt_vlan
+    - restrict_bmc_access_to_admin_ips
+    - update_bmc_firmware

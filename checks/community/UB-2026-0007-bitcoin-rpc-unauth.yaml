@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0007
+title: Unauthenticated Bitcoin Core JSON-RPC API
+cve: null
+category: crypto-node
+claim: confirmed-permission
+property: bitcoin-rpc-unauth
+severity: critical
+safety: read-only
+
+metadata:
+  vendor: Bitcoin Core / Generic
+  product: Bitcoin JSON-RPC Server
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://developer.bitcoin.org/reference/rpc/
+
+preconditions:
+  ports_any: [8332, 18332]
+  discovery_only: true
+
+probe:
+  type: bitcoin-rpc
+  timeout: 3s
+
+remediation:
+  summary: >
+    Bitcoin JSON-RPC answered getblockchaininfo without HTTP Basic or cookie
+    authentication. Bind rpcbind to 127.0.0.1, enforce rpcauth credentials, and
+    never forward TCP 8332 to WAN or untrusted VLANs.
+  unifi_actions:
+    - block_rpc_port_at_firewall
+    - bind_service_to_localhost

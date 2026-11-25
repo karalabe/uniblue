@@ -1,0 +1,40 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0005
+title: Unauthenticated Android Debug Bridge (ADB over TCP)
+cve: null
+category: unauth-rce
+severity: critical
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: Android TV / Fire TV / Android Device (ADB over TCP)
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://developer.android.com/tools/adb
+
+preconditions:
+  ports_any: [5555]
+
+probe:
+  type: adb
+  port: 5555
+  timeout: 3s
+
+remediation:
+  summary: >
+    Android Debug Bridge (ADB) over TCP port 5555 accepted a CNXN handshake
+    without RSA key authentication. Any host on the LAN can open an interactive
+    shell, install arbitrary APKs, or exfiltrate app data from this TV or
+    streaming box. Disable Network / ADB Debugging in Developer Options and
+    move streaming devices to an isolated IoT/Media VLAN.
+  unifi_actions:
+    - disable_adb_network_debugging
+    - move_to_iot_vlan
+    - restrict_inter_vlan_access

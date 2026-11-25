@@ -14,7 +14,7 @@ import (
 )
 
 // ProductSummary rolls up all CVE matches for a single (Host, Product, Confidence)
-// tuple into one compact, operator-friendly summary row — turning dozens of
+// tuple into one compact, operator-friendly summary row, turning dozens of
 // repetitive CVE lines into a single prioritized item with a computed minimum
 // fixed version.
 type ProductSummary struct {

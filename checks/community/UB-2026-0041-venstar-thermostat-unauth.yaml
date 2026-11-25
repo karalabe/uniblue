@@ -1,0 +1,51 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0041
+title: Unauthenticated Venstar ColorTouch Thermostat API
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Venstar
+  product: ColorTouch / Explorer Wi-Fi Thermostat
+  affected_versions: Local API enabled without HTTPS/auth
+  author: "@karalabe"
+  references:
+    - https://developer.venstar.com/documentation/
+
+preconditions:
+  ports_any: [80]
+  discovery_only: true
+
+probe:
+  type: http
+  method: GET
+  path: /query/info
+  timeout: 3s
+  match:
+    status: [200]
+    json_match:
+      - path: "$.mode"
+        exists: true
+      - path: "$.spacetemp"
+        exists: true
+      - path: "$.heattemp"
+        exists: true
+    evidence_summary: "Venstar thermostat returned /query/info HVAC state without authentication"
+    redact_body: true
+
+remediation:
+  summary: >
+    Venstar thermostat exposes its local HTTP API without authentication,
+    allowing any LAN host to read indoor temperature/occupancy and alter
+    heating/cooling setpoints. Move the thermostat to an isolated IoT VLAN and
+    restrict port 80 strictly to your Home Assistant controller IP.
+  unifi_actions:
+    - move_to_iot_vlan
+    - restrict_port_80_to_controller

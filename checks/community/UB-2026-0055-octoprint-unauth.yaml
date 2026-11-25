@@ -1,0 +1,49 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0055
+title: Unauthenticated OctoPrint 3D Printer Control API
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: OctoPrint
+  product: OctoPrint 3D Printer Server
+  affected_versions: any (when access control is disabled)
+  author: "@karalabe"
+  references:
+    - https://docs.octoprint.org/en/master/api/settings.html
+
+preconditions:
+  ports_any: [80, 5000]
+
+probe:
+  type: http
+  method: GET
+  path: /api/settings
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"appearance":'
+      - '"printerProfiles":'
+      - '"serial":'
+    redact_body: true
+
+remediation:
+  summary: >
+    OctoPrint returned full printer settings from /api/settings without an API
+    key or session cookie, indicating Access Control is disabled. Any LAN host
+    can execute G-code, control extruder/bed heaters (fire hazard), or install
+    arbitrary plugins. Enable Access Control in OctoPrint and isolate 3D
+    printers on a dedicated VLAN.
+  unifi_actions:
+    - enable_octoprint_access_control
+    - move_to_iot_vlan
+    - restrict_inter_vlan_access

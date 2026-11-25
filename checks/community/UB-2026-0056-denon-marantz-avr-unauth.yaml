@@ -1,0 +1,43 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0056
+title: Unauthenticated Denon / Marantz AVR Telnet Control
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+supersedes: ["UB-0001"]
+
+metadata:
+  vendor: Denon / Marantz (D&M Holdings)
+  product: Network AV Receiver
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+
+preconditions:
+  ports_any: [23]
+  mac_prefix: ["00:05:cd"]
+  hostname_regex: "(?i)(marantz|denon|avr|sr[0-9]{4})"
+
+probe:
+  type: avr
+  port: 23
+  timeout: 3s
+
+remediation:
+  summary: >
+    Denon and Marantz AV receivers expose an unauthenticated cleartext Telnet
+    control protocol on port 23. Any reachable device on the network can power
+    on the amplifier, switch inputs, or set maximum volume without credentials.
+    Isolate the receiver on a segmented VLAN and restrict port 23 access to
+    trusted home-automation controllers.
+  unifi_actions:
+    - move_to_iot_vlan
+    - restrict_inter_vlan_access
+    - block_wan_egress

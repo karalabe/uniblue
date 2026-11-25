@@ -599,7 +599,7 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		e.emitLocked(LiveEvent{
 			Type:     "policy_changed",
 			Severity: "high",
-			Summary:  "WAN port-forwarding rules changed — re-evaluating exposure surface",
+			Summary:  "WAN port-forwarding rules changed; re-evaluating exposure surface",
 		})
 		// Probe any active host referenced by an enabled port forward.
 		for _, pf := range snap.PortForwards {
@@ -619,7 +619,7 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		e.emitLocked(LiveEvent{
 			Type:     "policy_changed",
 			Severity: "high",
-			Summary:  "UniFi firewall policies changed — re-auditing zone rules",
+			Summary:  "UniFi firewall policies changed; re-auditing zone rules",
 		})
 	}
 

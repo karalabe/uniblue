@@ -189,7 +189,7 @@ func TestAcceptanceCase1_GuestApprovedIPPSPrintingAdminBlocked(t *testing.T) {
 // specific IPv6 rule permits guest access. UniBlue identifies Redfish, reports
 // the configured IPv6 path, and names the rule to narrow.
 func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
-	// Spin up a local Redfish ServiceRoot HTTP mock to test UB-2026-0061 end-to-end!
+	// Spin up a local Redfish ServiceRoot HTTP mock to test UB-0020 end-to-end!
 	redfishSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/redfish/v1") {
 			w.Header().Set("Content-Type", "application/json")
@@ -203,14 +203,14 @@ func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
 	host, portStr, _ := net.SplitHostPort(redfishSrv.Listener.Addr().String())
 	port, _ := strconv.Atoi(portStr)
 
-	// Load real UB-2026-0061 and adapt its port strictly to the local mock server port.
+	// Load real UB-0020 and adapt its port strictly to the local mock server port.
 	allChecks, err := checks.LoadFromFS(builtinchecks.BuiltinFS)
 	if err != nil {
 		t.Fatalf("LoadFromFS: %v", err)
 	}
 	var redfishCheck *checks.Check
 	for _, c := range allChecks {
-		if c.ID == "UB-2026-0061" {
+		if c.ID == "UB-0020" {
 			cp := *c
 			cp.Preconditions.PortsAny = []int{port}
 			cp.Probe.Scheme = "http"
@@ -219,7 +219,7 @@ func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
 		}
 	}
 	if redfishCheck == nil {
-		t.Fatal("UB-2026-0061 not found in embedded checks")
+		t.Fatal("UB-0020 not found in embedded checks")
 	}
 
 	snap := &unifi.Snapshot{
@@ -285,10 +285,10 @@ func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
 	foundRedfish := false
 	foundIPv6Finding := false
 	for _, f := range report.Findings {
-		if f.CheckID == "UB-2026-0061" {
+		if f.CheckID == "UB-0020" {
 			foundRedfish = true
 			if f.ClaimKind != checks.ClaimServiceObserved || f.EffectiveSeverity != checks.SeverityInfo {
-				t.Fatalf("expected UB-2026-0061 to be service-observed Info, got claim=%q sev=%v", f.ClaimKind, f.EffectiveSeverity)
+				t.Fatalf("expected UB-0020 to be service-observed Info, got claim=%q sev=%v", f.ClaimKind, f.EffectiveSeverity)
 			}
 		}
 		if f.CheckID == "UB-UNIFI-ISO-BMC-IPV6" {
@@ -299,7 +299,7 @@ func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
 		}
 	}
 	if !foundRedfish {
-		t.Fatal("expected UB-2026-0061 to identify Redfish ServiceRoot")
+		t.Fatal("expected UB-0020 to identify Redfish ServiceRoot")
 	}
 	if !foundIPv6Finding {
 		t.Fatalf("expected UB-UNIFI-ISO-BMC-IPV6 finding, got %+v", report.Findings)
@@ -358,7 +358,7 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 
 	rawFindings := []checks.Finding{
 		{
-			CheckID:      "UB-0006",
+			CheckID:      "UB-0040",
 			Title:        "Internal TCP Admin Panel",
 			Category:     "unauth-control",
 			ClaimKind:    checks.ClaimConfirmedPermission,
@@ -372,13 +372,13 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 	report := risk.Evaluate(snap, rawFindings, config.NetworkConfig{})
 	var tcpFinding *checks.Finding
 	for i := range report.Findings {
-		if report.Findings[i].CheckID == "UB-0006" {
+		if report.Findings[i].CheckID == "UB-0040" {
 			tcpFinding = &report.Findings[i]
 			break
 		}
 	}
 	if tcpFinding == nil {
-		t.Fatal("expected UB-0006 finding in report")
+		t.Fatal("expected UB-0040 finding in report")
 	}
 	// Because the forward is UDP-only, TCP finding on isolated IoT VLAN must NOT become WAN-Critical!
 	if tcpFinding.EffectiveSeverity == checks.SeverityCritical {
@@ -423,7 +423,7 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 	repTCP := risk.Evaluate(snap, rawFindings, config.NetworkConfig{})
 	foundTCP := false
 	for _, f := range repTCP.Findings {
-		if f.CheckID == "UB-0006" {
+		if f.CheckID == "UB-0040" {
 			foundTCP = true
 			if f.EffectiveSeverity != checks.SeverityCritical {
 				t.Fatalf("later unrestricted TCP forward must escalate TCP finding to Critical even after restricted forward, got %v", f.EffectiveSeverity)
@@ -431,7 +431,7 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 		}
 	}
 	if !foundTCP {
-		t.Fatal("expected UB-0006 in repTCP")
+		t.Fatal("expected UB-0040 in repTCP")
 	}
 }
 

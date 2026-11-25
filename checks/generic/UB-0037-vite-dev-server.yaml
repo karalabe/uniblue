@@ -1,0 +1,44 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0037
+title: Exposed Vite Development Server
+cve: null
+category: info-disclosure
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Vite
+  product: Vite Frontend Dev Server
+  affected_versions: any (started with --host / 0.0.0.0)
+  author: "@karalabe"
+  references:
+    - https://vite.dev/config/server-options.html
+
+preconditions:
+  ports_any: [5173]
+
+probe:
+  type: http
+  method: GET
+  path: /
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_all:
+      - "/@vite/client"
+    evidence_summary: "Vite development server exposed /@vite/client on LAN port 5173"
+    redact_body: true
+
+remediation:
+  summary: >
+    A workstation is running Vite's development server bound to a LAN
+    interface (--host). Development servers expose unbundled source code and
+    internal proxy routes without authentication. Bind Vite to localhost unless
+    actively testing from another device.
+  unifi_actions:
+    - bind_vite_to_localhost

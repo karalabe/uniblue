@@ -25,25 +25,25 @@ func TestNewChecksAddZeroGlobalPortsAndZeroConnectionsToUnrelatedHosts(t *testin
 		t.Fatalf("LoadFromFS: %v", err)
 	}
 
-	var newChecks []*Check
+	var scopedChecks []*Check
 	for _, c := range all {
-		if c.ID >= "UB-2026-0066" {
-			newChecks = append(newChecks, c)
+		if c.Preconditions.DiscoveryOnly || c.Probe.Type == "observe" || isNonTCPProbe(c.Probe.Type) {
+			scopedChecks = append(scopedChecks, c)
 		}
 	}
-	if len(newChecks) == 0 {
-		t.Fatal("expected new coverage checks >= UB-2026-0066")
+	if len(scopedChecks) == 0 {
+		t.Fatal("expected discovery-only / passive checks")
 	}
 
-	// 1. Planner invariant: adding inventory + protocol-specific checks must add
+	// 1. Planner invariant: discovery-only, passive, and UDP-only checks must add
 	// ZERO ports to the global TCP baseline sweep.
 	base := []int{80, 443}
-	planned := PlanGlobalPorts(base, newChecks)
+	planned := PlanGlobalPorts(base, scopedChecks)
 	if len(planned) != 2 || planned[0] != 80 || planned[1] != 443 {
-		t.Fatalf("new checks must add ZERO global TCP ports, got %v", planned)
+		t.Fatalf("scoped checks must add ZERO global TCP ports, got %v", planned)
 	}
 
-	// 2. Socket-level invariant: running all new checks against an unrelated host
+	// 2. Socket-level invariant: running all scoped checks against an unrelated host
 	// with a listening TCP socket must make ZERO connections to that host.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -69,13 +69,13 @@ func TestNewChecksAddZeroGlobalPortsAndZeroConnectionsToUnrelatedHosts(t *testin
 		Client:    unifi.Client{IP: "127.0.0.1", Name: "regular-laptop"},
 		OpenPorts: []int{port},
 	}
-	r := NewRunner(newChecks, 1)
+	r := NewRunner(scopedChecks, 1)
 	if got := r.RunHost(context.Background(), unrelated); len(got) != 0 {
 		t.Fatalf("expected 0 findings on unrelated host, got %+v", got)
 	}
 	time.Sleep(30 * time.Millisecond)
 	if n := connCount.Load(); n != 0 {
-		t.Fatalf("new checks made %d unexpected TCP connection(s) to unrelated host", n)
+		t.Fatalf("scoped checks made %d unexpected TCP connection(s) to unrelated host", n)
 	}
 }
 
@@ -86,7 +86,7 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 	}
 	r := NewRunner(all, 1)
 
-	// 1. Matter cm=1 (active commissioning) fires UB-2026-0067 at Info severity;
+	// 1. Matter cm=1 (active commissioning) fires UB-2026-0020 at Info severity;
 	// cm=0 (extended discovery outside commissioning window) MUST NOT fire!
 	matterActive := probe.HostProfile{
 		Client:       unifi.Client{IP: "192.0.2.10"},
@@ -97,8 +97,8 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 		MDNSServices: []probe.MDNSService{{Type: "_matterc._udp", Port: 5540, TXT: []string{"cm=0", "d=3840"}}},
 	}
 	gotActive := r.RunHost(context.Background(), matterActive)
-	if len(gotActive) != 1 || gotActive[0].CheckID != "UB-2026-0067" || gotActive[0].BaseSeverity != SeverityInfo {
-		t.Fatalf("expected Info UB-2026-0067 on cm=1 Matter device, got %+v", gotActive)
+	if len(gotActive) != 1 || gotActive[0].CheckID != "UB-2026-0020" || gotActive[0].BaseSeverity != SeverityInfo {
+		t.Fatalf("expected Info UB-2026-0020 on cm=1 Matter device, got %+v", gotActive)
 	}
 	if got := r.RunHost(context.Background(), matterExtended); len(got) != 0 {
 		t.Fatalf("Matter cm=0 extended discovery must NOT fire commissioning check, got %+v", got)
@@ -113,11 +113,11 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 		Client:       unifi.Client{IP: "192.0.2.13"},
 		MDNSServices: []probe.MDNSService{{Type: "_axis-video._tcp", Port: 80, TXT: []string{"macaddress=accc8e010203"}}},
 	}
-	if got := r.RunHost(context.Background(), doorbird); len(got) != 1 || got[0].CheckID != "UB-2026-0076" {
-		t.Fatalf("expected DoorBird match UB-2026-0076 on macaddress=1ccae3..., got %+v", got)
+	if got := r.RunHost(context.Background(), doorbird); len(got) != 1 || got[0].CheckID != "UB-2026-0012" {
+		t.Fatalf("expected DoorBird match UB-2026-0012 on macaddress=1ccae3..., got %+v", got)
 	}
 	if got := r.RunHost(context.Background(), axisCam); len(got) != 0 {
-		t.Fatalf("Axis camera must NOT match DoorBird UB-2026-0076, got %+v", got)
+		t.Fatalf("Axis camera must NOT match DoorBird UB-2026-0012, got %+v", got)
 	}
 
 	// 3. Raw printer zero-byte guard in Runner: even if a raw print sink overlaps
@@ -197,7 +197,7 @@ func TestPropertyKeyedNervaDeduplicationPreservesIndependentFindings(t *testing.
 	}
 	existing := []Finding{
 		{CheckID: "UB-CUSTOM-SMBV1", Property: "smb-v1", Transport: "tcp", Client: hp.Client, Port: 445},
-		{CheckID: "UB-0020", Property: "tls-protocol", Transport: "tcp", Client: hp.Client, Port: 443},
+		{CheckID: "UB-0009", Property: "tls-protocol", Transport: "tcp", Client: hp.Client, Port: 443},
 	}
 	got := FindingsFromProfiles([]probe.HostProfile{hp}, existing)
 	gotIDs := make(map[string]bool)

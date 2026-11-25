@@ -1340,11 +1340,11 @@ func bmcServiceEndpoints(bmc unifi.Client, rawFindings []checks.Finding) []endpo
 		if !sameClient(f.Client, bmc) {
 			continue
 		}
-		if f.CheckID == "UB-0030" || (f.Port == 623 && strings.EqualFold(f.EffectiveTransport(), "udp")) {
+		if f.CheckID == "UB-0019" || (f.Port == 623 && strings.EqualFold(f.EffectiveTransport(), "udp")) {
 			add("udp", 623, "bmc-ipmi")
 			continue
 		}
-		if f.Category == "oob-bmc" || f.CheckID == "UB-2026-0061" {
+		if f.Category == "oob-bmc" || f.CheckID == "UB-0020" {
 			p := f.Port
 			if p <= 0 {
 				p = 443
@@ -1374,7 +1374,7 @@ func printerServicePort(prn unifi.Client, rawFindings []checks.Finding, intent c
 
 func hasCUPSAdminFinding(prn unifi.Client, rawFindings []checks.Finding) bool {
 	for _, f := range rawFindings {
-		if sameClient(f.Client, prn) && f.CheckID == "UB-0010" {
+		if sameClient(f.Client, prn) && f.CheckID == "UB-0041" {
 			return true
 		}
 	}
@@ -1513,7 +1513,7 @@ func identifyBMCClients(snap *unifi.Snapshot, rawFindings []checks.Finding, mgmt
 	}
 	bmcByKey := make(map[string]unifi.Client)
 	for _, f := range rawFindings {
-		if f.Category == "oob-bmc" || f.CheckID == "UB-2026-0061" || f.CheckID == "UB-0030" {
+		if f.Category == "oob-bmc" || f.CheckID == "UB-0020" || f.CheckID == "UB-0019" {
 			cl := f.Client
 			// Prefer the richer snapshot Client record (which carries IPv6 addresses).
 			if full, ok := clientByKey[strings.ToLower(strings.TrimSpace(cl.MAC))]; ok {

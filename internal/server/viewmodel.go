@@ -563,7 +563,7 @@ func BuildPresentationModel(
 			}
 		}
 
-		// Attach Exact CVEs (independent Exposed verdict ).
+		// Attach Exact CVEs (independent Exposed verdict).
 		if exList := exactByIP[cl.IP]; len(exList) > 0 {
 			ent.ExactCVEs = exList
 			for i, s := range exList {
@@ -1098,7 +1098,7 @@ func BuildPresentationModel(
 
 	// 11. Build 1-Sentence Verdict Headline!
 	if len(pm.Queue) == 0 {
-		pm.Headline = fmt.Sprintf("All clear — %d VLANs, %d devices, and %d wall gates match policy.", len(pm.Logical), len(snap.Devices), pm.Census.TotalWallGates)
+		pm.Headline = fmt.Sprintf("All clear: %d VLANs, %d devices, and %d wall gates match policy.", len(pm.Logical), len(snap.Devices), pm.Census.TotalWallGates)
 	} else if len(pm.Queue) == 1 {
 		pm.Headline = pm.Queue[0].Sentence
 	} else {
@@ -1711,29 +1711,29 @@ func markServiceExposed(ent *Entity, f checks.Finding) {
 
 func compactCheckChip(f checks.Finding) string {
 	switch f.CheckID {
-	case "UB-0005":
+	case "UB-0002":
 		return fmt.Sprintf("VNC :%d", f.Port)
-	case "UB-0020":
+	case "UB-0009":
 		return fmt.Sprintf("TLS 1.0/1.1 :%d", f.Port)
-	case "UB-0021":
+	case "UB-0012":
 		return "SNMP public :161"
-	case "UB-0030":
+	case "UB-0019":
 		return "IPMI RMCP+ :623"
-	case "UB-2026-0001":
+	case "UB-2026-0039":
 		return fmt.Sprintf("Zehnder :%d", f.Port)
-	case "UB-2026-0002":
+	case "UB-2026-0056":
 		return "AVR Telnet :23"
-	case "UB-2026-0026":
-		return "Cast API :8008"
-	case "UB-2026-0061":
-		return "Redfish :443"
 	case "UB-2026-0062":
+		return "Cast API :8008"
+	case "UB-0020":
+		return "Redfish :443"
+	case "UB-2026-0001":
 		return "BMC Web :443"
-	case "UB-2026-0063":
+	case "UB-2026-0002":
 		return "iDRAC/iLO :443"
-	case "UB-2026-0064":
+	case "UB-2026-0003":
 		return fmt.Sprintf("Intel AMT :%d", f.Port)
-	case "UB-2026-0065":
+	case "UB-0021":
 		return fmt.Sprintf("iKVM :%d", f.Port)
 	}
 	if strings.Contains(f.CheckID, "SMB-V1") {

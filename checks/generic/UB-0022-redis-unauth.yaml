@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0022
+title: Unauthenticated Redis Server
+cve: null
+category: unauth-rce
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Redis
+  product: Redis / Valkey In-Memory Store
+  affected_versions: any (bound to LAN without requirepass / ACL)
+  author: "@karalabe"
+  references:
+    - https://redis.io/docs/latest/operate/oss_and_stack/management/security/
+
+preconditions:
+  ports_any: [6379]
+
+probe:
+  type: redis
+  port: 6379
+  timeout: 3s
+
+remediation:
+  summary: >
+    Redis responded with +PONG to an unauthenticated PING on port 6379. Any
+    host on the LAN can read/flush cached data or abuse CONFIG/SAVE/SLAVEOF
+    commands for host compromise on misconfigured workstations or containers.
+    Bind Redis to 127.0.0.1 (protected-mode yes) and configure ACLs/requirepass.
+  unifi_actions:
+    - bind_redis_to_localhost
+    - enable_redis_acl_auth
+    - restrict_inter_vlan_access

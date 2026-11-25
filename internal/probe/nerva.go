@@ -32,7 +32,7 @@ var noisyNervaFindings = map[string]struct{}{
 	"http-missing-x-content-type-options": {},
 	"http-server-version":                 {},
 	"tls-self-signed":                     {},
-	// Handled with deeper read-only verification by UniBlue's UB-0001 / UB-2026-0002 checks.
+	// Handled with deeper read-only verification by UniBlue's UB-0001 / UB-2026-0056 checks.
 	"telnet-cleartext": {},
 }
 

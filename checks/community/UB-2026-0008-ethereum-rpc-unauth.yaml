@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0008
+title: Unauthenticated Ethereum Execution JSON-RPC API
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Ethereum
+  product: Execution Client JSON-RPC (Geth / Reth / Nethermind / Besu)
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://geth.ethereum.org/docs/interacting-with-geth/rpc
+
+preconditions:
+  ports_any: [8545]
+
+probe:
+  type: eth-rpc
+  port: 8545
+  timeout: 3s
+
+remediation:
+  summary: >
+    Ethereum Execution JSON-RPC responds on TCP port 8545 without
+    authentication. While DevP2P peering ports (30303/30304) are safe to
+    expose, JSON-RPC should stay bound to localhost or isolated admin networks
+    (especially if admin/debug/personal namespaces are enabled).
+  unifi_actions:
+    - bind_rpc_to_localhost
+    - block_wan_port_8545
+    - restrict_inter_vlan_access

@@ -146,11 +146,11 @@ func formatSummary(site string, d risk.Diff) string {
 	fmt.Fprintf(&b, "UniBlue alert on site %q:\n", site)
 
 	for _, f := range d.NewFindings {
-		fmt.Fprintf(&b, "- [NEW %s] %s on %s (%s) — %s\n",
+		fmt.Fprintf(&b, "- [NEW %s] %s on %s (%s): %s\n",
 			strings.ToUpper(f.EffectiveSeverity.String()), f.Title, f.Client.DisplayName(), f.Client.IP, f.Evidence)
 	}
 	for _, f := range d.EscalatedFindings {
-		fmt.Fprintf(&b, "- [ESCALATED %s] %s on %s (%s) — %s\n",
+		fmt.Fprintf(&b, "- [ESCALATED %s] %s on %s (%s): %s\n",
 			strings.ToUpper(f.EffectiveSeverity.String()), f.Title, f.Client.DisplayName(), f.Client.IP, strings.Join(f.RiskReasons, "; "))
 	}
 	for _, cl := range d.NewTrustedClients {

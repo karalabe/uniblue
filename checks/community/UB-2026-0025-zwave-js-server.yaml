@@ -1,0 +1,37 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0025
+title: Z-Wave JS Server Control Listener Advertised
+cve: null
+category: exposed-protocol
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Z-Wave JS
+  product: Z-Wave JS Server
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://github.com/home-assistant/core/blob/dev/homeassistant/components/zwave_js/manifest.json
+
+preconditions:
+  mdns_type_any: ["_zwave-js-server._tcp"]
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    Z-Wave JS Server is advertising its unauthenticated WebSocket control
+    listener via mDNS. If reachable outside your Home Assistant host, any LAN
+    client can command Z-Wave locks, alarms, and switches. Bind Z-Wave JS
+    Server to localhost/internal Docker network or restrict its port with
+    UniFi firewall rules.
+  unifi_actions:
+    - restrict_zwave_ws_to_home_assistant
+    - restrict_inter_vlan_access

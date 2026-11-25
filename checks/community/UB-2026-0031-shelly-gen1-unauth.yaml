@@ -1,0 +1,49 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0031
+title: Unauthenticated Shelly Gen1 Control & Config API
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+supersedes: ["UB-0040"]
+
+metadata:
+  vendor: Shelly (Allterco)
+  product: Shelly Gen1 Smart Relay / Plug
+  affected_versions: Gen1 firmware with Restricted Login disabled
+  author: "@karalabe"
+  references:
+    - https://shelly-api-docs.shelly.cloud/gen1/#settings
+
+preconditions:
+  ports_any: [80]
+
+probe:
+  type: http
+  method: GET
+  path: /settings
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_contains_all:
+      - '"wifi_sta":'
+      - '"login":'
+      - '"enabled":false'
+    redact_body: true
+
+remediation:
+  summary: >
+    Shelly Gen1 device exposes /settings with login.enabled=false. Any host on
+    the LAN can toggle mains relays, read Wi-Fi/MQTT settings, or trigger
+    arbitrary OTA firmware updates. Enable "Restrict Login" in the Shelly web
+    UI and isolate smart relays on a dedicated IoT VLAN.
+  unifi_actions:
+    - enable_shelly_restricted_login
+    - move_to_iot_vlan
+    - block_wan_egress

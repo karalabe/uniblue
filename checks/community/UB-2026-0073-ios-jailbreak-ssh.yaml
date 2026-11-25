@@ -1,0 +1,43 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0073
+title: Jailbroken iOS Device SSH Service
+cve: null
+category: exposed-protocol
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Apple (Modified / Jailbroken iOS)
+  product: iPhone / iPad with OpenSSH or Dropbear
+  affected_versions: Jailbroken iOS / iPadOS devices exposing TCP port 22
+  author: "@karalabe"
+  references:
+    - https://support.apple.com/en-us/100100
+
+preconditions:
+  ports_all: [62078, 22]
+
+probe:
+  type: tcp
+  port: 22
+  timeout: 3s
+  match:
+    banner_regex: "(?i)^SSH-2\\.0-"
+
+remediation:
+  summary: >
+    This device simultaneously exposes iOS lockdownd (port 62078, unique to
+    iPhone/iPad) and an SSH daemon on port 22. Stock iOS never runs SSH on the
+    network, indicating a jailbroken iOS device, which historically ships with
+    the well-known default root/mobile password ("alpine") unless manually
+    changed. Immediately change root and mobile passwords (or disable SSH over
+    Wi-Fi / restore stock iOS).
+  unifi_actions:
+    - change_ios_root_and_mobile_passwords
+    - disable_ssh_over_wifi_on_ios
+    - isolate_unpatched_mobile_device

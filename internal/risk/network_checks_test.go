@@ -21,7 +21,7 @@ func boolPtr(b bool) *bool { return &b }
 func TestIsolationUnavailableGatewayPoliciesMustYieldUnknown(t *testing.T) {
 	// Critical safety invariant: when controller firewall policy telemetry is
 	// unavailable (e.g. HTTP 403/404 or legacy API), UniBlue MUST NEVER invent
-	// a passing "blocked-ok" verdict — every gateway-enforced cell must be unknown.
+	// a passing "blocked-ok" verdict; every gateway-enforced cell must be unknown.
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Devices: []unifi.Device{

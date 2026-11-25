@@ -263,7 +263,7 @@ func decodeASN1Int(b []byte) int {
 	return v
 }
 
-// probeTLSLegacy performs a single read-only TLS handshake pinned to TLS 1.0–1.1
+// probeTLSLegacy performs a single read-only TLS handshake pinned to TLS 1.0-1.1
 // to prove whether an HTTPS endpoint still accepts deprecated legacy TLS
 // protocols (RFC 8996).
 func probeTLSLegacy(ctx context.Context, ip string, port int) (string, bool) {

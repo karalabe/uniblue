@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0049
+title: Building Automation / Industrial OT Protocol Discovered
+cve: null
+category: service-inventory
+claim: service-observed
+property: ot-protocol-identity
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Generic (OT / BMS)
+  product: Building / Industrial Control Endpoint
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://csrc.nist.gov/pubs/sp/800/82/r3/final
+
+preconditions:
+  service_proto_any: ["bacnet", "knxip", "opcua", "s7comm", "ethernetip", "dnp3", "iec104"]
+  discovery_only: true
+
+probe:
+  type: observe
+  match:
+    evidence_summary: "OT / building control protocol observed (verify isolation from guest and general user VLANs; OPC UA discovery alone does not prove unauthorized actuation)"
+
+remediation:
+  summary: >
+    A building-automation or industrial OT protocol was discovered on the LAN.
+    Segment building and industrial controllers onto a dedicated OT VLAN
+    reachable only from authorized engineering or BMS hosts.
+  unifi_actions:
+    - isolate_ot_vlan

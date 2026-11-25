@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0028
+title: Message Broker / Event Stream Service Discovered
+cve: null
+category: service-inventory
+claim: service-observed
+property: message-broker-identity
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: Message Broker / Event Stream
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://docs.nats.io/learn/security/
+
+preconditions:
+  service_proto_any: ["amqp", "kafka", "nats", "pulsar", "activemq"]
+  discovery_only: true
+
+probe:
+  type: observe
+  match:
+    evidence_summary: "Message broker protocol observed on LAN endpoint"
+
+remediation:
+  summary: >
+    A message broker or event-streaming service was discovered on the LAN.
+    Verify topic and queue ACLs and keep broker management consoles restricted
+    to infrastructure admin hosts.
+  unifi_actions:
+    - restrict_broker_admin_access

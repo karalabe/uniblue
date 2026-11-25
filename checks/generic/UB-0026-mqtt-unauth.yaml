@@ -1,0 +1,41 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0026
+title: Unauthenticated MQTT Broker
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: MQTT Broker
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://cwe.mitre.org/data/definitions/306.html
+
+preconditions:
+  ports_any: [1883]
+
+probe:
+  type: mqtt
+  port: 1883
+  timeout: 3s
+
+remediation:
+  summary: >
+    MQTT broker accepts anonymous connections without credentials. Any host
+    that can reach port 1883 can subscribe to sensor/state topics or publish
+    control commands to connected smart-home and IoT devices. Disable
+    allow_anonymous in your broker configuration (e.g., mosquitto.conf),
+    require per-client credentials with topic ACLs, and isolate IoT clients on
+    a dedicated VLAN.
+  unifi_actions:
+    - enable_mqtt_authentication
+    - restrict_inter_vlan_access
+    - block_wan_egress

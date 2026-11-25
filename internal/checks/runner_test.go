@@ -486,9 +486,9 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 		byID[c.ID] = c
 	}
 
-	// Verify Shelly Gen2 (UB-2026-0006): matches 200 JSON, rejects 401 Digest.
+	// Verify Shelly Gen2 (UB-2026-0032): matches 200 JSON, rejects 401 Digest.
 	t.Run("shelly_gen2_unauth_vs_digest", func(t *testing.T) {
-		chk := byID["UB-2026-0006"]
+		chk := byID["UB-2026-0032"]
 		authEnabled := false
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/rpc/Shelly.GetConfig" {
@@ -508,17 +508,17 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 		r := NewRunner(nil, 1)
 
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
-			t.Fatal("expected unauth Shelly Gen2 to match UB-2026-0006")
+			t.Fatal("expected unauth Shelly Gen2 to match UB-2026-0032")
 		}
 		authEnabled = true
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); ok {
-			t.Fatal("expected Digest-protected Shelly Gen2 NOT to match UB-2026-0006")
+			t.Fatal("expected Digest-protected Shelly Gen2 NOT to match UB-2026-0032")
 		}
 	})
 
-	// Verify Transmission RPC (UB-2026-0031): matches 409+Session-Id, rejects 401.
+	// Verify Transmission RPC (UB-2026-0069): matches 409+Session-Id, rejects 401.
 	t.Run("transmission_409_vs_401", func(t *testing.T) {
-		chk := byID["UB-2026-0031"]
+		chk := byID["UB-2026-0069"]
 		authEnabled := false
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/transmission/rpc" {
@@ -539,17 +539,17 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 		r := NewRunner(nil, 1)
 
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
-			t.Fatal("expected unauth Transmission 409 to match UB-2026-0031")
+			t.Fatal("expected unauth Transmission 409 to match UB-2026-0069")
 		}
 		authEnabled = true
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); ok {
-			t.Fatal("expected auth-protected Transmission 401 NOT to match UB-2026-0031")
+			t.Fatal("expected auth-protected Transmission 401 NOT to match UB-2026-0069")
 		}
 	})
 
-	// Verify Brother CVE-2024-51977 (UB-2026-0013) CSV disclosure.
+	// Verify Brother CVE-2024-51977 (UB-2026-0053) CSV disclosure.
 	t.Run("brother_cve_2024_51977", func(t *testing.T) {
-		chk := byID["UB-2026-0013"]
+		chk := byID["UB-2026-0053"]
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/etc/mnt_info.csv" {
 				_, _ = io.WriteString(w, "\"Node Name\",\"Model Name\",\"Serial No.\"\n\"BRN001122\",\"MFC-L2750DW\",\"E12345678\"\n")
@@ -563,14 +563,14 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 		r := NewRunner(nil, 1)
 
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
-			t.Fatal("expected vulnerable Brother /etc/mnt_info.csv to match UB-2026-0013")
+			t.Fatal("expected vulnerable Brother /etc/mnt_info.csv to match UB-2026-0053")
 		}
 	})
 
-	// Verify ports_all precondition (UB-2026-0034 Jailbroken iOS SSH):
+	// Verify ports_all precondition (UB-2026-0073 Jailbroken iOS SSH):
 	// requires BOTH 62078 and 22, so neither stock iOS (62078 only) nor Mac/Linux (22 only) triggers.
 	t.Run("ports_all_jailbroken_ios", func(t *testing.T) {
-		chk := byID["UB-2026-0034"]
+		chk := byID["UB-2026-0073"]
 		stockIOS := probe.HostProfile{OpenPorts: []int{62078}}
 		normalMac := probe.HostProfile{OpenPorts: []int{22}}
 		jailbrokenIOS := probe.HostProfile{OpenPorts: []int{22, 62078}}
@@ -587,9 +587,9 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 		}
 	})
 
-	// Verify header_contains matcher (UB-0019 Python SimpleHTTP).
+	// Verify header_contains matcher (UB-0038 Python SimpleHTTP).
 	t.Run("python_simplehttp_header_contains", func(t *testing.T) {
-		chk := byID["UB-0019"]
+		chk := byID["UB-0038"]
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Server", "SimpleHTTP/0.6 Python/3.12.2")
 			_, _ = io.WriteString(w, "<html><title>Directory listing for /</title><body><h1>Directory listing for /</h1></body></html>")
@@ -600,7 +600,7 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 		r := NewRunner(nil, 1)
 
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
-			t.Fatal("expected Python SimpleHTTP to match UB-0019")
+			t.Fatal("expected Python SimpleHTTP to match UB-0038")
 		}
 	})
 }
@@ -629,9 +629,9 @@ func TestFindingsFromProfilesDeduplicationAndNormalization(t *testing.T) {
 		},
 	}
 
-	// Simulate UB-0005 already covering port 5900 on 10.0.255.0.
+	// Simulate UB-0002 already covering port 5900 on 10.0.255.0.
 	existing := []Finding{
-		{CheckID: "UB-0005", Client: profiles[0].Client, Port: 5900},
+		{CheckID: "UB-0002", Client: profiles[0].Client, Port: 5900},
 	}
 
 	got := FindingsFromProfiles(profiles, existing)

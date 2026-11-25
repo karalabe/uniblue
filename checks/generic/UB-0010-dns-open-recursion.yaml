@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0010
+title: Open Recursive DNS Resolver
+cve: null
+category: network-service
+claim: confirmed-permission
+property: dns-open-recursion
+severity: low
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: Recursive DNS Resolver
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://datatracker.ietf.org/doc/html/rfc5358
+
+preconditions:
+  ports_any: [53]
+  discovery_only: true
+
+probe:
+  type: dns-recursion
+  port: 53
+  timeout: 2s
+
+remediation:
+  summary: >
+    The host answered a recursive DNS query on UDP 53 with Recursion Available
+    (RA=1). Verify that only authorized internal subnets can query this resolver
+    and that UDP/TCP 53 is never forwarded from WAN.
+  unifi_actions:
+    - restrict_dns_resolver_clients

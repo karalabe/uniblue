@@ -172,7 +172,7 @@ func ParsePassiveFlows(raw []byte) ([]PassiveFlowRecord, error) {
 // ApplyPassiveFlows merges owner-supplied passive service and flow observations
 // onto matching HostProfiles:
 //   - Hosted local services enrich hp.Services (marking exact transport, family,
-//     and state — preserving "tls-unknown-app" / "unknown" when evidence shows
+//     and state, preserving "tls-unknown-app" / "unknown" when evidence shows
 //     only TLS, QUIC, or an opaque socket).
 //   - Outbound internet connections populate hp.OutboundDependencies and NEVER
 //     misclassify the local client as hosting that external server.

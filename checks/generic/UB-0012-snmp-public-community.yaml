@@ -1,0 +1,40 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0012
+title: 'SNMPv2c Default "public" Community Readable'
+cve: null
+category: info-disclosure
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: SNMPv2c Agent (Router / Switch / Printer / NAS / UPS)
+  affected_versions: Devices configured with default "public" SNMP community
+  author: "@karalabe"
+  references:
+    - https://www.rfc-editor.org/rfc/rfc3416
+
+preconditions:
+  ports_any: [80, 443, 22, 631]
+  discovery_only: true
+
+probe:
+  type: snmp
+  port: 161
+  community: public
+  timeout: 800ms
+
+remediation:
+  summary: >
+    Device answered a read-only SNMPv2c GET sysDescr.0 query using the default
+    "public" community string over unencrypted UDP 161. Disable SNMPv1/v2c if
+    unused, migrate to SNMPv3 (authPriv), or restrict UDP 161 to your
+    management monitoring host.
+  unifi_actions:
+    - disable_snmp_v1_v2c_or_change_community
+    - restrict_snmp_to_mgmt_host

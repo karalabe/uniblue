@@ -10,7 +10,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>UniBlue — Home Network Security Checkup</title>
+<title>UniBlue: Home Network Security Checkup</title>
 <style>
   :root {
     --bg: #f5f7fa;
@@ -139,7 +139,7 @@
   .icon-lg { width: 22px; height: 22px; flex-shrink: 0; }
 
   /* ==========================================================================
-     HEADER — Clean, airy, focused navigation
+     HEADER: Clean, airy, focused navigation
      ========================================================================== */
   header {
     background: var(--surface);
@@ -1141,39 +1141,39 @@ function humanServiceChip(svc) {
 function humanReason(r) {
   const ref = r.ref || "";
   const map = {
-    "UB-0030": {
+    "UB-0019": {
       title: "Hardware remote-control port (IPMI) is reachable",
       why: "IPMI lets someone turn this server on or off and control its hardware directly. Even with a password, its older protocol has known weaknesses.",
       fix: r.remediation || "Move this management cable to a separate private admin network that everyday devices can't reach, or disable IPMI-over-LAN in the server BIOS."
     },
-    "UB-2026-0061": {
+    "UB-0020": {
       title: "Server hardware API (Redfish) is exposed",
-      why: "This API controls server power, firmware, and virtual disks — it should only be reachable by you, not every device on the network.",
+      why: "This API controls server power, firmware, and virtual disks. It should only be reachable by you, not every device on the network.",
       fix: r.remediation || "Put server management panels on their own isolated admin network in UniFi."
     },
-    "UB-2026-0062": {
+    "UB-2026-0001": {
       title: "Server hardware web panel is reachable on this network",
       why: "Anyone on the same network can see the server's built-in hardware login page (which controls power, BIOS, and screen).",
       fix: r.remediation || "Move this management port onto a dedicated private admin network and restrict access with a UniFi firewall rule."
     },
-    "UB-2026-0063": {
+    "UB-2026-0002": {
       title: "Server hardware console (iDRAC / iLO) is reachable",
-      why: "This hardware console controls server power, BIOS, and virtual disks — keep it isolated from everyday devices.",
+      why: "This hardware console controls server power, BIOS, and virtual disks; keep it isolated from everyday devices.",
       fix: r.remediation || "Move this server management port onto a private admin network in UniFi."
     },
-    "UB-2026-0064": {
+    "UB-2026-0003": {
       title: "Intel remote hardware management (AMT) is enabled",
       why: "Intel AMT runs below the operating system and allows remote control even when the machine is asleep.",
       fix: r.remediation || "Disable Intel AMT in BIOS/MEBx if unused, or isolate it on a private admin network."
     },
-    "UB-2026-0065": {
+    "UB-0021": {
       title: "Remote BIOS keyboard & screen (iKVM) is exposed",
       why: "Anyone who reaches this port can view the server's screen or mount virtual boot media.",
       fix: r.remediation || "Restrict iKVM to a private admin network and turn off unencrypted legacy ports."
     },
     "UB-UNIFI-PORT-EXT-MULTI-MAC": {
       title: "More than one device detected on an outdoor cable",
-      why: "An exterior drop meant for a single camera or sensor is seeing multiple hardware addresses — check whether an unauthorized switch or device was plugged in.",
+      why: "An exterior drop meant for a single camera or sensor is seeing multiple hardware addresses. Check whether an unauthorized switch or device was plugged in.",
       fix: r.remediation || "Verify what is physically plugged into this outdoor cable and enable MAC Address Restriction in UniFi."
     },
     "UB-UNIFI-BMC-SHARED-VLAN": {
@@ -1181,17 +1181,17 @@ function humanReason(r) {
       why: "If any other computer or gadget on this network gets compromised, it could directly attack your server's hardware control board.",
       fix: r.remediation || "In UniFi → Settings → Networks, create an isolated Admin/Management network and assign this switch port to it."
     },
-    "UB-0020": {
+    "UB-0009": {
       title: "Uses outdated encryption (TLS 1.0 / 1.1)",
       why: "This device still accepts very old encryption standards from the 2000s that modern browsers no longer trust.",
       fix: r.remediation || "Update the device's firmware, or disable TLS 1.0/1.1 in its security settings (or isolate it from everyday devices)."
     },
-    "UB-0005": {
+    "UB-0002": {
       title: "Remote screen sharing (VNC) is open",
       why: "Screen sharing lets someone view or control this computer's desktop over the network.",
       fix: r.remediation || "Turn off VNC if you don't need it, or require a strong password and restrict it to trusted devices."
     },
-    "UB-0021": {
+    "UB-0012": {
       title: "Uses default 'public' status password (SNMP)",
       why: "Other devices on the network can read detailed system info using the factory-default community password.",
       fix: r.remediation || "Turn off SNMP in the device settings, or switch to SNMPv3 with a private password."
@@ -1243,12 +1243,12 @@ function humanReason(r) {
     },
     "UB-UNIFI-ISO-PRINTER-ADMIN": {
       title: "Guests can reach the printer's admin settings page",
-      why: "Guests should only be able to print — not open the printer's web admin panel or change its settings.",
+      why: "Guests should only be able to print, not open the printer's web admin panel or change its settings.",
       fix: r.remediation || "Allow guests only on TCP 631 (IPPS printing) and block TCP 80/443 (and CUPS /admin)."
     },
     "UB-UNIFI-ISO-GW-ADMIN": {
       title: "Untrusted network can reach the router's admin login",
-      why: "Guest or IoT devices should only get internet, DHCP, and DNS from your router — never its admin interface.",
+      why: "Guest or IoT devices should only get internet, DHCP, and DNS from your router, never its admin interface.",
       fix: r.remediation || "Block TCP 443 and SSH (22) from this zone to the Gateway while keeping DNS (53) and DHCP (67) allowed."
     },
     "UB-UNIFI-ISO-TRUSTED-TRANSIT": {
@@ -1291,17 +1291,17 @@ function humanReason(r) {
       why: "IPv6 relies on ICMPv6 (Neighbor Discovery and Packet Too Big) to discover devices and size packets properly.",
       fix: r.remediation || "Allow essential RFC 4890 ICMPv6 types while keeping unwanted inbound connections blocked."
     },
-    "UB-2026-0083": {
+    "UB-2026-0007": {
       title: "Bitcoin node control API (RPC) has no password",
       why: "Anyone on the network can query or control this Bitcoin node without credentials.",
       fix: r.remediation || "Bind Bitcoin RPC to 127.0.0.1 and require rpcauth credentials."
     },
-    "UB-2026-0084": {
+    "UB-2026-0009": {
       title: "Ethereum Engine API is missing JWT authentication",
       why: "The Ethereum consensus-to-execution port (8551) accepted an unauthenticated request.",
       fix: r.remediation || "Bind --authrpc.addr to 127.0.0.1 and enforce --authrpc.jwtsecret."
     },
-    "UB-2026-0087": {
+    "UB-0045": {
       title: "Network projector control (PJLink) has no password",
       why: "Anyone on this network can power on/off or switch inputs on this projector.",
       fix: r.remediation || "Set a PJLink password in the projector menu and place it on an isolated IoT network."
@@ -1527,7 +1527,7 @@ function renderCheckup() {
     ringSpin = unassessed === hosts.length ? " spin" : "";
     ringLabel = hosts.length ? `${Math.round(pct * 100)}%` : "…";
     heroTitle = "Checking your home network…";
-    heroSub = `Checked ${assessedCount} of ${hosts.length} devices so far. Results appear automatically as each device finishes — nothing is marked safe until checked.`;
+    heroSub = `Checked ${assessedCount} of ${hosts.length} devices so far. Results appear automatically as each device finishes; nothing is marked safe until checked.`;
   } else if (totalIssues > 0) {
     ringColor = hasCrit ? "var(--crit-solid)" : "var(--warn-solid)";
     ringOffset = C * 0.22;
@@ -1960,7 +1960,7 @@ function renderHouse() {
       <div class="house-hd">
         <div>
           <div class="house-title">${ICONS.tree} Outside Your House (${outside.length} switch / AP)</div>
-          <div class="house-sub">Hardware in a garage, shed, or exterior wall can be touched physically — turning off empty sockets stops strangers from plugging in.</div>
+          <div class="house-sub">Hardware in a garage, shed, or exterior wall can be touched physically. Turning off empty sockets stops strangers from plugging in.</div>
         </div>
       </div>
       ${outside.map(r => renderHWCard(vm, r)).join("")}
@@ -2000,7 +2000,7 @@ function renderHWCard(vm, row) {
     const dim = !sockMatches(pe) ? " dim" : "";
     const meta = pe.port_state === "active"
       ? (pe.poe_enabled && pe.poe_power ? "⚡" + pe.poe_power + "W" : fmtSpeed(pe.speed))
-      : (pe.port_state === "disabled" ? "off" : "—");
+      : (pe.port_state === "disabled" ? "off" : "-");
     const peers = peerNamesForPort(vm, pe);
     const who = peers.length ? peers.join(", ") : (pe.port_state === "disabled" ? "Turned off" : "Empty socket");
     const tip = `Socket #${pe.port_idx} · ${who}${pe.native_vlan ? " · Network: " + pe.native_vlan : ""}${pe.state !== "ok" ? " · Needs attention" : ""}`;
@@ -2100,8 +2100,8 @@ function renderDevices() {
 
     const expN = [...(lane.bmc_ids || []), ...otherIDs].map(id => vm.entities[id]).filter(e => e?.state === "exposed").length;
     const zoneExplain = lane.isolated
-      ? "Private isolated network — devices here can use the internet, but can't peek at your main home devices."
-      : "Shared home network — devices here can talk freely to each other.";
+      ? "Private isolated network: devices here can use the internet, but can't peek at your main home devices."
+      : "Shared home network: devices here can talk freely to each other.";
 
     html += `<div class="zone-card">
       <div class="zone-hd" style="border-left-color:${vlanColor(lane.name)}">
@@ -2123,7 +2123,7 @@ function renderDevices() {
     }
 
     if (bmcs.length) {
-      html += `<div class="bmc-band">${ICONS.cpu} Server hardware remote controls on ${esc(lane.name)} — best kept on their own private admin network</div>`;
+      html += `<div class="bmc-band">${ICONS.cpu} Server hardware remote controls on ${esc(lane.name)}: best kept on their own private admin network</div>`;
       html += bmcs.map(e => renderDeviceRow(vm, e)).join("");
     }
     if (others.length) {
@@ -2323,7 +2323,7 @@ function plainSummaryForEntity(vm, ent) {
       return `UniBlue hasn't finished checking <strong>${esc(ent.label)}</strong> yet. Once scanned, any open services or outdated software will appear right here.`;
     }
     if (ent.is_bmc) {
-      return `This is a server's built-in <strong>hardware remote control (BMC)</strong>. It gives direct power, BIOS, and virtual keyboard access even when the server is off — keep it isolated from everyday devices.`;
+      return `This is a server's built-in <strong>hardware remote control (BMC)</strong>. It gives direct power, BIOS, and virtual keyboard access even when the server is off; keep it isolated from everyday devices.`;
     }
     if (ent.state === "exposed") {
       const bits = [];
@@ -2332,7 +2332,7 @@ function plainSummaryForEntity(vm, ent) {
       if (nonCVE) bits.push(`${nonCVE} configuration or protocol warning${nonCVE === 1 ? "" : "s"}`);
       return `<strong>${esc(ent.label)}</strong> has ${bits.join(" and ")}. Follow the steps below to resolve ${bits.length > 1 ? "them" : "it"}.`;
     }
-    return `<strong>${esc(ent.label)}</strong> looks healthy — we checked its open services and software versions and found no active problems.`;
+    return `<strong>${esc(ent.label)}</strong> looks healthy. We checked its open services and software versions and found no active problems.`;
   }
   if (ent.kind === "child") {
     const parent = ent.parent_id ? vm.entities[ent.parent_id] : null;
@@ -2376,7 +2376,7 @@ function renderDrawer() {
 
   let b = `<div class="summary-box ${tone === "unk" ? "blue" : tone}">${plainSummaryForEntity(vm, ent)}</div>`;
 
-  // 1. Known Software Security Bugs (Exact CVEs — ALWAYS prominently at the top!)
+  // 1. Known Software Security Bugs (Exact CVEs, always prominently at the top)
   if (ent.exact_cves && ent.exact_cves.length) {
     b += `<div class="dsec"><div class="dsec-t">Software Updates Needed (${ent.exact_cve_count} known bug${ent.exact_cve_count === 1 ? "" : "s"})</div>`;
     for (const s of ent.exact_cves) {

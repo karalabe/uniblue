@@ -1,0 +1,40 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0012
+title: DoorBird Video Intercom Discovered
+cve: null
+category: service-inventory
+claim: asset-identity
+property: doorbird-intercom-identity
+severity: info
+safety: read-only
+
+metadata:
+  vendor: DoorBird (Bird Home Automation)
+  product: DoorBird IP Video Door Station
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://www.home-assistant.io/integrations/doorbird/
+
+preconditions:
+  mdns_type_any: ["_axis-video._tcp"]
+  mdns_txt_regex: "(?i)^(macaddress|mac)=(1c:?ca:?e3)"
+  discovery_only: true
+
+probe:
+  type: observe
+  match:
+    evidence_summary: "DoorBird IP intercom identified via _axis-video._tcp with DoorBird OUI 1c:ca:e3 (prevents Axis camera misattribution)"
+
+remediation:
+  summary: >
+    A DoorBird video intercom was discovered on the LAN. Restrict administration
+    and door-relay control paths to approved controllers while preserving call
+    signaling.
+  unifi_actions:
+    - move_to_camera_vlan

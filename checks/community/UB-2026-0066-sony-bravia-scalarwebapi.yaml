@@ -1,0 +1,35 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0066
+title: Sony Bravia ScalarWebAPI / IRCC Control Interface Advertised
+cve: null
+category: exposed-protocol
+severity: low
+safety: read-only
+
+metadata:
+  vendor: Sony
+  product: Sony Bravia Smart TV
+  affected_versions: Bravia TVs advertising ScalarWebAPI:1
+  author: "@karalabe"
+  references:
+    - https://github.com/home-assistant/core/blob/dev/homeassistant/components/braviatv/manifest.json
+
+preconditions:
+  upnp_service_regex: "(?i)ScalarWebAPI"
+
+probe:
+  type: observe
+
+remediation:
+  summary: >
+    Sony Bravia TV advertises its local ScalarWebAPI / IRCC remote-control
+    service on the LAN. Require Pre-Shared Key (PSK) authentication in the TV's
+    IP Control settings and place the TV on an isolated IoT/Media VLAN.
+  unifi_actions:
+    - enable_bravia_psk_auth
+    - move_to_iot_vlan

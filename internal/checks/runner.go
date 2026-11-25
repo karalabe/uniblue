@@ -948,7 +948,7 @@ func probeTelnet(ctx context.Context, ip string, port int) (string, bool) {
 	lower := strings.ToLower(banner)
 	switch {
 	case banner == "":
-		return "Telnet port 23 accepted connection (silent/no banner — likely custom cleartext control protocol)", true
+		return "Telnet port 23 accepted connection (silent/no banner; likely custom cleartext control protocol)", true
 	case strings.Contains(lower, "login:") || strings.Contains(lower, "username:") || strings.Contains(lower, "password:"):
 		return fmt.Sprintf("cleartext Telnet login prompt observed (%q)", banner), true
 	case strings.HasSuffix(banner, "#") || strings.HasSuffix(banner, "$") || strings.HasSuffix(banner, ">"):
@@ -1007,7 +1007,7 @@ func stripTelnetIAC(data []byte) (reply []byte, cleaned []byte) {
 	return reply, cleaned
 }
 
-// probeDenonMarantzAVR sends a strictly read-only status query ("PW?\r" —
+// probeDenonMarantzAVR sends a strictly read-only status query ("PW?\r",
 // Power State query) to a Denon/Marantz AVR Telnet control port. Receiving
 // "PWON" or "PWSTANDBY" confirms unauthenticated control access without
 // changing power, volume, or input state.
@@ -1070,7 +1070,7 @@ func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) 
 // type 1 ("None") is offered: it selects None, confirms SecurityResult == 0
 // (authentication genuinely bypassed), sends ClientInit with shared=1 so any
 // active viewer is never disconnected, and reads ServerInit to report the exact
-// exposed desktop name and framebuffer dimensions — without sending input or
+// exposed desktop name and framebuffer dimensions, without sending input or
 // reading screen pixels.
 func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)

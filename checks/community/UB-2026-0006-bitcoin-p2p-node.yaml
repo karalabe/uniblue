@@ -1,0 +1,38 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0006
+title: Bitcoin P2P Node Discovered
+cve: null
+category: crypto-node
+claim: service-observed
+property: bitcoin-p2p-node
+severity: info
+safety: read-only
+
+metadata:
+  vendor: Bitcoin Core / Generic
+  product: Bitcoin P2P Full Node
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://developer.bitcoin.org/reference/p2p_networking.html
+
+preconditions:
+  ports_any: [8333, 18333]
+  discovery_only: true
+
+probe:
+  type: bitcoin-p2p
+  timeout: 3s
+
+remediation:
+  summary: >
+    A Bitcoin P2P peer listener responded with a mainnet/testnet version
+    handshake. P2P peering on TCP 8333 is normal for a full node, whereas
+    JSON-RPC on TCP 8332 must stay bound to localhost or trusted admin hosts.
+  unifi_actions:
+    - isolate_p2p_node_vlan

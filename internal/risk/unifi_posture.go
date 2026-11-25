@@ -358,7 +358,7 @@ func AnalyzeUniFiPosture(
 				IP:   gw.IP,
 				Name: gw.Name,
 			},
-			Evidence: fmt.Sprintf("Gateway reported %d internal honeypot hit(s) in the last 24 hours — indicates active horizontal LAN scanning", honeypotCount),
+			Evidence: fmt.Sprintf("Gateway reported %d internal honeypot hit(s) in the last 24 hours (indicates active horizontal LAN scanning)", honeypotCount),
 			Remediation: checks.Remediation{
 				Summary: "Investigate the source IP in UniFi System Log immediately. Internal honeypot hits indicate an unexpected host scanning private LAN addresses.",
 				UniFiActions: []string{

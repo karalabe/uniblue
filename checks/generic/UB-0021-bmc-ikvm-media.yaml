@@ -1,0 +1,39 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0021
+title: Out-of-Band BMC Legacy iKVM / Virtual Media Port
+cve: null
+category: oob-bmc
+severity: high
+safety: read-only
+
+metadata:
+  vendor: AMI / ATEN / Supermicro / Dell
+  product: BMC iKVM & Virtual Media (CD/Floppy/Video)
+  affected_versions: BMCs exposing TCP 5120, 5123, 7578, or 3668 on general LAN
+  author: "@karalabe"
+  references:
+    - https://www.cisa.gov/news-events/alerts/2013/07/26/risks-using-intelligent-platform-management-interface-ipmi
+
+preconditions:
+  ports_any: [5120, 5123, 7578, 3668]
+  hostname_regex: "(?i)(ipmi|idrac|ilo|ikvm|bmc|asmb|megarac|management|console|supermicro|server|nas|unraid|truenas)"
+
+probe:
+  type: tcp
+  timeout: 2s
+
+remediation:
+  summary: >
+    A server BMC is exposing legacy iKVM video or Virtual Media (CD/Floppy/ISO
+    boot redirection) ports (5120/5123/7578/3668) on this network. Legacy Java
+    iKVM and virtual media protocols frequently use weak or unencrypted
+    transport and allow mounting arbitrary boot ISOs. Move BMCs to a dedicated
+    Out-of-Band Management VLAN and disable unused virtual media services.
+  unifi_actions:
+    - move_bmc_to_dedicated_oob_mgmt_vlan
+    - disable_unused_bmc_virtual_media

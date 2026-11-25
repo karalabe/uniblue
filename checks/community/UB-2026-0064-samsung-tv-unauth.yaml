@@ -1,0 +1,46 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0064
+title: Unauthenticated Samsung Smart TV Remote API
+cve: null
+category: unauth-control
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Samsung
+  product: Samsung Tizen Smart TV
+  affected_versions: Models reporting TokenAuthSupport=false on port 8001
+  author: "@karalabe"
+  references:
+    - https://www.home-assistant.io/integrations/samsungtv/
+
+preconditions:
+  ports_any: [8001]
+
+probe:
+  type: http
+  method: GET
+  path: /api/v2/
+  timeout: 3s
+  match:
+    status: [200]
+    body_contains_all:
+      - '"Samsung SmartTV"'
+      - '"TokenAuthSupport":"false"'
+    redact_body: true
+
+remediation:
+  summary: >
+    Samsung Smart TV reports TokenAuthSupport=false on port 8001, indicating
+    unencrypted local remote control over port 8001 without TLS token pairing.
+    Update TV firmware, restrict Device Connection Manager access notifications
+    to "Every Time", and move the TV to an isolated IoT/Media VLAN.
+  unifi_actions:
+    - update_tv_firmware
+    - move_to_iot_vlan
+    - restrict_inter_vlan_access

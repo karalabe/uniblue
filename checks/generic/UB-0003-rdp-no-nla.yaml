@@ -1,0 +1,40 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0003
+title: Remote Desktop (RDP) Without Network Level Authentication
+cve: null
+category: misconfig
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Microsoft / Generic
+  product: Windows Remote Desktop Services / xrdp
+  affected_versions: Windows XP / 7 / 8 / misconfigured Windows 10 & 11 / xrdp
+  author: "@karalabe"
+  references:
+    - https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/clients/remote-desktop-allow-access
+
+preconditions:
+  ports_any: [3389]
+
+probe:
+  type: rdp-nla
+  port: 3389
+  timeout: 3s
+
+remediation:
+  summary: >
+    RDP port 3389 accepted a classic PROTOCOL_RDP or TLS-only handshake without
+    enforcing Network Level Authentication (CredSSP/NLA). Pre-authentication
+    RDP login screens expose legacy Windows laptops and desktops to
+    BlueKeep-class kernel flaws and credential harvesting. Enable "Allow
+    connections only from computers running Remote Desktop with Network Level
+    Authentication" in System Properties (or disable RDP if unused).
+  unifi_actions:
+    - enable_rdp_nla_or_disable_rdp
+    - restrict_inter_vlan_access

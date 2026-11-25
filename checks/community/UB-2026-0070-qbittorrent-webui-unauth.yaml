@@ -1,0 +1,47 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0070
+title: Unauthenticated qBittorrent Web UI API
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: qBittorrent
+  product: qBittorrent Web UI
+  affected_versions: Deployments with "Bypass authentication for clients in whitelisted IP subnets" enabled
+  author: "@karalabe"
+  references:
+    - https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1)
+
+preconditions:
+  ports_any: [8080]
+  discovery_only: true
+
+probe:
+  type: http
+  method: GET
+  path: /api/v2/app/version
+  timeout: 3s
+  match:
+    status: [200]
+    headers_absent: ["WWW-Authenticate"]
+    body_regex: "^v[0-9]+\\.[0-9]+\\."
+    evidence_summary: "qBittorrent /api/v2/app/version returned version without session cookie (subnet auth bypass active)"
+    redact_body: true
+
+remediation:
+  summary: >
+    qBittorrent Web UI answered /api/v2/app/version without requiring login,
+    indicating subnet authentication bypass covers this LAN segment.
+    Unauthenticated qBittorrent Web UI allows configuring an arbitrary "Run
+    external program on torrent finished" command (instant RCE). Disable LAN
+    auth bypass in Web UI settings and require a strong password.
+  unifi_actions:
+    - disable_qbittorrent_subnet_auth_bypass
+    - restrict_inter_vlan_access

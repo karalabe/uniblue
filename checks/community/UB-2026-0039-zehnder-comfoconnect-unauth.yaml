@@ -1,0 +1,44 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0039
+title: Unencrypted Zehnder ComfoConnect LAN C Control Interface
+cve: null
+category: unauth-control
+severity: high
+safety: read-only
+
+metadata:
+  vendor: Zehnder
+  product: ComfoConnect LAN C Ventilation Bridge
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://github.com/michaelarnauts/aiocomfoconnect
+
+preconditions:
+  ports_any: [56747]
+  mac_prefix: ["14:4f:d7"]
+  hostname_regex: "(?i)(zehnder|comfoconnect|comfoair|ventilation)"
+
+probe:
+  type: comfoconnect
+  port: 56747
+  timeout: 3s
+
+remediation:
+  summary: >
+    Zehnder ComfoConnect LAN C exposes its cleartext protobuf control API on
+    TCP/UDP port 56747. Out of the box, many units use default PIN 0000 and
+    allow any host on the LAN to register or hijack the sole active control
+    session (changing fan speeds, temperature profiles, or disabling bypass).
+    Set a non-default PIN in ComfoControl, move the bridge to an isolated IoT
+    VLAN, and restrict port 56747 strictly to your Home Assistant / controller IP.
+  unifi_actions:
+    - set_custom_pin_on_device
+    - move_to_iot_vlan
+    - restrict_port_56747_to_controller
+    - block_wan_egress

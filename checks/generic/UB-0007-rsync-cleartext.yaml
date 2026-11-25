@@ -1,0 +1,37 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-0007
+title: Unencrypted rsync Daemon
+cve: null
+category: exposed-protocol
+severity: medium
+safety: read-only
+
+metadata:
+  vendor: Generic
+  product: rsync Daemon (NAS / Backup Server)
+  affected_versions: any
+  author: "@karalabe"
+  references:
+    - https://download.samba.org/pub/rsync/rsyncd.conf.5
+
+preconditions:
+  ports_any: [873]
+
+probe:
+  type: rsync
+  port: 873
+  timeout: 3s
+
+remediation:
+  summary: >
+    An unencrypted rsync daemon is listening on TCP port 873. Verify that all
+    exported modules enforce "auth users", "read only = true" where appropriate,
+    and strict "hosts allow" rules, or switch backup syncs to rsync over SSH.
+  unifi_actions:
+    - enforce_rsync_module_auth_or_use_ssh
+    - restrict_inter_vlan_access
