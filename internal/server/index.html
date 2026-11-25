@@ -3654,7 +3654,7 @@ if (authForm) {
     if (!token) return;
     if (btn) btn.disabled = true;
     try {
-      const resp = await fetch("/api/auth", {
+      const resp = await fetch("/api/v1/session", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -3696,7 +3696,7 @@ async function fetchState(progressOnly = false) {
   }
   fetchInFlight = true;
   try {
-    const r = await fetch("/api/state", {cache: "no-store"});
+    const r = await fetch("/api/v1/state", {cache: "no-store"});
     if (r.status === 401) {
       if (!authRequired) showAuthOverlay("");
       return;
@@ -3733,7 +3733,7 @@ async function fetchState(progressOnly = false) {
 
 async function triggerRescan(ip) {
   if (isStaticMode) return;
-  const url = ip ? ("/api/rescan?ip=" + encodeURIComponent(ip)) : "/api/rescan";
+  const url = ip ? ("/api/v1/hosts/" + encodeURIComponent(ip) + "/scan") : "/api/v1/scans";
   try {
     const resp = await fetch(url, {
       method: "POST",
@@ -3746,8 +3746,9 @@ async function triggerRescan(ip) {
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try {
-        const txt = (await resp.text()).trim();
-        if (txt) detail += ": " + txt.slice(0, 120);
+        const body = await resp.json();
+        if (body?.message) detail += ": " + String(body.message).slice(0, 120);
+        else if (body?.error) detail += ": " + String(body.error).slice(0, 120);
       } catch (_) {}
       showToast({
         type: "finding",
@@ -3840,7 +3841,7 @@ function connectSSE() {
     try { sseSource.close(); } catch (_) {}
     sseSource = null;
   }
-  const es = new EventSource("/api/events");
+  const es = new EventSource("/api/v1/events/stream");
   sseSource = es;
   es.addEventListener("uniblue", (msg) => {
     sseDisconnected = false;

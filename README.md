@@ -114,7 +114,9 @@ Built-in checks live in `checks/generic/` and `checks/community/` and are compil
 
 ### 4. Offline security bug (CVE) & hardware vendor databases
 
-UniBlue matches your UniFi firmware and LAN services against the official NVD + CISA KEV vulnerability catalog (~38 MB) and IEEE MAC vendor tables (~550 KB) completely offline. In `uniblue serve` mode (including Docker/Unraid), the local CVE cache is **automatically downloaded on first startup and checked hourly** in the background (configurable via `-cve-refresh 1h`, or `-cve-refresh 0` to disable auto-sync); unchanged feeds do zero work, and new CVEs are re-correlated in memory immediately without rescanning your LAN.
+UniBlue matches your UniFi firmware and LAN services offline against the official NVD + CISA KEV vulnerability catalog (~38 MB) and IEEE MAC vendor tables (~550 KB).
+
+In `uniblue serve` mode (including Docker/Unraid), the local CVE cache downloads automatically on first startup and checks hourly in the background (`-cve-refresh 1h`, or `0` to disable). Unchanged feeds do zero work, and new CVEs are re-correlated in memory without rescanning your LAN.
 
 You can also sync or query the databases manually from the CLI:
 
@@ -150,55 +152,84 @@ UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_R
 - **In a VM or Proxmox LXC (recommended):** Gives UniBlue its own static LAN IP, OS isolation, native mDNS/UPnP (plus optional extra VLAN NICs), and clean per-IP UniFi firewall and IPS rules. LXC gives you VM-like networking with container-level memory overhead.
 - **On a dedicated machine (Raspberry Pi or mini PC):** A standalone 24/7 appliance plugged into your switch on a fixed IP. Keeps catching cable swaps, new devices, and firewall drift even while your main server or hypervisor is down, at the cost of one more box to maintain.
 
-### Integrating with AI agents
+## Configuration & environment variables
+
+UniBlue can run with a `config.yaml` or purely from environment variables. In Docker/Unraid, mount `/data` so `uniblue-state.json`, pending webhooks, and the auto-synced CVE cache (`/data/.cache/uniblue/cve`) persist across container restarts.
+
+| Variable | Requirement | Purpose |
+| --- | --- | --- |
+| `UNIBLUE_UNIFI_URL` | Required | UniFi controller URL (e.g., `https://192.168.1.1`) |
+| `UNIBLUE_UNIFI_API_KEY` | Required (or login) | UniFi local Integration API key (recommended with 2FA) |
+| `UNIBLUE_UNIFI_USERNAME` | Fallback | Local view-only UniFi username (when not using an API key) |
+| `UNIBLUE_UNIFI_PASSWORD` | Fallback | Local view-only UniFi password (when not using an API key) |
+| `UNIBLUE_UNIFI_SITE` | Optional | UniFi site name or ID (default: `default`) |
+| `UNIBLUE_API_TOKEN` | Recommended | Protects `/api/v1/*` with Bearer auth for agents and a login cookie for browsers |
+| `UNIBLUE_ALLOWED_HOSTS` | Optional | Comma-separated reverse-proxy hostnames allowed past DNS-rebinding checks |
+| `UNIBLUE_WEBHOOK_URL` | Optional | Outbound alert webhook URL (Hermes, ntfy, Discord, Slack, or custom) |
+| `UNIBLUE_WEBHOOK_SECRET` | Optional | Standard Webhooks signing secret (raw secret or padded `whsec_<base64>`) |
+| `UNIBLUE_WEBHOOK_FORMAT` | Optional | Payload format: `json` (default), `ntfy`, `discord`, or `slack` |
+| `UNIBLUE_WEBHOOK_MIN_SEVERITY` | Optional | Minimum severity to push: `info`, `low`, `medium` (default), `high`, or `critical` |
+
+> Literal IPs, `localhost`, single-label hostnames, and local suffixes (`.local`, `.lan`, `.home`, `.internal`, `.home.arpa`) are accepted automatically without setting `UNIBLUE_ALLOWED_HOSTS`. When `UNIBLUE_API_TOKEN` is set, failed logins are rate-limited per IP (5 failed attempts within 15 minutes triggers a 15-minute lockout, doubling up to 1 hour).
+
+Common `uniblue serve` flags:
+
+```sh
+./uniblue serve \
+  -config /data/config.yaml \
+  -listen 0.0.0.0:8080 \
+  -reconcile 30m \
+  -cve-refresh 1h   # set 0 to disable auto-sync; pass -no-cve to skip CVE matching
+```
+
+## Integrating with AI agents
 
 Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes in real time, discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
 
-- **Push alerts with Standard Webhooks signing:** Point `UNIBLUE_WEBHOOK_URL` (`notify.webhook_url`, default `format: "json"`) at your agent's webhook listener and set `UNIBLUE_WEBHOOK_SECRET` (`notify.webhook_secret`, accepting either a raw shared secret or padded `whsec_<base64>`). Each POST is signed using the Standard Webhooks v1 scheme (`webhook-id`, `webhook-timestamp`, and `webhook-signature: v1,<base64 HMAC-SHA256>`), with durable retries keeping the same `webhook-id` and re-signing fresh timestamps. Agents without persistent SSE listeners do not need to poll `/api/state`.
-- **Inspect and verify via API:** Set `UNIBLUE_API_TOKEN` so your agent can authenticate with `Authorization: Bearer <token>` to query `GET /api/state` (findings, CVEs, topology, recent events) or subscribe to the live SSE stream at `GET /api/events`. Once you approve a fix (applied manually in UniFi or by your agent on a managed host), it can call `POST /api/rescan?ip=<ip>` to verify the issue is closed.
-- **Keep your dashboard locked down on LAN:** Whenever `UNIBLUE_API_TOKEN` is set, `/api/*` requires either a Bearer token or an `HttpOnly` `SameSite=Strict` session cookie established through the built-in login prompt, with per-IP brute-force lockout (5 bad attempts within 15 minutes triggers a 15-minute lockout, escalating up to 1 hour). If you expose UniBlue behind a reverse proxy or custom domain, add that hostname to `UNIBLUE_ALLOWED_HOSTS` so DNS-rebinding Host checks permit it.
+- **Signed push alerts:** Set `UNIBLUE_WEBHOOK_URL` (`format: "json"`) and `UNIBLUE_WEBHOOK_SECRET`. Each POST uses Standard Webhooks v1 headers (`webhook-id`, `webhook-timestamp`, `webhook-signature: v1,<base64 HMAC-SHA256>`), with durable retries keeping the same `webhook-id` and fresh timestamps. Agents do not need to poll `/api/v1/state`.
+- **On-demand inspection & verification:** Give your agent `UNIBLUE_API_TOKEN` (`Authorization: Bearer <token>`) to check `GET /api/v1/health`, query focused endpoints (`findings`, `cves`, `hosts`, `isolation`, `events`), stream `GET /api/v1/events/stream`, and trigger rescans via `POST /api/v1/hosts/{id}/scan` after you approve a fix.
+
+### HTTP API (`/api/v1`)
+
+All `/api/v1/*` endpoints return JSON (except the SSE stream) and share one error envelope (`{"error": "<code>", "message": "<detail>"}`). When `UNIBLUE_API_TOKEN` is set, every route except `/api/v1/session` requires `Authorization: Bearer <token>` or a session cookie.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/health` | Lightweight liveness and scan watchdog (`status`, `updated_at`, `last_scan_error`, `scanning`) |
+| `GET /api/v1/findings` | Active findings (`?severity=high&host=<ip\|mac>&category=...`) |
+| `GET /api/v1/cves` | Exact and potential CVE rollups (`?host=<ip\|mac>&kev=true&severity=...`) |
+| `GET /api/v1/hosts` | Host inventory (`?vlan=<name>&state=exposed\|review\|ok\|unknown&role=...`) |
+| `GET /api/v1/hosts/{id}` | Single host detail by entity ID (`host:<mac>`), MAC, or IPv4/IPv6 |
+| `GET /api/v1/isolation` | Effective VLAN/zone isolation matrix (`?verdict=violation&source=...&dest=...`) |
+| `GET /api/v1/events` | Recent live events as JSON (`?since_id=42&type=...&severity=...&limit=50`) |
+| `GET /api/v1/events/stream` | Live Server-Sent Events stream (`Last-Event-ID` replay supported) |
+| `GET /api/v1/state` | Full atomic snapshot powering the built-in web dashboard |
+| `POST /api/v1/scans` | Queue a full rescan (or single-host scan with `{"host": "<id\|mac\|ip>"}`) |
+| `POST /api/v1/hosts/{id}/scan` | Queue a targeted single-host scan by entity ID, MAC, or IP |
+| `GET` / `POST` / `DELETE /api/v1/session` | Check, create (`HttpOnly` cookie), or revoke a browser dashboard session |
 
 ### Webhook events
 
-With `format: "json"` (the default), each webhook POST sends `{"site", "summary", "diff"}` filtered by `min_severity` (default `medium`). Rapid live-event bursts coalesce over 15 seconds into one delivery, while new findings, CVEs, trusted devices, and port forwards dispatch immediately (merging any buffered live events).
+In `json` format, each POST sends `{"version": 1, "id", "timestamp", "site", "summary", "diff"}` filtered by `min_severity` (default `medium`), with `resolved_keys` omitted. Rapid live-event bursts coalesce over 15 seconds into one delivery; new findings, CVEs, trusted devices, and port forwards dispatch immediately and merge any buffered live events.
 
-| Payload field / `diff.events[].type` | Trigger |
+| Event / Field | Trigger |
 | --- | --- |
 | `diff.new_findings` | New security or posture finding at or above `min_severity` |
-| `diff.escalated_findings` | Existing finding whose effective severity increased (e.g., host moved to a trusted VLAN or port-forwarded) |
-| `diff.new_cves` | Newly matched High/Critical exact-version CVE or newly CISA KEV-listed CVE (includes `cve_id`, `product`, `version`, `cvss`, `kev`, `min_fixed_version`) |
+| `diff.escalated_findings` | Existing finding whose effective severity increased |
+| `diff.new_cves` | Newly matched High/Critical exact CVE or CISA KEV promotion (includes `min_fixed_version`) |
 | `diff.new_trusted_clients` | Previously unseen device joining a trusted VLAN |
 | `diff.new_port_forwards` | Newly enabled WAN port-forwarding rule |
 | `admin_activity` | UniFi console admin logins, account edits, and settings changes |
 | `policy_changed` | Firewall policy or WAN port-forward rule set changed |
-| `config_drift` | Controller security controls (SSH, UPnP, IPS, Honeypot, DoH, Teleport) or Wi-Fi SSID security changed |
+| `config_drift` | Controller security controls (SSH, UPnP, IPS, Honeypot, DoH, Teleport) or Wi-Fi security changed |
 | `honeypot_hit` | Internal LAN host probed UniFi's internal Honeypot |
-| `port_link_up` / `port_link_down` / `port_config_changed` | Link or port-config changes on ports zoned `external`, `external_uplink`, or `unused` |
+| `port_link_up`<br>`port_link_down`<br>`port_config_changed` | Link or port-config changes on ports zoned `external`, `external_uplink`, or `unused` |
 | `port_poe_tamper` | PoE device replaced by a non-PoE host on an `external` or `unused` port |
 | `port_mac_surge` | Single-MAC access port jumped to 2+ MACs (possible inline hub or tap) |
 | `wifi_evil_twin` | Unknown AP broadcasting one of your site's Wi-Fi SSIDs |
 | `client_medium_swap` | Trusted-VLAN device switched between wired and Wi-Fi with the same MAC |
 
-Intentionally kept on the dashboard/SSE only (not pushed to webhooks): WAN IPS/IDS blocked scanner traffic (`ids_threat`), internal port link/PoE/config flaps, STP blocks, dormant device wakeups, untrusted-VLAN joins/medium swaps, low/info findings, and resolved items.
-
-### Environment variables (Docker / Unraid / zero-config)
-
-UniBlue can run with a `config.yaml` or purely from environment variables (mount `/data` in Docker so `uniblue-state.json` and the auto-synced CVE cache under `/data/.cache/uniblue/cve` persist across container restarts):
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `UNIBLUE_UNIFI_URL` | Yes | UniFi controller URL (e.g., `https://192.168.1.1`) |
-| `UNIBLUE_UNIFI_API_KEY` | Yes* | UniFi local Integration API key (recommended with 2FA) |
-| `UNIBLUE_UNIFI_USERNAME` / `UNIBLUE_UNIFI_PASSWORD` | *Fallback | Local view-only UniFi credentials (when not using an API key) |
-| `UNIBLUE_UNIFI_SITE` | No | UniFi site ID (default: `default`) |
-| `UNIBLUE_API_TOKEN` | Recommended | Shared secret protecting `/api/*` (Bearer auth for agents/scripts + login prompt cookie for browsers) |
-| `UNIBLUE_ALLOWED_HOSTS` | Optional | Comma-separated reverse-proxy hostnames allowed past DNS-rebinding Host checks (IPs and `.local`/`.lan`/`.home` work automatically) |
-| `UNIBLUE_WEBHOOK_URL` | Optional | Outbound alert webhook URL (for Hermes, ntfy, Discord, Slack, or custom receivers) |
-| `UNIBLUE_WEBHOOK_SECRET` | Optional | Standard Webhooks signing secret (`whsec_<base64>` or raw string); omit to send unsigned |
-| `UNIBLUE_WEBHOOK_FORMAT` | No | Payload format: `json` (default, recommended for agents), `ntfy`, `discord`, or `slack` |
-| `UNIBLUE_WEBHOOK_MIN_SEVERITY` | No | Minimum severity to push: `info`, `low`, `medium` (default), `high`, or `critical` |
-
-Useful `uniblue serve` flags: `-listen 0.0.0.0:8080`, `-reconcile 30m`, `-cve-refresh 1h` (`0` disables auto-sync), and `-no-cve`.
+> **Kept on the dashboard only (not pushed to webhooks):** WAN IPS/IDS blocked scanner traffic (`ids_threat`), internal port link/PoE/config flaps, STP blocks, dormant device wakeups, untrusted-VLAN joins or medium swaps, low/info findings, and resolved items.
 
 ### Why not run UniBlue inside your agent?
 

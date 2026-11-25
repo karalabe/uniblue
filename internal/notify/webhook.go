@@ -131,6 +131,27 @@ func signStandardWebhook(key []byte, id, timestamp string, body []byte) string {
 	return "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
+// WebhookPayload is the versioned JSON envelope delivered when format == "json".
+type WebhookPayload struct {
+	// Version identifies the webhook payload schema version.
+	Version int `json:"version"`
+
+	// ID is a unique, retry-stable delivery identifier matching the webhook-id header.
+	ID string `json:"id"`
+
+	// Timestamp records when this delivery attempt was generated (UTC).
+	Timestamp time.Time `json:"timestamp"`
+
+	// Site is the UniFi site name where the alert originated.
+	Site string `json:"site"`
+
+	// Summary is a concise human-readable digest of the alert items.
+	Summary string `json:"summary"`
+
+	// Diff carries the structured findings, CVEs, devices, forwards, and security events.
+	Diff risk.Diff `json:"diff"`
+}
+
 // Send delivers an alert for diff if a webhook URL is configured and at least
 // one item meets the minimum severity threshold.
 func (n *Notifier) Send(ctx context.Context, site string, diff risk.Diff) error {
@@ -149,6 +170,15 @@ func (n *Notifier) SendWithID(ctx context.Context, id, site string, diff risk.Di
 	// items never clutter the alert payload.
 	filtered := filterDiff(diff, n.minSeverity)
 
+	msgID := strings.TrimSpace(id)
+	if msgID == "" {
+		msgID = NewWebhookID()
+	}
+	now := time.Now().UTC()
+	if n.nowFn != nil {
+		now = n.nowFn().UTC()
+	}
+
 	var (
 		body        []byte
 		contentType string
@@ -164,24 +194,27 @@ func (n *Notifier) SendWithID(ctx context.Context, id, site string, diff risk.Di
 				"parse": []string{},
 			},
 		})
-		contentType = "application/json"
+		contentType = "application/json; charset=utf-8"
 	case "slack":
 		body, err = json.Marshal(map[string]string{
 			"text": formatSummary(site, filtered, escapeSlack),
 		})
-		contentType = "application/json"
+		contentType = "application/json; charset=utf-8"
 	case "ntfy":
 		body = []byte(truncate(formatSummary(site, filtered, nil), maxNtfyBodyBytes))
 		contentType = "text/plain; charset=utf-8"
 		headers["Title"] = fmt.Sprintf("UniBlue Alert (%s)", site)
 		headers["Priority"] = ntfyPriority(filtered)
 	default: // "json"
-		body, err = json.Marshal(map[string]any{
-			"site":    site,
-			"summary": formatSummary(site, filtered, nil),
-			"diff":    filtered,
+		body, err = json.Marshal(WebhookPayload{
+			Version:   1,
+			ID:        msgID,
+			Timestamp: now,
+			Site:      site,
+			Summary:   formatSummary(site, filtered, nil),
+			Diff:      filtered,
 		})
-		contentType = "application/json"
+		contentType = "application/json; charset=utf-8"
 	}
 	if err != nil {
 		return fmt.Errorf("marshal notification: %w", err)
@@ -192,19 +225,11 @@ func (n *Notifier) SendWithID(ctx context.Context, id, site string, diff risk.Di
 		return fmt.Errorf("build webhook request: %w", sanitizeTransportError(n.webhookURL, err))
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("User-Agent", "UniBlue/0.1")
+	req.Header.Set("User-Agent", "UniBlue/1.0")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	if len(n.signingKey) > 0 {
-		msgID := strings.TrimSpace(id)
-		if msgID == "" {
-			msgID = NewWebhookID()
-		}
-		now := time.Now()
-		if n.nowFn != nil {
-			now = n.nowFn()
-		}
 		ts := strconv.FormatInt(now.Unix(), 10)
 		req.Header.Set("webhook-id", msgID)
 		req.Header.Set("webhook-timestamp", ts)
@@ -296,10 +321,10 @@ func escapeSlack(s string) string {
 	return r.Replace(s)
 }
 
-// filterDiff returns a copy of diff containing only items at or above minSev.
+// filterDiff returns a copy of diff containing only actionable alert items at
+// or above minSev (omitting resolved keys that are not push alert triggers).
 func filterDiff(d risk.Diff, minSev checks.Severity) risk.Diff {
 	out := risk.Diff{
-		ResolvedKeys:      d.ResolvedKeys,
 		NewTrustedClients: d.NewTrustedClients,
 		NewPortForwards:   d.NewPortForwards,
 	}

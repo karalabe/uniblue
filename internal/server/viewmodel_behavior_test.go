@@ -809,12 +809,12 @@ func TestDashboardHTMLInvariants(t *testing.T) {
 		t.Fatal("index.html must preserve focus/details state and render full view when transitioning out of splash")
 	}
 
-	// Token sign-in overlay must post to /api/auth on HTTP 401, preserve existing
-	// error text on subsequent 401 polls, and reconnect SSE once /api/state succeeds.
+	// Token sign-in overlay must post to /api/v1/session on HTTP 401, preserve existing
+	// error text on subsequent 401 polls, and reconnect SSE once /api/v1/state succeeds.
 	for _, needle := range []string{
 		`id="auth-overlay"`,
 		`id="auth-form"`,
-		`fetch("/api/auth"`,
+		`fetch("/api/v1/session"`,
 		`r.status === 401`,
 		`if (!authRequired) showAuthOverlay("")`,
 		`const needReconnectSSE = authRequired || !sseSource;`,

@@ -76,7 +76,7 @@ type Options struct {
 	// When 0, only an already-present local cache is loaded without network sync.
 	CVERefreshInterval time.Duration
 
-	// APIToken optionally requires Authorization: Bearer <token> or session cookie on /api/* endpoints.
+	// APIToken optionally requires Authorization: Bearer <token> or session cookie on /api/v1/* endpoints.
 	APIToken string
 
 	// AllowedHosts optionally whitelists additional reverse-proxy Host / Origin
@@ -147,7 +147,7 @@ type ClientView struct {
 	SkipReason string `json:"skip_reason,omitempty"`
 }
 
-// StateSnapshot is the complete, immutable read model served by GET /api/state
+// StateSnapshot is the complete, immutable read model served by GET /api/v1/state
 // and rendered by the live web dashboard.
 type StateSnapshot struct {
 	// StartedAt records when `uniblue serve` booted.
@@ -730,18 +730,42 @@ func (e *Engine) queueFullRescan(reason string) {
 	}
 }
 
-// TriggerHostRescan queues a targeted live probe against a single client IP.
-func (e *Engine) TriggerHostRescan(ip string) bool {
-	return e.triggerHostRescanStatus(ip) == hostRescanQueued
+// TriggerHostRescan queues a targeted live probe against a single client
+// identified by entity ID ("host:<mac>"), MAC address, or IPv4/IPv6 address.
+func (e *Engine) TriggerHostRescan(target string) bool {
+	_, st := e.triggerHostRescanStatus(target)
+	return st == hostRescanQueued
 }
 
-func (e *Engine) triggerHostRescanStatus(ip string) hostRescanStatus {
-	ip = strings.TrimSpace(ip)
+func clientMatchesIdentifier(cl unifi.Client, query string) bool {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return false
+	}
+	if strings.EqualFold(hostEntityID(cl), q) {
+		return true
+	}
+	if cl.MAC != "" && strings.EqualFold(cl.MAC, q) {
+		return true
+	}
+	if cl.IP != "" && strings.EqualFold(cl.IP, q) {
+		return true
+	}
+	for _, ip := range cl.AllIPs() {
+		if strings.EqualFold(ip, q) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) triggerHostRescanStatus(query string) (unifi.Client, hostRescanStatus) {
+	q := strings.TrimSpace(query)
 	e.mu.RLock()
 	var target *unifi.Client
-	if e.snap != nil {
+	if e.snap != nil && q != "" {
 		for _, cl := range e.snap.Clients {
-			if cl.IP == ip || cl.PrimaryIP() == ip {
+			if clientMatchesIdentifier(cl, q) {
 				cp := cl
 				target = &cp
 				break
@@ -750,7 +774,7 @@ func (e *Engine) triggerHostRescanStatus(ip string) hostRescanStatus {
 	}
 	e.mu.RUnlock()
 	if target == nil {
-		return hostRescanNotFound
+		return unifi.Client{}, hostRescanNotFound
 	}
 	if e.demoMode {
 		e.emit(LiveEvent{
@@ -761,7 +785,7 @@ func (e *Engine) triggerHostRescanStatus(ip string) hostRescanStatus {
 			SubjectID: hostEntityID(*target),
 			Summary:   fmt.Sprintf("Demo host %s (%s) rechecked (simulated, zero packets sent)", target.DisplayName(), target.PrimaryIP()),
 		})
-		return hostRescanQueued
+		return *target, hostRescanQueued
 	}
 	select {
 	case e.hostScanCh <- hostScanTask{client: *target}:
@@ -773,9 +797,9 @@ func (e *Engine) triggerHostRescanStatus(ip string) hostRescanStatus {
 			SubjectID: hostEntityID(*target),
 			Summary:   fmt.Sprintf("Rescanning %s (%s)...", target.DisplayName(), target.PrimaryIP()),
 		})
-		return hostRescanQueued
+		return *target, hostRescanQueued
 	default:
-		return hostRescanQueueFull
+		return *target, hostRescanQueueFull
 	}
 }
 
@@ -786,6 +810,33 @@ func (e *Engine) Subscribe() (chan LiveEvent, func()) {
 	e.subscribers[ch] = struct{}{}
 	e.subMu.Unlock()
 	return ch, func() {
+		e.subMu.Lock()
+		delete(e.subscribers, ch)
+		e.subMu.Unlock()
+	}
+}
+
+// SubscribeWithReplay atomically registers an SSE subscriber and collects any
+// buffered events with ID > lastEventID in chronological (ascending ID) order
+// so reconnecting clients never miss events across reconnect boundaries.
+func (e *Engine) SubscribeWithReplay(lastEventID int64) ([]LiveEvent, chan LiveEvent, func()) {
+	ch := make(chan LiveEvent, 32)
+	e.mu.RLock()
+	var replay []LiveEvent
+	if lastEventID > 0 && len(e.events) > 0 {
+		// e.events is stored newest-first; collect matching items then reverse.
+		for i := len(e.events) - 1; i >= 0; i-- {
+			if e.events[i].ID > lastEventID {
+				replay = append(replay, e.events[i])
+			}
+		}
+	}
+	e.subMu.Lock()
+	e.subscribers[ch] = struct{}{}
+	e.subMu.Unlock()
+	e.mu.RUnlock()
+
+	return replay, ch, func() {
 		e.subMu.Lock()
 		delete(e.subscribers, ch)
 		e.subMu.Unlock()

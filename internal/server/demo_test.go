@@ -43,7 +43,7 @@ func TestNewDemoEngineBuildsCompletePresentationModel(t *testing.T) {
 
 	// Verify HTTP routes and static HTML rendering work cleanly in demo mode.
 	h := eng.Handler()
-	for _, route := range []string{"/", "/api/state", "/assets/logo-light.svg", "/assets/favicon.svg", "/favicon.ico"} {
+	for _, route := range []string{"/", "/api/v1/health", "/api/v1/state", "/api/v1/findings", "/api/v1/hosts", "/assets/logo-light.svg", "/assets/favicon.svg", "/favicon.ico"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+route, nil))
 		if rec.Code != http.StatusOK {

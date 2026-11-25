@@ -38,20 +38,24 @@ import (
 // TestHTTPProtectionHostOriginTokenAndRescanResponses verifies DNS-rebinding
 // Host protection on both loopback and non-loopback listeners, reverse-proxy
 // AllowedHosts support, cross-origin POST CSRF blocking, Bearer token and
-// HttpOnly session cookie authentication via POST /api/auth, and 503 queue-full
-// responses.
+// HttpOnly session cookie authentication via /api/v1/session, uniform JSON
+// error envelopes, and 503 queue-full responses.
 func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 	eng := NewDemoEngineForTest(t)
 	eng.opts.ListenAddr = "127.0.0.1:8080"
 	h := eng.Handler()
 
-	// 1. Spoofed Host header on loopback listener must be rejected (403).
-	req := httptest.NewRequest(http.MethodGet, "http://rebind.evil.example/api/state", nil)
+	// 1. Spoofed Host header on loopback listener must be rejected (JSON 403).
+	req := httptest.NewRequest(http.MethodGet, "http://rebind.evil.example/api/v1/state", nil)
 	req.Host = "rebind.evil.example:8080"
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for spoofed Host header, got %d", rec.Code)
+	}
+	var hostErr apiError
+	if err := json.Unmarshal(rec.Body.Bytes(), &hostErr); err != nil || hostErr.Error != "forbidden_host" {
+		t.Fatalf("expected JSON forbidden_host error, got %q (%v)", rec.Body.String(), err)
 	}
 
 	// 2. Non-loopback listener (0.0.0.0:8080) without a token must still reject
@@ -65,13 +69,13 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 		host   string
 		want   int
 	}{
-		{http.MethodGet, "/api/state", "rebind.evil.example:8080", http.StatusForbidden},
-		{http.MethodPost, "/api/rescan", "rebind.evil.example:8080", http.StatusForbidden},
-		{http.MethodGet, "/api/state", "192.168.1.50:8080", http.StatusOK},
-		{http.MethodGet, "/api/state", "[fd00::50]:8080", http.StatusOK},
-		{http.MethodGet, "/api/state", "uniblue.local:8080", http.StatusOK},
-		{http.MethodGet, "/api/state", "uniblue.lan", http.StatusOK},
-		{http.MethodGet, "/api/state", "uniblue", http.StatusOK},
+		{http.MethodGet, "/api/v1/state", "rebind.evil.example:8080", http.StatusForbidden},
+		{http.MethodPost, "/api/v1/scans", "rebind.evil.example:8080", http.StatusForbidden},
+		{http.MethodGet, "/api/v1/state", "192.168.1.50:8080", http.StatusOK},
+		{http.MethodGet, "/api/v1/state", "[fd00::50]:8080", http.StatusOK},
+		{http.MethodGet, "/api/v1/state", "uniblue.local:8080", http.StatusOK},
+		{http.MethodGet, "/api/v1/state", "uniblue.lan", http.StatusOK},
+		{http.MethodGet, "/api/v1/state", "uniblue", http.StatusOK},
 	} {
 		r := httptest.NewRequest(tc.method, "http://127.0.0.1"+tc.path, nil)
 		r.Host = tc.host
@@ -82,24 +86,24 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 		}
 	}
 
-	// 3. Cross-origin POST /api/rescan must be rejected (403).
-	reqCSRF := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan", nil)
+	// 3. Cross-origin POST /api/v1/scans must be rejected (403).
+	reqCSRF := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/scans", nil)
 	reqCSRF.Host = "127.0.0.1:8080"
 	reqCSRF.Header.Set("Origin", "https://evil.example")
 	recCSRF := httptest.NewRecorder()
 	h.ServeHTTP(recCSRF, reqCSRF)
 	if recCSRF.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for cross-origin POST /api/rescan, got %d", recCSRF.Code)
+		t.Fatalf("expected 403 for cross-origin POST /api/v1/scans, got %d", recCSRF.Code)
 	}
 
-	// 4. Same-origin POST /api/rescan succeeds.
-	reqOK := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan", nil)
+	// 4. Same-origin POST /api/v1/scans succeeds.
+	reqOK := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/scans", nil)
 	reqOK.Host = "127.0.0.1:8080"
 	reqOK.Header.Set("Origin", "http://127.0.0.1:8080")
 	recOK := httptest.NewRecorder()
 	h.ServeHTTP(recOK, reqOK)
 	if recOK.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 for same-origin POST /api/rescan, got %d", recOK.Code)
+		t.Fatalf("expected 202 for same-origin POST /api/v1/scans, got %d", recOK.Code)
 	}
 
 	// 5. Reverse-proxy AllowedHosts supports both Host-preserving (Caddy) and
@@ -110,7 +114,7 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 	engProxy.opts.AllowedHosts = []string{"uniblue.example.com"}
 	hProxy := engProxy.Handler()
 
-	reqCaddy := httptest.NewRequest(http.MethodGet, "http://uniblue.example.com/api/state", nil)
+	reqCaddy := httptest.NewRequest(http.MethodGet, "http://uniblue.example.com/api/v1/state", nil)
 	reqCaddy.Host = "uniblue.example.com"
 	reqCaddy.Header.Set("Origin", "https://uniblue.example.com")
 	recCaddy := httptest.NewRecorder()
@@ -119,16 +123,16 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 		t.Fatalf("expected 200 for Host-preserving reverse proxy, got %d", recCaddy.Code)
 	}
 
-	reqNginx := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan", nil)
+	reqNginx := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/scans", nil)
 	reqNginx.Host = "127.0.0.1:8080"
 	reqNginx.Header.Set("Origin", "https://uniblue.example.com")
 	recNginx := httptest.NewRecorder()
 	hProxy.ServeHTTP(recNginx, reqNginx)
 	if recNginx.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 for Host-rewriting reverse proxy rescan, got %d", recNginx.Code)
+		t.Fatalf("expected 202 for Host-rewriting reverse proxy scan, got %d", recNginx.Code)
 	}
 
-	reqEvilOrigin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan", nil)
+	reqEvilOrigin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/scans", nil)
 	reqEvilOrigin.Host = "127.0.0.1:8080"
 	reqEvilOrigin.Header.Set("Origin", "https://attacker.example")
 	recEvilOrigin := httptest.NewRecorder()
@@ -137,18 +141,31 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 		t.Fatalf("expected 403 for unlisted Origin even with AllowedHosts, got %d", recEvilOrigin.Code)
 	}
 
-	// 6. Optional Bearer token and POST /api/auth HttpOnly session cookie protect /api/*.
+	// 6. Optional Bearer token and POST /api/v1/session HttpOnly session cookie protect /api/v1/*.
 	eng.opts.APIToken = "secret-token"
 	hTok := eng.Handler()
-	reqNoAuth := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/state", nil)
+	reqNoAuth := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
 	reqNoAuth.Host = "127.0.0.1:8080"
 	recNoAuth := httptest.NewRecorder()
 	hTok.ServeHTTP(recNoAuth, reqNoAuth)
 	if recNoAuth.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 when APIToken required and absent, got %d", recNoAuth.Code)
 	}
+	var unauthErr apiError
+	if err := json.Unmarshal(recNoAuth.Body.Bytes(), &unauthErr); err != nil || unauthErr.Error != "unauthorized" {
+		t.Fatalf("expected JSON unauthorized error, got %q", recNoAuth.Body.String())
+	}
 
-	reqAuth := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/state", nil)
+	// GET /api/v1/session reports unauthenticated cleanly without triggering auth errors.
+	reqSessCheck := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/session", nil)
+	reqSessCheck.Host = "127.0.0.1:8080"
+	recSessCheck := httptest.NewRecorder()
+	hTok.ServeHTTP(recSessCheck, reqSessCheck)
+	if recSessCheck.Code != http.StatusOK || !strings.Contains(recSessCheck.Body.String(), `"authenticated":false`) {
+		t.Fatalf("expected 200 authenticated=false from GET /api/v1/session, got %d %s", recSessCheck.Code, recSessCheck.Body.String())
+	}
+
+	reqAuth := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
 	reqAuth.Host = "127.0.0.1:8080"
 	reqAuth.Header.Set("Authorization", "Bearer secret-token")
 	recAuth := httptest.NewRecorder()
@@ -157,22 +174,22 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 		t.Fatalf("expected 200 with valid Bearer token, got %d", recAuth.Code)
 	}
 
-	// Bad token to POST /api/auth returns 401.
-	reqBadLogin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/auth", strings.NewReader(`{"token":"wrong"}`))
+	// Bad token to POST /api/v1/session returns 401.
+	reqBadLogin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/session", strings.NewReader(`{"token":"wrong"}`))
 	reqBadLogin.Host = "127.0.0.1:8080"
 	recBadLogin := httptest.NewRecorder()
 	hTok.ServeHTTP(recBadLogin, reqBadLogin)
 	if recBadLogin.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for bad /api/auth token, got %d", recBadLogin.Code)
+		t.Fatalf("expected 401 for bad /api/v1/session token, got %d", recBadLogin.Code)
 	}
 
-	// Valid token to POST /api/auth issues HttpOnly; SameSite=Strict session cookie.
-	reqLogin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/auth", strings.NewReader(`{"token":"secret-token"}`))
+	// Valid token to POST /api/v1/session issues HttpOnly; SameSite=Strict session cookie.
+	reqLogin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/session", strings.NewReader(`{"token":"secret-token"}`))
 	reqLogin.Host = "127.0.0.1:8080"
 	recLogin := httptest.NewRecorder()
 	hTok.ServeHTTP(recLogin, reqLogin)
 	if recLogin.Code != http.StatusOK {
-		t.Fatalf("expected 200 for valid /api/auth token, got %d", recLogin.Code)
+		t.Fatalf("expected 200 for valid /api/v1/session token, got %d", recLogin.Code)
 	}
 	cookies := recLogin.Result().Cookies()
 	var sessCookie *http.Cookie
@@ -187,13 +204,13 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 	if sessCookie.Value == "secret-token" {
 		t.Fatal("session cookie must not store raw plaintext API token")
 	}
-	reqCookieState := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/state", nil)
+	reqCookieState := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
 	reqCookieState.Host = "127.0.0.1:8080"
 	reqCookieState.AddCookie(sessCookie)
 	recCookieState := httptest.NewRecorder()
 	hTok.ServeHTTP(recCookieState, reqCookieState)
 	if recCookieState.Code != http.StatusOK {
-		t.Fatalf("expected 200 for GET /api/state with session cookie, got %d", recCookieState.Code)
+		t.Fatalf("expected 200 for GET /api/v1/state with session cookie, got %d", recCookieState.Code)
 	}
 
 	// 7. Full host-scan queue returns 503 Service Unavailable (not 404).
@@ -207,9 +224,13 @@ func TestHTTPProtectionHostOriginTokenAndRescanResponses(t *testing.T) {
 	}
 	liveEng.hostScanCh <- hostScanTask{} // fill queue
 	recFull := httptest.NewRecorder()
-	liveEng.handleRescan(recFull, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan?ip=192.0.2.10", nil))
+	liveEng.Handler().ServeHTTP(recFull, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/hosts/192.0.2.10/scan", nil))
 	if recFull.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when hostScanCh is full, got %d", recFull.Code)
+	}
+	var queueErr apiError
+	if err := json.Unmarshal(recFull.Body.Bytes(), &queueErr); err != nil || queueErr.Error != "queue_full" {
+		t.Fatalf("expected JSON queue_full error, got %q", recFull.Body.String())
 	}
 }
 
@@ -778,9 +799,9 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 	eng.authLimiter.nowFn = func() time.Time { return now }
 	h := eng.Handler()
 
-	// Unauthenticated GET /api/state without Authorization header never locks out.
+	// Unauthenticated GET /api/v1/state without Authorization header never locks out.
 	for i := 0; i < 8; i++ {
-		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
 		req.RemoteAddr = "10.0.0.50:40000"
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -789,9 +810,9 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		}
 	}
 
-	// 4 bad POST /api/auth attempts return 401; the 5th triggers 429 lockout.
+	// 4 bad POST /api/v1/session attempts return 401; the 5th triggers 429 lockout.
 	for i := 1; i <= authMaxFailedAttempts; i++ {
-		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"wrong"}`))
+		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"wrong"}`))
 		req.RemoteAddr = "10.0.0.50:40001"
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -809,7 +830,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 
 	// Even the valid token is rejected while locked out (including IPv4-mapped form).
 	for _, remote := range []string{"10.0.0.50:55555", "[::ffff:10.0.0.50]:55556"} {
-		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"super-secret-token"}`))
+		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"super-secret-token"}`))
 		req.RemoteAddr = remote
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -819,7 +840,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 	}
 
 	// Another IP is unaffected and can authenticate normally.
-	reqOther := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"super-secret-token"}`))
+	reqOther := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"super-secret-token"}`))
 	reqOther.RemoteAddr = "10.0.0.51:12345"
 	recOther := httptest.NewRecorder()
 	h.ServeHTTP(recOther, reqOther)
@@ -829,7 +850,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 
 	// After lockout expires, valid auth succeeds and resets state.
 	now = now.Add(authLockoutDuration + time.Second)
-	reqUnlock := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"super-secret-token"}`))
+	reqUnlock := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"super-secret-token"}`))
 	reqUnlock.RemoteAddr = "10.0.0.50:60000"
 	recUnlock := httptest.NewRecorder()
 	h.ServeHTTP(recUnlock, reqUnlock)
@@ -837,10 +858,10 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		t.Fatalf("after lockout expiry expected 200, got %d", recUnlock.Code)
 	}
 
-	// Bad Bearer tokens on /api/state also count toward lockout, and a valid
+	// Bad Bearer tokens on /api/v1/state also count toward lockout, and a valid
 	// Bearer token before the threshold resets the counter.
 	for i := 0; i < authMaxFailedAttempts-1; i++ {
-		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
 		req.RemoteAddr = "10.0.0.52:1000"
 		req.Header.Set("Authorization", "Bearer bad-guess")
 		rec := httptest.NewRecorder()
@@ -849,7 +870,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 			t.Fatalf("bad bearer %d: expected 401, got %d", i+1, rec.Code)
 		}
 	}
-	reqGood := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+	reqGood := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
 	reqGood.RemoteAddr = "10.0.0.52:1001"
 	reqGood.Header.Set("Authorization", "Bearer super-secret-token")
 	recGood := httptest.NewRecorder()
@@ -858,7 +879,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		t.Fatalf("valid bearer before threshold expected 200, got %d", recGood.Code)
 	}
 	// One more bad attempt must be 401 (counter was reset), not 429.
-	reqAfterReset := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+	reqAfterReset := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
 	reqAfterReset.RemoteAddr = "10.0.0.52:1002"
 	reqAfterReset.Header.Set("Authorization", "Bearer bad-again")
 	recAfterReset := httptest.NewRecorder()
@@ -869,7 +890,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 
 	// Forged session cookies also count toward lockout and are cleared on rejection.
 	for i := 1; i <= authMaxFailedAttempts; i++ {
-		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
 		req.RemoteAddr = "10.0.0.53:1000"
 		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "forged-cookie"})
 		rec := httptest.NewRecorder()
@@ -1449,10 +1470,10 @@ func TestPendingWebhooksSurviveRestartWithSameID(t *testing.T) {
 	t.Fatalf("expected %q to be removed after queue drained", persistPath)
 }
 
-// TestRandomPerLoginSessionCookiesAndLogout verifies that each POST /api/auth
+// TestRandomPerLoginSessionCookiesAndLogout verifies that each POST /api/v1/session
 // mints a distinct 32-byte random hex session cookie, validates against the
 // engine's bounded session store, expires old sessions, and revokes only the
-// caller's session on POST /api/logout.
+// caller's session on DELETE /api/v1/session.
 func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 	eng := NewDemoEngineForTest(t)
 	eng.opts.ListenAddr = "127.0.0.1:8080"
@@ -1462,19 +1483,19 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 	h := eng.Handler()
 
 	login := func() *http.Cookie {
-		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/auth", strings.NewReader(`{"token":"session-secret-token"}`))
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/session", strings.NewReader(`{"token":"session-secret-token"}`))
 		req.Host = "127.0.0.1:8080"
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("POST /api/auth status = %d, want 200", rec.Code)
+			t.Fatalf("POST /api/v1/session status = %d, want 200", rec.Code)
 		}
 		for _, ck := range rec.Result().Cookies() {
 			if ck.Name == sessionCookieName {
 				return ck
 			}
 		}
-		t.Fatal("POST /api/auth did not set session cookie")
+		t.Fatal("POST /api/v1/session did not set session cookie")
 		return nil
 	}
 
@@ -1489,27 +1510,27 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 
 	checkState := func(ck *http.Cookie, want int) {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/state", nil)
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
 		req.Host = "127.0.0.1:8080"
 		req.AddCookie(ck)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != want {
-			t.Fatalf("GET /api/state status = %d, want %d", rec.Code, want)
+			t.Fatalf("GET /api/v1/state status = %d, want %d", rec.Code, want)
 		}
 	}
 
 	checkState(ck1, http.StatusOK)
 	checkState(ck2, http.StatusOK)
 
-	// POST /api/logout revokes ck1 and clears the cookie without affecting ck2.
-	reqLogout := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/logout", nil)
+	// DELETE /api/v1/session revokes ck1 and clears the cookie without affecting ck2.
+	reqLogout := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:8080/api/v1/session", nil)
 	reqLogout.Host = "127.0.0.1:8080"
 	reqLogout.AddCookie(ck1)
 	recLogout := httptest.NewRecorder()
 	h.ServeHTTP(recLogout, reqLogout)
 	if recLogout.Code != http.StatusOK {
-		t.Fatalf("POST /api/logout status = %d, want 200", recLogout.Code)
+		t.Fatalf("DELETE /api/v1/session status = %d, want 200", recLogout.Code)
 	}
 	cleared := false
 	for _, ck := range recLogout.Result().Cookies() {
@@ -1518,7 +1539,7 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 		}
 	}
 	if !cleared {
-		t.Fatalf("expected POST /api/logout to expire session cookie, got %+v", recLogout.Result().Cookies())
+		t.Fatalf("expected DELETE /api/v1/session to expire session cookie, got %+v", recLogout.Result().Cookies())
 	}
 
 	checkState(ck1, http.StatusUnauthorized)

@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -88,17 +89,27 @@ func TestHTTPHandlers(t *testing.T) {
 		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
 			t.Fatalf("GET / content-type = %q, want text/html", ct)
 		}
-		if !strings.Contains(rec.Body.String(), "UniBlue") || !strings.Contains(rec.Body.String(), "/api/events") {
+		if !strings.Contains(rec.Body.String(), "UniBlue") || !strings.Contains(rec.Body.String(), "/api/v1/events/stream") {
 			t.Fatalf("GET / missing expected dashboard markup")
 		}
 	})
 
-	// Unknown root subpaths return 404.
+	// Unknown root subpaths return 404; unknown /api/ paths return JSON 404.
 	t.Run("not_found", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/does-not-exist", nil))
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("GET /does-not-exist status = %d, want 404", rec.Code)
+		}
+
+		recAPI := httptest.NewRecorder()
+		h.ServeHTTP(recAPI, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/nope", nil))
+		if recAPI.Code != http.StatusNotFound {
+			t.Fatalf("GET /api/v1/nope status = %d, want 404", recAPI.Code)
+		}
+		var apiErr apiError
+		if err := json.Unmarshal(recAPI.Body.Bytes(), &apiErr); err != nil || apiErr.Error != "not_found" {
+			t.Fatalf("expected JSON not_found error, got %q (%v)", recAPI.Body.String(), err)
 		}
 	})
 
@@ -119,19 +130,35 @@ func TestHTTPHandlers(t *testing.T) {
 		})
 	}
 
-	// GET /api/state returns the live StateSnapshot JSON.
+	// GET /api/v1/state returns the live StateSnapshot JSON.
 	t.Run("state", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/state", nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil))
 		if rec.Code != http.StatusOK {
-			t.Fatalf("GET /api/state status = %d, want 200", rec.Code)
+			t.Fatalf("GET /api/v1/state status = %d, want 200", rec.Code)
 		}
 		var got StateSnapshot
 		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-			t.Fatalf("decode /api/state: %v", err)
+			t.Fatalf("decode /api/v1/state: %v", err)
 		}
 		if got.Site != "default" || got.EventMode != "poll-5s" {
 			t.Fatalf("unexpected state: %+v", got)
+		}
+	})
+
+	// GET /api/v1/health returns lightweight liveness and watchdog status.
+	t.Run("health", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/health", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/v1/health status = %d, want 200", rec.Code)
+		}
+		var got HealthResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode /api/v1/health: %v", err)
+		}
+		if got.Status != "ok" || got.Site != "default" || got.EventMode != "poll-5s" {
+			t.Fatalf("unexpected health: %+v", got)
 		}
 	})
 
@@ -147,13 +174,14 @@ func TestHTTPHandlers(t *testing.T) {
 		}
 	})
 
-	// POST /api/rescan queues full or single-host rescans and rejects unknown IPs.
-	t.Run("rescan", func(t *testing.T) {
+	// POST /api/v1/scans and POST /api/v1/hosts/{id}/scan queue full or single-host
+	// scans and reject unknown hosts with JSON 404.
+	t.Run("scans", func(t *testing.T) {
 		// Full rescan
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan", nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/scans", nil))
 		if rec.Code != http.StatusAccepted {
-			t.Fatalf("POST /api/rescan status = %d, want 202", rec.Code)
+			t.Fatalf("POST /api/v1/scans status = %d, want 202", rec.Code)
 		}
 		select {
 		case <-eng.fullRescanCh:
@@ -161,11 +189,11 @@ func TestHTTPHandlers(t *testing.T) {
 			t.Fatalf("expected full rescan signal to be queued")
 		}
 
-		// Known host rescan
+		// Known host rescan via /api/v1/hosts/{id}/scan (by IP)
 		recHost := httptest.NewRecorder()
-		h.ServeHTTP(recHost, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan?ip=192.0.2.10", nil))
+		h.ServeHTTP(recHost, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/hosts/192.0.2.10/scan", nil))
 		if recHost.Code != http.StatusAccepted {
-			t.Fatalf("POST /api/rescan?ip=192.0.2.10 status = %d, want 202", recHost.Code)
+			t.Fatalf("POST /api/v1/hosts/192.0.2.10/scan status = %d, want 202", recHost.Code)
 		}
 		select {
 		case task := <-eng.hostScanCh:
@@ -176,17 +204,36 @@ func TestHTTPHandlers(t *testing.T) {
 			t.Fatalf("expected host rescan to be queued")
 		}
 
-		// Unknown host rescan returns 404
+		// Known host rescan via POST /api/v1/scans body (by MAC)
+		recHostBody := httptest.NewRecorder()
+		h.ServeHTTP(recHostBody, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/scans", strings.NewReader(`{"host":"aa:bb:cc:dd:ee:01"}`)))
+		if recHostBody.Code != http.StatusAccepted {
+			t.Fatalf("POST /api/v1/scans {host:MAC} status = %d, want 202", recHostBody.Code)
+		}
+		select {
+		case task := <-eng.hostScanCh:
+			if task.client.MAC != "aa:bb:cc:dd:ee:01" {
+				t.Fatalf("queued host MAC = %q, want aa:bb:cc:dd:ee:01", task.client.MAC)
+			}
+		default:
+			t.Fatalf("expected host rescan via JSON body to be queued")
+		}
+
+		// Unknown host rescan returns JSON 404
 		recUnknown := httptest.NewRecorder()
-		h.ServeHTTP(recUnknown, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan?ip=192.0.2.99", nil))
+		h.ServeHTTP(recUnknown, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/v1/hosts/192.0.2.99/scan", nil))
 		if recUnknown.Code != http.StatusNotFound {
-			t.Fatalf("POST /api/rescan unknown IP status = %d, want 404", recUnknown.Code)
+			t.Fatalf("POST /api/v1/hosts/192.0.2.99/scan status = %d, want 404", recUnknown.Code)
+		}
+		var apiErr apiError
+		if err := json.Unmarshal(recUnknown.Body.Bytes(), &apiErr); err != nil || apiErr.Error != "not_found" {
+			t.Fatalf("expected JSON not_found error, got %q", recUnknown.Body.String())
 		}
 	})
 }
 
-// TestEventsSSE verifies that /api/events sends an initial keepalive frame and
-// streams live Engine events to subscribed clients.
+// TestEventsSSE verifies that /api/v1/events/stream sends an initial keepalive
+// frame and streams live Engine events to subscribed clients.
 func TestEventsSSE(t *testing.T) {
 	eng := newTestEngine()
 	srv := httptest.NewServer(eng.Handler())
@@ -195,21 +242,21 @@ func TestEventsSSE(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/v1/events/stream", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	resp, err := srv.Client().Do(req)
 	if err != nil {
-		t.Fatalf("GET /api/events: %v", err)
+		t.Fatalf("GET /api/v1/events/stream: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /api/events status = %d, want 200", resp.StatusCode)
+		t.Fatalf("GET /api/v1/events/stream status = %d, want 200", resp.StatusCode)
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
-		t.Fatalf("GET /api/events content-type = %q, want text/event-stream", ct)
+		t.Fatalf("GET /api/v1/events/stream content-type = %q, want text/event-stream", ct)
 	}
 
 	br := bufio.NewReader(resp.Body)
@@ -577,17 +624,17 @@ func TestServeExitsImmediatelyWithActiveSSE(t *testing.T) {
 		done <- eng.Serve(ctx)
 	}()
 
-	// Wait until /api/events accepts connections and emits the initial SSE comment.
+	// Wait until /api/v1/events/stream accepts connections and emits the initial SSE comment.
 	var resp *http.Response
 	for range 40 {
-		resp, err = http.Get("http://" + addr + "/api/events")
+		resp, err = http.Get("http://" + addr + "/api/v1/events/stream")
 		if err == nil {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	if err != nil {
-		t.Fatalf("connect /api/events: %v", err)
+		t.Fatalf("connect /api/v1/events/stream: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -654,5 +701,173 @@ func TestScanProgressBroadcastWithoutActivitySpam(t *testing.T) {
 	eng.setScanProgress(nil)
 	if after := eng.Snapshot(); after.ScanProgress != nil {
 		t.Fatalf("expected ScanProgress to clear after setScanProgress(nil), got %+v", after.ScanProgress)
+	}
+}
+
+// TestAPIV1EndpointsAndSSEReplay verifies the focused /api/v1/* read endpoints
+// (health, findings, cves, hosts, hosts/{id}, isolation, events JSON filters)
+// and Last-Event-ID replay on /api/v1/events/stream.
+func TestAPIV1EndpointsAndSSEReplay(t *testing.T) {
+	eng := NewDemoEngineForTest(t)
+	eng.mu.Lock()
+	eng.lastScanError = "unifi unreachable"
+	eng.current.LastScanError = "unifi unreachable"
+	eng.mu.Unlock()
+
+	h := eng.Handler()
+
+	// 1. GET /api/v1/health reflects degraded status on scan error.
+	recHealth := httptest.NewRecorder()
+	h.ServeHTTP(recHealth, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/health", nil))
+	if recHealth.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/health = %d, want 200", recHealth.Code)
+	}
+	var health HealthResponse
+	if err := json.Unmarshal(recHealth.Body.Bytes(), &health); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if health.Status != "degraded" || health.LastScanError != "unifi unreachable" || health.ClientCount == 0 {
+		t.Fatalf("unexpected health response: %+v", health)
+	}
+
+	// 2. GET /api/v1/findings supports severity filtering and rejects invalid severity with JSON 400.
+	recFind := httptest.NewRecorder()
+	h.ServeHTTP(recFind, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/findings?severity=high", nil))
+	if recFind.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/findings?severity=high = %d, want 200", recFind.Code)
+	}
+	var findBody struct {
+		Findings []checks.Finding `json:"findings"`
+	}
+	if err := json.Unmarshal(recFind.Body.Bytes(), &findBody); err != nil {
+		t.Fatalf("decode findings: %v", err)
+	}
+	if len(findBody.Findings) == 0 {
+		t.Fatal("expected demo high+ findings")
+	}
+	for _, f := range findBody.Findings {
+		if f.EffectiveSeverity < checks.SeverityHigh {
+			t.Fatalf("finding %s has severity %s < high", f.CheckID, f.EffectiveSeverity)
+		}
+	}
+	if strings.Contains(recFind.Body.String(), `"UniFiActions"`) || strings.Contains(recFind.Body.String(), `"Summary"`) {
+		t.Fatalf("expected snake_case remediation JSON tags, got PascalCase in: %s", recFind.Body.String()[:min(300, recFind.Body.Len())])
+	}
+
+	recBadSev := httptest.NewRecorder()
+	h.ServeHTTP(recBadSev, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/findings?severity=bogus", nil))
+	if recBadSev.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid severity, got %d", recBadSev.Code)
+	}
+
+	// 3. GET /api/v1/hosts and GET /api/v1/hosts/{id} resolve by ID, MAC, and IP.
+	recHosts := httptest.NewRecorder()
+	h.ServeHTTP(recHosts, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/hosts?state=exposed", nil))
+	if recHosts.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/hosts?state=exposed = %d, want 200", recHosts.Code)
+	}
+	var hostsBody struct {
+		Hosts []Entity `json:"hosts"`
+	}
+	if err := json.Unmarshal(recHosts.Body.Bytes(), &hostsBody); err != nil {
+		t.Fatalf("decode hosts: %v", err)
+	}
+	if len(hostsBody.Hosts) == 0 {
+		t.Fatal("expected exposed demo hosts")
+	}
+	sample := hostsBody.Hosts[0]
+	for _, lookup := range []string{sample.ID, sample.MAC, sample.IP} {
+		if lookup == "" {
+			continue
+		}
+		recOne := httptest.NewRecorder()
+		h.ServeHTTP(recOne, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/hosts/"+lookup, nil))
+		if recOne.Code != http.StatusOK {
+			t.Fatalf("GET /api/v1/hosts/%s = %d, want 200 (%s)", lookup, recOne.Code, recOne.Body.String())
+		}
+		var got Entity
+		if err := json.Unmarshal(recOne.Body.Bytes(), &got); err != nil || got.ID != sample.ID {
+			t.Fatalf("lookup %q returned %+v (err=%v), want ID %q", lookup, got, err, sample.ID)
+		}
+	}
+
+	// 4. GET /api/v1/cves and GET /api/v1/isolation return valid non-null arrays.
+	recCVE := httptest.NewRecorder()
+	h.ServeHTTP(recCVE, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/cves?kev=true", nil))
+	if recCVE.Code != http.StatusOK || !strings.Contains(recCVE.Body.String(), `"exact":`) {
+		t.Fatalf("GET /api/v1/cves?kev=true = %d %s", recCVE.Code, recCVE.Body.String())
+	}
+
+	recIso := httptest.NewRecorder()
+	h.ServeHTTP(recIso, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/isolation?verdict=violation", nil))
+	if recIso.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/isolation?verdict=violation = %d, want 200", recIso.Code)
+	}
+	var iso risk.IsolationMatrix
+	if err := json.Unmarshal(recIso.Body.Bytes(), &iso); err != nil {
+		t.Fatalf("decode isolation: %v", err)
+	}
+	for _, cell := range iso.Cells {
+		if cell.Verdict != risk.IsolationViolation {
+			t.Fatalf("unexpected non-violation cell %+v", cell)
+		}
+	}
+
+	// 5. GET /api/v1/events returns JSON with since_id/type/limit filters, and
+	// GET /api/v1/events/stream replays missed events via Last-Event-ID.
+	eng.emit(LiveEvent{Type: "admin_activity", Severity: "medium", Summary: "ev1"})
+	eng.emit(LiveEvent{Type: "policy_changed", Severity: "high", Summary: "ev2"})
+	eng.emit(LiveEvent{Type: "honeypot_hit", Severity: "high", Summary: "ev3"})
+
+	recAllEv := httptest.NewRecorder()
+	h.ServeHTTP(recAllEv, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/events?type=admin_activity,policy_changed,honeypot_hit&limit=10", nil))
+	if recAllEv.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/events = %d, want 200", recAllEv.Code)
+	}
+	var evResp struct {
+		Events []LiveEvent `json:"events"`
+	}
+	if err := json.Unmarshal(recAllEv.Body.Bytes(), &evResp); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	if len(evResp.Events) != 3 {
+		t.Fatalf("expected 3 filtered events, got %d", len(evResp.Events))
+	}
+	// Newest-first: evResp.Events[2] is ev1, evResp.Events[1] is ev2, evResp.Events[0] is ev3.
+	firstID := evResp.Events[2].ID
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	reqSSE, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/v1/events/stream", nil)
+	if err != nil {
+		t.Fatalf("new SSE request: %v", err)
+	}
+	reqSSE.Header.Set("Last-Event-ID", strings.TrimSpace(strconv.FormatInt(firstID, 10)))
+	respSSE, err := srv.Client().Do(reqSSE)
+	if err != nil {
+		t.Fatalf("SSE connect: %v", err)
+	}
+	defer respSSE.Body.Close()
+
+	br := bufio.NewReader(respSSE.Body)
+	var replayed []LiveEvent
+	for len(replayed) < 2 {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read replayed SSE line: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "data: ") {
+			var ev LiveEvent
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+				t.Fatalf("unmarshal replayed event: %v", err)
+			}
+			replayed = append(replayed, ev)
+		}
+	}
+	if replayed[0].Summary != "ev2" || replayed[1].Summary != "ev3" {
+		t.Fatalf("expected chronological replay [ev2, ev3], got [%s, %s]", replayed[0].Summary, replayed[1].Summary)
 	}
 }

@@ -482,6 +482,18 @@ func TestNotifierFormatsNewCVEsAndSecurityEvents(t *testing.T) {
 	defer srv.Close()
 
 	diff := risk.Diff{
+		ResolvedKeys: []string{"UB-0001|aa:bb:cc:dd:ee:01|23"},
+		NewFindings: []checks.Finding{{
+			CheckID:           "UB-0002",
+			Title:             "Exposed Admin",
+			EffectiveSeverity: checks.SeverityHigh,
+			Client:            unifi.Client{IP: "10.0.30.51", Name: "Cam1"},
+			Evidence:          "HTTP 200",
+			Remediation: checks.Remediation{
+				Summary:      "Move to isolated VLAN",
+				UniFiActions: []string{"move_to_iot_vlan"},
+			},
+		}},
 		NewCVEs: []risk.CVEAlert{{
 			CVEID:           "CVE-2026-99999",
 			HostName:        "LivingRoomAmp",
@@ -508,13 +520,18 @@ func TestNotifierFormatsNewCVEsAndSecurityEvents(t *testing.T) {
 	if err := nJSON.Send(context.Background(), "Home", diff); err != nil {
 		t.Fatalf("Send(json): %v", err)
 	}
-	var payload struct {
-		Site    string    `json:"site"`
-		Summary string    `json:"summary"`
-		Diff    risk.Diff `json:"diff"`
-	}
+	var payload WebhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("unmarshal json payload: %v", err)
+	}
+	if payload.Version != 1 || !strings.HasPrefix(payload.ID, "msg_") || payload.Timestamp.IsZero() {
+		t.Fatalf("expected version=1, msg_* id, and non-zero timestamp, got %+v", payload)
+	}
+	if len(payload.Diff.ResolvedKeys) != 0 {
+		t.Fatalf("expected resolved_keys omitted from alert webhook, got %+v", payload.Diff.ResolvedKeys)
+	}
+	if !strings.Contains(string(body), `"summary":"Move to isolated VLAN"`) || !strings.Contains(string(body), `"unifi_actions":["move_to_iot_vlan"]`) {
+		t.Fatalf("expected snake_case remediation fields in JSON webhook body, got: %s", string(body))
 	}
 	if len(payload.Diff.NewCVEs) != 1 || payload.Diff.NewCVEs[0].CVEID != "CVE-2026-99999" {
 		t.Fatalf("expected 1 NewCVE in JSON diff, got %+v", payload.Diff.NewCVEs)

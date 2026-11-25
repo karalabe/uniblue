@@ -400,10 +400,10 @@ type MatchSpec struct {
 // Remediation captures plain-English guidance and suggested UniFi actions.
 type Remediation struct {
 	// Summary explains what is exposed and how to reduce risk.
-	Summary string `yaml:"summary"`
+	Summary string `yaml:"summary" json:"summary"`
 
 	// UniFiActions lists structured UniFi remediation hints (e.g., move_to_iot_vlan).
-	UniFiActions []string `yaml:"unifi_actions"`
+	UniFiActions []string `yaml:"unifi_actions" json:"unifi_actions,omitempty"`
 }
 
 // compiledPatterns caches compiled regular expressions validated at load time.

@@ -24,12 +24,16 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/karalabe/uniblue/docs"
+	"github.com/karalabe/uniblue/internal/checks"
+	"github.com/karalabe/uniblue/internal/cve"
+	"github.com/karalabe/uniblue/internal/risk"
 )
 
 const (
@@ -266,23 +270,51 @@ func clientRemoteIP(r *http.Request) string {
 	return host
 }
 
+// apiError is the uniform JSON error envelope returned by all /api/v1/* endpoints.
+type apiError struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+// HealthResponse is the lightweight liveness and scan-watchdog payload served by
+// GET /api/v1/health.
+type HealthResponse struct {
+	Status         string    `json:"status"`
+	Site           string    `json:"site"`
+	ControllerType string    `json:"controller_type,omitempty"`
+	StartedAt      time.Time `json:"started_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	LastFullScanAt time.Time `json:"last_full_scan_at,omitempty"`
+	LastScanError  string    `json:"last_scan_error,omitempty"`
+	Scanning       bool      `json:"scanning"`
+	EventMode      string    `json:"event_mode"`
+	CVELoaded      bool      `json:"cve_loaded"`
+	ClientCount    int       `json:"client_count"`
+	FindingCount   int       `json:"finding_count"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeAPIError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, apiError{Error: code, Message: message})
+}
+
 func writeAuthLockedResponse(w http.ResponseWriter, retryAfter time.Duration) {
 	secs := int(retryAfter.Round(time.Second).Seconds())
 	if secs < 1 {
 		secs = 1
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
-	w.WriteHeader(http.StatusTooManyRequests)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"error": "too many failed authentication attempts; try again later",
-	})
+	writeAPIError(w, http.StatusTooManyRequests, "rate_limited", "too many failed authentication attempts; try again later")
 }
 
-// Serve starts the HTTP server for the built-in web UI, JSON API, live SVG
-// topology endpoint, and SSE event stream, shutting down gracefully when ctx is
-// cancelled.
+// Serve starts the HTTP server for the built-in web UI, JSON API, and SSE event
+// stream, shutting down gracefully when ctx is cancelled.
 func (e *Engine) Serve(ctx context.Context) error {
 	addr := e.opts.ListenAddr
 	if addr == "" {
@@ -291,7 +323,7 @@ func (e *Engine) Serve(ctx context.Context) error {
 	}
 
 	if !isLoopbackListenAddr(addr) && e.effectiveAPIToken() == "" {
-		e.logger.Warn("uniblue web UI listening on non-loopback address without UNIBLUE_API_TOKEN; set UNIBLUE_API_TOKEN to require bearer auth on /api/*", "listen", addr)
+		e.logger.Warn("uniblue web UI listening on non-loopback address without UNIBLUE_API_TOKEN; set UNIBLUE_API_TOKEN to require bearer auth on /api/v1/*", "listen", addr)
 	}
 
 	mux := e.Handler()
@@ -329,22 +361,52 @@ func (e *Engine) Serve(ctx context.Context) error {
 	}
 }
 
-// Handler builds the HTTP router for UniBlue's live dashboard and APIs wrapped
-// with Host (DNS-rebinding), Origin/Sec-Fetch-Site (CSRF), and optional Bearer
-// token / HttpOnly session cookie protection.
+// Handler builds the HTTP router for UniBlue's live dashboard and /api/v1/*
+// endpoints wrapped with Host (DNS-rebinding), Origin/Sec-Fetch-Site (CSRF),
+// and optional Bearer token / HttpOnly session cookie protection.
 func (e *Engine) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", e.handleIndex)
-	mux.HandleFunc("POST /api/auth", e.handleAuth)
-	mux.HandleFunc("POST /api/logout", e.handleLogout)
-	mux.HandleFunc("GET /api/state", e.handleState)
-	mux.HandleFunc("GET /api/events", e.handleEventsSSE)
-	mux.HandleFunc("POST /api/rescan", e.handleRescan)
+	mux.HandleFunc("GET /{$}", e.handleIndex)
+	mux.HandleFunc("GET /api/v1/health", e.handleHealth)
+	mux.HandleFunc("GET /api/v1/session", e.handleSessionGet)
+	mux.HandleFunc("POST /api/v1/session", e.handleSessionCreate)
+	mux.HandleFunc("DELETE /api/v1/session", e.handleSessionDelete)
+	mux.HandleFunc("GET /api/v1/state", e.handleState)
+	mux.HandleFunc("GET /api/v1/findings", e.handleFindings)
+	mux.HandleFunc("GET /api/v1/cves", e.handleCVEs)
+	mux.HandleFunc("GET /api/v1/hosts", e.handleHosts)
+	mux.HandleFunc("GET /api/v1/hosts/{id}", e.handleHostByID)
+	mux.HandleFunc("GET /api/v1/isolation", e.handleIsolation)
+	mux.HandleFunc("GET /api/v1/events", e.handleEventsList)
+	mux.HandleFunc("GET /api/v1/events/stream", e.handleEventsStream)
+	mux.HandleFunc("POST /api/v1/scans", e.handleScans)
+	mux.HandleFunc("POST /api/v1/hosts/{id}/scan", e.handleHostScan)
 	mux.HandleFunc("GET /assets/logo-light.svg", serveEmbeddedSVG("logo-header-light.svg"))
 	mux.HandleFunc("GET /assets/logo-dark.svg", serveEmbeddedSVG("logo-header-dark.svg"))
 	mux.HandleFunc("GET /assets/favicon.svg", serveEmbeddedSVG("logo-light.svg"))
 	mux.HandleFunc("GET /favicon.ico", serveEmbeddedSVG("logo-light.svg"))
-	return e.protectHTTP(mux)
+
+	jsonFallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			if _, pat := mux.Handler(r); pat == "" {
+				for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+					if m == r.Method {
+						continue
+					}
+					probeReq := r.Clone(r.Context())
+					probeReq.Method = m
+					if _, altPat := mux.Handler(probeReq); altPat != "" {
+						writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", fmt.Sprintf("method %s not allowed on %s", r.Method, r.URL.Path))
+						return
+					}
+				}
+				writeAPIError(w, http.StatusNotFound, "not_found", "endpoint not found")
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
+	return e.protectHTTP(jsonFallback)
 }
 
 func (e *Engine) effectiveAPIToken() string {
@@ -491,44 +553,53 @@ func (e *Engine) hasValidAPIAuth(r *http.Request, tok string) bool {
 
 // protectHTTP rejects DNS-rebinding Host headers on both loopback and LAN
 // listeners (honoring UNIBLUE_ALLOWED_HOSTS for reverse proxies), blocks
-// cross-origin / cross-site browser requests (especially POST /api/rescan CSRF),
-// and enforces Bearer token or HttpOnly session cookie auth on /api/* when
+// cross-origin / cross-site browser requests (especially mutating CSRF calls),
+// and enforces Bearer token or HttpOnly session cookie auth on /api/v1/* when
 // UNIBLUE_API_TOKEN is set.
 func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 	loopbackOnly := isLoopbackListenAddr(e.opts.ListenAddr)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
+		writeErr := func(status int, code, msg string) {
+			if isAPI {
+				writeAPIError(w, status, code, msg)
+				return
+			}
+			http.Error(w, msg, status)
+		}
+
 		allowedHosts := e.effectiveAllowedHosts()
 		if r.Host != "" && !matchesAllowedHost(r.Host, allowedHosts) {
 			hostName := requestHostName(r.Host)
 			if loopbackOnly {
 				if !isLoopbackHostName(hostName) {
-					http.Error(w, "forbidden host header", http.StatusForbidden)
+					writeErr(http.StatusForbidden, "forbidden_host", "forbidden host header")
 					return
 				}
 			} else if !isAllowedLANHostName(hostName) {
-				http.Error(w, "forbidden host header", http.StatusForbidden)
+				writeErr(http.StatusForbidden, "forbidden_host", "forbidden host header")
 				return
 			}
 		}
 
-		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
 		if isAPI || (r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions) {
 			if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
 				parsedOrigin, err := url.Parse(origin)
 				if err != nil || parsedOrigin.Host == "" ||
 					(!strings.EqualFold(parsedOrigin.Host, r.Host) && !matchesAllowedHost(parsedOrigin.Host, allowedHosts)) {
-					http.Error(w, "forbidden cross-origin request", http.StatusForbidden)
+					writeErr(http.StatusForbidden, "forbidden_origin", "forbidden cross-origin request")
 					return
 				}
 			}
 			if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" && sfs != "same-origin" && sfs != "none" {
-				http.Error(w, "forbidden cross-site request", http.StatusForbidden)
+				writeErr(http.StatusForbidden, "forbidden_cross_site", "forbidden cross-site request")
 				return
 			}
 		}
 
-		isAuthEndpoint := r.Method == http.MethodPost && (r.URL.Path == "/api/auth" || r.URL.Path == "/api/logout")
-		if isAPI && !isAuthEndpoint {
+		isSessionEndpoint := r.URL.Path == "/api/v1/session" &&
+			(r.Method == http.MethodGet || r.Method == http.MethodPost || r.Method == http.MethodDelete)
+		if isAPI && !isSessionEndpoint {
 			if tok := e.effectiveAPIToken(); tok != "" {
 				ip := clientRemoteIP(r)
 				if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
@@ -545,15 +616,7 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 					ck, ckErr := r.Cookie(sessionCookieName)
 					hasBadCookie := ckErr == nil && ck.Value != ""
 					if hasBadCookie {
-						http.SetCookie(w, &http.Cookie{
-							Name:     sessionCookieName,
-							Value:    "",
-							Path:     "/",
-							HttpOnly: true,
-							SameSite: http.SameSiteStrictMode,
-							Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
-							MaxAge:   -1,
-						})
+						clearSessionCookie(w, r)
 					}
 					if hasBearer || hasBadCookie {
 						if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
@@ -562,7 +625,7 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 						}
 					}
 					w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
-					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					writeAPIError(w, http.StatusUnauthorized, "unauthorized", "valid bearer token or session cookie required")
 					return
 				}
 				e.authLimiter.reset(ip)
@@ -573,12 +636,59 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 	})
 }
 
-func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+func isSecureRequest(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   isSecureRequest(r),
+		MaxAge:   -1,
+	})
+}
+
+func (e *Engine) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	tok := e.effectiveAPIToken()
 	if tok == "" {
-		_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": true, "required": false})
+		writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": false})
+		return
+	}
+
+	hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
+	ck, ckErr := r.Cookie(sessionCookieName)
+	hasCookie := ckErr == nil && ck.Value != ""
+
+	ip := clientRemoteIP(r)
+	if hasBearer || hasCookie {
+		if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
+			writeAuthLockedResponse(w, retryAfter)
+			return
+		}
+		if e.hasValidAPIAuth(r, tok) {
+			e.authLimiter.reset(ip)
+			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": true})
+			return
+		}
+		if hasCookie {
+			clearSessionCookie(w, r)
+		}
+		if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
+			writeAuthLockedResponse(w, retryAfter)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": false, "required": true})
+}
+
+func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
+	tok := e.effectiveAPIToken()
+	if tok == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": false})
 		return
 	}
 
@@ -608,8 +718,7 @@ func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
+		writeAPIError(w, http.StatusUnauthorized, "invalid_token", "invalid API token")
 		return
 	}
 
@@ -617,8 +726,7 @@ func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	sessionID, err := e.sessions.create(tok)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to create session"})
+		writeAPIError(w, http.StatusInternalServerError, "session_error", "failed to create session")
 		return
 	}
 
@@ -628,28 +736,18 @@ func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
+		Secure:   isSecureRequest(r),
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
-	_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": true, "required": true})
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": true})
 }
 
-func (e *Engine) handleLogout(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+func (e *Engine) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
 		e.sessions.revoke(ck.Value)
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
-		MaxAge:   -1,
-	})
-	_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": false})
+	clearSessionCookie(w, r)
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
 }
 
 // RenderStaticHTML renders a self-contained, offline interactive HTML snapshot
@@ -690,18 +788,430 @@ func (e *Engine) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(dashboardHTML)
 }
 
-func (e *Engine) handleState(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	enc := json.NewEncoder(w)
-	_ = enc.Encode(e.Snapshot())
+func (e *Engine) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	snap := e.Snapshot()
+	status := "ok"
+	switch {
+	case snap.LastScanError != "":
+		status = "degraded"
+	case snap.Scanning && snap.LastFullScanAt.IsZero():
+		status = "scanning"
+	}
+	clientCount := snap.Report.ClientCount
+	if clientCount == 0 && len(snap.Clients) > 0 {
+		clientCount = len(snap.Clients)
+	}
+	writeJSON(w, http.StatusOK, HealthResponse{
+		Status:         status,
+		Site:           snap.Site,
+		ControllerType: snap.ControllerType,
+		StartedAt:      snap.StartedAt,
+		UpdatedAt:      snap.UpdatedAt,
+		LastFullScanAt: snap.LastFullScanAt,
+		LastScanError:  snap.LastScanError,
+		Scanning:       snap.Scanning,
+		EventMode:      snap.EventMode,
+		CVELoaded:      snap.CVELoaded,
+		ClientCount:    clientCount,
+		FindingCount:   len(snap.Report.Findings),
+	})
 }
 
-func (e *Engine) handleEventsSSE(w http.ResponseWriter, r *http.Request) {
+func (e *Engine) handleState(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, e.Snapshot())
+}
+
+func (e *Engine) handleFindings(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var (
+		hasMinSev bool
+		minSev    checks.Severity
+	)
+	if rawSev := strings.TrimSpace(q.Get("severity")); rawSev != "" {
+		parsed, err := checks.ParseSeverity(rawSev)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", err.Error())
+			return
+		}
+		hasMinSev = true
+		minSev = parsed
+	}
+	hostFilter := strings.TrimSpace(q.Get("host"))
+	catFilter := strings.TrimSpace(q.Get("category"))
+
+	snap := e.Snapshot()
+	out := make([]checks.Finding, 0, len(snap.Report.Findings))
+	for _, f := range snap.Report.Findings {
+		if hasMinSev && f.EffectiveSeverity < minSev {
+			continue
+		}
+		if catFilter != "" && !strings.EqualFold(f.Category, catFilter) {
+			continue
+		}
+		if hostFilter != "" && !clientMatchesIdentifier(f.Client, hostFilter) &&
+			!strings.EqualFold(f.Client.DisplayName(), hostFilter) {
+			continue
+		}
+		out = append(out, f)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"findings": out})
+}
+
+func (e *Engine) handleCVEs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var (
+		hasMinSev bool
+		minSev    checks.Severity
+	)
+	if rawSev := strings.TrimSpace(q.Get("severity")); rawSev != "" {
+		parsed, err := checks.ParseSeverity(rawSev)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", err.Error())
+			return
+		}
+		hasMinSev = true
+		minSev = parsed
+	}
+	kevOnly := false
+	if rawKEV := strings.TrimSpace(q.Get("kev")); rawKEV != "" {
+		parsed, err := strconv.ParseBool(rawKEV)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "invalid kev boolean parameter")
+			return
+		}
+		kevOnly = parsed
+	}
+	hostFilter := strings.TrimSpace(q.Get("host"))
+
+	snap := e.Snapshot()
+	hostAliases := resolveHostFilterAliases(snap, hostFilter)
+
+	filterSummaries := func(in []cve.ProductSummary) []cve.ProductSummary {
+		out := make([]cve.ProductSummary, 0, len(in))
+		for _, s := range in {
+			if hasMinSev && s.MaxSeverity < minSev {
+				continue
+			}
+			if kevOnly && s.KEVCount == 0 {
+				continue
+			}
+			if hostFilter != "" && !matchesCVESummaryHost(s, hostFilter, hostAliases) {
+				continue
+			}
+			out = append(out, s)
+		}
+		return out
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"loaded":    snap.CVELoaded,
+		"exact":     filterSummaries(snap.ExactCVEs),
+		"potential": filterSummaries(snap.PotentialCVEs),
+	})
+}
+
+func resolveHostFilterAliases(snap StateSnapshot, hostFilter string) map[string]struct{} {
+	if hostFilter == "" {
+		return nil
+	}
+	aliases := map[string]struct{}{
+		strings.ToLower(hostFilter): {},
+	}
+	for _, cv := range snap.Clients {
+		if clientMatchesIdentifier(cv.Client, hostFilter) || strings.EqualFold(cv.Client.DisplayName(), hostFilter) {
+			if cv.Client.DisplayName() != "" {
+				aliases[strings.ToLower(cv.Client.DisplayName())] = struct{}{}
+			}
+			for _, ip := range cv.Client.AllIPs() {
+				aliases[strings.ToLower(ip)] = struct{}{}
+			}
+		}
+	}
+	if snap.View != nil {
+		for _, ent := range snap.View.Entities {
+			if ent == nil || ent.Kind != "host" {
+				continue
+			}
+			if entityMatchesIdentifier(*ent, hostFilter) {
+				if ent.Label != "" {
+					aliases[strings.ToLower(ent.Label)] = struct{}{}
+				}
+				if ent.IP != "" {
+					aliases[strings.ToLower(ent.IP)] = struct{}{}
+				}
+				for _, ip6 := range ent.IPv6 {
+					if ip6 != "" {
+						aliases[strings.ToLower(ip6)] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	return aliases
+}
+
+func matchesCVESummaryHost(s cve.ProductSummary, hostFilter string, aliases map[string]struct{}) bool {
+	if strings.EqualFold(s.Product.HostIP, hostFilter) || strings.EqualFold(s.Product.HostName, hostFilter) {
+		return true
+	}
+	if _, ok := aliases[strings.ToLower(s.Product.HostIP)]; ok {
+		return true
+	}
+	if _, ok := aliases[strings.ToLower(s.Product.HostName)]; ok {
+		return true
+	}
+	return false
+}
+
+func collectHostEntities(snap StateSnapshot) []Entity {
+	var hosts []Entity
+	if snap.View != nil && len(snap.View.Entities) > 0 {
+		for _, ent := range snap.View.Entities {
+			if ent != nil && ent.Kind == "host" {
+				hosts = append(hosts, *ent)
+			}
+		}
+	} else {
+		for _, cv := range snap.Clients {
+			state := VerdictOK
+			if cv.FindingCount > 0 {
+				state = VerdictExposed
+			} else if cv.LastScannedAt == nil && !cv.Skipped {
+				state = VerdictUnknown
+			}
+			hosts = append(hosts, Entity{
+				ID:          hostEntityID(cv.Client),
+				Kind:        "host",
+				Label:       cv.Client.DisplayName(),
+				Role:        string(cv.Class.Category),
+				State:       state,
+				MaxSeverity: cv.MaxSeverity,
+				ScannedAt:   cv.LastScannedAt,
+				Skipped:     cv.Skipped,
+				SkipReason:  cv.SkipReason,
+				NetworkID:   cv.Client.NetworkID,
+				NetworkName: cv.Client.NetworkName,
+				IP:          cv.Client.IP,
+				IPv6:        cv.Client.IPv6,
+				MAC:         cv.Client.MAC,
+				Vendor:      cv.Class.Vendor,
+				IsWired:     cv.Client.IsWired,
+			})
+		}
+	}
+	sort.Slice(hosts, func(i, j int) bool {
+		ri, rj := verdictRank(hosts[i].State), verdictRank(hosts[j].State)
+		if ri != rj {
+			return ri > rj
+		}
+		if hosts[i].Label != hosts[j].Label {
+			return strings.ToLower(hosts[i].Label) < strings.ToLower(hosts[j].Label)
+		}
+		return hosts[i].ID < hosts[j].ID
+	})
+	return hosts
+}
+
+func entityMatchesIdentifier(ent Entity, query string) bool {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return false
+	}
+	if strings.EqualFold(ent.ID, q) {
+		return true
+	}
+	if ent.MAC != "" && strings.EqualFold(ent.MAC, q) {
+		return true
+	}
+	if ent.IP != "" && strings.EqualFold(ent.IP, q) {
+		return true
+	}
+	for _, ip6 := range ent.IPv6 {
+		if strings.EqualFold(ip6, q) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) handleHosts(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	vlanFilter := strings.TrimSpace(q.Get("vlan"))
+	roleFilter := strings.TrimSpace(q.Get("role"))
+	stateFilter := strings.ToLower(strings.TrimSpace(q.Get("state")))
+	if stateFilter != "" {
+		switch VerdictState(stateFilter) {
+		case VerdictOK, VerdictUnknown, VerdictReview, VerdictExposed:
+		default:
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", fmt.Sprintf("unknown state %q (expected ok, unknown, review, or exposed)", stateFilter))
+			return
+		}
+	}
+
+	hosts := collectHostEntities(e.Snapshot())
+	out := make([]Entity, 0, len(hosts))
+	for _, h := range hosts {
+		if stateFilter != "" && string(h.State) != stateFilter {
+			continue
+		}
+		if vlanFilter != "" && !strings.EqualFold(h.NetworkName, vlanFilter) && !strings.EqualFold(h.NetworkID, vlanFilter) {
+			continue
+		}
+		if roleFilter != "" && !strings.EqualFold(h.Role, roleFilter) {
+			continue
+		}
+		out = append(out, h)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hosts": out})
+}
+
+func (e *Engine) handleHostByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "host identifier is required")
+		return
+	}
+	for _, h := range collectHostEntities(e.Snapshot()) {
+		if entityMatchesIdentifier(h, id) {
+			writeJSON(w, http.StatusOK, h)
+			return
+		}
+	}
+	writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("host %q not found", id))
+}
+
+func (e *Engine) handleIsolation(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	verdictFilter := strings.ToLower(strings.TrimSpace(q.Get("verdict")))
+	if verdictFilter != "" {
+		switch risk.IsolationVerdict(verdictFilter) {
+		case risk.IsolationApproved, risk.IsolationBlockedOK, risk.IsolationViolation, risk.IsolationBrokenDependency, risk.IsolationUnknown:
+		default:
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", fmt.Sprintf("unknown isolation verdict %q", verdictFilter))
+			return
+		}
+	}
+	srcFilter := strings.TrimSpace(q.Get("source"))
+	dstFilter := strings.TrimSpace(q.Get("dest"))
+
+	snap := e.Snapshot()
+	if snap.Report.Isolation == nil {
+		writeJSON(w, http.StatusOK, risk.IsolationMatrix{Cells: []risk.IsolationCell{}})
+		return
+	}
+
+	out := risk.IsolationMatrix{Cells: make([]risk.IsolationCell, 0, len(snap.Report.Isolation.Cells))}
+	for _, cell := range snap.Report.Isolation.Cells {
+		if verdictFilter != "" && string(cell.Verdict) != verdictFilter {
+			continue
+		}
+		if srcFilter != "" && !strings.EqualFold(cell.SourceZone, srcFilter) && !strings.EqualFold(cell.SourceNetwork, srcFilter) {
+			continue
+		}
+		if dstFilter != "" && !strings.EqualFold(cell.DestZone, dstFilter) && !strings.EqualFold(cell.DestNetwork, dstFilter) {
+			continue
+		}
+		out.Cells = append(out.Cells, cell)
+		switch cell.Verdict {
+		case risk.IsolationApproved:
+			out.ApprovedCount++
+		case risk.IsolationBlockedOK:
+			out.BlockedOKCount++
+		case risk.IsolationViolation:
+			out.ViolationCount++
+		case risk.IsolationBrokenDependency:
+			out.BrokenDepCount++
+		case risk.IsolationUnknown:
+			out.UnknownCount++
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (e *Engine) handleEventsList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var sinceID int64
+	if rawSince := strings.TrimSpace(q.Get("since_id")); rawSince != "" {
+		parsed, err := strconv.ParseInt(rawSince, 10, 64)
+		if err != nil || parsed < 0 {
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "since_id must be a non-negative integer")
+			return
+		}
+		sinceID = parsed
+	}
+	limit := 50
+	if rawLimit := strings.TrimSpace(q.Get("limit")); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed < 1 || parsed > maxEventHistory {
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", fmt.Sprintf("limit must be between 1 and %d", maxEventHistory))
+			return
+		}
+		limit = parsed
+	}
+	var (
+		hasMinSev bool
+		minSev    checks.Severity
+	)
+	if rawSev := strings.TrimSpace(q.Get("severity")); rawSev != "" {
+		parsed, err := checks.ParseSeverity(rawSev)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", err.Error())
+			return
+		}
+		hasMinSev = true
+		minSev = parsed
+	}
+	var allowedTypes map[string]struct{}
+	if rawType := strings.TrimSpace(q.Get("type")); rawType != "" {
+		allowedTypes = make(map[string]struct{})
+		for _, part := range strings.Split(rawType, ",") {
+			if t := strings.ToLower(strings.TrimSpace(part)); t != "" {
+				allowedTypes[t] = struct{}{}
+			}
+		}
+	}
+
+	snap := e.Snapshot()
+	out := make([]LiveEvent, 0, min(limit, len(snap.Events)))
+	for _, ev := range snap.Events {
+		if sinceID > 0 && ev.ID <= sinceID {
+			continue
+		}
+		if len(allowedTypes) > 0 {
+			if _, ok := allowedTypes[strings.ToLower(ev.Type)]; !ok {
+				continue
+			}
+		}
+		if hasMinSev {
+			sev, err := checks.ParseSeverity(ev.Severity)
+			if err != nil || sev < minSev {
+				continue
+			}
+		}
+		out = append(out, ev)
+		if len(out) >= limit {
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": out})
+}
+
+func (e *Engine) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, "streaming_unsupported", "streaming unsupported")
 		return
+	}
+
+	var lastEventID int64
+	rawLast := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if rawLast == "" {
+		rawLast = strings.TrimSpace(r.URL.Query().Get("last_event_id"))
+	}
+	if rawLast != "" {
+		if parsed, err := strconv.ParseInt(rawLast, 10, 64); err == nil && parsed > 0 {
+			lastEventID = parsed
+		}
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -709,12 +1219,27 @@ func (e *Engine) handleEventsSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	ch, unsub := e.Subscribe()
+	replay, ch, unsub := e.SubscribeWithReplay(lastEventID)
 	defer unsub()
 
 	// Send initial comment so proxies/browsers mark the stream connected immediately.
 	_, _ = fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
+
+	var lastSentID int64
+	for _, ev := range replay {
+		raw, err := json.Marshal(ev)
+		if err != nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "id: %d\nevent: uniblue\ndata: %s\n\n", ev.ID, raw)
+		if ev.ID > lastSentID {
+			lastSentID = ev.ID
+		}
+	}
+	if len(replay) > 0 {
+		flusher.Flush()
+	}
 
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
@@ -727,36 +1252,78 @@ func (e *Engine) handleEventsSSE(w http.ResponseWriter, r *http.Request) {
 			_, _ = fmt.Fprint(w, ": ping\n\n")
 			flusher.Flush()
 		case ev := <-ch:
+			if ev.ID <= lastSentID {
+				continue
+			}
 			raw, err := json.Marshal(ev)
 			if err != nil {
 				continue
 			}
 			_, _ = fmt.Fprintf(w, "id: %d\nevent: uniblue\ndata: %s\n\n", ev.ID, raw)
+			lastSentID = ev.ID
 			flusher.Flush()
 		}
 	}
 }
 
-func (e *Engine) handleRescan(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if ip := strings.TrimSpace(r.URL.Query().Get("ip")); ip != "" {
-		switch e.triggerHostRescanStatus(ip) {
-		case hostRescanNotFound:
-			w.WriteHeader(http.StatusNotFound)
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "not_found"})
-			return
-		case hostRescanQueueFull:
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "queue_full"})
+func (e *Engine) handleScans(w http.ResponseWriter, r *http.Request) {
+	var host string
+	if r.Body != nil {
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_request", "failed to read request body")
 			return
 		}
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "queued", "ip": ip})
+		if len(bytes.TrimSpace(raw)) > 0 {
+			var body struct {
+				Host string `json:"host"`
+			}
+			if err := json.Unmarshal(raw, &body); err != nil {
+				writeAPIError(w, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+				return
+			}
+			host = strings.TrimSpace(body.Host)
+		}
+	}
+	if host != "" {
+		e.queueHostScanResponse(w, host)
 		return
 	}
 	e.TriggerFullRescan()
-	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "queued", "scope": "full"})
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status": "queued",
+		"scope":  "full",
+	})
+}
+
+func (e *Engine) handleHostScan(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "host identifier is required")
+		return
+	}
+	e.queueHostScanResponse(w, id)
+}
+
+func (e *Engine) queueHostScanResponse(w http.ResponseWriter, target string) {
+	cl, st := e.triggerHostRescanStatus(target)
+	switch st {
+	case hostRescanNotFound:
+		writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("host %q not found", target))
+		return
+	case hostRescanQueueFull:
+		writeAPIError(w, http.StatusServiceUnavailable, "queue_full", "host scan queue is full; try again shortly")
+		return
+	}
+	resp := map[string]string{
+		"status": "queued",
+		"scope":  "host",
+		"target": hostEntityID(cl),
+	}
+	if ip := cl.PrimaryIP(); ip != "" {
+		resp["ip"] = ip
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func serveEmbeddedSVG(name string) http.HandlerFunc {
