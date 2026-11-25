@@ -198,6 +198,7 @@ type portLiveState struct {
 type Engine struct {
 	cfg        *config.Config
 	opts       Options
+	demoMode   bool
 	ctrl       *unifi.Controller
 	checkList  []*checks.Check
 	scanPorts  []int
@@ -368,6 +369,14 @@ func (e *Engine) Snapshot() StateSnapshot {
 
 // TriggerFullRescan queues an asynchronous full scan if one is not already queued.
 func (e *Engine) TriggerFullRescan() {
+	if e.demoMode {
+		e.emit(LiveEvent{
+			Type:     "scan_complete",
+			Severity: "info",
+			Summary:  "Demo network refreshed (simulated scan, zero packets sent)",
+		})
+		return
+	}
 	e.queueFullRescan("manual rescan")
 }
 
@@ -395,6 +404,17 @@ func (e *Engine) TriggerHostRescan(ip string) bool {
 	e.mu.RUnlock()
 	if target == nil {
 		return false
+	}
+	if e.demoMode {
+		e.emit(LiveEvent{
+			Type:      "host_scanned",
+			Severity:  "info",
+			Host:      target.DisplayName(),
+			IP:        target.IP,
+			SubjectID: hostEntityID(*target),
+			Summary:   fmt.Sprintf("Demo host %s (%s) rechecked (simulated, zero packets sent)", target.DisplayName(), target.IP),
+		})
+		return true
 	}
 	select {
 	case e.hostScanCh <- *target:

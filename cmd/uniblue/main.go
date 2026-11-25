@@ -66,6 +66,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runWatch(ctx, args[1:], stdout, stderr)
 	case "serve":
 		return runServe(ctx, args[1:], stdout, stderr)
+	case "demo":
+		return runDemo(ctx, args[1:], stdout, stderr)
 	case "inventory":
 		return runInventory(ctx, args[1:], stdout, stderr)
 	case "ports":
@@ -98,6 +100,7 @@ Commands:
   scan        Run a single UniFi + LAN security scan and print prioritized findings
   watch       Continuously scan on an interval and notify only on new/escalated changes
   serve       Run live event-driven monitor (5s poll / WebSocket) with built-in web UI
+  demo        Run built-in web UI seeded with a realistic offline demo network
   inventory   Fetch and display UniFi clients, devices, VLANs, and port forwards
   ports       Map physical switch ports, external equipment, and perimeter security
   topology    Generate an interactive offline HTML topology report or JSON summary
@@ -1339,8 +1342,12 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	poll := fs.Duration("poll", 5*time.Second, "UniFi topology delta poll interval (when WebSocket is unavailable)")
 	reconcile := fs.Duration("reconcile", 30*time.Minute, "periodic full LAN reconciliation interval")
 	noCVE := fs.Bool("no-cve", false, "skip local CVE cache correlation even if synced")
+	demo := fs.Bool("demo", false, "serve built-in offline demo network (no UniFi controller needed)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *demo {
+		return runDemo(ctx, []string{"-listen", *listen}, stdout, stderr)
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -1366,6 +1373,42 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	if err := eng.Start(ctx); err != nil {
 		return err
+	}
+	return eng.Serve(ctx)
+}
+
+// runDemo serves UniBlue's web dashboard seeded with a realistic, completely
+// offline synthetic UniFi network (or exports it as static HTML with -out) so
+// operators and contributors can preview the UI or capture demo screenshots
+// without connecting to a real UniFi controller.
+func runDemo(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("demo", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	listen := fs.String("listen", "127.0.0.1:8080", "HTTP listen address for the built-in demo web UI")
+	outPath := fs.String("out", "", "optional path to export a self-contained static demo HTML file instead of serving")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	logger := slog.New(slog.NewTextHandler(stdout, nil))
+	eng, err := server.NewDemoEngine(server.Options{
+		ListenAddr: *listen,
+		Logger:     logger,
+	})
+	if err != nil {
+		return err
+	}
+	if *outPath != "" {
+		f, err := os.Create(*outPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if err := server.RenderStaticHTML(f, eng.Snapshot()); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Wrote static UniBlue demo HTML to %s\n", *outPath)
+		return nil
 	}
 	return eng.Serve(ctx)
 }

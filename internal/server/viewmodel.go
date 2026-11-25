@@ -1721,6 +1721,10 @@ func compactCheckChip(f checks.Finding) string {
 		return "SNMP public :161"
 	case "UB-0019":
 		return "IPMI RMCP+ :623"
+	case "UB-0030":
+		return fmt.Sprintf("Grafana :%d", f.Port)
+	case "UB-0032":
+		return fmt.Sprintf("Ollama :%d", f.Port)
 	case "UB-0045":
 		return "PJLink :4352"
 	case "UB-2026-0007":
@@ -1729,10 +1733,14 @@ func compactCheckChip(f checks.Finding) string {
 		return fmt.Sprintf("Eth Engine :%d", f.Port)
 	case "UB-2026-0039":
 		return fmt.Sprintf("Zehnder :%d", f.Port)
+	case "UB-2026-0055":
+		return fmt.Sprintf("OctoPrint :%d", f.Port)
 	case "UB-2026-0056":
 		return "AVR Telnet :23"
 	case "UB-2026-0062":
 		return "Cast API :8008"
+	case "UB-2026-0063":
+		return fmt.Sprintf("Roku ECP :%d", f.Port)
 	case "UB-0020":
 		return "Redfish :443"
 	case "UB-2026-0001":

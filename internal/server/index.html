@@ -1141,6 +1141,10 @@ function humanServiceChip(svc) {
   if (lbl.includes("smb unsigned")) return "Unsigned file sharing (SMB)";
   if (lbl.includes("expired cert")) return "Expired security certificate";
   if (lbl.includes("pjlink")) return "Open projector control";
+  if (lbl.includes("grafana")) return "Open Grafana dashboard";
+  if (lbl.includes("ollama")) return "Open Ollama AI API";
+  if (lbl.includes("octoprint")) return "Open 3D printer control";
+  if (lbl.includes("roku")) return "Open TV remote API";
   if (lbl.includes("bitcoin rpc")) return "Open Bitcoin RPC";
   if (lbl.includes("eth engine")) return "Open Ethereum Engine API";
   return svc.label || ("Port " + svc.port);
@@ -1333,6 +1337,26 @@ function humanReason(r) {
       title: "Network projector control (PJLink) has no password",
       why: "Anyone on this network can power on/off or switch inputs on this projector.",
       fix: r.remediation || "Set a PJLink password in the projector menu and place it on an isolated IoT network."
+    },
+    "UB-0030": {
+      title: "Grafana dashboard allows anonymous access",
+      why: "Anyone on this network can view Grafana dashboards and organization data without logging in.",
+      fix: r.remediation || "Disable anonymous access (GF_AUTH_ANONYMOUS_ENABLED=false) and require Grafana login."
+    },
+    "UB-0032": {
+      title: "Local AI server (Ollama) is open on the network",
+      why: "Any device on your network can run GPU inference or download/delete local models without a password.",
+      fix: r.remediation || "Bind OLLAMA_HOST to 127.0.0.1 or put Ollama behind an authenticated reverse proxy."
+    },
+    "UB-2026-0055": {
+      title: "3D printer control (OctoPrint) has no login enabled",
+      why: "Anyone on your network can send print commands, control bed/nozzle heaters, or install plugins.",
+      fix: r.remediation || "Enable Access Control in OctoPrint settings and move the 3D printer to an isolated IoT network."
+    },
+    "UB-2026-0063": {
+      title: "Roku remote control API is open on this network",
+      why: "Other devices on your network can launch apps or send remote keypresses to this streaming box.",
+      fix: r.remediation || "Set Control by mobile apps to Limited or Disabled in Roku Settings and move it to your Smart Home network."
     }
   };
   if (map[ref]) return map[ref];
@@ -2594,7 +2618,9 @@ function renderDrawer() {
 function renderIsolationPanelDrawer(vm, filter) {
   const iso = vm.isolation || { cells: [] };
   const allCells = iso.cells || [];
-  const cells = filter === "all" ? allCells : allCells.filter(c => c.verdict === filter);
+  const verdictOrder = { violation: 0, "broken-dependency": 1, unknown: 2, approved: 3, "blocked-ok": 4 };
+  const cells = (filter === "all" ? [...allCells] : allCells.filter(c => c.verdict === filter))
+    .sort((a, b) => (verdictOrder[a.verdict] ?? 9) - (verdictOrder[b.verdict] ?? 9));
 
   const verdictInfo = {
     approved: { label: "Approved ✓", tone: "ok" },

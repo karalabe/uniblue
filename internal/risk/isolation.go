@@ -1220,6 +1220,36 @@ func matchesEndpoint(ep unifi.PolicyEndpoint, zone, netID, netName, ip, mac stri
 		return matchUnknown, ep.UnsupportedSelector
 	}
 
+	// Evaluate port constraints first when the query fixes a concrete port:
+	// a definitive port mismatch (matchNo) rules out the policy even if the
+	// target selector names a host IP not fixed in a zone-level query.
+	portUnknownReason := ""
+	if !ep.AnyPort {
+		if len(ep.Ports) == 0 {
+			portUnknownReason = "port group selector unresolved"
+		} else if port == 0 {
+			portUnknownReason = "policy restricts specific port(s) not fixed in query"
+		} else {
+			portState := matchNo
+			for _, p := range ep.Ports {
+				if p == port {
+					portState = matchYes
+					break
+				}
+			}
+			if ep.NegatePort {
+				if portState == matchYes {
+					portState = matchNo
+				} else {
+					portState = matchYes
+				}
+			}
+			if portState == matchNo {
+				return matchNo, ""
+			}
+		}
+	}
+
 	if !ep.AnyTarget {
 		hasSelector := len(ep.IPs) > 0 || len(ep.NetworkIDs) > 0 || len(ep.MACs) > 0
 		if !hasSelector {
@@ -1266,30 +1296,8 @@ func matchesEndpoint(ep unifi.PolicyEndpoint, zone, netID, netName, ip, mac stri
 		}
 	}
 
-	if !ep.AnyPort {
-		if len(ep.Ports) == 0 {
-			return matchUnknown, "port group selector unresolved"
-		}
-		if port == 0 {
-			return matchUnknown, "policy restricts specific port(s) not fixed in query"
-		}
-		portState := matchNo
-		for _, p := range ep.Ports {
-			if p == port {
-				portState = matchYes
-				break
-			}
-		}
-		if ep.NegatePort {
-			if portState == matchYes {
-				portState = matchNo
-			} else {
-				portState = matchYes
-			}
-		}
-		if portState == matchNo {
-			return matchNo, ""
-		}
+	if portUnknownReason != "" {
+		return matchUnknown, portUnknownReason
 	}
 	return matchYes, ""
 }
