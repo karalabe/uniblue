@@ -466,3 +466,57 @@ func TestOutboxCommitsOneBatchAfterStorageRecovers(t *testing.T) {
 		t.Fatalf("expected exactly 1 queued batch after storage recovery, got %d (%+v)", len(e.pendingWebhooks), e.pendingWebhooks)
 	}
 }
+
+// TestScanProgressRetainsCompletedStageTotals verifies that setScanProgress
+// accumulates completed per-stage totals across phase transitions without
+// mutating prior snapshots, ignores out-of-order regressions within a phase,
+// and resets cleanly for subsequent scans.
+func TestScanProgressRetainsCompletedStageTotals(t *testing.T) {
+	e := NewDemoEngineForTest(t)
+	e.setScanProgress(&ScanProgress{Phase: "probing", Completed: 25, Total: 25, Percent: 46, Initial: true})
+	snapAfterProbing := e.Snapshot()
+	if snapAfterProbing.ScanProgress == nil || snapAfterProbing.ScanProgress.StageTotals["probing"] != 25 {
+		t.Fatalf("expected probing total in snapshot, got %+v", snapAfterProbing.ScanProgress)
+	}
+
+	e.setScanProgress(&ScanProgress{Phase: "fingerprinting", Completed: 48, Total: 48, Percent: 64, Initial: true})
+	// Prior snapshot's StageTotals map must remain immutable after phase transitions.
+	if _, leaked := snapAfterProbing.ScanProgress.StageTotals["fingerprinting"]; leaked {
+		t.Fatalf("prior snapshot StageTotals mutated across phase transition: %+v", snapAfterProbing.ScanProgress.StageTotals)
+	}
+
+	e.setScanProgress(&ScanProgress{Phase: "fingerprinting-fallback", Completed: 16, Total: 16, Percent: 68, Initial: true})
+	// Out-of-order worker callback with a lower Completed count must be ignored.
+	e.setScanProgress(&ScanProgress{Phase: "fingerprinting-fallback", Completed: 15, Total: 16, Percent: 67, Initial: true})
+	if cur := e.Snapshot().ScanProgress; cur == nil || cur.Completed != 16 {
+		t.Fatalf("expected monotonic fallback progress 16, got %+v", cur)
+	}
+
+	e.setScanProgress(&ScanProgress{Phase: "checks", Completed: 5, Total: 25, Percent: 73, Initial: true})
+	got := e.Snapshot().ScanProgress
+	if got == nil {
+		t.Fatal("expected active ScanProgress")
+	}
+	want := map[string]int{
+		"probing":                 25,
+		"fingerprinting":          48,
+		"fingerprinting-fallback": 16,
+		"checks":                  25,
+	}
+	for phase, total := range want {
+		if got.StageTotals[phase] != total {
+			t.Fatalf("StageTotals[%q] = %d, want %d (all=%+v)", phase, got.StageTotals[phase], total, got.StageTotals)
+		}
+	}
+
+	// Clearing and starting a second scan must not inherit stale totals from scan 1.
+	e.setScanProgress(nil)
+	if cleared := e.Snapshot().ScanProgress; cleared != nil {
+		t.Fatalf("expected nil ScanProgress after clear, got %+v", cleared)
+	}
+	e.setScanProgress(&ScanProgress{Phase: "probing", Completed: 1, Total: 3, Percent: 24})
+	next := e.Snapshot().ScanProgress
+	if next == nil || next.StageTotals["probing"] != 3 || len(next.StageTotals) != 1 {
+		t.Fatalf("second scan inherited stale StageTotals: %+v", next)
+	}
+}

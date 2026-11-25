@@ -1002,6 +1002,8 @@
   .init-sub { margin: 8px auto 0; max-width: 500px; font-size: 14.5px; color: var(--text-2); line-height: 1.55; }
   .pbar-wrap { margin: 22px 0 8px; text-align: left; }
   .pbar-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 13px; color: var(--text-2); margin-bottom: 8px; }
+  .pbar-meta > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pbar-meta > span { flex-shrink: 0; }
   .pbar-track {
     width: 100%;
     height: 9px;
@@ -1016,7 +1018,7 @@
     background: var(--blue);
     transition: width .35s cubic-bezier(.16, 1, .3, 1);
   }
-  .pbar-host { font-size: 12px; color: var(--muted); min-height: 18px; margin-top: 7px; text-align: left; }
+  .pbar-host { font-size: 12px; color: var(--muted); height: 18px; line-height: 18px; margin-top: 7px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .init-steps {
     margin: 20px 0 0;
     padding: 14px 16px;
@@ -1052,7 +1054,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     padding: 11px 16px;
     margin-bottom: 18px;
     border-radius: 13px;
@@ -1061,8 +1063,37 @@
     color: var(--text);
     font-size: 13px;
   }
+  .scan-banner.error { flex-wrap: wrap; }
+  .scan-banner-copy {
+    flex: 1;
+    min-width: 0;
+  }
+  .scan-banner-text {
+    height: 20px;
+    line-height: 20px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .scan-banner-note {
+    font-size: 12px;
+    color: var(--text-2);
+    line-height: 1.35;
+    margin-top: 2px;
+  }
+  .scan-banner-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
   .scan-banner-bar { width: 160px; height: 7px; border-radius: 999px; background: var(--surface); border: 1px solid var(--blue-bd); overflow: hidden; flex-shrink: 0; }
   .scan-banner-bar > div { height: 100%; background: var(--blue); transition: width .35s ease; }
+  @media (max-width: 720px) {
+    .scan-banner:not(.error) { flex-direction: column; align-items: stretch; gap: 10px; }
+    .scan-banner-right { justify-content: space-between; }
+    .scan-banner-bar { flex: 1; width: auto; }
+  }
   .nav-pills.locked { opacity: .45; pointer-events: none; }
   .auth-overlay {
     position: fixed;
@@ -1987,7 +2018,7 @@ function renderScanBanner(initial) {
   const host = document.getElementById("scan-banner");
   if (!host) return;
   if (state?.last_scan_error && !state?.scanning) {
-    host.innerHTML = `<div class="scan-banner" style="background:var(--crit-bg);border-color:var(--crit-bd);color:var(--crit)">
+    host.innerHTML = `<div class="scan-banner error" style="background:var(--crit-bg);border-color:var(--crit-bd);color:var(--crit)">
       <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1">
         <span class="sdot" style="background:var(--crit-solid);flex-shrink:0"></span>
         <div style="min-width:0">
@@ -2005,19 +2036,24 @@ function renderScanBanner(initial) {
     return;
   }
   const pct = Math.max(4, Math.min(99, Number(sp.percent) || 0));
+  const bannerLead = initial ? "Initial checkup in progress" : "Refreshing network scan";
+  const bannerLabel = sp.label || "Checking devices…";
+  const bannerTitle = `${bannerLead}: ${bannerLabel}${sp.current_host ? " · " + sp.current_host : ""}`;
   host.innerHTML = `<div class="scan-banner">
     <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1">
       <span class="sdot" style="background:var(--blue);animation:pulse 1.2s infinite;flex-shrink:0"></span>
-      <div style="min-width:0">
-        <strong>${initial ? "Initial checkup in progress" : "Refreshing network scan"}:</strong>
-        <span>${esc(sp.label || "Checking devices…")}</span>
-        ${sp.current_host ? `<span class="small mono"> · ${esc(sp.current_host)}</span>` : ""}
-        ${initial ? `<span class="small"> · Counts below are partial until baseline completes.</span>` : ""}
+      <div class="scan-banner-copy">
+        <div class="scan-banner-text" title="${esc(bannerTitle)}">
+          <strong>${bannerLead}:</strong>
+          <span>${esc(bannerLabel)}</span>
+          ${sp.current_host ? `<span class="small mono"> · ${esc(sp.current_host)}</span>` : ""}
+        </div>
+        ${initial ? `<div class="scan-banner-note">Counts below are partial until baseline completes.</div>` : ""}
       </div>
     </div>
-    <div style="display:flex;align-items:center;gap:10px">
+    <div class="scan-banner-right">
       <div class="scan-banner-bar"><div style="width:${pct}%"></div></div>
-      <span class="mono" style="font-size:12px;font-weight:700;color:var(--blue)">${pct}%</span>
+      <span class="mono" style="font-size:12px;font-weight:700;color:var(--blue);min-width:30px;text-align:right">${pct}%</span>
       ${initial ? `<button class="btn sm" data-action="show-splash">Show progress</button>` : ""}
     </div>
   </div>`;
@@ -2038,20 +2074,27 @@ function renderInitialSplash() {
   const C = 226.2;
   const offset = C * (1 - pct / 100);
 
-  const phaseRank = { topology: 0, discovery: 1, probing: 1, fingerprinting: 2, "fingerprinting-fallback": 2, checks: 3, evaluating: 4 };
+  const phaseRank = { topology: 0, discovery: 1, probing: 1, fingerprinting: 2, "fingerprinting-fallback": 3, checks: 4, evaluating: 5 };
   const rank = phaseRank[sp.phase] ?? 0;
   const stepState = (idx) => (idx < rank ? "done" : (idx === rank ? "active" : ""));
   const stepMark = (idx) => (idx < rank ? "✓" : (idx === rank ? "·" : ""));
+  const stageTotals = sp.stage_totals || {};
+  const stepCount = (phase, stepIdx, unit) => {
+    if (sp.phase === phase && sp.total > 0) {
+      return ` (${sp.completed} / ${sp.total} ${unit})`;
+    }
+    if (rank > stepIdx) {
+      const doneTotal = Number(stageTotals[phase]) || 0;
+      if (doneTotal > 0) return ` (${doneTotal} / ${doneTotal} ${unit})`;
+      return ` (0 ${unit})`;
+    }
+    return "";
+  };
 
-  const probeCount = (sp.phase === "probing" && sp.total > 0)
-    ? ` (${sp.completed} / ${sp.total} devices)`
-    : (rank > 1 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts} devices)` : "");
-  const fpCount = ((sp.phase === "fingerprinting" || sp.phase === "fingerprinting-fallback") && sp.total > 0)
-    ? ` (${sp.completed} / ${sp.total} ports)`
-    : "";
-  const checkCount = (sp.phase === "checks" && sp.total > 0)
-    ? ` (${sp.completed} / ${sp.total} devices)`
-    : (rank > 3 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts} devices)` : "");
+  const probeCount = stepCount("probing", 1, "devices");
+  const fpCount = stepCount("fingerprinting", 2, "ports");
+  const fbCount = stepCount("fingerprinting-fallback", 3, "ports");
+  const checkCount = stepCount("checks", 4, "devices");
 
   document.getElementById("view-initial").innerHTML = `
     <div class="init-splash">
@@ -2070,19 +2113,20 @@ function renderInitialSplash() {
 
       <div class="pbar-wrap">
         <div class="pbar-meta">
-          <strong style="color:var(--text)">${esc(sp.label || "Checking devices…")}</strong>
+          <strong style="color:var(--text)" title="${esc(sp.label || "Checking devices…")}">${esc(sp.label || "Checking devices…")}</strong>
           <span class="mono" style="font-weight:700;color:var(--blue)">${pct}%</span>
         </div>
         <div class="pbar-track"><div class="pbar-fill" style="width:${pct}%"></div></div>
-        <div class="pbar-host">${sp.current_host ? `Last checked: <strong>${esc(sp.current_host)}</strong>` : "Read-only &amp; rate-paced so fragile IoT gear stays undisturbed."}</div>
+        <div class="pbar-host"${sp.current_host ? ` title="${esc(sp.current_host)}"` : ""}>${sp.current_host ? `Last checked: <strong>${esc(sp.current_host)}</strong>` : "Read-only &amp; rate-paced so fragile IoT gear stays undisturbed."}</div>
       </div>
 
       <div class="init-steps">
         <div class="init-step ${stepState(0)}"><span class="step-dot">${stepMark(0)}</span>Read UniFi router, switches, cables &amp; firewall rules</div>
         <div class="init-step ${stepState(1)}"><span class="step-dot">${stepMark(1)}</span>Discover devices &amp; scan open ports${esc(probeCount)}</div>
         <div class="init-step ${stepState(2)}"><span class="step-dot">${stepMark(2)}</span>Identify services across open ports${esc(fpCount)}</div>
-        <div class="init-step ${stepState(3)}"><span class="step-dot">${stepMark(3)}</span>Run read-only security checks${esc(checkCount)}</div>
-        <div class="init-step ${stepState(4)}"><span class="step-dot">${stepMark(4)}</span>Evaluate firewall isolation &amp; known security bugs (CVEs)</div>
+        <div class="init-step ${stepState(3)}"><span class="step-dot">${stepMark(3)}</span>Check unclassified open ports${esc(fbCount)}</div>
+        <div class="init-step ${stepState(4)}"><span class="step-dot">${stepMark(4)}</span>Run read-only security checks${esc(checkCount)}</div>
+        <div class="init-step ${stepState(5)}"><span class="step-dot">${stepMark(5)}</span>Evaluate firewall isolation &amp; known security bugs (CVEs)</div>
       </div>
 
       <div class="init-foot">

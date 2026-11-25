@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -260,6 +261,10 @@ type ScanProgress struct {
 
 	// Initial is true during the first baseline scan before LastFullScanAt is set.
 	Initial bool `json:"initial"`
+
+	// StageTotals retains the total item count for each completed or active scan
+	// stage (keyed by Phase) so the UI can keep displaying finished counters.
+	StageTotals map[string]int `json:"stage_totals,omitempty"`
 }
 
 // missingClient records a client that disappeared from UniFi's active list
@@ -712,6 +717,31 @@ func (e *Engine) setScanProgress(p *ScanProgress) {
 		return
 	}
 	cp := *p
+	// Discard stale out-of-order updates from concurrent workers within the same phase.
+	if e.scanProgress != nil && e.scanProgress.Phase == cp.Phase &&
+		e.scanProgress.Total == cp.Total && cp.Completed < e.scanProgress.Completed {
+		e.mu.Unlock()
+		return
+	}
+	// Clone prior stage totals so each emitted ScanProgress owns an immutable map
+	// and retains completed counts across phase transitions and page reloads.
+	var totals map[string]int
+	if e.scanProgress != nil && len(e.scanProgress.StageTotals) > 0 {
+		totals = maps.Clone(e.scanProgress.StageTotals)
+	}
+	if len(p.StageTotals) > 0 {
+		if totals == nil {
+			totals = make(map[string]int, len(p.StageTotals)+1)
+		}
+		maps.Copy(totals, p.StageTotals)
+	}
+	if cp.Phase != "" && cp.Total >= 0 {
+		if totals == nil {
+			totals = make(map[string]int, 1)
+		}
+		totals[cp.Phase] = cp.Total
+	}
+	cp.StageTotals = totals
 	e.scanProgress = &cp
 	shouldBroadcast := cp.Phase != prevPhase ||
 		(cp.Total > 0 && cp.Completed >= cp.Total) ||

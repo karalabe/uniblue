@@ -100,8 +100,6 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 	// Report live per-port service identification progress as Nerva workers
 	// complete each target so startup never appears stalled on large LANs.
 	f.reportProgress("fingerprinting", 0, len(targets), "")
-	var progressMu sync.Mutex
-	completedTargets := 0
 	services, err := scan.ScanTargets(ctx, targets, scan.Config{
 		DefaultTimeout: nervaTimeout,
 		Workers:        f.concurrency,
@@ -118,14 +116,10 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 			if len(results) > 0 && strings.TrimSpace(results[0].Protocol) != "" {
 				label += fmt.Sprintf(" (%s)", strings.ToLower(strings.TrimSpace(results[0].Protocol)))
 			}
-			progressMu.Lock()
-			if c := int(completed); c > completedTargets {
-				completedTargets = c
-			} else {
-				completedTargets++
-			}
-			done := min(completedTargets, len(targets))
-			progressMu.Unlock()
+			// Pass Nerva's absolute atomic completion count directly rather than
+			// synthesizing increments on out-of-order worker callbacks; callers
+			// discard stale lower counts under their own lock.
+			done := min(max(int(completed), 0), len(targets))
 			f.reportProgress("fingerprinting", done, len(targets), label)
 		},
 	})
