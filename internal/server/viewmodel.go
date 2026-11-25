@@ -248,6 +248,7 @@ type PresentationModel struct {
 	Isolation       *risk.IsolationMatrix        `json:"isolation,omitempty"`
 	ServiceCoverage *probe.ServiceCoverageReport `json:"service_coverage,omitempty"`
 	Copyright       string                       `json:"copyright"`
+	AuthorURL       string                       `json:"author_url,omitempty"`
 	License         string                       `json:"license"`
 	RepoURL         string                       `json:"repo_url"`
 }
@@ -283,6 +284,7 @@ func BuildPresentationModel(
 	pm := &PresentationModel{
 		Entities:  make(map[string]*Entity),
 		Copyright: "© 2026 Péter Szilágyi",
+		AuthorURL: "https://x.com/peter_szilagyi",
 		License:   "BSD-3-Clause",
 		RepoURL:   "https://github.com/karalabe/uniblue",
 	}

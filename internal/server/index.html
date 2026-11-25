@@ -1129,7 +1129,7 @@
 <footer>
   <div class="ft-inner" id="app-footer">
     <span><strong>UniBlue</strong> · Home &amp; UniFi network security checkup</span>
-    <span>© 2026 Péter Szilágyi · <a href="https://github.com/karalabe/uniblue/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">BSD-3-Clause</a> · <a href="https://github.com/karalabe/uniblue" target="_blank" rel="noopener noreferrer">github.com/karalabe/uniblue</a></span>
+    <span>© 2026 <a href="https://x.com/peter_szilagyi" target="_blank" rel="noopener noreferrer">Péter Szilágyi</a> · <a href="https://github.com/karalabe/uniblue/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">BSD-3-Clause</a> · <a href="https://github.com/karalabe/uniblue" target="_blank" rel="noopener noreferrer">github.com/karalabe/uniblue</a></span>
   </div>
 </footer>
 
@@ -1866,9 +1866,14 @@ function renderHeader() {
   document.getElementById("nb-ac").textContent = actCount;
 
   if (vm.copyright) {
+    const authorURL = vm.author_url || "https://x.com/peter_szilagyi";
+    const cpHTML = esc(vm.copyright).replace(
+      "Péter Szilágyi",
+      `<a href="${esc(authorURL)}" target="_blank" rel="noopener noreferrer">Péter Szilágyi</a>`
+    );
     document.getElementById("app-footer").innerHTML = `
       <span><strong>UniBlue</strong> · Home &amp; UniFi network security checkup · Site: <strong>${esc(state.site || "default")}</strong></span>
-      <span>${esc(vm.copyright)} · <a href="${esc(vm.repo_url)}/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">${esc(vm.license)}</a> · <a href="${esc(vm.repo_url)}" target="_blank" rel="noopener noreferrer">github.com/karalabe/uniblue</a></span>`;
+      <span>${cpHTML} · <a href="${esc(vm.repo_url)}/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">${esc(vm.license)}</a> · <a href="${esc(vm.repo_url)}" target="_blank" rel="noopener noreferrer">github.com/karalabe/uniblue</a></span>`;
   }
 }
 
