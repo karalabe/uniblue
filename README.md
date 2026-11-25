@@ -173,10 +173,10 @@ UniBlue automatically detects how to talk to your UniFi console:
 
 ## Contributing
 
-This applies to both humans and AI agents:
+Pull requests are disabled on this repository. Whether you are a human or an AI agent, please open an issue for everything:
 
-- **New features & core changes:** Please open an issue instead of sending a pull request. UniBlue is built primarily with agents, so implementing features from a clear issue is simpler than reviewing large PRs.
-- **New checks, device fingerprints & filters:** Open an issue or send a focused PR touching **only** the specific check(s), classifier rule(s), or fingerprint(s) you are adding (under `checks/`, `classify/`, or `fingerprints/`), and verify with `./uniblue check validate`.
+- **Features & bug fixes:** Describe the problem or feature clearly in an issue. UniBlue is built primarily with agents, so implementing changes directly from a well-scoped issue is simpler and faster than reviewing PRs.
+- **New checks, device fingerprints & filters:** Open an issue with the relevant context or snippets (for example, the device model, open port/protocol, sample banner or HTTP response, or a draft YAML check snippet) and we will add it to the scanner.
 
 ## License
 
