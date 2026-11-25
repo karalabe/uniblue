@@ -639,6 +639,14 @@ type Network struct {
 	// is enabled on this network.
 	IsolationEnabled bool `json:"isolation_enabled,omitempty"`
 
+	// InternetAccessEnabled reports UniFi's per-network "Allow Internet Access"
+	// toggle when exposed by the controller (nil means omitted/unknown).
+	InternetAccessEnabled *bool `json:"internet_access_enabled,omitempty"`
+
+	// DomainName records the optional local DHCP domain configured on this
+	// network (e.g., "iot", "guest", "localdomain").
+	DomainName string `json:"domain_name,omitempty"`
+
 	// ZoneID is the UniFi Zone-Based Firewall zone UUID containing this network.
 	ZoneID string `json:"zone_id,omitempty"`
 
@@ -1111,6 +1119,8 @@ type rawNetwork struct {
 	IPSubnet                string     `json:"ip_subnet"`
 	IPv6Subnet              string     `json:"ipv6_subnet"`
 	NetworkIsolationEnabled bool       `json:"network_isolation_enabled"`
+	InternetAccessEnabled   *bool      `json:"internet_access_enabled"`
+	DomainName              string     `json:"domain_name"`
 	GatewayType             string     `json:"gateway_type"`
 	GatewayDevice           string     `json:"gateway_device"`
 	DHCPDEnabled            *bool      `json:"dhcpd_enabled"`
@@ -1185,22 +1195,25 @@ type integrationNetwork struct {
 	VLANID            flexString `json:"vlanId"`
 	Subnet            string     `json:"subnet"`
 	IPv6Subnet        string     `json:"ipv6Subnet"`
-	IsolationEnabled  bool       `json:"isolationEnabled"`
-	ZoneID            string     `json:"zoneId"`
-	RouterDeviceMAC   string     `json:"routerDeviceMac"`
-	GatewayDevice     string     `json:"gatewayDevice"`
-	DHCPStart         string     `json:"dhcpStart"`
-	DHCPEnd           string     `json:"dhcpEnd"`
-	DHCPGuardEnabled  *bool      `json:"dhcpGuardEnabled"`
-	MDNSEnabled       *bool      `json:"mdnsEnabled"`
-	IGMPSnooping      *bool      `json:"igmpSnooping"`
-	DNSServers        []string   `json:"dnsServers"`
-	IPv4Configuration *struct {
+	IsolationEnabled      bool       `json:"isolationEnabled"`
+	InternetAccessEnabled *bool      `json:"internetAccessEnabled"`
+	ZoneID                string     `json:"zoneId"`
+	RouterDeviceMAC       string     `json:"routerDeviceMac"`
+	GatewayDevice         string     `json:"gatewayDevice"`
+	DHCPStart             string     `json:"dhcpStart"`
+	DHCPEnd               string     `json:"dhcpEnd"`
+	DomainName            string     `json:"domainName"`
+	DHCPGuardEnabled      *bool      `json:"dhcpGuardEnabled"`
+	MDNSEnabled           *bool      `json:"mdnsEnabled"`
+	IGMPSnooping          *bool      `json:"igmpSnooping"`
+	DNSServers            []string   `json:"dnsServers"`
+	IPv4Configuration     *struct {
 		HostIPAddress     string `json:"hostIpAddress"`
 		PrefixLength      int    `json:"prefixLength"`
 		DHCPConfiguration *struct {
 			Mode           string `json:"mode"`
 			Enabled        *bool  `json:"enabled"`
+			DomainName     string `json:"domainName"`
 			IPAddressRange *struct {
 				Start string `json:"start"`
 				Stop  string `json:"stop"`
@@ -1320,4 +1333,41 @@ func (f *flexMACFilter) UnmarshalJSON(data []byte) error {
 	}
 	*f = flexMACFilter(obj)
 	return nil
+}
+
+// integrationACLRule maps a switch ACL rule returned by GET /integration/v1/sites/{id}/acl-rules.
+type integrationACLRule struct {
+	ID                    string                 `json:"id"`
+	Type                  string                 `json:"type"` // "IPV4" | "IPV6" | "MAC"
+	Name                  string                 `json:"name"`
+	Enabled               bool                   `json:"enabled"`
+	Index                 int                    `json:"index"`
+	Action                string                 `json:"action"` // "ALLOW" | "BLOCK"
+	ProtocolFilter        []string               `json:"protocolFilter"`
+	NetworkIDFilter       string                 `json:"networkIdFilter"`
+	NetworkIDs            []string               `json:"networkIds"`
+	EnforcingDeviceFilter *integrationDeviceRef  `json:"enforcingDeviceFilter"`
+	SourceFilter          *integrationACLEndpoint `json:"sourceFilter"`
+	DestinationFilter     *integrationACLEndpoint `json:"destinationFilter"`
+}
+
+type integrationDeviceRef struct {
+	Type      string   `json:"type"`
+	DeviceIDs []string `json:"deviceIds"`
+}
+
+type integrationACLEndpoint struct {
+	Type          string   `json:"type"`
+	MatchOpposite bool     `json:"matchOpposite"`
+	NetworkIDs    []string `json:"networkIds"`
+	IPAddresses   []string `json:"ipAddresses"`
+	IPs           []string `json:"ips"`
+	MACAddresses  []string `json:"macAddresses"`
+	Ports         []int    `json:"ports"`
+	Items         []struct {
+		Type  string     `json:"type"`
+		Value flexString `json:"value"`
+		Start int        `json:"start"`
+		End   int        `json:"end"`
+	} `json:"items"`
 }

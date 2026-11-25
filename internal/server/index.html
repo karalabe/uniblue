@@ -1588,6 +1588,36 @@ function humanReason(r, ent) {
       why: "Same-network peer isolation is off or not enforced across switches/APs, letting one compromised gadget scan others on the same network.",
       fix: r.remediation || "Enable Client Device Isolation on Wi-Fi and Port Isolation or switch ACLs on wired ports."
     },
+    "UB-UNIFI-ISO-INTERNET-LEAK": {
+      title: "No-internet network still has a path out to the internet",
+      why: "This isolated network is meant to stay offline, but a firewall rule or IPv6 parity gap still permits outbound internet traffic.",
+      fix: r.remediation || "Disable Allow Internet Access on this network or block External egress across both IPv4 and IPv6."
+    },
+    "UB-UNIFI-ISO-IOT-INTERNET": {
+      title: "IoT network has unrestricted internet access",
+      why: "Smart appliances and sensors on an IoT network can phone home freely unless outbound internet access is disabled or allowlisted.",
+      fix: r.remediation || "Turn off Allow Internet Access on this IoT network if devices work locally, or move it to a dedicated IoT zone and allow only required endpoints."
+    },
+    "UB-UNIFI-ISO-CAMERA-INTERNET": {
+      title: "Camera network has unrestricted internet access",
+      why: "Security cameras should talk only to your local recorder/Protect console rather than reaching the public internet directly.",
+      fix: r.remediation || "Disable Allow Internet Access on this camera network."
+    },
+    "UB-UNIFI-ISO-INBOUND-LEAK": {
+      title: "Strict inbound policy still allows broad LAN access into this isolated network",
+      why: "A firewall rule or IPv6 parity gap permits unrestricted connections from your main network into this isolated network.",
+      fix: r.remediation || "Restrict Internal inbound rules strictly to approved controller IPs and ports across both IPv4 and IPv6."
+    },
+    "UB-UNIFI-ISO-IOT-INBOUND": {
+      title: "Broad LAN inbound access is open into this IoT network",
+      why: "By default UniFi allows any main-network host to initiate connections to isolated networks instead of limiting access to specific controllers.",
+      fix: r.remediation || "Restrict Internal -> IoT rules to only the controller(s) and ports that manage these devices (such as Home Assistant)."
+    },
+    "UB-UNIFI-ISO-CAMERA-INBOUND": {
+      title: "Broad LAN inbound access is open into this camera network",
+      why: "By default UniFi allows any main-network host to initiate connections directly to cameras instead of limiting access to your recorder/admin host.",
+      fix: r.remediation || "Restrict Internal -> Camera rules strictly to your NVR or admin workstation."
+    },
     "UB-UNIFI-DYNAMIC-NAT-MAPPING": {
       title: "A device opened an automatic internet port (UPnP / NAT-PMP / PCP)",
       why: "An active dynamic port mapping forwards internet traffic to a local device without a manual router rule.",
@@ -2902,9 +2932,33 @@ function renderDevices() {
     shown += bmcs.length + others.length;
 
     const expN = [...(lane.bmc_ids || []), ...otherIDs].map(id => vm.entities[id]).filter(e => e?.state === "exposed").length;
+    const cont = lane.containment || null;
+    const archLabel = cont && cont.archetype && cont.archetype !== "isolated"
+      ? ({ guest: "Guest", iot: "IoT", camera: "Cameras" }[cont.archetype] || cont.archetype)
+      : "";
     const zoneExplain = lane.isolated
-      ? "Private isolated network: devices here can use the internet, but can't peek at your main home devices."
+      ? (cont && cont.internet_egress && (cont.internet_egress.state === "blocked" || cont.internet_egress.state === "restricted")
+          ? "Offline isolated network: devices here are separated from your main home devices and restricted from the internet."
+          : "Private isolated network: devices here are separated from your main home devices.")
       : "Shared home network: devices here can talk freely to each other.";
+
+    const axisChip = (label, axis, openIsOK) => {
+      if (!axis || !axis.state) return "";
+      const st = axis.state;
+      let tone = "neutral";
+      if (st === "isolated" || st === "blocked" || st === "restricted" || (openIsOK && st === "open")) tone = "ok";
+      else if (st === "partial") tone = "warn";
+      else if (st === "open") tone = "warn";
+      return `<span class="tag ${tone}" title="${esc(axis.detail || "")}">${esc(label)}: ${esc(st)}</span>`;
+    };
+    const contStrip = cont
+      ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+          ${axisChip("Peers", cont.peers, false)}
+          ${axisChip("LAN egress", cont.lan_egress, false)}
+          ${axisChip("Internet", cont.internet_egress, cont.archetype === "guest")}
+          ${axisChip("LAN inbound", cont.lan_inbound, false)}
+        </div>`
+      : "";
 
     html += `<div class="zone-card">
       <div class="zone-hd" style="border-left-color:${vlanColor(lane.name)}">
@@ -2914,9 +2968,11 @@ function renderDevices() {
             ${lane.isolated
               ? `<span class="tag ok">${ICONS.lock} Isolated</span>`
               : `<span class="tag blue">${ICONS.house} Shared</span>`}
+            ${archLabel ? `<span class="tag neutral" title="${esc(cont.archetype_reason || "")}">${esc(archLabel)}</span>` : ""}
             ${lane.vlan ? `<span class="small mono">VLAN ${esc(lane.vlan)}</span>` : ""}
           </div>
           <div class="zone-desc">${esc(zoneExplain)}</div>
+          ${contStrip}
         </div>
         <div class="small"><strong>${bmcs.length + others.length}</strong> device${(bmcs.length + others.length) === 1 ? "" : "s"}${expN ? ` · <strong style="color:var(--crit)">${expN} need attention</strong>` : ""}</div>
       </div>`;

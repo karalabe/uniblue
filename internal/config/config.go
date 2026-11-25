@@ -193,6 +193,17 @@ type IsolationIntent struct {
 	// GuestVLANs lists VLAN/network names reserved for guests/visitors.
 	GuestVLANs []string `yaml:"guest_vlans,omitempty" json:"guest_vlans,omitempty"`
 
+	// IoTVLANs lists VLAN/network names reserved for untrusted IoT/smart-home devices.
+	IoTVLANs []string `yaml:"iot_vlans,omitempty" json:"iot_vlans,omitempty"`
+
+	// NoInternetVLANs lists VLAN/network names where outbound internet access
+	// must stay blocked (flagging any open or leaking VLAN -> External path).
+	NoInternetVLANs []string `yaml:"no_internet_vlans,omitempty" json:"no_internet_vlans,omitempty"`
+
+	// StrictInboundVLANs lists VLAN/network names where broad LAN -> VLAN
+	// inbound access must stay blocked outside explicitly approved paths.
+	StrictInboundVLANs []string `yaml:"strict_inbound_vlans,omitempty" json:"strict_inbound_vlans,omitempty"`
+
 	// ApprovedPaths lists explicitly permitted cross-zone service paths.
 	ApprovedPaths []ApprovedPath `yaml:"approved_paths,omitempty" json:"approved_paths,omitempty"`
 

@@ -224,8 +224,9 @@ type LogicalLane struct {
 	PinnedHostIDs  []string     `json:"pinned_host_ids,omitempty"`
 	CleanHostIDs   []string     `json:"clean_host_ids,omitempty"`
 	UnknownHostIDs []string     `json:"unknown_host_ids,omitempty"`
-	TotalHosts     int          `json:"total_hosts"`
-	MigrationHint  string       `json:"migration_hint,omitempty"`
+	TotalHosts     int                      `json:"total_hosts"`
+	MigrationHint  string                   `json:"migration_hint,omitempty"`
+	Containment    *risk.NetworkContainment `json:"containment,omitempty"`
 }
 
 // Census holds exact clickable filter counts derived from the same predicates
@@ -1485,7 +1486,7 @@ func BuildPresentationModel(
 	pm.Physical = buildPhysicalRows(snap, swByMAC, gwMAC, apClientCount, pm.Entities)
 
 	// 9. Build logical zone lanes (BMCs stay pinned in their real VLAN, clean hosts group in the dot grid).
-	pm.Logical = buildLogicalLanes(snap, topo, pm.Entities, netEntByName)
+	pm.Logical = buildLogicalLanes(snap, topo, report.Isolation, pm.Entities, netEntByName)
 
 	// 10. Compute census counts from the finalized entities.
 	for _, ent := range pm.Entities {
@@ -1980,9 +1981,18 @@ func buildPhysicalRows(
 func buildLogicalLanes(
 	snap *unifi.Snapshot,
 	topo *topology.Model,
+	iso *risk.IsolationMatrix,
 	entities map[string]*Entity,
 	netEntByName map[string]string,
 ) []LogicalLane {
+	containmentByNet := make(map[string]risk.NetworkContainment)
+	if iso != nil {
+		for _, nc := range iso.Containment {
+			if k := strings.ToLower(strings.TrimSpace(nc.NetworkName)); k != "" {
+				containmentByNet[k] = nc
+			}
+		}
+	}
 	// Index all host entities by lowercase VLAN name, mapping empty/unresolved names
 	// to "unassigned" so they match topology.Build's "Unassigned" VLAN group.
 	hostsByNet := make(map[string][]*Entity)
@@ -2025,6 +2035,10 @@ func buildLogicalLanes(
 			Isolated:   isolated,
 			ValveState: VerdictOK,
 		}
+		if nc, ok := containmentByNet[key]; ok {
+			cp := nc
+			lane.Containment = &cp
+		}
 		hosts := hostsByNet[key]
 		sort.Slice(hosts, func(i, j int) bool {
 			if verdictRank(hosts[i].State) != verdictRank(hosts[j].State) {
@@ -2038,7 +2052,8 @@ func buildLogicalLanes(
 				lane.BMCIDs = append(lane.BMCIDs, h.ID)
 				continue
 			}
-			if !isolated && h.State == VerdictExposed && (h.Role == "iot" || h.Role == "camera" || h.Role == "printer" || h.Role == "media") {
+			isUniFiGear := strings.Contains(strings.ToLower(h.Vendor), "ubiquiti") || strings.Contains(strings.ToLower(h.Vendor), "unifi")
+			if !isolated && !isUniFiGear && h.State == VerdictExposed && (h.Role == "iot" || h.Role == "camera" || h.Role == "printer" || h.Role == "media") {
 				trustedExposedIoT++
 			}
 			switch h.State {

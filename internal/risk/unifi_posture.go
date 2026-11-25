@@ -141,8 +141,10 @@ func AnalyzeUniFiPosture(
 			})
 		}
 
-		// Guest or IoT SSID missing Layer-2 Client Device Isolation.
-		if isIntendedIsolated && !w.L2Isolation {
+		// Guest or IoT SSID missing Layer-2 Client Device Isolation (also applies to
+		// any SSID mapped onto an isolated VLAN even if the SSID name itself is generic).
+		isOnIsolatedVLAN := isNetworkInSet(w.NetworkName, isolatedSet)
+		if (isIntendedIsolated || isOnIsolatedVLAN) && !w.L2Isolation {
 			findings = append(findings, checks.Finding{
 				CheckID:           "UB-UNIFI-WIFI-NO-L2-ISOLATION",
 				Title:             fmt.Sprintf("Guest/IoT Wi-Fi Missing Client Device Isolation (%s)", w.Name),

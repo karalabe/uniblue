@@ -61,12 +61,13 @@ type IsolationCell struct {
 // IsolationMatrix summarizes effective isolation policy evaluation across zones,
 // IPv4/IPv6 families, gateway vs switch routing, and Wi-Fi/wired L2 boundaries.
 type IsolationMatrix struct {
-	Cells          []IsolationCell `json:"cells,omitempty"`
-	ApprovedCount  int             `json:"approved_count"`
-	BlockedOKCount int             `json:"blocked_ok_count"`
-	ViolationCount int             `json:"violation_count"`
-	UnknownCount   int             `json:"unknown_count"`
-	BrokenDepCount int             `json:"broken_dep_count"`
+	Cells          []IsolationCell      `json:"cells,omitempty"`
+	Containment    []NetworkContainment `json:"containment,omitempty"`
+	ApprovedCount  int                  `json:"approved_count"`
+	BlockedOKCount int                  `json:"blocked_ok_count"`
+	ViolationCount int                  `json:"violation_count"`
+	UnknownCount   int                  `json:"unknown_count"`
+	BrokenDepCount int                  `json:"broken_dep_count"`
 }
 
 type pathQuery struct {
@@ -756,6 +757,20 @@ func EvaluateIsolation(
 		addCell(c)
 	}
 	findings = append(findings, sameVLANFindings...)
+
+	// 5. Evaluate 4-axis Network Containment (Peers, LAN Egress, Internet Egress,
+	// LAN Inbound) and smart Guest/IoT/Camera archetypes for every isolated VLAN.
+	containment, contCells, contFindings, contNotes := evaluateNetworkContainment(
+		snap, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason,
+		switchACLStatus, switchACLReason, gwName, gwIP,
+		untrustedNets, trustedNets, matrix.Cells,
+	)
+	matrix.Containment = containment
+	for _, c := range contCells {
+		addCell(c)
+	}
+	findings = append(findings, contFindings...)
+	notes = append(notes, contNotes...)
 
 	return matrix, findings, notes
 }
