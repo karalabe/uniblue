@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -43,6 +44,9 @@ import (
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
 		fmt.Fprintf(os.Stderr, "uniblue: %v\n", err)
 		os.Exit(1)
 	}
@@ -127,6 +131,9 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
+	if err := verifyStatePathWritable(cfg.State.Path); err != nil {
+		return fmt.Errorf("state path %q is not writable (set state.path to a writable file): %w", cfg.State.Path, err)
+	}
 	checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
 	if err != nil {
 		return err
@@ -146,7 +153,8 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 
 	if *saveState {
-		st := risk.BuildState(snap, report, cfg.Network)
+		prev, _ := risk.LoadState(cfg.State.Path)
+		st := risk.BuildStateWithPrev(prev, snap, report, cfg.Network, probedHostKeys(profiles))
 		if err := risk.SaveState(cfg.State.Path, st); err != nil {
 			return err
 		}
@@ -162,7 +170,7 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			"potential_cves":   potentialCVEs,
 		})
 	}
-	printReport(stdout, snap, report, exactCVEs, potentialCVEs, cveLoaded)
+	printReport(stdout, snap, report, profiles, exactCVEs, potentialCVEs, cveLoaded)
 	return nil
 }
 
@@ -180,6 +188,9 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
+	}
+	if err := verifyStatePathWritable(cfg.State.Path); err != nil {
+		return fmt.Errorf("state path %q is not writable (set state.path to a writable file): %w", cfg.State.Path, err)
 	}
 	checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
 	if err != nil {
@@ -210,7 +221,7 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			return
 		}
 
-		snap, _, report, err := executeCycle(ctx, cfg, checkList)
+		snap, profiles, report, err := executeCycle(ctx, cfg, checkList)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -232,11 +243,12 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 
 		if diff.HasAlerts(minSev) {
 			if err := notifier.Send(ctx, snap.Site, diff); err != nil {
-				logger.Error("failed to send notification", "err", err)
+				logger.Error("failed to send notification; preserving previous baseline for retry", "err", err)
+				return
 			}
 		}
 
-		nextState := risk.BuildState(snap, report, cfg.Network)
+		nextState := risk.BuildStateWithPrev(prev, snap, report, cfg.Network, probedHostKeys(profiles))
 		if err := risk.SaveState(cfg.State.Path, nextState); err != nil {
 			logger.Error("failed to save state", "err", err)
 		}
@@ -368,6 +380,8 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	fs := flag.NewFlagSet("check test", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	target := fs.String("target", "", "target LAN IP address to test")
+	hostname := fs.String("hostname", "", "optional target hostname for hostname-gated checks")
+	mac := fs.String("mac", "", "optional target MAC address for MAC/OUI-gated checks")
 	dir := fs.String("dir", "", "optional directory of extra YAML checks")
 	checkID := fs.String("check", "", "optional single check ID to run (e.g., UB-0003)")
 	timeout := fs.Duration("timeout", 3*time.Second, "per-probe timeout")
@@ -395,8 +409,8 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		list = filtered
 	}
 
-	// Build a minimal port list covering every precondition port across the
-	// selected checks plus UniBlue's default ports.
+	// Build a port list covering every precondition port (PortsAny, PortsAll,
+	// Probe.Port) across the selected checks plus UniBlue's default ports.
 	portSet := make(map[int]struct{})
 	for _, p := range config.DefaultPorts {
 		portSet[p] = struct{}{}
@@ -405,14 +419,34 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		for _, p := range chk.Preconditions.PortsAny {
 			portSet[p] = struct{}{}
 		}
+		for _, p := range chk.Preconditions.PortsAll {
+			portSet[p] = struct{}{}
+		}
+		if chk.Probe.Port > 0 {
+			portSet[chk.Probe.Port] = struct{}{}
+		}
 	}
 	ports := make([]int, 0, len(portSet))
 	for p := range portSet {
 		ports = append(ports, p)
 	}
 
+	targetCl := unifi.Client{
+		IP:       strings.TrimSpace(*target),
+		Hostname: strings.TrimSpace(*hostname),
+		MAC:      config.CanonicalMAC(*mac),
+	}
 	fp := probe.NewFingerprinter(ports, 1, *timeout, nil)
-	profile := fp.FingerprintHost(ctx, unifi.Client{IP: *target, Name: *target})
+	profiles := fp.FingerprintAll(ctx, []unifi.Client{targetCl})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var profile probe.HostProfile
+	if len(profiles) > 0 {
+		profile = profiles[0]
+	} else {
+		profile = probe.HostProfile{Client: targetCl}
+	}
 
 	fmt.Fprintf(stdout, "Target: %s | Open ports: %v\n", *target, profile.OpenPorts)
 	for port, banner := range profile.HTTP {
@@ -421,8 +455,20 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 	runner := checks.NewRunner(list, 1)
 	findings := runner.RunHost(ctx, profile)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(findings) == 0 {
 		fmt.Fprintln(stdout, "No findings matched.")
+		if *checkID != "" && len(list) == 1 {
+			chk := list[0]
+			if chk.Preconditions.HostnameRegex != "" && targetCl.Hostname == "" {
+				fmt.Fprintln(stderr, "Note: this check requires hostname_regex; pass -hostname <name> to evaluate it.")
+			}
+			if (len(chk.Preconditions.MACPrefix) > 0 || len(chk.Preconditions.OUIContains) > 0) && targetCl.MAC == "" {
+				fmt.Fprintln(stderr, "Note: this check requires MAC/OUI metadata; pass -mac <mac> to evaluate it.")
+			}
+		}
 		return nil
 	}
 	for _, f := range findings {
@@ -457,6 +503,9 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	// matching hosts instead of every host on the LAN.
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, risk.Report{}, err
+	}
 
 	// Attach owner-supplied site supplement, bridge/NVR inventories, and passive
 	// service/flow records through the same helper used across all CLI modes.
@@ -464,6 +513,9 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 
 	runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
 	rawFindings := runner.RunAll(ctx, profiles)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, risk.Report{}, err
+	}
 
 	// Merge noise-filtered Nerva protocol findings (e.g., legacy protocols,
 	// anonymous service access, expired TLS certs) so they receive UniFi
@@ -472,6 +524,45 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 
 	report := risk.Evaluate(snap, rawFindings, cfg.Network)
 	return snap, profiles, report, nil
+}
+
+// verifyStatePathWritable creates parent directories if needed and writes+removes
+// a tiny probe file so unwritable state paths fail fast at startup instead of
+// silently causing repeated alert storms every watch interval.
+func verifyStatePathWritable(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	f, err := os.CreateTemp(dir, ".uniblue-write-check-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
+}
+
+func probedHostKeys(profiles []probe.HostProfile) map[string]struct{} {
+	out := make(map[string]struct{}, len(profiles)*2)
+	for _, hp := range profiles {
+		if m := strings.ToLower(strings.TrimSpace(hp.Client.MAC)); m != "" {
+			out[m] = struct{}{}
+		}
+		for _, ip := range hp.Client.AllIPs() {
+			out[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
+		}
+	}
+	return out
 }
 
 // enrichSiteAndProfiles merges owner-supplied site supplements (switch ACLs,
@@ -569,7 +660,7 @@ func loadAllChecks(extraDir string) ([]*checks.Check, error) {
 // printReport renders a unified, operator-ready security summary combining
 // confirmed live check findings, exact-version CVE rollups, classified WAN
 // exposure, version-unknown patch checks, and clean-posture statistics.
-func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVEs, potentialCVEs []cve.ProductSummary, cveLoaded bool) {
+func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, profiles []probe.HostProfile, exactCVEs, potentialCVEs []cve.ProductSummary, cveLoaded bool) {
 	fmt.Fprintf(w, "UniBlue Security Summary | Site: %s (%s) | Clients: %d | UniFi Gear: %d | Networks: %d\n\n",
 		snap.Site, snap.ControllerType, report.ClientCount, report.UniFiDeviceCount, len(snap.Networks))
 
@@ -686,7 +777,20 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, exactCVE
 		fmt.Fprintf(w, "  - [LOW] %s: %s\n", f.Title, f.Evidence)
 	}
 	fmt.Fprintf(w, "  - [OK] UniFi Infrastructure: %d/%d device(s) up to date\n", report.CleanUniFiDevices, report.UniFiDeviceCount)
-	fmt.Fprintf(w, "  - [OK] LAN Clients:          %d/%d active host(s) passed with zero unauthenticated services exposed\n", report.CleanClients, report.ClientCount)
+	probedCount := len(profiles)
+	skippedCount := report.ClientCount - probedCount
+	if skippedCount < 0 {
+		skippedCount = 0
+	}
+	cleanProbed := report.CleanClients - skippedCount
+	if cleanProbed < 0 {
+		cleanProbed = 0
+	}
+	if skippedCount > 0 {
+		fmt.Fprintf(w, "  - [OK] LAN Clients:          %d/%d probed host(s) passed (%d skipped/excluded)\n", cleanProbed, probedCount, skippedCount)
+	} else {
+		fmt.Fprintf(w, "  - [OK] LAN Clients:          %d/%d active host(s) passed with zero unauthenticated services exposed\n", report.CleanClients, report.ClientCount)
+	}
 	if !cveLoaded {
 		fmt.Fprintln(w, "  - [TIP] Run `uniblue cve sync` once to include offline NVD+KEV correlation in `uniblue scan`.")
 	}
@@ -817,19 +921,35 @@ func runCVE(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 }
 
+// resolveCVECacheDir resolves the local CVE cache directory, honoring an
+// explicit -cache flag first, then cve.cache_dir from config.yaml when present,
+// and finally cve.DefaultCacheDir().
+func resolveCVECacheDir(flagDir, cfgPath string) string {
+	if strings.TrimSpace(flagDir) != "" {
+		return strings.TrimSpace(flagDir)
+	}
+	if strings.TrimSpace(cfgPath) != "" {
+		if cfg, err := config.Load(cfgPath); err == nil && strings.TrimSpace(cfg.CVE.CacheDir) != "" {
+			return strings.TrimSpace(cfg.CVE.CacheDir)
+		}
+	}
+	return cve.DefaultCacheDir()
+}
+
 // runCVESync downloads CISA KEV and NVD JSON 2.0 yearly feeds into the local
 // vendor-sharded cache and prints storage and timing metrics.
 func runCVESync(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("cve sync", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cacheDir := fs.String("cache", cve.DefaultCacheDir(), "local CVE cache directory")
+	cfgPath := fs.String("config", "config.yaml", "optional UniBlue YAML config file (used for cve.cache_dir)")
+	cacheDir := fs.String("cache", "", "local CVE cache directory (overrides config)")
 	since := fs.Int("since", 2002, "earliest NVD year to download (2002 = full database)")
 	force := fs.Bool("force", false, "re-download and re-index even if feeds are unchanged")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	cache := cve.NewCache(*cacheDir)
+	cache := cve.NewCache(resolveCVECacheDir(*cacheDir, *cfgPath))
 	stats, err := cache.Sync(ctx, cve.SyncOptions{
 		SinceYear: *since,
 		Force:     *force,
@@ -864,6 +984,9 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 	jsonOut := fs.Bool("json", false, "output matches as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *limit < 0 {
+		return fmt.Errorf("cve explore: -limit must be >= 0 (got %d)", *limit)
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -971,13 +1094,17 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 func runCVESearch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("cve search", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cacheDir := fs.String("cache", cve.DefaultCacheDir(), "local CVE cache directory")
+	cfgPath := fs.String("config", "config.yaml", "optional UniBlue YAML config file (used for cve.cache_dir)")
+	cacheDir := fs.String("cache", "", "local CVE cache directory (overrides config)")
 	vendor := fs.String("vendor", "", "restrict search to one CPE vendor shard")
 	kevOnly := fs.Bool("kev", false, "show only CISA KEV actively exploited CVEs")
 	minSevStr := fs.String("min-severity", "low", "minimum severity (info, low, medium, high, critical)")
 	limit := fs.Int("limit", 30, "maximum number of results")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *limit < 0 {
+		return fmt.Errorf("cve search: -limit must be >= 0 (got %d)", *limit)
 	}
 
 	minSev, err := checks.ParseSeverity(*minSevStr)
@@ -989,7 +1116,7 @@ func runCVESearch(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return errors.New("cve search requires a query, -vendor, or -kev")
 	}
 
-	cache := cve.NewCache(*cacheDir)
+	cache := cve.NewCache(resolveCVECacheDir(*cacheDir, *cfgPath))
 	recs, err := cache.Search(ctx, query, cve.SearchOptions{
 		Vendor:      *vendor,
 		KEVOnly:     *kevOnly,
@@ -1024,7 +1151,8 @@ func runCVESearch(ctx context.Context, args []string, stdout, stderr io.Writer) 
 func runCVEShow(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("cve show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cacheDir := fs.String("cache", cve.DefaultCacheDir(), "local CVE cache directory")
+	cfgPath := fs.String("config", "config.yaml", "optional UniBlue YAML config file (used for cve.cache_dir)")
+	cacheDir := fs.String("cache", "", "local CVE cache directory (overrides config)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1032,7 +1160,7 @@ func runCVEShow(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return errors.New("usage: uniblue cve show [-cache <dir>] <CVE-ID>")
 	}
 
-	cache := cve.NewCache(*cacheDir)
+	cache := cve.NewCache(resolveCVECacheDir(*cacheDir, *cfgPath))
 	rec, err := cache.LookupCVE(ctx, fs.Arg(0))
 	if err != nil {
 		return err
@@ -1083,6 +1211,9 @@ func formatCPERange(m cve.CPEMatch) string {
 
 // printCVEMatchTable renders a compact, readable table of CVE matches.
 func printCVEMatchTable(w io.Writer, matches []cve.Match, maxRows int) {
+	if maxRows < 0 {
+		maxRows = 0
+	}
 	if len(matches) > maxRows {
 		matches = matches[:maxRows]
 	}
@@ -1216,9 +1347,15 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
 		fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		enrichSiteAndProfiles(snap, profiles, cfg.Network)
 		runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
 		rawFindings = runner.RunAll(ctx, profiles)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 	} else {
 		profiles = make([]probe.HostProfile, len(snap.Clients))
@@ -1269,8 +1406,10 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			}
 			if hp, ok := profileByMAC[k]; ok {
 				cv.OpenPorts = hp.OpenPorts
-				ts := hp.ScannedAt
-				cv.LastScannedAt = &ts
+				if !hp.ScannedAt.IsZero() {
+					ts := hp.ScannedAt
+					cv.LastScannedAt = &ts
+				}
 			}
 			clientViews = append(clientViews, cv)
 		}
@@ -1353,6 +1492,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
+	}
+	if err := verifyStatePathWritable(cfg.State.Path); err != nil {
+		return fmt.Errorf("state path %q is not writable (set state.path to a writable file): %w", cfg.State.Path, err)
 	}
 	checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
 	if err != nil {
