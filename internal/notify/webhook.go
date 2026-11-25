@@ -111,11 +111,8 @@ func parseWebhookSecret(raw string) ([]byte, error) {
 			return nil, errors.New("notify webhook_secret: empty whsec_ base64 payload")
 		}
 		key, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			key, err = base64.RawStdEncoding.DecodeString(encoded)
-		}
 		if err != nil || len(key) == 0 {
-			return nil, errors.New("notify webhook_secret: invalid whsec_ base64 payload")
+			return nil, errors.New("notify webhook_secret: invalid whsec_ standard base64 payload (check padding)")
 		}
 		return key, nil
 	}

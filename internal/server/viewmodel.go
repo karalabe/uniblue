@@ -60,6 +60,7 @@ type Reason struct {
 type ServiceView struct {
 	Port             int    `json:"port"`
 	Proto            string `json:"proto"` // "tcp" | "udp"
+	AddressFamily    string `json:"address_family,omitempty"`
 	Name             string `json:"name,omitempty"`
 	Reachable        string `json:"reachable"` // "wan" | "wan-restricted" | "wan-cgnat" | "lan" | "vlan-only" | "advertised" | "unknown"
 	State            string `json:"state,omitempty"`
@@ -2152,49 +2153,112 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		return wanReachLabel(wanPortInfo{restricted: allRestricted}), allRestricted, true
 	}
 
-	protoByKey := make(map[string]probe.Service)
+	// Group observed services by (transport, port), preserving distinct protocols
+	// across IPv4/IPv6 (e.g., IPv4 HTTPS and IPv6 MQTT on the same TCP port)
+	// while collapsing duplicate rows when both families run the same protocol.
+	servicesByEndpoint := make(map[string][]probe.Service)
 	for _, svc := range hp.Services {
-		if svc.Port > 0 {
-			t := strings.ToLower(strings.TrimSpace(svc.Transport))
-			if t == "" {
-				t = "tcp"
+		if svc.Port <= 0 {
+			continue
+		}
+		t := strings.ToLower(strings.TrimSpace(svc.Transport))
+		if t == "" {
+			t = "tcp"
+		}
+		epKey := fmt.Sprintf("%s:%d", t, svc.Port)
+		normProto := strings.ToLower(strings.TrimSpace(svc.Protocol))
+		normFam := strings.ToLower(strings.TrimSpace(svc.AddressFamily))
+		existing := servicesByEndpoint[epKey]
+		merged := false
+		for i := range existing {
+			exProto := strings.ToLower(strings.TrimSpace(existing[i].Protocol))
+			exFam := strings.ToLower(strings.TrimSpace(existing[i].AddressFamily))
+			if exProto == normProto {
+				if exFam != "" && normFam != "" && exFam != normFam {
+					existing[i].AddressFamily = ""
+				} else if exFam == "" && normFam != "" {
+					existing[i].AddressFamily = normFam
+				}
+				if existing[i].State == "" && svc.State != "" {
+					existing[i].State = svc.State
+				}
+				merged = true
+				break
 			}
-			protoByKey[fmt.Sprintf("%s:%d", t, svc.Port)] = svc
+		}
+		if !merged {
+			cp := svc
+			cp.Transport = t
+			cp.AddressFamily = normFam
+			servicesByEndpoint[epKey] = append(existing, cp)
 		}
 	}
+
 	defaultReach := "lan"
 	if vlanIsolated {
 		defaultReach = "vlan-only"
 	}
 
+	formatServiceLabel := func(name, transport string, port int, fam string, multiOnPort bool) string {
+		base := fmt.Sprintf("%s :%d", strings.ToUpper(firstStr(name, transport)), port)
+		if multiOnPort && fam != "" {
+			switch strings.ToLower(fam) {
+			case "ipv4":
+				return base + " (IPv4)"
+			case "ipv6":
+				return base + " (IPv6)"
+			default:
+				return fmt.Sprintf("%s (%s)", base, fam)
+			}
+		}
+		return base
+	}
+
 	var out []ServiceView
 	seen := make(map[string]bool)
-	for _, p := range cv.OpenPorts {
-		key := fmt.Sprintf("tcp:%d", p)
-		if seen[key] {
-			continue
+	emitObservedEndpoint := func(epKey string, port int, transport string) {
+		if seen[epKey] {
+			return
 		}
-		seen[key] = true
+		seen[epKey] = true
 		reach := defaultReach
 		srcRestricted := false
-		if lbl, restr, ok := wanReachForEndpoint(p, "tcp"); ok {
+		if lbl, restr, ok := wanReachForEndpoint(port, transport); ok {
 			reach = lbl
 			srcRestricted = restr
 		}
-		svcMeta := protoByKey[key]
-		name := svcMeta.Protocol
-		if name == "" {
-			name = commonPortLabel(p)
+		svcs := servicesByEndpoint[epKey]
+		if len(svcs) == 0 {
+			name := commonPortLabel(port)
+			out = append(out, ServiceView{
+				Port:             port,
+				Proto:            transport,
+				Name:             name,
+				Reachable:        reach,
+				State:            probe.ServiceStateCandidatePort,
+				SourceRestricted: srcRestricted,
+				Label:            formatServiceLabel(name, transport, port, "", false),
+			})
+			return
 		}
-		out = append(out, ServiceView{
-			Port:             p,
-			Proto:            "tcp",
-			Name:             name,
-			Reachable:        reach,
-			State:            firstStr(svcMeta.State, probe.ServiceStateCandidatePort),
-			SourceRestricted: srcRestricted,
-			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(firstStr(name, "tcp")), p),
-		})
+		multi := len(svcs) > 1
+		for _, svc := range svcs {
+			name := firstStr(svc.Protocol, commonPortLabel(port))
+			out = append(out, ServiceView{
+				Port:             port,
+				Proto:            transport,
+				AddressFamily:    svc.AddressFamily,
+				Name:             name,
+				Reachable:        reach,
+				State:            firstStr(svc.State, probe.ServiceStateObservedProtocol),
+				SourceRestricted: srcRestricted,
+				Label:            formatServiceLabel(name, transport, port, svc.AddressFamily, multi),
+			})
+		}
+	}
+
+	for _, p := range cv.OpenPorts {
+		emitObservedEndpoint(fmt.Sprintf("tcp:%d", p), p, "tcp")
 	}
 	// Include observed UDP or passive services from hp.Services that were not in TCP OpenPorts.
 	for _, svc := range hp.Services {
@@ -2205,27 +2269,7 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		if t == "" {
 			t = "tcp"
 		}
-		key := fmt.Sprintf("%s:%d", t, svc.Port)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		reach := defaultReach
-		srcRestricted := false
-		if lbl, restr, ok := wanReachForEndpoint(svc.Port, t); ok {
-			reach = lbl
-			srcRestricted = restr
-		}
-		name := firstStr(svc.Protocol, commonPortLabel(svc.Port))
-		out = append(out, ServiceView{
-			Port:             svc.Port,
-			Proto:            t,
-			Name:             name,
-			Reachable:        reach,
-			State:            firstStr(svc.State, probe.ServiceStateObservedProtocol),
-			SourceRestricted: srcRestricted,
-			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(firstStr(name, t)), svc.Port),
-		})
+		emitObservedEndpoint(fmt.Sprintf("%s:%d", t, svc.Port), svc.Port, t)
 	}
 	// Also record UDP-only WAN forwards as distinct UDP endpoints in deterministic
 	// sorted port order so a UDP forward never conflates with a TCP service.
@@ -2325,6 +2369,52 @@ func isSnapshotWANBehindCGNAT(snap *unifi.Snapshot) bool {
 	return cgnat.Contains(addr)
 }
 
+func findMatchingServiceIndex(services []ServiceView, f checks.Finding) int {
+	proto := f.EffectiveTransport()
+	var matches []int
+	for i := range services {
+		if services[i].Port == f.Port && strings.EqualFold(services[i].Proto, proto) {
+			matches = append(matches, i)
+		}
+	}
+	if len(matches) == 0 {
+		return -1
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	hay := strings.ToLower(f.Title + " " + f.Evidence + " " + f.CheckID + " " + f.Property)
+	for _, idx := range matches {
+		if name := strings.ToLower(strings.TrimSpace(services[idx].Name)); name != "" && strings.Contains(hay, name) {
+			return idx
+		}
+	}
+	return matches[0]
+}
+
+func appendFamilyTagIfNeeded(label, fam string, services []ServiceView, port int, proto string) string {
+	if fam == "" {
+		return label
+	}
+	count := 0
+	for _, s := range services {
+		if s.Port == port && strings.EqualFold(s.Proto, proto) {
+			count++
+		}
+	}
+	if count <= 1 {
+		return label
+	}
+	switch strings.ToLower(fam) {
+	case "ipv4":
+		return label + " (IPv4)"
+	case "ipv6":
+		return label + " (IPv6)"
+	default:
+		return fmt.Sprintf("%s (%s)", label, fam)
+	}
+}
+
 func recordObservedService(ent *Entity, f checks.Finding) {
 	if f.Port <= 0 {
 		return
@@ -2334,16 +2424,14 @@ func recordObservedService(ent *Entity, f checks.Finding) {
 	if f.ClaimKind == checks.ClaimServiceAdvertised {
 		obsState = probe.ServiceStateAdvertisedService
 	}
-	for i := range ent.Services {
-		if ent.Services[i].Port == f.Port && strings.EqualFold(ent.Services[i].Proto, proto) {
-			if !ent.Services[i].Exposed {
-				ent.Services[i].Label = compactCheckChip(f)
-			}
-			if obsState == probe.ServiceStateObservedProtocol {
-				ent.Services[i].State = obsState
-			}
-			return
+	if idx := findMatchingServiceIndex(ent.Services, f); idx >= 0 {
+		if !ent.Services[idx].Exposed {
+			ent.Services[idx].Label = appendFamilyTagIfNeeded(compactCheckChip(f), ent.Services[idx].AddressFamily, ent.Services, f.Port, proto)
 		}
+		if obsState == probe.ServiceStateObservedProtocol {
+			ent.Services[idx].State = obsState
+		}
+		return
 	}
 	reach := "lan"
 	if f.ClaimKind == checks.ClaimServiceAdvertised {
@@ -2366,16 +2454,14 @@ func markServiceExposed(ent *Entity, f checks.Finding) {
 	}
 	proto := f.EffectiveTransport()
 	newSev := f.EffectiveSeverity.String()
-	for i := range ent.Services {
-		if ent.Services[i].Port == f.Port && strings.EqualFold(ent.Services[i].Proto, proto) {
-			wasExposed := ent.Services[i].Exposed
-			ent.Services[i].Exposed = true
-			if !wasExposed || sevStrRank(newSev) > sevStrRank(ent.Services[i].Severity) {
-				ent.Services[i].Severity = newSev
-				ent.Services[i].Label = compactCheckChip(f)
-			}
-			return
+	if idx := findMatchingServiceIndex(ent.Services, f); idx >= 0 {
+		wasExposed := ent.Services[idx].Exposed
+		ent.Services[idx].Exposed = true
+		if !wasExposed || sevStrRank(newSev) > sevStrRank(ent.Services[idx].Severity) {
+			ent.Services[idx].Severity = newSev
+			ent.Services[idx].Label = appendFamilyTagIfNeeded(compactCheckChip(f), ent.Services[idx].AddressFamily, ent.Services, f.Port, proto)
 		}
+		return
 	}
 	ent.Services = append(ent.Services, ServiceView{
 		Port:      f.Port,

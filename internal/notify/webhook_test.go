@@ -448,17 +448,22 @@ func TestNotifierStandardWebhooksSigning(t *testing.T) {
 	})
 
 	t.Run("invalid_whsec_rejected_without_echoing_secret", func(t *testing.T) {
-		_, err := New(config.NotifyConfig{
-			WebhookURL:    "https://hooks.example.test/x",
-			WebhookSecret: "whsec_!!!NOT_BASE64_TOPSECRET!!!",
-			Format:        "json",
-			MinSeverity:   "medium",
-		})
-		if err == nil {
-			t.Fatal("expected error for malformed whsec_ secret")
-		}
-		if strings.Contains(err.Error(), "TOPSECRET") {
-			t.Fatalf("error leaked secret: %v", err)
+		for _, bad := range []string{
+			"whsec_!!!NOT_BASE64_TOPSECRET!!!",
+			"whsec_" + base64.RawStdEncoding.EncodeToString([]byte("unpadded-secret-1")), // missing '=' padding
+		} {
+			_, err := New(config.NotifyConfig{
+				WebhookURL:    "https://hooks.example.test/x",
+				WebhookSecret: bad,
+				Format:        "json",
+				MinSeverity:   "medium",
+			})
+			if err == nil {
+				t.Fatalf("expected error for malformed/unpadded whsec_ secret %q", bad)
+			}
+			if strings.Contains(err.Error(), "TOPSECRET") || strings.Contains(err.Error(), "unpadded") {
+				t.Fatalf("error leaked secret: %v", err)
+			}
 		}
 	})
 }

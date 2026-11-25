@@ -1083,3 +1083,62 @@ func TestWebhookRetryPreservesIDAndResigns(t *testing.T) {
 		}
 	}
 }
+
+// TestIPv6OnlyClientJoinTriggersImmediateScan verifies that applySnapshotDelta
+// queues an immediate targeted scan when an IPv6-only client joins or changes
+// its IPv6 address (even when Client.IP is empty).
+func TestIPv6OnlyClientJoinTriggersImmediateScan(t *testing.T) {
+	eng := NewDemoEngineForTest(t)
+	eng.cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+
+	baseSnap := &unifi.Snapshot{
+		Site: "default",
+		Networks: []unifi.Network{
+			{ID: "net-iot", Name: "IoT", VLAN: "20", Subnet: "10.0.20.1/24", IPv6Subnet: "fd00:20::1/64", Purpose: "corporate", ZoneName: "IoT"},
+		},
+		Clients: []unifi.Client{},
+	}
+	eng.mu.Lock()
+	eng.snap = baseSnap
+	eng.mu.Unlock()
+
+	v6Client := unifi.Client{
+		MAC:         "02:66:77:88:99:01",
+		Name:        "matter-sensor",
+		IPv6:        []string{"fd00:20::42"},
+		NetworkID:   "net-iot",
+		NetworkName: "IoT",
+		IsWired:     false,
+	}
+	joinSnap := &unifi.Snapshot{
+		Site:     "default",
+		Networks: baseSnap.Networks,
+		Clients:  []unifi.Client{v6Client},
+	}
+	toScan := eng.applySnapshotDelta(context.Background(), joinSnap, time.Now().UTC())
+	if len(toScan) != 1 || toScan[0].client.MAC != v6Client.MAC || toScan[0].client.PrimaryIP() != "fd00:20::42" {
+		t.Fatalf("expected IPv6-only client join to queue immediate scan, got %+v", toScan)
+	}
+	foundJoined := false
+	for _, ev := range eng.Snapshot().Events {
+		if ev.Type == "client_joined" && ev.IP == "fd00:20::42" && strings.Contains(ev.Summary, "queuing security scan") {
+			foundJoined = true
+		}
+	}
+	if !foundJoined {
+		t.Fatalf("expected client_joined event with IPv6 address and scan queued, got %+v", eng.Snapshot().Events)
+	}
+
+	// Updating the IPv6 address on the IPv6-only client must also re-queue a scan.
+	movedClient := v6Client
+	movedClient.IPv6 = []string{"fd00:20::99"}
+	moveSnap := &unifi.Snapshot{
+		Site:     "default",
+		Networks: baseSnap.Networks,
+		Clients:  []unifi.Client{movedClient},
+	}
+	toScanMove := eng.applySnapshotDelta(context.Background(), moveSnap, time.Now().UTC().Add(time.Second))
+	if len(toScanMove) != 1 || toScanMove[0].client.PrimaryIP() != "fd00:20::99" {
+		t.Fatalf("expected IPv6 address change to re-queue scan, got %+v", toScanMove)
+	}
+}

@@ -946,3 +946,70 @@ func TestIPv6OnlyHostReceivesAdvisoriesAndClassification(t *testing.T) {
 		t.Fatalf("expected IPv6-only host to receive 2 exact CVEs, got count=%d list=%+v", ent.ExactCVECount, ent.ExactCVEs)
 	}
 }
+
+// TestHostServicesPreservesDistinctProtocolsAcrossAddressFamiliesOnSamePort
+// verifies that buildHostServices preserves both IPv4 HTTPS and IPv6 MQTT on
+// the same TCP port as distinct service rows (labeled with IPv4/IPv6) while
+// still collapsing identical protocols across dual-stack families.
+func TestHostServicesPreservesDistinctProtocolsAcrossAddressFamiliesOnSamePort(t *testing.T) {
+	now := time.Now().UTC()
+	cl := unifi.Client{
+		MAC:         "02:aa:bb:cc:dd:44",
+		Name:        "dual-broker",
+		IP:          "10.0.10.44",
+		IPv6:        []string{"fd00:10::44"},
+		NetworkName: "LAN",
+	}
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Networks: []unifi.Network{
+			{ID: "net-lan", Name: "LAN", VLAN: "1", Subnet: "10.0.10.1/24", IPv6Subnet: "fd00:10::1/64", Purpose: "corporate", ZoneName: "Internal"},
+		},
+		Clients: []unifi.Client{cl},
+	}
+	clientViews := []ClientView{
+		{
+			Client:        cl,
+			OpenPorts:     []int{22, 443},
+			LastScannedAt: &now,
+		},
+	}
+	profiles := []probe.HostProfile{
+		{
+			Client:    cl,
+			OpenPorts: []int{22, 443},
+			Services: []probe.Service{
+				{Port: 22, Transport: "tcp", Protocol: "ssh", AddressFamily: "ipv4", State: probe.ServiceStateObservedProtocol},
+				{Port: 22, Transport: "tcp", Protocol: "ssh", AddressFamily: "ipv6", State: probe.ServiceStateObservedProtocol},
+				{Port: 443, Transport: "tcp", Protocol: "https", AddressFamily: "ipv4", State: probe.ServiceStateObservedProtocol},
+				{Port: 443, Transport: "tcp", Protocol: "mqtt", AddressFamily: "ipv6", State: probe.ServiceStateObservedProtocol},
+			},
+		},
+	}
+
+	pm := BuildPresentationModel(snap, risk.Report{}, nil, clientViews, nil, nil, profiles)
+	ent := pm.Entities["host:02:aa:bb:cc:dd:44"]
+	if ent == nil {
+		t.Fatal("missing dual-broker entity")
+	}
+
+	var hasHTTPSv4, hasMQTTv6 bool
+	sshCount := 0
+	for _, s := range ent.Services {
+		if s.Port == 22 && s.Name == "ssh" {
+			sshCount++
+		}
+		if s.Port == 443 && s.Name == "https" && s.AddressFamily == "ipv4" && strings.Contains(s.Label, "IPv4") {
+			hasHTTPSv4 = true
+		}
+		if s.Port == 443 && s.Name == "mqtt" && s.AddressFamily == "ipv6" && strings.Contains(s.Label, "IPv6") {
+			hasMQTTv6 = true
+		}
+	}
+	if !hasHTTPSv4 || !hasMQTTv6 {
+		t.Fatalf("expected distinct IPv4 HTTPS and IPv6 MQTT rows on port 443, got %+v", ent.Services)
+	}
+	if sshCount != 1 {
+		t.Fatalf("expected identical dual-stack SSH on port 22 to stay collapsed into 1 row, got %d (%+v)", sshCount, ent.Services)
+	}
+}

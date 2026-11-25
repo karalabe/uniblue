@@ -932,7 +932,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 	var toScan []hostScanTask
 	queuedScan := make(map[string]struct{})
 	queueScan := func(cl unifi.Client, retryOnEmpty bool) {
-		if cl.IP == "" {
+		if cl.PrimaryIP() == "" {
 			return
 		}
 		k := clientKey(cl)
@@ -974,15 +974,16 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 		switch {
 		case !existed:
 			changed = true
+			clIP := cl.PrimaryIP()
 			summary := fmt.Sprintf("%s joined %s (waiting for IP)", cl.DisplayName(), fallbackVLAN(cl.NetworkName))
-			if cl.IP != "" {
-				summary = fmt.Sprintf("%s joined %s (%s); queuing security scan", cl.DisplayName(), fallbackVLAN(cl.NetworkName), cl.IP)
+			if clIP != "" {
+				summary = fmt.Sprintf("%s joined %s (%s); queuing security scan", cl.DisplayName(), fallbackVLAN(cl.NetworkName), clIP)
 			}
 			pendingEvents = append(pendingEvents, LiveEvent{
 				Type:      "client_joined",
 				Severity:  "info",
 				Host:      cl.DisplayName(),
-				IP:        cl.IP,
+				IP:        clIP,
 				SubjectID: hostEntityID(cl),
 				Summary:   summary,
 			})
@@ -990,19 +991,21 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 				pendingEvents = append(pendingEvents, e.anomalies.EvaluateClientJoinAnomalies(cl, now)...)
 			}
 			queueScan(cl, true)
-		case prev.IP != cl.IP || prev.NetworkName != cl.NetworkName:
+		case !sameClientIPSet(prev, cl) || prev.NetworkName != cl.NetworkName:
 			changed = true
 			delete(e.profilesByMAC, k)
 			delete(e.findingsByMAC, k)
-			summary := fmt.Sprintf("%s changed (%s/%s -> %s/%s)", cl.DisplayName(), prev.IP, fallbackVLAN(prev.NetworkName), cl.IP, fallbackVLAN(cl.NetworkName))
-			if cl.IP != "" {
+			prevIP := prev.PrimaryIP()
+			clIP := cl.PrimaryIP()
+			summary := fmt.Sprintf("%s changed (%s/%s -> %s/%s)", cl.DisplayName(), prevIP, fallbackVLAN(prev.NetworkName), clIP, fallbackVLAN(cl.NetworkName))
+			if clIP != "" {
 				summary += "; queuing security scan"
 			}
 			pendingEvents = append(pendingEvents, LiveEvent{
 				Type:      "client_moved",
 				Severity:  "medium",
 				Host:      cl.DisplayName(),
-				IP:        cl.IP,
+				IP:        clIP,
 				SubjectID: hostEntityID(cl),
 				Summary:   summary,
 			})
@@ -1027,13 +1030,14 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 			delete(e.profilesByMAC, k)
 			delete(e.findingsByMAC, k)
 			changed = true
+			prevIP := prev.PrimaryIP()
 			pendingEvents = append(pendingEvents, LiveEvent{
 				Type:      "client_left",
 				Severity:  "info",
 				Host:      prev.DisplayName(),
-				IP:        prev.IP,
+				IP:        prevIP,
 				SubjectID: hostEntityID(prev),
-				Summary:   fmt.Sprintf("%s left %s (%s)", prev.DisplayName(), fallbackVLAN(prev.NetworkName), prev.IP),
+				Summary:   fmt.Sprintf("%s left %s (%s)", prev.DisplayName(), fallbackVLAN(prev.NetworkName), prevIP),
 			})
 			continue
 		}
@@ -1049,13 +1053,14 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 			delete(e.profilesByMAC, k)
 			delete(e.findingsByMAC, k)
 			changed = true
+			mcIP := mc.client.PrimaryIP()
 			pendingEvents = append(pendingEvents, LiveEvent{
 				Type:      "client_left",
 				Severity:  "info",
 				Host:      mc.client.DisplayName(),
-				IP:        mc.client.IP,
+				IP:        mcIP,
 				SubjectID: hostEntityID(mc.client),
-				Summary:   fmt.Sprintf("%s left %s (%s)", mc.client.DisplayName(), fallbackVLAN(mc.client.NetworkName), mc.client.IP),
+				Summary:   fmt.Sprintf("%s left %s (%s)", mc.client.DisplayName(), fallbackVLAN(mc.client.NetworkName), mcIP),
 			})
 		}
 	}
@@ -1077,7 +1082,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 				continue
 			}
 			for _, cl := range snap.Clients {
-				if cl.IP == pf.FwdIP {
+				if clientHasIP(cl, pf.FwdIP) {
 					queueScan(cl, false)
 					break
 				}
@@ -1121,7 +1126,8 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 				// queue a fresh scan so patched or swapped hardware is re-verified.
 				if isAccessPortZone(curr.Zone) {
 					for _, cl := range snap.Clients {
-						if !cl.IsWired || cl.SwitchMAC == "" || cl.SwitchPort <= 0 || cl.IP == "" {
+						clIP := cl.PrimaryIP()
+						if !cl.IsWired || cl.SwitchMAC == "" || cl.SwitchPort <= 0 || clIP == "" {
 							continue
 						}
 						if portKey(cl.SwitchMAC, cl.SwitchPort) != pk {
@@ -1137,9 +1143,9 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 							Type:      "host_scanning",
 							Severity:  "info",
 							Host:      cl.DisplayName(),
-							IP:        cl.IP,
+							IP:        clIP,
 							SubjectID: hostEntityID(cl),
-							Summary:   fmt.Sprintf("Cable reconnected on %s Port %d; queuing security scan for %s (%s)", curr.DeviceName, curr.PortIdx, cl.DisplayName(), cl.IP),
+							Summary:   fmt.Sprintf("Cable reconnected on %s Port %d; queuing security scan for %s (%s)", curr.DeviceName, curr.PortIdx, cl.DisplayName(), clIP),
 						})
 						queueScan(cl, true)
 					}
@@ -1313,10 +1319,12 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	// Emit a crisp scan-result event using the freshly evaluated findings
 	// (avoids issuing duplicate check probes against the host).
 	published := e.Snapshot()
+	clIP := cl.PrimaryIP()
 	var hostFindings int
 	maxSev := checks.SeverityInfo
 	for _, f := range published.Report.Findings {
-		if f.Client.IP == cl.IP && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" && !f.IsInventoryOnly() {
+		sameHost := (k != "" && clientKey(f.Client) == k) || (clIP != "" && strings.EqualFold(f.Client.PrimaryIP(), clIP))
+		if sameHost && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" && !f.IsInventoryOnly() {
 			hostFindings++
 			if f.EffectiveSeverity > maxSev {
 				maxSev = f.EffectiveSeverity
@@ -1325,17 +1333,17 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	}
 	if !task.quietOnEmpty || len(hp.OpenPorts) > 0 || hostFindings > 0 {
 		sev := "info"
-		summary := fmt.Sprintf("Scanned %s (%s): %d open port(s), clean", cl.DisplayName(), cl.IP, len(hp.OpenPorts))
+		summary := fmt.Sprintf("Scanned %s (%s): %d open port(s), clean", cl.DisplayName(), clIP, len(hp.OpenPorts))
 		if hostFindings > 0 {
 			sev = maxSev.String()
 			summary = fmt.Sprintf("Scanned %s (%s): %d open port(s), %d exposure(s) detected!",
-				cl.DisplayName(), cl.IP, len(hp.OpenPorts), hostFindings)
+				cl.DisplayName(), clIP, len(hp.OpenPorts), hostFindings)
 		}
 		e.emit(LiveEvent{
 			Type:      "host_scanned",
 			Severity:  sev,
 			Host:      cl.DisplayName(),
-			IP:        cl.IP,
+			IP:        clIP,
 			SubjectID: hostEntityID(cl),
 			Summary:   summary,
 		})
@@ -1357,7 +1365,7 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 			active := false
 			if e.snap != nil {
 				for _, cur := range e.snap.Clients {
-					if clientKey(cur) == clientKey(target) && cur.IP == target.IP {
+					if clientKey(cur) == clientKey(target) && cur.PrimaryIP() == target.PrimaryIP() {
 						active = true
 						target = cur
 						break
@@ -1374,6 +1382,37 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 			}
 		}(cl)
 	}
+}
+
+func sameClientIPSet(a, b unifi.Client) bool {
+	ipsA := a.AllIPs()
+	ipsB := b.AllIPs()
+	if len(ipsA) != len(ipsB) {
+		return false
+	}
+	set := make(map[string]struct{}, len(ipsA))
+	for _, ip := range ipsA {
+		set[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
+	}
+	for _, ip := range ipsB {
+		if _, ok := set[strings.ToLower(strings.TrimSpace(ip))]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func clientHasIP(cl unifi.Client, target string) bool {
+	t := strings.ToLower(strings.TrimSpace(target))
+	if t == "" {
+		return false
+	}
+	for _, ip := range cl.AllIPs() {
+		if strings.ToLower(strings.TrimSpace(ip)) == t {
+			return true
+		}
+	}
+	return false
 }
 
 // runFullScan executes a complete UniFi snapshot + uniform LAN probe sweep and
