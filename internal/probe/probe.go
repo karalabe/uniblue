@@ -11,12 +11,15 @@ package probe
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
@@ -215,8 +218,14 @@ type HostProfile struct {
 	ScannedAt time.Time `json:"scanned_at"`
 }
 
+// cgnatPrefix matches RFC 6598 Carrier-Grade NAT space (100.64.0.0/10),
+// commonly used for Tailscale and private lab VLANs.
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
 // IsRawPrintPort reports whether port on this host is protected by the raw
-// print sink zero-byte guard.
+// print or raw serial sink zero-byte guard. Non-well-known sink ports learned
+// from mDNS are honored only when the advertisement was not reflected and its
+// responder IP (when present) matches one of this host's own IPs.
 func (h HostProfile) IsRawPrintPort(port int) bool {
 	if port == 9100 || port == 515 {
 		return true
@@ -227,7 +236,27 @@ func (h HostProfile) IsRawPrintPort(port int) bool {
 		}
 	}
 	for _, md := range h.MDNSServices {
-		if !md.Withdrawn && md.Port == port && isMDNSRawPrintSink(md.Type) {
+		if md.Withdrawn || md.Port != port || !isMDNSZeroByteSink(md.Type) {
+			continue
+		}
+		if md.Reflected {
+			continue
+		}
+		if md.ResponderIP != "" && !hostOwnsIP(h.Client, md.ResponderIP) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func hostOwnsIP(cl unifi.Client, candidate string) bool {
+	want := canonicalIPKey(candidate)
+	if want == "" {
+		return false
+	}
+	for _, ip := range cl.AllIPs() {
+		if canonicalIPKey(ip) == want {
 			return true
 		}
 	}
@@ -329,6 +358,10 @@ type Fingerprinter struct {
 	// excludeIPs contains IP addresses skipped without sending any packets.
 	excludeIPs map[string]struct{}
 
+	// allowedSubnets lists explicitly configured site prefixes (in addition to
+	// RFC1918/ULA, CGNAT, link-local, and loopback) that are allowed to be probed.
+	allowedSubnets []netip.Prefix
+
 	// hostPortHints maps specific client IPs to extra TCP ports discovered from
 	// UniFi port forwards, firewall policies, or per-host LAN discovery.
 	hostPortHints map[string][]int
@@ -337,7 +370,8 @@ type Fingerprinter struct {
 	// WS-Discovery) collected once per FingerprintAll sweep.
 	discovery *LANDiscovery
 
-	// skipDiscovery disables multicast discovery (used by isolated unit tests).
+	// skipDiscovery disables multicast discovery (used by isolated unit tests
+	// or when cached discovery is injected via SetCachedDiscovery).
 	skipDiscovery bool
 
 	// httpClient is configured with redirects disabled and self-signed TLS
@@ -350,10 +384,52 @@ type Fingerprinter struct {
 }
 
 // SetHostPortHints attaches optional per-host TCP port hints (such as ports
-// derived from UniFi port forwards or firewall policies) that are merged into
-// the base scan port list when fingerprinting matching hosts.
+// derived from UniFi port forwards or firewall policies) that are dialed ahead
+// of the base scan port list when fingerprinting matching hosts.
 func (f *Fingerprinter) SetHostPortHints(hints map[string][]int) {
 	f.hostPortHints = hints
+}
+
+// SetAllowedSubnets registers explicitly configured site subnets that may be
+// probed in addition to private (RFC1918/ULA), CGNAT (100.64.0.0/10),
+// link-local unicast, and loopback addresses.
+func (f *Fingerprinter) SetAllowedSubnets(prefixes []netip.Prefix) {
+	f.allowedSubnets = append([]netip.Prefix(nil), prefixes...)
+}
+
+// SetCachedDiscovery injects a previously collected LANDiscovery snapshot so
+// single-host rescans can reuse cached discovery without sending a new
+// LAN-wide multicast sweep.
+func (f *Fingerprinter) SetCachedDiscovery(d *LANDiscovery) {
+	f.discovery = d
+	if d != nil {
+		f.skipDiscovery = true
+	}
+}
+
+// Discovery returns the LANDiscovery snapshot collected or injected for this
+// Fingerprinter so callers can cache and reuse it across rescans.
+func (f *Fingerprinter) Discovery() *LANDiscovery {
+	return f.discovery
+}
+
+// isAllowedProbeIP enforces that active probing only targets private/local LAN
+// ranges or explicitly configured site subnets, never arbitrary public IPs.
+func (f *Fingerprinter) isAllowedProbeIP(rawIP string) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(rawIP))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	if addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback() || cgnatPrefix.Contains(addr) {
+		return true
+	}
+	for _, pfx := range f.allowedSubnets {
+		if pfx.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetProgressFunc registers an optional callback invoked on the collector
@@ -389,7 +465,9 @@ func NewFingerprinter(ports []int, concurrency int, timeout time.Duration, exclu
 		httpClient: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
-				DialContext: (&net.Dialer{Timeout: timeout}).DialContext,
+				DialContext:       (&net.Dialer{Timeout: timeout}).DialContext,
+				DisableKeepAlives: true,
+				IdleConnTimeout:   5 * time.Second,
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true, //nolint:gosec // LAN IoT devices routinely use self-signed certificates
 				},
@@ -406,15 +484,18 @@ func NewFingerprinter(ports []int, concurrency int, timeout time.Duration, exclu
 // FingerprintAll profiles every eligible client concurrently using a bounded
 // channel worker pool and returns the collected HostProfiles sorted by IP.
 func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Client) []HostProfile {
-	// Filter down to clients with a valid, non-excluded IPv4 or IPv6 address.
+	defer f.httpClient.CloseIdleConnections()
+
+	// Filter down to clients with a valid, non-excluded, probe-eligible LAN IP.
 	targets := make([]unifi.Client, 0, len(clients))
 	for _, cl := range clients {
-		if cl.PrimaryIP() == "" {
+		primaryIP := cl.PrimaryIP()
+		if primaryIP == "" || !f.isAllowedProbeIP(primaryIP) {
 			continue
 		}
 		excluded := false
 		for _, ip := range cl.AllIPs() {
-			if _, skip := f.excludeIPs[ip]; skip {
+			if isExcludedIP(ip, f.excludeIPs) {
 				excluded = true
 				break
 			}
@@ -436,9 +517,9 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	// Run one bounded LAN multicast discovery sweep (mDNS, SSDP/UPnP, WS-Discovery)
 	// when profiling non-loopback LAN hosts so per-host port hints and passive
 	// service metadata enrich every matching HostProfile with zero blind dials.
-	if !f.skipDiscovery && hasNonLoopbackTarget(targets) {
+	if f.discovery == nil && !f.skipDiscovery && hasNonLoopbackTarget(targets) {
 		f.reportProgress("discovery", 0, len(targets), "")
-		f.discovery = DiscoverLAN(ctx, f.httpClient)
+		f.discovery = DiscoverLANWithExclusions(ctx, f.httpClient, f.excludeIPs)
 	}
 	return f.collectProfiles(ctx, targets, workers)
 }
@@ -532,7 +613,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 		sort.Ints(profile.RawPrintPorts)
 	}
-	if targetIP == "" {
+	if targetIP == "" || !f.isAllowedProbeIP(targetIP) {
 		return profile
 	}
 
@@ -542,7 +623,12 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	}
 	dialer := net.Dialer{Timeout: dialTimeout}
 
-	ports := f.portsForHost(allIPs...)
+	priorityPorts, baselinePorts := f.splitPortsForHost(allIPs...)
+	priorityCount := len(priorityPorts)
+	ports := make([]int, 0, priorityCount+len(baselinePorts))
+	ports = append(ports, priorityPorts...)
+	ports = append(ports, baselinePorts...)
+
 	consecutiveTimeouts := 0
 	for i, port := range ports {
 		if ctx.Err() != nil {
@@ -564,9 +650,14 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				consecutiveTimeouts++
-				if len(profile.OpenPorts) == 0 && consecutiveTimeouts >= maxConsecutiveSilentTimeouts {
-					break
+				// Apply the silent-host cutoff only to baseline ports so
+				// Windows/macOS stealth firewalls dropping SYNs still have all
+				// hinted, forwarded, and discovered priority ports checked.
+				if i >= priorityCount {
+					consecutiveTimeouts++
+					if len(profile.OpenPorts) == 0 && consecutiveTimeouts >= maxConsecutiveSilentTimeouts {
+						break
+					}
 				}
 			} else {
 				// Received an active TCP RST / ECONNREFUSED: host is awake and reachable.
@@ -576,7 +667,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 		consecutiveTimeouts = 0
 
-		rawPrint := isRawPrintSinkPortAny(port, f.discovery, allIPs)
+		rawPrint := isRawPrintSinkPortAny(port, f.discovery, allIPs) || profile.IsRawPrintPort(port)
 		if rawPrint && !profile.IsRawPrintPort(port) {
 			profile.RawPrintPorts = append(profile.RawPrintPorts, port)
 			sort.Ints(profile.RawPrintPorts)
@@ -631,28 +722,12 @@ func isRawPrintSinkPortAny(port int, disc *LANDiscovery, ips []string) bool {
 	return false
 }
 
-// portsForHost returns the deduplicated, sorted list of TCP ports to probe on
-// a host, merging UniBlue's base port list with UniFi-derived port hints and
-// per-host ports dynamically discovered via mDNS/SSDP/WS-Discovery across all
-// known IPv4 and IPv6 addresses for that host.
-func (f *Fingerprinter) portsForHost(ips ...string) []int {
-	var hints []int
-	var discPorts []int
-	for _, ip := range ips {
-		if ip == "" {
-			continue
-		}
-		hints = append(hints, f.hostPortHints[ip]...)
-		if f.discovery != nil {
-			discPorts = append(discPorts, f.discovery.PortsByIP[ip]...)
-		}
-	}
-	if len(hints) == 0 && len(discPorts) == 0 {
-		return f.ports
-	}
-	seen := make(map[int]struct{}, len(f.ports)+len(hints)+len(discPorts))
-	out := make([]int, 0, len(f.ports)+len(hints)+len(discPorts))
-	add := func(list []int) {
+// splitPortsForHost separates priority ports (UniFi port-forward/firewall hints
+// and per-host mDNS/SSDP/WS-Discovery ports) from the baseline scan port list.
+// Priority ports are dialed first and exempt from the silent-host timeout cutoff.
+func (f *Fingerprinter) splitPortsForHost(ips ...string) (priority, baseline []int) {
+	seen := make(map[int]struct{}, len(f.ports)+16)
+	addInto := func(dst *[]int, list []int) {
 		for _, p := range list {
 			if p < 1 || p > 65535 {
 				continue
@@ -661,13 +736,31 @@ func (f *Fingerprinter) portsForHost(ips ...string) []int {
 				continue
 			}
 			seen[p] = struct{}{}
-			out = append(out, p)
+			*dst = append(*dst, p)
 		}
 	}
-	add(f.ports)
-	add(hints)
-	add(discPorts)
-	sort.Ints(out)
+	for _, ip := range ips {
+		if ip == "" {
+			continue
+		}
+		addInto(&priority, f.hostPortHints[ip])
+		if f.discovery != nil {
+			addInto(&priority, f.discovery.PortsByIP[ip])
+		}
+	}
+	sort.Ints(priority)
+	addInto(&baseline, f.ports)
+	sort.Ints(baseline)
+	return priority, baseline
+}
+
+// portsForHost returns the deduplicated list of TCP ports to probe on a host,
+// with hinted and discovered priority ports first followed by baseline ports.
+func (f *Fingerprinter) portsForHost(ips ...string) []int {
+	priority, baseline := f.splitPortsForHost(ips...)
+	out := make([]int, 0, len(priority)+len(baseline))
+	out = append(out, priority...)
+	out = append(out, baseline...)
 	return out
 }
 
@@ -768,12 +861,20 @@ func (f *Fingerprinter) fetchHTTPBanner(ctx context.Context, scheme, ip string, 
 			exp := cert.NotAfter.UTC()
 			banner.TLSNotAfter = &exp
 			banner.TLSExpired = time.Now().UTC().After(exp)
-			if cert.Subject.String() == cert.Issuer.String() {
-				banner.TLSSelfSigned = cert.CheckSignatureFrom(cert) == nil
-			}
+			banner.TLSSelfSigned = isSelfSignedCert(cert)
 		}
 	}
 	return banner, true
+}
+
+// isSelfSignedCert reports whether cert was signed by its own public key.
+// Unlike x509.Certificate.CheckSignatureFrom, it does not require CA basic
+// constraints so typical self-signed device leaf certificates are recognized.
+func isSelfSignedCert(cert *x509.Certificate) bool {
+	if cert == nil || len(cert.RawIssuer) == 0 || !bytes.Equal(cert.RawIssuer, cert.RawSubject) {
+		return false
+	}
+	return cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature) == nil
 }
 
 func tlsVersionString(v uint16) string {

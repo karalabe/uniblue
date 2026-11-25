@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"io"
 	"net"
 	"net/netip"
 	"sort"
@@ -111,61 +112,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 			}
 			hp := &profiles[idx]
 
-			var meta nervaMetaSubset
-			if len(rawSvc.Raw) > 0 {
-				_ = json.Unmarshal(rawSvc.Raw, &meta)
-			}
-
-			// Filter out known false-positive classifications (e.g., ASUS ASMB9-iKVM
-			// server BMCs matching Oracle OUAF login heuristics).
-			proto := strings.ToLower(strings.TrimSpace(rawSvc.Protocol))
-			isBMCFalsePositive := proto == "oracle_ouaf" && strings.Contains(strings.ToLower(meta.Title), "ikvm")
-			if isBMCFalsePositive {
-				proto = "https"
-				meta.CPEs = nil
-			}
-
-			svcState := ServiceStateObservedProtocol
-			switch proto {
-			case "", "unknown":
-				svcState = ServiceStateUnknown
-			case "tls", "ssl", "dtls":
-				svcState = ServiceStateTLSUnknownApp
-			}
-			now := time.Now().UTC()
-			svc := Service{
-				Port:          rawSvc.Port,
-				Transport:     "tcp",
-				Protocol:      proto,
-				State:         svcState,
-				AddressFamily: ipFamilyOf(rawSvc.IP),
-				ObservedAt:    &now,
-				TLS:           rawSvc.TLS,
-				Version:       strings.TrimSpace(rawSvc.Version),
-				Title:         strings.TrimSpace(meta.Title),
-				Banner:        strings.TrimSpace(meta.Banner),
-				CPEs:          meta.CPEs,
-			}
-
-			for _, sf := range rawSvc.SecurityFindings {
-				if isBMCFalsePositive && strings.EqualFold(sf.ID, "oracle-ouaf-login-exposed") {
-					continue
-				}
-				if !shouldKeepNervaFinding(sf) {
-					continue
-				}
-				if strings.Contains(strings.ToLower(sf.ID), "anon") || strings.Contains(strings.ToLower(sf.ID), "no-auth") {
-					svc.AnonymousAccess = true
-				}
-				svc.Findings = append(svc.Findings, ServiceFinding{
-					ID:          sf.ID,
-					Severity:    strings.ToLower(string(sf.Severity)),
-					Title:       strings.TrimSpace(sf.Title),
-					Description: strings.TrimSpace(sf.Description),
-					Evidence:    strings.TrimSpace(sf.Evidence),
-				})
-			}
-
+			svc, meta, proto := convertNervaService(rawSvc, time.Now().UTC())
 			hp.Services = append(hp.Services, svc)
 
 			// Backfill SSHBanner and HTTP banners discovered on non-default ports
@@ -265,6 +212,131 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 	}
 }
 
+// convertNervaService translates a raw Nerva plugin detection into UniBlue's
+// normalized Service record, preserving Nerva's canonical AnonymousAccess flag
+// without false-positiving on TLS cipher findings such as tls-anon-cipher.
+func convertNervaService(rawSvc plugins.Service, now time.Time) (Service, nervaMetaSubset, string) {
+	var meta nervaMetaSubset
+	if len(rawSvc.Raw) > 0 {
+		_ = json.Unmarshal(rawSvc.Raw, &meta)
+	}
+
+	// Filter out known false-positive classifications (e.g., ASUS ASMB9-iKVM
+	// server BMCs matching Oracle OUAF login heuristics).
+	proto := strings.ToLower(strings.TrimSpace(rawSvc.Protocol))
+	isBMCFalsePositive := proto == "oracle_ouaf" && strings.Contains(strings.ToLower(meta.Title), "ikvm")
+	if isBMCFalsePositive {
+		proto = "https"
+		meta.CPEs = nil
+	}
+
+	svcState := ServiceStateObservedProtocol
+	switch proto {
+	case "", "unknown":
+		svcState = ServiceStateUnknown
+	case "tls", "ssl", "dtls":
+		svcState = ServiceStateTLSUnknownApp
+	}
+	svc := Service{
+		Port:            rawSvc.Port,
+		Transport:       "tcp",
+		Protocol:        proto,
+		State:           svcState,
+		AddressFamily:   ipFamilyOf(rawSvc.IP),
+		ObservedAt:      &now,
+		TLS:             rawSvc.TLS,
+		Version:         strings.TrimSpace(rawSvc.Version),
+		Title:           strings.TrimSpace(meta.Title),
+		Banner:          sanitizeBanner(meta.Banner),
+		AnonymousAccess: rawSvc.AnonymousAccess && !isBMCFalsePositive,
+		CPEs:            meta.CPEs,
+	}
+
+	droppedSyntheticAnon := false
+	keptAuthFinding := false
+	for _, sf := range rawSvc.SecurityFindings {
+		if isBMCFalsePositive && strings.EqualFold(sf.ID, "oracle-ouaf-login-exposed") {
+			continue
+		}
+		if !shouldKeepNervaFinding(sf) {
+			if isSyntheticHTTPAnonFinding(sf) {
+				droppedSyntheticAnon = true
+			}
+			continue
+		}
+		if isNervaAnonAccessFinding(sf.ID) {
+			svc.AnonymousAccess = true
+			keptAuthFinding = true
+		}
+		svc.Findings = append(svc.Findings, ServiceFinding{
+			ID:          sf.ID,
+			Severity:    strings.ToLower(string(sf.Severity)),
+			Title:       strings.TrimSpace(sf.Title),
+			Description: strings.TrimSpace(sf.Description),
+			Evidence:    strings.TrimSpace(sf.Evidence),
+		})
+	}
+	// If Nerva's only auth-related signal was a synthetic HTTP product-detection
+	// placeholder that we filtered out, do not carry over AnonymousAccess.
+	if droppedSyntheticAnon && !keptAuthFinding && len(rawSvc.SecurityFindings) > 0 && len(svc.Findings) == 0 {
+		svc.AnonymousAccess = false
+	}
+	return svc, meta, proto
+}
+
+// isNervaAnonAccessFinding reports whether a Nerva finding ID specifically
+// denotes unauthenticated or anonymous service access rather than an unrelated
+// TLS cipher attribute such as tls-anon-cipher.
+func isNervaAnonAccessFinding(rawID string) bool {
+	id := strings.ToLower(strings.TrimSpace(rawID))
+	if id == "" || strings.HasPrefix(id, "tls-") {
+		return false
+	}
+	switch {
+	case strings.HasSuffix(id, "-anon-access"),
+		strings.HasSuffix(id, "-anonymous-access"),
+		strings.HasSuffix(id, "-anonymous-bind"),
+		strings.HasSuffix(id, "-anonymous-login"),
+		strings.HasSuffix(id, "-no-auth"),
+		strings.HasSuffix(id, "-unauth"),
+		strings.Contains(id, "-unauth-"),
+		strings.Contains(id, "-unauthenticated"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isSyntheticHTTPAnonFinding(sf plugins.SecurityFinding) bool {
+	id := strings.ToLower(strings.TrimSpace(sf.ID))
+	return strings.HasSuffix(id, "-anon-access") &&
+		strings.EqualFold(strings.TrimSpace(sf.Evidence), "Successfully queried endpoint without credentials")
+}
+
+// maxFallbackBannerBytes caps passive banner reads in probeAlternatePortFallback
+// so a hostile device streaming unbounded data without newlines cannot exhaust memory.
+const maxFallbackBannerBytes = 256
+
+// sanitizeBanner strips non-printable control characters and truncates banners
+// to maxFallbackBannerBytes bytes.
+func sanitizeBanner(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(min(len(s), maxFallbackBannerBytes))
+	for _, r := range s {
+		if r >= 0x20 && r != 0x7f {
+			if b.Len()+len(string(r)) > maxFallbackBannerBytes {
+				break
+			}
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // probeAlternatePortFallback performs a gentle read-only check on an open TCP
 // port that Nerva FastMode left unclassified: first listens briefly for a
 // server-initiated greeting (SSH, RFB/VNC, SMTP/FTP/Redis), and if the server
@@ -277,7 +349,7 @@ func probeAlternatePortFallback(ctx context.Context, ip string, port int, timeou
 	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	now := time.Now().UTC()
 
-	// 1. Passive greeting read (zero bytes written).
+	// 1. Passive greeting read (zero bytes written, bounded to 256 bytes).
 	dialer := net.Dialer{Timeout: timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -288,10 +360,10 @@ func probeAlternatePortFallback(ctx context.Context, ip string, port int, timeou
 		greetTimeout = 120 * time.Millisecond
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(greetTimeout))
-	line, readErr := bufio.NewReader(conn).ReadString('\n')
+	line, readErr := bufio.NewReaderSize(io.LimitReader(conn, maxFallbackBannerBytes), maxFallbackBannerBytes).ReadString('\n')
 	_ = conn.Close()
 	if readErr == nil || len(line) > 0 {
-		trimmed := strings.TrimSpace(line)
+		trimmed := sanitizeBanner(line)
 		switch {
 		case strings.HasPrefix(trimmed, "SSH-"):
 			return Service{

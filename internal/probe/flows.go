@@ -210,12 +210,16 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 		if transport == "" {
 			transport = "tcp"
 		}
+		remoteIP := strings.TrimSpace(rec.RemoteIP)
+		remoteHost := strings.TrimSpace(rec.RemoteHost)
 		dir := strings.ToLower(strings.TrimSpace(rec.Direction))
 		if dir == "" {
 			switch {
-			case rec.RemoteIP != "" && !isPrivateOrLocalIP(rec.RemoteIP):
+			case remoteIP != "" && !isPrivateOrLocalIP(remoteIP):
 				dir = "outbound"
-			case rec.RemoteIP == "":
+			case remoteIP == "" && remoteHost != "":
+				dir = "outbound"
+			case remoteIP == "" && remoteHost == "":
 				dir = "hosted"
 			default:
 				// Private-to-private flow with no explicit direction cannot safely

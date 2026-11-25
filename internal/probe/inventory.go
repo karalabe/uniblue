@@ -171,6 +171,7 @@ func parseGenericBridgeInventory(raw []byte, spec BridgeInventorySpec, format st
 	}
 
 	out := make([]ChildDevice, 0, len(list))
+	seenIDs := make(map[string]struct{}, len(list))
 	for i, c := range list {
 		c.ParentIP = firstNonEmpty(c.ParentIP, parentIP)
 		c.ParentMAC = strings.ToLower(strings.TrimSpace(firstNonEmpty(c.ParentMAC, parentMAC)))
@@ -178,8 +179,17 @@ func parseGenericBridgeInventory(raw []byte, spec BridgeInventorySpec, format st
 		c.IdentitySource = firstNonEmpty(c.IdentitySource, source)
 		c.ObservedFrom = firstNonEmpty(c.ObservedFrom, spec.ObservedFrom, wrapper.ObservedFrom)
 		if strings.TrimSpace(c.ID) == "" {
-			basis := firstNonEmpty(c.PrivateAddress, c.Name, c.Model, fmt.Sprintf("item-%d", i+1))
-			c.ID = fmt.Sprintf("%s:%s", c.IdentitySource, sanitizeChildIDSlug(basis))
+			basis := firstNonEmpty(c.PrivateAddress, c.Name, c.Model)
+			slug := sanitizeChildIDSlug(basis)
+			var candidate string
+			if basis == "" || slug == "unknown" {
+				candidate = fmt.Sprintf("%s:item-%d", c.IdentitySource, i+1)
+			} else {
+				candidate = fmt.Sprintf("%s:%s", c.IdentitySource, slug)
+			}
+			c.ID = uniqueChildID(candidate, i+1, seenIDs)
+		} else {
+			seenIDs[c.ID] = struct{}{}
 		}
 		if c.DirectLANReachability == "" {
 			if format == "ble" {
@@ -199,6 +209,21 @@ func parseGenericBridgeInventory(raw []byte, spec BridgeInventorySpec, format st
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+func uniqueChildID(base string, itemNum int, seen map[string]struct{}) string {
+	if _, dup := seen[base]; !dup {
+		seen[base] = struct{}{}
+		return base
+	}
+	candidate := fmt.Sprintf("%s-%d", base, itemNum)
+	for suffix := 2; ; suffix++ {
+		if _, dup := seen[candidate]; !dup {
+			seen[candidate] = struct{}{}
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d-%d", base, itemNum, suffix)
+	}
 }
 
 // parseZigbee2MQTTInventory parses a standard Zigbee2MQTT `bridge/devices` JSON array.
@@ -222,7 +247,8 @@ func parseZigbee2MQTTInventory(raw []byte, spec BridgeInventorySpec) ([]ChildDev
 		return nil, fmt.Errorf("parse zigbee2mqtt inventory: %w", err)
 	}
 	var out []ChildDevice
-	for _, n := range rawNodes {
+	seenIDs := make(map[string]struct{}, len(rawNodes))
+	for i, n := range rawNodes {
 		if strings.EqualFold(n.Type, "Coordinator") {
 			continue
 		}
@@ -238,8 +264,13 @@ func parseZigbee2MQTTInventory(raw []byte, spec BridgeInventorySpec) ([]ChildDev
 		}
 		iv := n.InterviewCompleted
 		sleeping := strings.EqualFold(n.PowerSource, "Battery") || strings.EqualFold(n.Type, "EndDevice")
+		id := firstNonEmpty(n.IEEEAddress, n.FriendlyName)
+		if id == "" {
+			id = fmt.Sprintf("zigbee2mqtt:item-%d", i+1)
+		}
+		id = uniqueChildID(id, i+1, seenIDs)
 		out = append(out, ChildDevice{
-			ID:                    firstNonEmpty(n.IEEEAddress, n.FriendlyName),
+			ID:                    id,
 			Name:                  firstNonEmpty(n.FriendlyName, model, n.IEEEAddress),
 			ParentIP:              spec.ParentIP,
 			ParentMAC:             strings.ToLower(strings.TrimSpace(spec.ParentMAC)),

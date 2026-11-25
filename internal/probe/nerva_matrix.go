@@ -144,7 +144,7 @@ func ComputeServiceCoverage(profiles []HostProfile) ServiceCoverageReport {
 
 	for _, hp := range profiles {
 		rep.OutboundDependencies += len(hp.OutboundDependencies)
-		hostFamily := ipFamilyOf(hp.Client.IP)
+		hostFamily := ipFamilyOf(hp.Client.PrimaryIP())
 		if hostFamily == "" {
 			hostFamily = "ipv4"
 		}
@@ -195,12 +195,18 @@ func ComputeServiceCoverage(profiles []HostProfile) ServiceCoverageReport {
 		}
 
 		// Advertised DNS-SD services (counted at advertised-service rank, above bare candidate-port).
+		// Record under the host's probed address family rather than "dual" so
+		// dual-stack hosts do not double-count the same advertised port.
 		for _, md := range hp.MDNSServices {
 			if md.Withdrawn || md.Port <= 0 {
 				continue
 			}
 			t := firstNonEmpty(md.Transport, mdnsRealTransport(md.Type))
-			record(t, md.Port, firstNonEmpty(md.AddressFamily, hostFamily), ServiceStateAdvertisedService)
+			fam := md.AddressFamily
+			if fam == "" || fam == "dual" {
+				fam = hostFamily
+			}
+			record(t, md.Port, fam, ServiceStateAdvertisedService)
 		}
 
 		// Open TCP ports with no higher-ranked protocol or advertisement remain candidate ports.
