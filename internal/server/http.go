@@ -37,6 +37,7 @@ func (e *Engine) Serve(ctx context.Context) error {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -55,9 +56,11 @@ func (e *Engine) Serve(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutCtx)
+		if err := srv.Shutdown(shutCtx); err != nil {
+			_ = srv.Close()
+		}
 		return nil
 	case err := <-errCh:
 		return err

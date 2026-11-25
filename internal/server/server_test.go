@@ -10,6 +10,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -530,5 +533,65 @@ func TestWirelessLeaveGraceEvictsProfileAndFindings(t *testing.T) {
 	if len(eng.profilesByMAC) != 0 || len(eng.findingsByMAC) != 0 || len(eng.missingClients) != 0 {
 		t.Fatalf("expected wireless client eviction after grace: profiles=%d findings=%d missing=%d",
 			len(eng.profilesByMAC), len(eng.findingsByMAC), len(eng.missingClients))
+	}
+}
+
+// TestServeExitsImmediatelyWithActiveSSE verifies that cancelling the server
+// context (as on Ctrl-C) immediately terminates open SSE streams and shuts down
+// Serve without blocking on the graceful shutdown timeout.
+func TestServeExitsImmediatelyWithActiveSSE(t *testing.T) {
+	// Reserve an ephemeral localhost port then release it for Engine.Serve.
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ephemeral port: %v", err)
+	}
+	addr := probeLn.Addr().String()
+	_ = probeLn.Close()
+
+	eng := newTestEngine()
+	eng.opts.ListenAddr = addr
+	eng.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- eng.Serve(ctx)
+	}()
+
+	// Wait until /api/events accepts connections and emits the initial SSE comment.
+	var resp *http.Response
+	for range 40 {
+		resp, err = http.Get("http://" + addr + "/api/events")
+		if err == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("connect /api/events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	br := bufio.NewReader(resp.Body)
+	if line, err := br.ReadString('\n'); err != nil || !strings.HasPrefix(line, ": connected") {
+		t.Fatalf("unexpected initial SSE line %q (err=%v)", line, err)
+	}
+
+	// Simulate Ctrl-C while the browser SSE connection is still open.
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("Serve took %s to exit with open SSE stream, want <500ms", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Serve hung on shutdown while SSE stream was open")
 	}
 }
