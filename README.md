@@ -10,11 +10,11 @@
 
 <br>
 
-Most network scanners dump hundreds of cryptic port numbers and leave you guessing what actually matters. **UniBlue** connects to your UniFi gateway, gently checks the devices on your network, and answers three practical questions in plain English:
+Most network scanners dump hundreds of cryptic port numbers and leave you guessing what actually matters. **UniBlue** connects to your UniFi gateway, gently checks the devices on your network, and answers in English:
 
 1. **What is on my network?** Every computer, phone, camera, smart-home gadget, switch cable, Wi-Fi network, and even downstream devices hidden behind an NVR or smart-home bridge.
 2. **What services do they offer or use?** Real wire-verified services separated cleanly from local announcements (mDNS/UPnP), encrypted sockets, and outbound internet connections.
-3. **What actually needs fixing, and how?** Plain-English steps in UniFi for open internet doors, exposed outdoor cables, leaky guest/IoT rules (across both IPv4 and IPv6), and known software security bugs.
+3. **What actually needs fixing, and how?** Friendly steps in UniFi for open internet doors, exposed outdoor cables, leaky guest/IoT rules (across both IPv4 and IPv6), and known software security bugs.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/how-it-works-dark.svg">
@@ -22,15 +22,15 @@ Most network scanners dump hundreds of cryptic port numbers and leave you guessi
   <img alt="How UniBlue works" src="docs/how-it-works-light.svg">
 </picture>
 
-<br>
+## Demo
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/demo/checkup-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/demo/checkup-light.png">
-    <img alt="UniBlue Network Checkup dashboard" src="docs/demo/checkup-light.png">
-  </picture>
-</p>
+You can quickly look around in demo mode: `./uniblue demo -listen 127.0.0.1:8080`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/demo/checkup-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/demo/checkup-light.png">
+  <img alt="UniBlue Network Checkup dashboard" src="docs/demo/checkup-light.png">
+</picture>
 
 ## What makes UniBlue different?
 
