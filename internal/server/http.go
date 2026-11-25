@@ -73,6 +73,8 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rescan", e.handleRescan)
 	mux.HandleFunc("GET /assets/logo-light.svg", serveEmbeddedSVG("logo-horizontal-light.svg"))
 	mux.HandleFunc("GET /assets/logo-dark.svg", serveEmbeddedSVG("logo-horizontal-dark.svg"))
+	mux.HandleFunc("GET /assets/favicon.svg", serveEmbeddedSVG("logo-light.svg"))
+	mux.HandleFunc("GET /favicon.ico", serveEmbeddedSVG("logo-light.svg"))
 	return mux
 }
 

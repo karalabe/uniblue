@@ -10,7 +10,7 @@ package docs
 
 import "embed"
 
-// LogoFS contains the horizontal light and dark UniBlue SVG logos.
+// LogoFS contains the UniBlue SVG brand logos and favicon icon.
 //
-//go:embed logo-horizontal-light.svg logo-horizontal-dark.svg
+//go:embed logo-horizontal-light.svg logo-horizontal-dark.svg logo-light.svg
 var LogoFS embed.FS

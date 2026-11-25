@@ -1108,11 +1108,11 @@ type integrationFirewallPolicy struct {
 	IPProtocolScope *struct {
 		IPVersion      string `json:"ipVersion"`
 		ProtocolFilter *struct {
-			Type     string `json:"type"`
-			Protocol *struct {
-				Name string `json:"name"`
-			} `json:"protocol"`
-			NamedProtocol string `json:"namedProtocol"`
+			Type          string          `json:"type"`
+			Protocol      json.RawMessage `json:"protocol"`
+			NamedProtocol string          `json:"namedProtocol"`
+			Preset        json.RawMessage `json:"preset"`
+			PresetName    string          `json:"presetName"`
 		} `json:"protocolFilter"`
 	} `json:"ipProtocolScope"`
 	LoggingEnabled bool `json:"loggingEnabled"`

@@ -542,6 +542,11 @@ func EvaluateIsolation(
 				{proto: "udp", port: 53, function: "gateway-dns"},
 				{proto: "udp", port: 67, function: "gateway-dhcp"},
 			} {
+				srcPort := 0
+				if dep.function == "gateway-dhcp" {
+					// DHCPv4 clients originate requests from UDP port 68 to server port 67.
+					srcPort = 68
+				}
 				depCell := evaluateRoutedPath(
 					snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
 					switchACLStatus, switchACLReason, gwName, srcNet, unifi.Network{Name: "Gateway", ZoneName: "Gateway"},
@@ -549,6 +554,7 @@ func EvaluateIsolation(
 						srcZone:    srcZone,
 						srcNetID:   srcNet.ID,
 						srcNetName: srcNet.Name,
+						srcPort:    srcPort,
 						dstZone:    "Gateway",
 						dstNetName: "Gateway",
 						dstIP:      gwIP,

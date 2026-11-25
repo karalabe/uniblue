@@ -272,7 +272,7 @@ func TestFetchSnapshotFirewallVisibilityAndPolicySemantics(t *testing.T) {
 			{
 				"id":"p-block","name":"Higher Priority Block","enabled":true,"index":5,
 				"action":{"type":"BLOCK"},
-				"ipProtocolScope":{"ipVersion":"IPV4"},
+				"ipProtocolScope":{"ipVersion":"IPV4","protocolFilter":{"type":"PRESET","preset":"TCP_UDP"}},
 				"source":{"zoneId":"z-guest","trafficFilter":{"type":"MAC_ADDRESS","macAddressFilter":"aa:bb:cc:dd:ee:01"}},
 				"destination":{"zoneId":"z-mgmt"}
 			}
@@ -318,6 +318,9 @@ func TestFetchSnapshotFirewallVisibilityAndPolicySemantics(t *testing.T) {
 	p1 := snapOK.FirewallPolicies[1]
 	if len(p1.Source.MACs) != 1 || p1.Source.MACs[0] != "aa:bb:cc:dd:ee:01" {
 		t.Fatalf("expected string-valued macAddressFilter to decode cleanly, got %+v", p1.Source)
+	}
+	if p1.Protocol != "tcp_udp" || p1.UnsupportedReason != "" {
+		t.Fatalf("expected PRESET TCP_UDP protocol filter to decode cleanly, got proto=%q unsupported=%q", p1.Protocol, p1.UnsupportedReason)
 	}
 
 	// 3. Verify JSON site supplement preserves nested snake_case fields cleanly.

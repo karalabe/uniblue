@@ -30,6 +30,7 @@ var noisyNervaFindings = map[string]struct{}{
 	"http-missing-csp":                    {},
 	"http-missing-x-frame-options":        {},
 	"http-missing-x-content-type-options": {},
+	"http-cors-wildcard":                  {},
 	"http-server-version":                 {},
 	"tls-self-signed":                     {},
 	// Handled with deeper read-only verification by UniBlue's UB-0001 / UB-2026-0056 checks.

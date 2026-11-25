@@ -1255,11 +1255,15 @@ func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[s
 			}
 			if rp.IPProtocolScope.ProtocolFilter != nil {
 				pf := rp.IPProtocolScope.ProtocolFilter
+				pName := firstNonEmpty(
+					extractProtocolName(pf.Protocol),
+					pf.NamedProtocol,
+					extractProtocolName(pf.Preset),
+					pf.PresetName,
+				)
 				switch {
-				case pf.Protocol != nil && pf.Protocol.Name != "":
-					proto = strings.ToLower(pf.Protocol.Name)
-				case pf.NamedProtocol != "":
-					proto = strings.ToLower(pf.NamedProtocol)
+				case pName != "":
+					proto = strings.ToLower(strings.TrimSpace(pName))
 				case pf.Type != "" && !strings.EqualFold(pf.Type, "ALL") && !strings.EqualFold(pf.Type, "ANY"):
 					unsupported = fmt.Sprintf("protocol filter type %q", pf.Type)
 				}
@@ -1300,6 +1304,29 @@ func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[s
 		})
 	}
 	return out
+}
+
+// extractProtocolName decodes a UniFi Integration v1 protocol or preset field
+// whether the controller emits a plain string ("TCP_UDP") or an object
+// ({"name":"TCP_UDP"} / {"type":"TCP_UDP"} / {"value":"TCP_UDP"}).
+func extractProtocolName(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	var obj struct {
+		Name  string `json:"name"`
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(trimmed, &obj); err == nil {
+		return strings.TrimSpace(firstNonEmpty(obj.Name, obj.Type, obj.Value))
+	}
+	return ""
 }
 
 // convertPolicyEndpoint extracts zone identity, IP addresses, network IDs, MACs,

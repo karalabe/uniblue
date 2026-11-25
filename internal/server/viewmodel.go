@@ -1715,10 +1715,18 @@ func compactCheckChip(f checks.Finding) string {
 		return fmt.Sprintf("VNC :%d", f.Port)
 	case "UB-0009":
 		return fmt.Sprintf("TLS 1.0/1.1 :%d", f.Port)
+	case "UB-0010":
+		return "Open DNS :53"
 	case "UB-0012":
 		return "SNMP public :161"
 	case "UB-0019":
 		return "IPMI RMCP+ :623"
+	case "UB-0045":
+		return "PJLink :4352"
+	case "UB-2026-0007":
+		return fmt.Sprintf("Bitcoin RPC :%d", f.Port)
+	case "UB-2026-0009":
+		return fmt.Sprintf("Eth Engine :%d", f.Port)
 	case "UB-2026-0039":
 		return fmt.Sprintf("Zehnder :%d", f.Port)
 	case "UB-2026-0056":

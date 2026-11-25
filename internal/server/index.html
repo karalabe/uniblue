@@ -11,6 +11,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>UniBlue: Home Network Security Checkup</title>
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <style>
   :root {
     --bg: #f5f7fa;
@@ -426,7 +427,8 @@
     justify-content: space-between;
     gap: 14px;
   }
-  .story-hd-l { display: flex; gap: 13px; align-items: flex-start; }
+  .story-hd-l { display: flex; gap: 13px; align-items: flex-start; min-width: 0; }
+  .story-hd > .btn { white-space: nowrap; flex-shrink: 0; }
   .story-ico {
     width: 36px;
     height: 36px;
@@ -1129,12 +1131,18 @@ function humanServiceChip(svc) {
   if (lbl.includes("idrac") || lbl.includes("ilo")) return "Server remote console";
   if (lbl.includes("ikvm")) return "Remote screen & keyboard";
   if (lbl.includes("tls 1.0")) return "Old encryption (TLS 1.0)";
-  if (lbl.includes("vnc")) return "Remote screen (VNC)";
+  if (lbl.includes("vnc")) return svc.port ? `Remote screen (VNC :${svc.port})` : "Remote screen (VNC)";
+  if (lbl.includes("open dns")) return "Open DNS resolver";
   if (lbl.includes("snmp")) return "Open device info (SNMP)";
   if (lbl.includes("telnet")) return "Unencrypted login (Telnet)";
+  if (lbl.includes("zehnder")) return "Open ventilation control";
   if (lbl.includes("cast")) return "Open Cast control";
   if (lbl.includes("smbv1")) return "Old file sharing (SMBv1)";
+  if (lbl.includes("smb unsigned")) return "Unsigned file sharing (SMB)";
   if (lbl.includes("expired cert")) return "Expired security certificate";
+  if (lbl.includes("pjlink")) return "Open projector control";
+  if (lbl.includes("bitcoin rpc")) return "Open Bitcoin RPC";
+  if (lbl.includes("eth engine")) return "Open Ethereum Engine API";
   return svc.label || ("Port " + svc.port);
 }
 
@@ -1191,10 +1199,30 @@ function humanReason(r) {
       why: "Screen sharing lets someone view or control this computer's desktop over the network.",
       fix: r.remediation || "Turn off VNC if you don't need it, or require a strong password and restrict it to trusted devices."
     },
+    "UB-0010": {
+      title: "Open recursive DNS resolver is reachable",
+      why: "This device answers recursive DNS lookups on UDP 53. Keep it limited to trusted internal networks and never forward port 53 from the internet.",
+      fix: r.remediation || "Verify only authorized internal subnets can query UDP/TCP 53 and keep port 53 blocked from WAN."
+    },
     "UB-0012": {
       title: "Uses default 'public' status password (SNMP)",
       why: "Other devices on the network can read detailed system info using the factory-default community password.",
       fix: r.remediation || "Turn off SNMP in the device settings, or switch to SNMPv3 with a private password."
+    },
+    "UB-2026-0039": {
+      title: "Ventilation unit control API (ComfoConnect) is open",
+      why: "Anyone on the same network can connect to this Zehnder ComfoConnect bridge over cleartext port 56747 and adjust ventilation settings.",
+      fix: r.remediation || "Set a non-default PIN in ComfoControl, move the bridge to an isolated IoT network, and allow port 56747 only from your home automation controller."
+    },
+    "UB-2026-0056": {
+      title: "AV receiver remote control (Telnet) has no password",
+      why: "Any device on this network can connect over cleartext port 23 to turn on the amplifier, change inputs, or raise the volume.",
+      fix: r.remediation || "Move the receiver to an isolated Smart Home / Media network and allow port 23 only from your home automation hub."
+    },
+    "UB-2026-0062": {
+      title: "Chromecast local setup API is reachable on this network",
+      why: "Devices on this network can query device details and initiate Cast sessions over port 8008.",
+      fix: r.remediation || "Place streaming media devices on an isolated Smart Home / Media network."
     },
     "UB-UNIFI-PORT-EXT-UPLINK": {
       title: "Outdoor cable carries all of your home networks",
@@ -1464,9 +1492,18 @@ function renderHeader() {
   }
 
   const q = vm.queue || [];
+  const exposedBMCCount = hosts.filter(e => e.is_bmc && e.state === "exposed").length;
+  const exposedHostCount = hosts.filter(e => !e.is_bmc && e.state === "exposed").length;
+  const wanAlertCount = (vm.wan_flows || []).filter(f => !f.expected).length;
+  const perimCount = q.filter(x => x.category === "perimeter").length;
+  const ctrlCount = q.filter(x => x.category === "controller").length;
+  const checkupTotal = exposedBMCCount + perimCount + wanAlertCount + exposedHostCount + ctrlCount;
+  const checkupHasCrit = q.some(x => x.severity === "critical")
+    || hosts.some(e => e.state === "exposed" && e.max_severity === "critical")
+    || (vm.wan_flows || []).some(f => !f.expected && f.severity === "critical");
   const ckB = document.getElementById("nb-ck");
-  ckB.textContent = checking && !q.length ? "…" : q.length;
-  ckB.className = "nav-cnt" + (q.some(x => x.severity === "critical") ? " crit" : q.length ? " warn" : checking ? " blue" : "");
+  ckB.textContent = checking && !checkupTotal ? "…" : checkupTotal;
+  ckB.className = "nav-cnt" + (checkupHasCrit ? " crit" : checkupTotal ? " warn" : checking ? " blue" : "");
 
   const openGates = c.open_wall_gates || 0;
   const hsB = document.getElementById("nb-hs");
@@ -1508,8 +1545,11 @@ function renderCheckup() {
   const wanAlerts = (vm.wan_flows || []).filter(f => !f.expected);
   const perimItems = (vm.queue || []).filter(x => x.category === "perimeter");
   const ctrlItems = (vm.queue || []).filter(x => x.category === "controller");
-  const totalIssues = (vm.queue || []).length;
-  const hasCrit = (vm.queue || []).some(x => x.severity === "critical");
+  const totalIssues = exposedBMCs.length + perimItems.length + wanAlerts.length + exposedHosts.length + ctrlItems.length;
+  const hasCrit = (vm.queue || []).some(x => x.severity === "critical")
+    || exposedBMCs.some(x => x.max_severity === "critical")
+    || exposedHosts.some(x => x.max_severity === "critical")
+    || wanAlerts.some(x => x.severity === "critical");
 
   // Compute SVG Progress Ring (r=36, circumference=226.2)
   const C = 226.2;
@@ -1674,7 +1714,7 @@ function renderCheckup() {
       const target = f.kind === "firewall" ? f.id : (f.target_id || vm.gateway_id);
       html += `<div class="story-item" onclick="openEntity('${esc(target)}')">
         <div class="story-item-l">
-          <div class="story-item-name">${esc(f.rule_name)} <span class="tag ${humanStateTone(f.severity)}">${esc(f.severity)}</span></div>
+          <div class="story-item-name">${esc(f.rule_name)} <span class="tag ${humanStateTone(f.severity)}">${f.severity === "critical" ? "Urgent" : "Review"}</span></div>
           <div class="story-item-sub">Points to <strong>${esc(f.target_name || f.target_ip || "Router")}</strong> · <span class="mono">${esc(f.label)}</span></div>
         </div>
         <div class="story-item-r"><span class="go-arrow">Inspect →</span></div>
@@ -2215,11 +2255,22 @@ function renderDeviceRow(vm, ent) {
   if (ent.child_ids && ent.child_ids.length) {
     pills.push(`<span class="tag blue">+${ent.child_ids.length} managed</span>`);
   }
+  const seenWanPorts = new Set();
+  const seenExposedLabels = new Set();
   for (const svc of (ent.services || [])) {
-    if (svc.exposed) pills.push(`<span class="tag ${humanStateTone(svc.severity)}">${esc(humanServiceChip(svc))}</span>`);
-    else if (svc.reachable === "wan") pills.push(`<span class="tag blue">Internet :${svc.port}</span>`);
-    else if (svc.reachable === "wan-restricted") pills.push(`<span class="tag blue">Internet (restricted) :${svc.port}</span>`);
-    else if (svc.reachable === "wan-cgnat") pills.push(`<span class="tag neutral">Forward (CGNAT) :${svc.port}</span>`);
+    if (svc.exposed) {
+      const chip = humanServiceChip(svc);
+      if (seenExposedLabels.has(chip)) continue;
+      seenExposedLabels.add(chip);
+      pills.push(`<span class="tag ${humanStateTone(svc.severity)}">${esc(chip)}</span>`);
+    } else if (svc.reachable === "wan" || svc.reachable === "wan-restricted" || svc.reachable === "wan-cgnat") {
+      const wKey = `${svc.reachable}:${svc.port}`;
+      if (seenWanPorts.has(wKey)) continue;
+      seenWanPorts.add(wKey);
+      if (svc.reachable === "wan") pills.push(`<span class="tag blue">Internet :${svc.port}</span>`);
+      else if (svc.reachable === "wan-restricted") pills.push(`<span class="tag blue">Internet (restricted) :${svc.port}</span>`);
+      else pills.push(`<span class="tag neutral">Forward (CGNAT) :${svc.port}</span>`);
+    }
   }
   if (!pills.length) {
     pills.push(`<span class="tag ${humanStateTone(ent)}">${esc(humanStateLabel(ent))}</span>`);
@@ -2405,12 +2456,16 @@ function renderDrawer() {
     for (const r of nonCVE) {
       const hr = humanReason(r);
       const rTone = r.state === "exposed" ? humanStateTone(r.severity) : "warn";
+      const portTag = r.port ? ` (port ${r.port})` : "";
+      const titleWithPort = hr.title.includes(String(r.port || "")) ? hr.title : (hr.title + portTag);
+      const showEvidence = r.evidence && r.evidence !== hr.why && r.evidence !== hr.title;
       b += `<div class="fix-card ${rTone}">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-          <strong style="font-size:14.5px">${esc(hr.title)}</strong>
+          <strong style="font-size:14.5px">${esc(titleWithPort)}</strong>
           <span class="tag ${rTone}">${r.severity === "critical" ? "Urgent" : (r.state === "review" ? "Review" : "Fix")}</span>
         </div>
         ${hr.why ? `<div class="small" style="margin-top:6px;color:var(--text-2)">${esc(hr.why)}</div>` : ""}
+        ${showEvidence ? `<div class="small mono" style="margin-top:5px;color:var(--muted)">Observed: ${esc(r.evidence)}</div>` : ""}
         ${hr.fix ? `<div class="fix-step"><strong>How to fix:</strong> ${esc(hr.fix)}</div>` : ""}
       </div>`;
     }
