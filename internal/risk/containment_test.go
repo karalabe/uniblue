@@ -277,9 +277,13 @@ func TestLockedDownIoTAndIPv6InternetInboundParityLeaks(t *testing.T) {
 			},
 			Devices: []unifi.Device{
 				{MAC: "aa:bb:cc:00:00:01", Name: "UDM Pro", Type: "udm", IP: "10.0.0.1"},
+				{MAC: "aa:bb:cc:00:00:02", Name: "Switch", Type: "usw", Ports: []unifi.SwitchPort{
+					{PortIdx: 1, Up: true, Isolation: true, MACTableCount: 1},
+				}},
 			},
 			Clients: []unifi.Client{
 				{MAC: "11:22:33:44:55:99", Name: "Unraid Management Console", IP: "10.2.0.5", NetworkName: "Servers", IsWired: true},
+				{MAC: "11:22:33:44:55:88", Name: "Camera - Fence", IP: "10.3.0.46", NetworkName: "Cameras", IsWired: true, SwitchMAC: "aa:bb:cc:00:00:02", SwitchPort: 1},
 			},
 			FirewallPolicies: []unifi.FirewallPolicy{
 				{
@@ -325,6 +329,24 @@ func TestLockedDownIoTAndIPv6InternetInboundParityLeaks(t *testing.T) {
 		}
 		if len(findings) != 0 || len(notes) != 0 {
 			t.Fatalf("expected 0 findings and 0 notes, got findings=%+v notes=%+v", findings, notes)
+		}
+
+		// Turning off switch port isolation on the camera port MUST be detected
+		// even when network-level IsolationEnabled ("Isolate Network") is true.
+		snap.Devices[1].Ports[0].Isolation = false
+		matOpen, findingsOpen, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{})
+		if matOpen.Containment[0].Peers.State != "open" {
+			t.Fatalf("expected Peers=open when switch port isolation is off (despite IsolationEnabled=true), got %+v", matOpen.Containment[0].Peers)
+		}
+		foundWiredSameVLAN := false
+		for _, f := range findingsOpen {
+			if f.CheckID == "UB-UNIFI-ISO-SAME-VLAN" {
+				foundWiredSameVLAN = true
+				break
+			}
+		}
+		if !foundWiredSameVLAN {
+			t.Fatalf("expected UB-UNIFI-ISO-SAME-VLAN when wired camera port lacks isolation, got %+v", findingsOpen)
 		}
 	})
 }

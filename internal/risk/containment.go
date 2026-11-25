@@ -503,7 +503,11 @@ func evaluatePeerContainmentAxis(
 
 	hasWiFi := len(wifiIso)+len(wifiOpen) > 0
 	multiAP := hasWiFi && len(siteAPs) >= 2
-	crossAPIsolated := !multiAP || n.IsolationEnabled || allAPUplinksIsolated || aclBlocksPeers
+	// UniFi's network-level "Isolate Network" flag (IsolationEnabled) enforces
+	// Layer-3 gateway rules between VLANs, NOT Layer-2 same-VLAN switching on
+	// UniFi switches. Cross-AP and wired peer isolation requires either switch
+	// port isolation (single switch) or an explicit L2 switch deny ACL.
+	crossAPIsolated := !multiAP || allAPUplinksIsolated || aclBlocksPeers
 
 	// Emit cross-AP violation when switch ACLs are known complete and do not isolate peers.
 	if multiAP && !crossAPIsolated && switchACLStatus == "complete" && !hasCrossAPCell {
@@ -522,7 +526,7 @@ func evaluatePeerContainmentAxis(
 			Verdict:          IsolationViolation,
 			DecisiveRuleName: aclDec.ruleName,
 			DecisiveReason:   fmt.Sprintf("%d APs serve %s without switch ACL or AP uplink port isolation", len(siteAPs), n.Name),
-			RecommendedFix:   fmt.Sprintf("Enable Network Isolation on %s, add a switch L2 ACL blocking intra-VLAN peer traffic, or isolate AP switch ports.", n.Name),
+			RecommendedFix:   fmt.Sprintf("Add a switch L2 ACL blocking intra-VLAN peer traffic on %s or enable Port Isolation on AP switch uplinks.", n.Name),
 		}
 		cells = append(cells, c)
 		findings = append(findings, checks.Finding{
@@ -534,17 +538,17 @@ func evaluatePeerContainmentAxis(
 			BaseSeverity:      checks.SeverityMedium,
 			EffectiveSeverity: checks.SeverityMedium,
 			Client:            unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
-			Evidence:          fmt.Sprintf("%d APs serve %s with isolationEnabled=false and 0 blocking switch ACLs (%s)", len(siteAPs), n.Name, aclDec.ruleName),
+			Evidence:          fmt.Sprintf("%d APs serve %s with un-isolated AP uplinks and 0 blocking switch ACLs (%s)", len(siteAPs), n.Name, aclDec.ruleName),
 			Remediation: checks.Remediation{
 				Summary:      c.RecommendedFix,
-				UniFiActions: []string{"enable_network_isolation", "add_switch_l2_isolation_acl"},
+				UniFiActions: []string{"add_switch_l2_isolation_acl", "enable_switch_port_isolation"},
 			},
 		})
 	}
 
 	// Emit wired peer violation when wired clients sit on un-isolated ports and
 	// switch ACLs are known complete without a deny ACL.
-	if len(wiredClients) > 0 && !allWiredPortIsolated && !n.IsolationEnabled && !aclBlocksPeers && switchACLStatus == "complete" && !hasWiredCell {
+	if len(wiredClients) > 0 && !allWiredPortIsolated && !aclBlocksPeers && switchACLStatus == "complete" && !hasWiredCell {
 		c := IsolationCell{
 			SourceZone:       zoneLabel,
 			SourceNetwork:    n.Name,
@@ -591,7 +595,7 @@ func evaluatePeerContainmentAxis(
 			State:  state,
 			Detail: fmt.Sprintf("Wi-Fi l2_isolation disabled on %s", strings.Join(wifiOpen, ", ")),
 		}, cells, findings
-	case len(wiredClients) > 0 && !allWiredPortIsolated && !n.IsolationEnabled && !aclBlocksPeers:
+	case len(wiredClients) > 0 && !allWiredPortIsolated && !aclBlocksPeers:
 		if switchACLStatus != "complete" {
 			state := "unknown"
 			if len(wifiIso) > 0 || wiredIsoCount > 0 {
@@ -621,7 +625,7 @@ func evaluatePeerContainmentAxis(
 			State:  "partial",
 			Detail: fmt.Sprintf("Same-AP Wi-Fi isolated; cross-AP traffic across %d APs not blocked by switch ACLs", len(siteAPs)),
 		}, cells, findings
-	case len(wifiIso) > 0 || allWiredPortIsolated || n.IsolationEnabled || aclBlocksPeers:
+	case len(wifiIso) > 0 || allWiredPortIsolated || aclBlocksPeers:
 		var parts []string
 		if len(wifiIso) > 0 {
 			parts = append(parts, "Wi-Fi L2 isolated")
@@ -629,9 +633,7 @@ func evaluatePeerContainmentAxis(
 		if allWiredPortIsolated {
 			parts = append(parts, "wired ports isolated")
 		}
-		if n.IsolationEnabled {
-			parts = append(parts, "Network Isolation enabled")
-		} else if aclBlocksPeers {
+		if aclBlocksPeers {
 			parts = append(parts, "switch ACL blocks peers")
 		} else if allAPUplinksIsolated && multiAP {
 			parts = append(parts, "AP uplinks isolated")
