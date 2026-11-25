@@ -171,6 +171,8 @@ UniBlue automatically detects how to talk to your UniFi console:
 - **UniFi OS** (UDM Pro, UDM SE, Cloud Gateways, modern Cloud Keys): `/api/auth/login` + `/proxy/network/...`
 - **Classic Network Controller** (older Cloud Key / standalone Network App): `/api/login` + `/api/s/<site>/...`
 
+Wired and wirelessly meshed UniFi APs are supported. Ubiquiti's separate **AmpliFi** consumer line (HD, Instant, Alien) is not supported, as it does not run the UniFi Network API.
+
 ## Contributing
 
 Pull requests are disabled on this repository. Whether you are a human or an AI agent, please open an issue for everything:
