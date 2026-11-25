@@ -1,0 +1,664 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-label="UniBlue: Blue-team security engine for UniFi home and lab networks">
+  <defs>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif; }
+      .mono { font-family: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, monospace; }
+    </style>
+
+    <!-- Background gradients -->
+    <radialGradient id="bg-grad" cx="0.68" cy="0.34" r="0.82">
+      <stop offset="0%" stop-color="#0d1b36"/>
+      <stop offset="48%" stop-color="#070e1f"/>
+      <stop offset="100%" stop-color="#040711"/>
+    </radialGradient>
+
+    <radialGradient id="glow-cyan" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#2dd4ff" stop-opacity="0.22"/>
+      <stop offset="45%" stop-color="#3977f4" stop-opacity="0.09"/>
+      <stop offset="100%" stop-color="#3977f4" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="glow-logo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#2dd4ff" stop-opacity="0.28"/>
+      <stop offset="60%" stop-color="#268dff" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#268dff" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="glow-red" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#f87171" stop-opacity="0.20"/>
+      <stop offset="60%" stop-color="#f87171" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#f87171" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="headline-grad" x1="0" y1="0" x2="1" y2="0.2">
+      <stop offset="0%" stop-color="#38e2ff"/>
+      <stop offset="55%" stop-color="#4ea1ff"/>
+      <stop offset="100%" stop-color="#608cff"/>
+    </linearGradient>
+
+    <linearGradient id="card-stroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#305082" stop-opacity="0.95"/>
+      <stop offset="50%" stop-color="#1c2f4f" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#26426e" stop-opacity="0.9"/>
+    </linearGradient>
+
+    <linearGradient id="term-stroke" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2dd4ff" stop-opacity="0.75"/>
+      <stop offset="45%" stop-color="#284c82" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#1c2f4f" stop-opacity="0.75"/>
+    </linearGradient>
+
+    <linearGradient id="beam-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2dd4ff" stop-opacity="0.08"/>
+      <stop offset="20%" stop-color="#2dd4ff" stop-opacity="0.85"/>
+      <stop offset="50%" stop-color="#3898ff" stop-opacity="1"/>
+      <stop offset="80%" stop-color="#2dd4ff" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#2dd4ff" stop-opacity="0.08"/>
+    </linearGradient>
+
+    <linearGradient id="spark-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2dd4ff" stop-opacity="0.34"/>
+      <stop offset="100%" stop-color="#2dd4ff" stop-opacity="0.0"/>
+    </linearGradient>
+
+    <linearGradient id="card-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f182c"/>
+      <stop offset="100%" stop-color="#0a101f"/>
+    </linearGradient>
+
+    <!-- Exact UniBlue logo shield gradient & mask from docs/logo-horizontal-dark.svg -->
+    <linearGradient id="shield-blue" x1="0.24" y1="0" x2="0.72" y2="1">
+      <stop stop-color="#2dd4ff"/>
+      <stop offset="0.53" stop-color="#268dff"/>
+      <stop offset="1" stop-color="#3977f4"/>
+    </linearGradient>
+    <mask id="node-clearance" maskUnits="userSpaceOnUse" x="0" y="0" width="300" height="310" style="mask-type:alpha">
+      <path fill="white" fill-rule="evenodd" d="M0 0H300V310H0Z M49 204a19 19 0 1 0 38 0a19 19 0 1 0 -38 0Z M213 204a19 19 0 1 0 38 0a19 19 0 1 0 -38 0Z"/>
+    </mask>
+
+    <!-- Engineering dot grid -->
+    <pattern id="dot-grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.05" fill="#449aff" opacity="0.16"/>
+    </pattern>
+
+    <!-- Diagonal red hazard hatching for exposed outdoor switch ports -->
+    <pattern id="hazard-red" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#f87171" stroke-width="2.2" stroke-opacity="0.35"/>
+    </pattern>
+
+    <!-- Soft neon glow filters -->
+    <filter id="neon-soft" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="neon-tight" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="2.4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="card-shadow" x="-8%" y="-8%" width="116%" height="120%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#02050c" flood-opacity="0.65"/>
+    </filter>
+  </defs>
+
+  <!-- ==================== BACKDROP & ATMOSPHERE ==================== -->
+  <rect width="1600" height="900" fill="url(#bg-grad)"/>
+  <rect width="1600" height="900" fill="url(#dot-grid)"/>
+
+  <!-- Atmospheric glows -->
+  <circle cx="1180" cy="360" r="520" fill="url(#glow-cyan)"/>
+  <circle cx="155" cy="192" r="210" fill="url(#glow-logo)"/>
+  <circle cx="910" cy="245" r="210" fill="url(#glow-red)"/>
+
+  <!-- Subtle background circuit / topology traces -->
+  <g fill="none" stroke="#22406e" stroke-width="1.3" opacity="0.45">
+    <path d="M 0 132 H 48 L 76 160 H 120"/>
+    <path d="M 0 762 H 36 L 56 782 H 72"/>
+    <path d="M 520 198 H 655 L 690 163 H 796"/>
+    <path d="M 736 564 H 766 L 784 546 H 796"/>
+    <path d="M 1528 212 H 1564 L 1582 230 H 1600"/>
+    <path d="M 1528 638 H 1560 L 1582 616 H 1600"/>
+    <path d="M 650 900 V 862 L 680 832 H 796"/>
+  </g>
+  <g fill="#2dd4ff" opacity="0.42">
+    <circle cx="655" cy="198" r="2.8"/>
+    <circle cx="690" cy="163" r="2.8"/>
+    <circle cx="766" cy="564" r="2.5"/>
+    <circle cx="680" cy="832" r="2.5"/>
+    <circle cx="48" cy="132" r="2.5"/>
+  </g>
+
+  <!-- Outer technical HUD hairline border + corner brackets -->
+  <rect x="22" y="22" width="1556" height="856" rx="18" fill="none" stroke="#1b2d4c" stroke-width="1.2" opacity="0.75"/>
+  <g fill="none" stroke="#2dd4ff" stroke-width="2" stroke-linecap="round" opacity="0.65">
+    <path d="M 22 50 V 32 Q 22 22 32 22 H 50"/>
+    <path d="M 1550 22 H 1568 Q 1578 22 1578 32 V 50"/>
+    <path d="M 22 850 V 868 Q 22 878 32 878 H 50"/>
+    <path d="M 1550 878 H 1568 Q 1578 878 1578 868 V 850"/>
+  </g>
+
+  <!-- ==================== LEFT HERO COLUMN ==================== -->
+
+  <!-- Top Eyebrow Pill -->
+  <g transform="translate(72, 64)">
+    <rect width="368" height="32" rx="16" fill="#0b1528" stroke="#1e3a63" stroke-width="1.2"/>
+    <circle cx="19" cy="16" r="7" fill="#34d399" opacity="0.22"/>
+    <circle cx="19" cy="16" r="3.8" fill="#34d399" filter="url(#neon-tight)"/>
+    <text x="35" y="20" class="mono" font-size="11.2" font-weight="700" letter-spacing="0.08em" fill="#8ad8ff">OPEN SOURCE · SINGLE GO BINARY · READ-ONLY</text>
+  </g>
+
+  <!-- Exact UniBlue Logo + Wordmark (from docs/logo-horizontal-dark.svg) -->
+  <g transform="translate(64, 114) scale(0.76)">
+    <g id="symbol" transform="translate(8 8) scale(.63)">
+      <g id="shield" fill="none" stroke="url(#shield-blue)" stroke-width="23" stroke-linejoin="round" mask="url(#node-clearance)" filter="url(#neon-soft)">
+        <path d="M150 24 C188 46 223 57 260 67 L260 116 C260 202 228 254 150 287 C72 254 40 202 40 116 L40 67 C77 57 112 46 150 24 Z"/>
+      </g>
+      <g id="wifi" fill="none" stroke="#3898ff" stroke-width="10.5" stroke-linecap="round">
+        <path d="M98 85 Q150 45 202 85"/>
+        <path d="M115 100 Q150 73 185 100"/>
+        <path d="M132 115 Q150 100 168 115"/>
+      </g>
+      <g id="home" fill="#e3efff">
+        <path d="M95 178 L150 130 L205 178 V216 L193 225 V182 L150 145 L107 182 V225 L95 216 Z"/>
+        <path fill="none" stroke="#e3efff" stroke-width="18" stroke-linejoin="round" stroke-linecap="round" d="M82 177 L150 124 L218 177"/>
+        <rect x="185" y="125" width="17" height="40" rx="3"/>
+      </g>
+      <g id="windows" fill="#3898ff">
+        <rect x="133" y="170" width="15" height="15" rx="2.4"/>
+        <rect x="133" y="189" width="15" height="15" rx="2.4"/>
+        <rect x="152" y="170" width="15" height="15" rx="2.4"/>
+        <rect x="152" y="189" width="15" height="15" rx="2.4"/>
+      </g>
+      <g id="network" fill="none" stroke="#3898ff" stroke-linecap="round" stroke-width="8">
+        <path d="M79 212 Q112 237 137 239 M163 239 Q188 237 221 212 M150 217 V226.5"/>
+      </g>
+      <g id="nodes">
+        <path fill="#3898ff" fill-rule="evenodd" d="M54 204 a14 14 0 1 0 28 0 a14 14 0 1 0 -28 0 Z M60 204 a8 8 0 1 0 16 0 a8 8 0 1 0 -16 0 Z"/>
+        <path fill="#3898ff" fill-rule="evenodd" d="M218 204 a14 14 0 1 0 28 0 a14 14 0 1 0 -28 0 Z M224 204 a8 8 0 1 0 16 0 a8 8 0 1 0 -16 0 Z"/>
+        <path fill="#3898ff" fill-rule="evenodd" d="M134 240 a16 16 0 1 0 32 0 a16 16 0 1 0 -32 0 Z M141 240 a9 9 0 1 0 18 0 a9 9 0 1 0 -18 0 Z"/>
+      </g>
+    </g>
+    <g transform="translate(0 67.937)">
+      <g id="wordmark" aria-label="UniBlue">
+        <path fill="#e5effc" d="M234.426 74.126C252.787 74.126 264.803 63.516 264.803 47.576V0.775H247.797V46.171C247.797 53.826 242.468 59.301 234.426 59.301C226.432 59.301 221.005 53.778 221.005 46.171V0.775H204V47.576C204 63.516 215.967 74.126 234.426 74.126Z"/>
+        <path fill="#e5effc" d="M288.978 45.154C288.978 38.177 292.37 34.931 297.65 34.931C302.931 34.931 305.984 38.226 305.984 44.282V72.963H322.65V40.793C322.65 28.197 316.158 20.687 305.063 20.687C297.36 20.687 292.176 24.224 288.784 30.086V21.802H272.312V72.963H288.978Z"/>
+        <path fill="#e5effc" d="M330.256 72.963H346.922V21.802H330.256ZM338.541 16.812C343.919 16.812 347.746 13.275 347.746 8.382C347.746 3.488 343.919 0 338.541 0C333.211 0 329.384 3.488 329.384 8.382C329.384 13.275 333.211 16.812 338.541 16.812Z"/>
+        <path fill="#449aff" d="M354.529 72.963H386.747C402.783 72.963 411.843 64.533 411.843 52.566C411.843 42.344 404.915 35.755 395.904 35.173V35.077C404.043 33.284 409.324 27.422 409.324 19.089C409.324 8.285 400.603 0.775 384.567 0.775H354.529ZM371.534 59.591V42.78H383.985C390.235 42.78 394.062 46.074 394.062 51.307C394.062 56.491 390.187 59.591 383.888 59.591ZM371.534 30.086V14.147H382.919C388.491 14.147 391.931 17.248 391.931 22.092C391.931 26.986 388.491 30.086 382.919 30.086Z"/>
+        <path fill="#449aff" d="M433.693 0.775H417.027V72.963H433.693Z"/>
+        <path fill="#449aff" d="M458.886 74.077C466.59 74.077 471.773 70.541 475.165 64.678V72.963H491.637V21.802H474.971V49.611C474.971 56.588 471.58 59.834 466.299 59.834C461.018 59.834 457.966 56.539 457.966 50.483V21.802H441.3V53.971C441.3 66.568 447.792 74.077 458.886 74.077Z"/>
+        <path fill="#449aff" d="M523.468 74.126C536.403 74.126 546.723 66.907 548.612 56.588H533.642C532.431 59.979 528.942 62.111 524.049 62.111C517.46 62.111 513.584 57.993 513.391 51.5H549V46.995C549 31.491 538.39 20.639 523.032 20.639C507.867 20.639 497.112 31.782 497.112 47.382C497.112 62.983 507.771 74.126 523.468 74.126ZM513.487 41.52C514.214 36.142 517.848 32.945 523.468 32.945C529.039 32.945 532.721 36.142 533.448 41.52Z"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- Hero Headline -->
+  <text x="72" y="346" class="sans" font-size="56" font-weight="800" letter-spacing="-0.03em" fill="#f0f6fc">Blue-team your</text>
+  <text x="72" y="408" class="sans" font-size="56" font-weight="800" letter-spacing="-0.03em" fill="url(#headline-grad)">UniFi home &amp; lab.</text>
+
+  <!-- Crisp Subtitle -->
+  <text x="72" y="454" class="sans" font-size="19.5" font-weight="400" fill="#9bb0ce">Maps your UniFi topology, firewall zones, outdoor PoE</text>
+  <text x="72" y="482" class="sans" font-size="19.5" font-weight="400" fill="#9bb0ce">cables, and LAN services. Tells you what actually matters.</text>
+
+  <!-- 2x2 Capability Cards -->
+  <!-- Card 1: 122 Checks -->
+  <g transform="translate(72, 520)">
+    <rect width="322" height="84" rx="12" fill="url(#card-bg)" stroke="#1e3557" stroke-width="1.2"/>
+    <rect x="14" y="18" width="4" height="48" rx="2" fill="#2dd4ff"/>
+    <text x="32" y="41" class="sans" font-size="17" font-weight="700" fill="#f0f6fc"><tspan class="mono" fill="#2dd4ff">122</tspan> Read-Only Checks</text>
+    <text x="32" y="63" class="sans" font-size="13.5" fill="#8298b8">170+ wire &amp; mDNS recognizers</text>
+  </g>
+
+  <!-- Card 2: Offline CVE Radar -->
+  <g transform="translate(414, 520)">
+    <rect width="322" height="84" rx="12" fill="url(#card-bg)" stroke="#2d244d" stroke-width="1.2"/>
+    <rect x="14" y="18" width="4" height="48" rx="2" fill="#c084fc"/>
+    <text x="32" y="41" class="sans" font-size="17" font-weight="700" fill="#f0f6fc"><tspan fill="#c084fc">Offline</tspan> CVE Radar</text>
+    <text x="32" y="63" class="sans" font-size="13.5" fill="#8298b8">NVD + CISA KEV · zero cloud calls</text>
+  </g>
+
+  <!-- Card 3: IPv4 + IPv6 Isolation -->
+  <g transform="translate(72, 620)">
+    <rect width="322" height="84" rx="12" fill="url(#card-bg)" stroke="#3d3019" stroke-width="1.2"/>
+    <rect x="14" y="18" width="4" height="48" rx="2" fill="#fbbf24"/>
+    <text x="32" y="41" class="sans" font-size="17" font-weight="700" fill="#f0f6fc"><tspan class="mono" fill="#fbbf24">IPv4+v6</tspan> Blast Radius</text>
+    <text x="32" y="63" class="sans" font-size="13.5" fill="#8298b8">Real UniFi zone &amp; VLAN isolation</text>
+  </g>
+
+  <!-- Card 4: Outdoor Cable Watch -->
+  <g transform="translate(414, 620)">
+    <rect width="322" height="84" rx="12" fill="url(#card-bg)" stroke="#472028" stroke-width="1.2"/>
+    <rect x="14" y="18" width="4" height="48" rx="2" fill="#f87171"/>
+    <text x="32" y="41" class="sans" font-size="17" font-weight="700" fill="#f0f6fc"><tspan fill="#f87171">Outdoor</tspan> Cable &amp; PoE</text>
+    <text x="32" y="63" class="sans" font-size="13.5" fill="#8298b8">Trunk exposure &amp; plug-in tamper</text>
+  </g>
+
+  <!-- Geeky Terminal Command Strip -->
+  <g transform="translate(72, 732)">
+    <rect width="664" height="58" rx="12" fill="#070c17" stroke="url(#term-stroke)" stroke-width="1.3"/>
+    <text x="22" y="35" class="mono" font-size="15.5">
+      <tspan fill="#2dd4ff" font-weight="700">$</tspan>
+      <tspan fill="#f0f6fc" font-weight="700" dx="6">uniblue</tspan>
+      <tspan fill="#34d399" font-weight="600" dx="8">demo</tspan>
+      <tspan fill="#334155" dx="6">|</tspan>
+      <tspan fill="#7dd3fc" dx="6">scan</tspan>
+      <tspan fill="#334155" dx="6">|</tspan>
+      <tspan fill="#7dd3fc" dx="6">ports</tspan>
+      <tspan fill="#334155" dx="6">|</tspan>
+      <tspan fill="#7dd3fc" dx="6">serve</tspan>
+      <tspan fill="#334155" dx="6">|</tspan>
+      <tspan fill="#7dd3fc" dx="6">watch</tspan>
+    </text>
+    <!-- Docker / GHCR tag chip on right -->
+    <rect x="540" y="15" width="108" height="28" rx="7" fill="#0d1d33" stroke="#1e3f6b" stroke-width="1"/>
+    <text x="594" y="33" text-anchor="middle" class="mono" font-size="11.5" font-weight="700" fill="#60a5fa">ghcr.io</text>
+  </g>
+
+  <!-- Footer GitHub Link -->
+  <g transform="translate(72, 818)">
+    <!-- Minimal crisp GitHub octocat mark -->
+    <path transform="translate(0, 2) scale(0.95)" fill="#8ba2c2" fill-rule="evenodd" d="M12 1C5.92 1 1 5.92 1 12c0 4.86 3.15 8.99 7.52 10.44.55.1.75-.24.75-.53 0-.26-.01-.95-.01-1.87-3.06.66-3.71-1.48-3.71-1.48-.5-1.27-1.22-1.61-1.22-1.61-.99-.68.08-.67.08-.67 1.1.08 1.68 1.13 1.68 1.13.98 1.68 2.57 1.19 3.2.91.1-.71.38-1.19.7-1.47-2.44-.28-5.01-1.22-5.01-5.43 0-1.2.43-2.18 1.13-2.95-.11-.28-.49-1.4.11-2.91 0 0 .92-.3 3.02 1.13a10.5 10.5 0 0 1 5.5 0c2.1-1.43 3.02-1.13 3.02-1.13.6 1.51.22 2.63.11 2.91.7.77 1.13 1.75 1.13 2.95 0 4.22-2.57 5.15-5.02 5.42.39.34.74 1.01.74 2.04 0 1.47-.01 2.66-.01 3.02 0 .29.2.64.76.53A11.01 11.01 0 0 0 23 12c0-6.08-4.92-11-11-11Z"/>
+    <text x="32" y="19" class="mono" font-size="19" font-weight="700" fill="#e5effc">github.com/karalabe/<tspan fill="#449aff">uniblue</tspan></text>
+    <text x="366" y="18" class="sans" font-size="13.5" fill="#788faf">·  BSD-3-Clause  ·  Web UI &amp; CLI</text>
+  </g>
+
+
+  <!-- ==================== RIGHT VISUAL SHOWPIECE ==================== -->
+
+  <!-- PANEL A: Live PoE Switch & Outdoor Cable Matrix -->
+  <g filter="url(#card-shadow)">
+    <rect x="796" y="64" width="732" height="278" rx="16" fill="url(#card-bg)" stroke="url(#card-stroke)" stroke-width="1.4"/>
+    <!-- Subtle top specular highlight -->
+    <line x1="824" y1="65" x2="1500" y2="65" stroke="#38bdf8" stroke-width="1" opacity="0.35"/>
+
+    <!-- Switch Card Header -->
+    <circle cx="824" cy="96" r="5" fill="#3898ff" filter="url(#neon-tight)"/>
+    <text x="840" y="101" class="sans" font-size="17" font-weight="700" fill="#f0f6fc">Office 24 PoE Switch</text>
+    <text x="1020" y="101" class="mono" font-size="12.5" font-weight="600" fill="#647a99">USW 24 PoE</text>
+
+    <!-- Status pills in header -->
+    <rect x="1148" y="81" width="186" height="28" rx="14" fill="#2c1218" stroke="#992b37" stroke-width="1.1"/>
+    <circle cx="1164" cy="95" r="3.5" fill="#f87171"/>
+    <text x="1175" y="99" class="sans" font-size="12" font-weight="700" fill="#fca5a5">3 outdoor ports exposed</text>
+
+    <rect x="1346" y="81" width="158" height="28" rx="14" fill="#0d1e36" stroke="#1e4273" stroke-width="1.1"/>
+    <text x="1425" y="99" text-anchor="middle" class="mono" font-size="11.5" font-weight="600" fill="#7dd3fc">↳ UDM SE #11 · 10G</text>
+
+    <!-- Recessed Switch Faceplate Container -->
+    <rect x="820" y="124" width="684" height="134" rx="11" fill="#060a14" stroke="#182842" stroke-width="1.2"/>
+    <g transform="translate(838.0,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#2b1218" stroke="#f87171" stroke-width="1.2"/>
+  <rect x="1" y="1" width="40" height="44" rx="4.5" fill="url(#hazard-red)" opacity="0.55"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#fecaca">#1</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.2" font-weight="600" fill="#f87171">⚡7.4W</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#f87171" opacity="0.95"/>
+</g>
+<g transform="translate(886.6,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#3</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(935.2,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#5</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(983.8,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#7</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1032.4,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#9</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.2" font-weight="600" fill="#7dd3fc">⚡5.4W</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<g transform="translate(1081.0,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#11</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1129.6,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#13</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1178.2,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#15</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1226.8,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#291e0e" stroke="#fbbf24" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#fde68a">#17</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#fbbf24">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#fbbf24" opacity="0.95"/>
+</g>
+<g transform="translate(1275.4,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#19</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<g transform="translate(1324.0,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#21</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1372.6,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#23</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(838.0,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0d261d" stroke="#34d399" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#a7f3d0">#2</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.2" font-weight="600" fill="#34d399">⚡6.8W</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#34d399" opacity="0.95"/>
+</g>
+<g transform="translate(886.6,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#4</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(935.2,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#2b1218" stroke="#f87171" stroke-width="1.2"/>
+  <rect x="1" y="1" width="40" height="44" rx="4.5" fill="url(#hazard-red)" opacity="0.55"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#fecaca">#6</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.2" font-weight="600" fill="#f87171">⚡3.2W</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#f87171" opacity="0.95"/>
+</g>
+<g transform="translate(983.8,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#8</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1032.4,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#10</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1081.0,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#12</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<g transform="translate(1129.6,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#14</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<g transform="translate(1178.2,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#16</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<g transform="translate(1226.8,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#18</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<g transform="translate(1275.4,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#2b1218" stroke="#f87171" stroke-width="1.2"/>
+  <rect x="1" y="1" width="40" height="44" rx="4.5" fill="url(#hazard-red)" opacity="0.55"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#fecaca">#20</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#f87171">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#f87171" opacity="0.95"/>
+</g>
+<g transform="translate(1324.0,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#22</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<g transform="translate(1372.6,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#24</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">1G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+<line x1="1430" y1="142" x2="1430" y2="238" stroke="#1e3150" stroke-width="1.2" stroke-dasharray="3 3"/>
+<g transform="translate(1444.0,140.0)">
+  <rect width="42" height="46" rx="5.5" fill="#0a101d" stroke="#1b2840" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#5b6f8c">#25</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#3b4c66">-</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#1f3557" opacity="0.55"/>
+</g>
+<g transform="translate(1444.0,194.0)">
+  <rect width="42" height="46" rx="5.5" fill="#101d35" stroke="#2d5a9e" stroke-width="1.2"/>
+  <text x="21.0" y="17.5" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#e2eeff">#26</text>
+  <text x="21.0" y="31.5" text-anchor="middle" class="mono" font-size="8.8" font-weight="600" fill="#7dd3fc">10G</text>
+  <rect x="8" y="38.5" width="26" height="3" rx="1.5" fill="#3898ff" opacity="0.95"/>
+</g>
+
+    <!-- Bottom Port Callout Chips inside Switch Card -->
+    <!-- Chip 1: #1 Front Gate Cam -->
+    <g transform="translate(820, 276)">
+      <rect width="232" height="44" rx="9" fill="#241016" stroke="#7f232e" stroke-width="1.1"/>
+      <rect x="0" y="0" width="232" height="44" rx="9" fill="url(#hazard-red)" opacity="0.28"/>
+      <text x="14" y="19" class="mono" font-size="11.5" font-weight="700" fill="#fca5a5">#1 → Front Gate Camera</text>
+      <text x="14" y="35" class="sans" font-size="11" fill="#e2949c">Outdoor cable · carries all VLANs</text>
+    </g>
+
+    <!-- Chip 2: #6 Shed Switch -->
+    <g transform="translate(1064, 276)">
+      <rect width="218" height="44" rx="9" fill="#241016" stroke="#7f232e" stroke-width="1.1"/>
+      <rect x="0" y="0" width="218" height="44" rx="9" fill="url(#hazard-red)" opacity="0.28"/>
+      <text x="14" y="19" class="mono" font-size="11.5" font-weight="700" fill="#fca5a5">#6 → Detached Shed</text>
+      <text x="14" y="35" class="sans" font-size="11" fill="#e2949c">Outdoor switch · empty port live</text>
+    </g>
+
+    <!-- Chip 3: #2 Patio Cam (Safe) -->
+    <g transform="translate(1294, 276)">
+      <rect width="210" height="44" rx="9" fill="#0c221a" stroke="#1b6b4d" stroke-width="1.1"/>
+      <text x="14" y="19" class="mono" font-size="11.5" font-weight="700" fill="#6ee7b7">#2 → Patio Camera</text>
+      <text x="14" y="35" class="sans" font-size="11" fill="#86c9ae">Locked to IoT · MAC restricted</text>
+    </g>
+  </g>
+
+
+  <!-- ==================== FIREWALL POLICY SCAN BEAM (y=342..424) ==================== -->
+  <!-- Layered glow + crisp vertical signal traces (zero-width filter-safe across all SVG engines) -->
+  <g fill="none" stroke-linecap="round">
+    <!-- Soft outer glow strokes -->
+    <line x1="876" y1="342" x2="876" y2="424" stroke="#f87171" stroke-width="7" opacity="0.18"/>
+    <line x1="946" y1="342" x2="946" y2="424" stroke="#34d399" stroke-width="6" opacity="0.16"/>
+    <line x1="1016" y1="342" x2="1016" y2="424" stroke="#fbbf24" stroke-width="6" opacity="0.16"/>
+    <line x1="1116" y1="342" x2="1116" y2="424" stroke="#f87171" stroke-width="7" opacity="0.18"/>
+    <line x1="1465" y1="342" x2="1465" y2="424" stroke="#2dd4ff" stroke-width="7" opacity="0.22"/>
+
+    <!-- Crisp core traces -->
+    <line x1="876" y1="342" x2="876" y2="424" stroke="#f87171" stroke-width="2" stroke-dasharray="5 4"/>
+    <line x1="946" y1="342" x2="946" y2="424" stroke="#34d399" stroke-width="2"/>
+    <line x1="1016" y1="342" x2="1016" y2="424" stroke="#fbbf24" stroke-width="2"/>
+    <line x1="1116" y1="342" x2="1116" y2="424" stroke="#f87171" stroke-width="2" stroke-dasharray="5 4"/>
+    <line x1="1465" y1="342" x2="1465" y2="424" stroke="#2dd4ff" stroke-width="2.2"/>
+  </g>
+
+  <!-- Glowing Horizontal Inspection Beam (rects so objectBoundingBox gradient renders everywhere) -->
+  <rect x="796" y="379" width="732" height="8" rx="4" fill="url(#beam-grad)" opacity="0.22"/>
+  <rect x="796" y="382" width="732" height="2" rx="1" fill="url(#beam-grad)"/>
+
+  <!-- Intersection pulse dots on beam -->
+  <g>
+    <circle cx="876" cy="383" r="9" fill="#f87171" opacity="0.22"/>
+    <circle cx="876" cy="383" r="4.5" fill="#f87171"/>
+    <circle cx="946" cy="383" r="8" fill="#34d399" opacity="0.2"/>
+    <circle cx="946" cy="383" r="4.2" fill="#34d399"/>
+    <circle cx="1016" cy="383" r="8" fill="#fbbf24" opacity="0.2"/>
+    <circle cx="1016" cy="383" r="4.2" fill="#fbbf24"/>
+    <circle cx="1116" cy="383" r="9" fill="#f87171" opacity="0.22"/>
+    <circle cx="1116" cy="383" r="4.5" fill="#f87171"/>
+    <circle cx="1465" cy="383" r="9" fill="#2dd4ff" opacity="0.25"/>
+    <circle cx="1465" cy="383" r="4.8" fill="#2dd4ff"/>
+  </g>
+
+  <!-- Policy Engine Pill cleanly nestled between x=1116 and x=1465 -->
+  <g transform="translate(1152, 368)">
+    <rect width="282" height="30" rx="15" fill="#081326" stroke="#2dd4ff" stroke-width="1.2"/>
+    <text x="141" y="19.5" text-anchor="middle" class="mono" font-size="11" font-weight="700" letter-spacing="0.06em" fill="#8ad8ff">UNIFI ZONES · IPv4 + IPv6 AUDIT</text>
+  </g>
+
+
+  <!-- ==================== MIDDLE ROW: CHECKUP & ROUTER SHIELD ==================== -->
+
+  <!-- PANEL B: Blast Radius & Checkup Findings -->
+  <g filter="url(#card-shadow)">
+    <rect x="796" y="424" width="388" height="308" rx="16" fill="url(#card-bg)" stroke="url(#card-stroke)" stroke-width="1.3"/>
+
+    <!-- Circular Checkup Gauge -->
+    <g transform="translate(840, 466)">
+      <circle r="22" fill="#080e1b" stroke="#1a2942" stroke-width="4.5"/>
+      <!-- Crimson alert arc (~70%) -->
+      <circle r="22" fill="none" stroke="#f87171" stroke-width="4.5" stroke-linecap="round"
+              stroke-dasharray="92 140" transform="rotate(-90)" filter="url(#neon-tight)"/>
+      <text x="0" y="6" text-anchor="middle" class="mono" font-size="16" font-weight="800" fill="#fca5a5">11</text>
+    </g>
+
+    <text x="878" y="462" class="sans" font-size="17" font-weight="700" fill="#f0f6fc">Checkup Findings</text>
+    <text x="878" y="481" class="sans" font-size="12.5" fill="#7f95b5">Ranked by zone blast radius</text>
+
+    <!-- Row 1: iDRAC -->
+    <g transform="translate(814, 504)">
+      <rect width="352" height="48" rx="10" fill="#0a111f" stroke="#24344f" stroke-width="1"/>
+      <circle cx="18" cy="24" r="4.2" fill="#f87171"/>
+      <text x="32" y="21" class="sans" font-size="13.5" font-weight="700" fill="#f0f6fc">Rack Server iDRAC</text>
+      <text x="32" y="38" class="mono" font-size="10.8" fill="#7f95b5">IPMI on Trusted VLAN · Port #17</text>
+      <rect x="278" y="13" width="62" height="22" rx="11" fill="#2d1218" stroke="#992b37" stroke-width="1"/>
+      <text x="309" y="27.5" text-anchor="middle" class="mono" font-size="10" font-weight="700" fill="#fca5a5">URGENT</text>
+    </g>
+
+    <!-- Row 2: Outdoor Camera Trunk -->
+    <g transform="translate(814, 560)">
+      <rect width="352" height="48" rx="10" fill="#0a111f" stroke="#24344f" stroke-width="1"/>
+      <circle cx="18" cy="24" r="4.2" fill="#f87171"/>
+      <text x="32" y="21" class="sans" font-size="13.5" font-weight="700" fill="#f0f6fc">Front Gate Camera</text>
+      <text x="32" y="38" class="mono" font-size="10.8" fill="#7f95b5">Unrestricted outdoor PoE trunk</text>
+      <rect x="286" y="13" width="54" height="22" rx="11" fill="#2d1218" stroke="#992b37" stroke-width="1"/>
+      <text x="313" y="27.5" text-anchor="middle" class="mono" font-size="10" font-weight="700" fill="#fca5a5">LOCK</text>
+    </g>
+
+    <!-- Row 3: WAN Port Forward -->
+    <g transform="translate(814, 616)">
+      <rect width="352" height="48" rx="10" fill="#0a111f" stroke="#24344f" stroke-width="1"/>
+      <circle cx="18" cy="24" r="4.2" fill="#fbbf24"/>
+      <text x="32" y="21" class="sans" font-size="13.5" font-weight="700" fill="#f0f6fc">Open WAN Door · 443</text>
+      <text x="32" y="38" class="mono" font-size="10.8" fill="#7f95b5">NAT forward · CVE match found</text>
+      <rect x="278" y="13" width="62" height="22" rx="11" fill="#291e0e" stroke="#855517" stroke-width="1"/>
+      <text x="309" y="27.5" text-anchor="middle" class="mono" font-size="10" font-weight="700" fill="#fde68a">REVIEW</text>
+    </g>
+
+    <!-- Row 4: Contained IoT -->
+    <g transform="translate(814, 672)">
+      <rect width="352" height="48" rx="10" fill="#091815" stroke="#184737" stroke-width="1"/>
+      <circle cx="18" cy="24" r="4.2" fill="#34d399"/>
+      <text x="32" y="21" class="sans" font-size="13.5" font-weight="700" fill="#e5fff5">Patio Camera</text>
+      <text x="32" y="38" class="mono" font-size="10.8" fill="#7eb8a2">Isolated IoT · Blast Radius -1</text>
+      <rect x="266" y="13" width="74" height="22" rx="11" fill="#0e2c21" stroke="#1d7a57" stroke-width="1"/>
+      <text x="303" y="27.5" text-anchor="middle" class="mono" font-size="9.8" font-weight="700" fill="#6ee7b7">CONTAINED</text>
+    </g>
+  </g>
+
+
+  <!-- PANEL C: Router Protection -->
+  <g filter="url(#card-shadow)">
+    <rect x="1202" y="424" width="326" height="308" rx="16" fill="url(#card-bg)" stroke="url(#card-stroke)" stroke-width="1.3"/>
+
+    <!-- Header -->
+    <path d="M1228 450 L1237 454 V461 C1237 468 1233 472 1228 475 C1223 472 1219 468 1219 461 V454 Z" fill="none" stroke="#2dd4ff" stroke-width="1.8" stroke-linejoin="round"/>
+    <text x="1248" y="468" class="sans" font-size="16.5" font-weight="700" fill="#f0f6fc">Router Shield</text>
+    <rect x="1450" y="451" width="60" height="22" rx="6" fill="#0d1c33" stroke="#1f3a61" stroke-width="1"/>
+    <text x="1480" y="466" text-anchor="middle" class="mono" font-size="10.5" font-weight="700" fill="#7dd3fc">UDM SE</text>
+
+    <!-- 6 Crisp Telemetry Rows -->
+    <g transform="translate(1220, 494)">
+      <!-- Row 1 -->
+      <circle cx="8" cy="14" r="3.8" fill="#34d399"/>
+      <text x="22" y="18" class="sans" font-size="13.5" font-weight="600" fill="#dce7f7">Intrusion Shield</text>
+      <text x="290" y="18" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#34d399">Blocking</text>
+      <line x1="0" y1="34" x2="290" y2="34" stroke="#16233a" stroke-width="1"/>
+
+      <!-- Row 2 -->
+      <circle cx="8" cy="52" r="3.8" fill="#34d399"/>
+      <text x="22" y="56" class="sans" font-size="13.5" font-weight="600" fill="#dce7f7">Auto Port Open (UPnP)</text>
+      <text x="290" y="56" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#34d399">Off</text>
+      <line x1="0" y1="72" x2="290" y2="72" stroke="#16233a" stroke-width="1"/>
+
+      <!-- Row 3 -->
+      <circle cx="8" cy="90" r="3.8" fill="#34d399"/>
+      <text x="22" y="94" class="sans" font-size="13.5" font-weight="600" fill="#dce7f7">Encrypted DNS</text>
+      <text x="290" y="94" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#34d399">DoH On</text>
+      <line x1="0" y1="110" x2="290" y2="110" stroke="#16233a" stroke-width="1"/>
+
+      <!-- Row 4 -->
+      <circle cx="8" cy="128" r="3.8" fill="#34d399"/>
+      <text x="22" y="132" class="sans" font-size="13.5" font-weight="600" fill="#dce7f7">Honeypot Trap</text>
+      <text x="290" y="132" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#34d399">Active (2)</text>
+      <line x1="0" y1="148" x2="290" y2="148" stroke="#16233a" stroke-width="1"/>
+
+      <!-- Row 5 -->
+      <circle cx="8" cy="166" r="3.8" fill="#fbbf24"/>
+      <text x="22" y="170" class="sans" font-size="13.5" font-weight="600" fill="#dce7f7">Router SSH Login</text>
+      <text x="290" y="170" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#fbbf24">Password</text>
+      <line x1="0" y1="186" x2="290" y2="186" stroke="#16233a" stroke-width="1"/>
+
+      <!-- Row 6 -->
+      <circle cx="8" cy="204" r="3.8" fill="#2dd4ff"/>
+      <text x="22" y="208" class="sans" font-size="13.5" font-weight="600" fill="#dce7f7">Evil-Twin Wi-Fi Watch</text>
+      <text x="290" y="208" text-anchor="end" class="mono" font-size="12" font-weight="700" fill="#2dd4ff">All Clear</text>
+    </g>
+  </g>
+
+
+  <!-- ==================== PANEL D: LIVE DRIFT OSCILLOSCOPE BAR ==================== -->
+  <g filter="url(#card-shadow)">
+    <rect x="796" y="750" width="732" height="86" rx="14" fill="url(#card-bg)" stroke="url(#card-stroke)" stroke-width="1.3"/>
+
+    <!-- Live Status Left -->
+    <circle cx="826" cy="781" r="7" fill="#34d399" opacity="0.22"/>
+    <circle cx="826" cy="781" r="3.8" fill="#34d399" filter="url(#neon-tight)"/>
+    <text x="842" y="786" class="mono" font-size="13" font-weight="700" letter-spacing="0.06em" fill="#f0f6fc">LIVE DRIFT &amp; TAMPER WATCH</text>
+    <text x="820" y="813" class="sans" font-size="13" fill="#92a8c8">Alerts via Web UI, ntfy &amp; Slack on rogue cables, MAC swaps &amp; CVEs</text>
+
+    <!-- Recessed Mini Oscilloscope / Activity Waveform -->
+    <g transform="translate(1258, 764)">
+      <rect width="250" height="58" rx="9" fill="#060b16" stroke="#182a47" stroke-width="1.1"/>
+      <!-- Subtle oscilloscope grid -->
+      <line x1="0" y1="19" x2="250" y2="19" stroke="#13223b" stroke-width="0.8"/>
+      <line x1="0" y1="39" x2="250" y2="39" stroke="#13223b" stroke-width="0.8"/>
+      <line x1="62" y1="0" x2="62" y2="58" stroke="#13223b" stroke-width="0.8"/>
+      <line x1="125" y1="0" x2="125" y2="58" stroke="#13223b" stroke-width="0.8"/>
+      <line x1="188" y1="0" x2="188" y2="58" stroke="#13223b" stroke-width="0.8"/>
+
+      <!-- Gradient fill under sparkline -->
+      <path d="M 8 44 L 30 42 L 46 34 L 62 40 L 82 22 L 96 38 L 118 35 L 136 14 L 152 34 L 174 28 L 194 18 L 214 30 L 236 20 L 236 54 L 8 54 Z" fill="url(#spark-fill)"/>
+      <!-- Neon waveform -->
+      <polyline points="8,44 30,42 46,34 62,40 82,22 96,38 118,35 136,14 152,34 174,28 194,18 214,30 236,20"
+                fill="none" stroke="#2dd4ff" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" filter="url(#neon-tight)"/>
+      <!-- Alert spike dot + live cursor -->
+      <circle cx="136" cy="14" r="3.4" fill="#f87171"/>
+      <circle cx="236" cy="20" r="3.8" fill="#34d399" filter="url(#neon-tight)"/>
+    </g>
+  </g>
+</svg>
