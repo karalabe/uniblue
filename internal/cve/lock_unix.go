@@ -17,6 +17,9 @@ import (
 	"time"
 )
 
+// acquireCacheLock obtains an exclusive, non-blocking flock on lockPath so
+// concurrent UniBlue processes serialize CVE feed downloads and index rebuilds
+// while honoring context cancellation.
 func acquireCacheLock(ctx context.Context, lockPath string) (func(), error) {
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {

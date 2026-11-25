@@ -164,6 +164,9 @@ func classifyIsolatedArchetype(
 	return "isolated", "isolated network", nil
 }
 
+// classifyNetworkMetadata infers a secondary archetype hint from the VLAN's
+// DHCP domain name and network/zone labels (ignoring generic "Hotspot" / "DMZ"
+// zone names since IoT and Guest VLANs commonly share them).
 func classifyNetworkMetadata(n unifi.Network) (string, string) {
 	dom := strings.TrimSpace(n.DomainName)
 	if dom != "" {
@@ -194,11 +197,14 @@ func classifyNetworkMetadata(n unifi.Network) (string, string) {
 	return "", ""
 }
 
+// isUbiquitiOUI reports whether an OUI string identifies first-party Ubiquiti
+// or UniFi hardware (kept separate from third-party IoT migration hints).
 func isUbiquitiOUI(oui string) bool {
 	low := strings.ToLower(strings.TrimSpace(oui))
 	return strings.Contains(low, "ubiquiti") || strings.Contains(low, "unifi")
 }
 
+// dedupeSortedStrings returns a sorted, case-insensitively deduplicated copy of in.
 func dedupeSortedStrings(in []string) []string {
 	if len(in) == 0 {
 		return nil
@@ -423,6 +429,9 @@ func evaluateNetworkContainment(
 	return containments, cells, findings, notes
 }
 
+// evaluatePeerContainmentAxis assesses Layer-2 client-to-client isolation on n
+// across Wi-Fi SSID l2_isolation, wired switch port isolation, AP uplink port
+// isolation, and switch ACLs.
 func evaluatePeerContainmentAxis(
 	snap *unifi.Snapshot,
 	n unifi.Network,
@@ -639,6 +648,8 @@ func evaluatePeerContainmentAxis(
 	}
 }
 
+// summarizeLANEgressAxis rolls up the already-evaluated LAN transit and
+// gateway-admin isolation cells for netName into a single containment axis.
 func summarizeLANEgressAxis(netName string, cells []IsolationCell) ContainmentAxis {
 	hasViolation, hasUnknown, hasApproved, hasBlocked := false, false, false, false
 	var violRule string
@@ -684,6 +695,9 @@ func summarizeLANEgressAxis(netName string, cells []IsolationCell) ContainmentAx
 	}
 }
 
+// evaluateInternetEgressAxis evaluates VLAN -> External internet reachability
+// from both the network-level Allow Internet Access toggle and IPv4/IPv6
+// gateway firewall policies, tailoring findings to the detected archetype.
 func evaluateInternetEgressAxis(
 	snap *unifi.Snapshot,
 	sortedPolicies []unifi.FirewallPolicy,
@@ -993,6 +1007,9 @@ func evaluateInternetEgressAxis(
 	}
 }
 
+// evaluateLANInboundAxis evaluates Internal -> VLAN inbound reachability across
+// IPv4 and IPv6, distinguishing wide-open defaults, narrow controller allowlists,
+// and partial-block parity leaks.
 func evaluateLANInboundAxis(
 	snap *unifi.Snapshot,
 	sortedPolicies []unifi.FirewallPolicy,
@@ -1220,6 +1237,8 @@ func evaluateLANInboundAxis(
 	return ContainmentAxis{State: "open", Detail: detail}, cells, findings, notes
 }
 
+// containmentSampleIP selects a representative non-gateway host address inside
+// n's IPv4 or IPv6 subnet for generic inbound policy probing.
 func containmentSampleIP(n unifi.Network, fam string) string {
 	raw := strings.TrimSpace(n.Subnet)
 	if fam == "ipv6" {

@@ -20,6 +20,9 @@ import (
 // sync reclaims it after an ungraceful termination on Windows.
 const staleWindowsLockAge = 30 * time.Minute
 
+// acquireCacheLock obtains an exclusive lock file on Windows using atomic
+// O_CREATE|O_EXCL creation, reclaiming stale lock files older than
+// staleWindowsLockAge left behind by crashed processes.
 func acquireCacheLock(ctx context.Context, lockPath string) (func(), error) {
 	for {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
