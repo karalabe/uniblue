@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -215,10 +216,13 @@ type HostProfile struct {
 	// services used by this host, kept strictly separate from hosted LAN services.
 	OutboundDependencies []OutboundDependency `json:"outbound_dependencies,omitempty"`
 
-	// RawPrintPorts records TCP ports on this host known to be raw print sinks
-	// (9100, 515, or advertised via _pdl-datastream._tcp / _printer._tcp) where
-	// UniBlue enforces a strict zero-byte connect-only guard.
+	// RawPrintPorts lists protected raw print and serial sink ports, including
+	// ports learned from discovery before a TCP connection was attempted.
 	RawPrintPorts []int `json:"raw_print_ports,omitempty"`
+
+	// ConnectOnlyPorts lists open sink ports where the scanner connected and
+	// skipped all application probes.
+	ConnectOnlyPorts []int `json:"connect_only_ports,omitempty"`
 
 	// ScannedAt records when fingerprinting finished for this host.
 	ScannedAt time.Time `json:"scanned_at"`
@@ -241,8 +245,7 @@ func (h HostProfile) EffectiveProbeIP() string {
 
 // IsRawPrintPort reports whether port on this host is protected by the raw
 // print or raw serial sink zero-byte guard. Self-announced sinks are always
-// honored; reflected sinks from a local reflector are honored only for known
-// serial coordinator ports (6638, 6639, 20108) and raw print port 9100.
+// honored. Configured reflectors can identify JetDirect and serial bridge ports.
 func (h HostProfile) IsRawPrintPort(port int) bool {
 	if port == 9100 || port == 515 {
 		return true
@@ -256,12 +259,25 @@ func (h HostProfile) IsRawPrintPort(port int) bool {
 		if md.Withdrawn || md.Port != port || !isMDNSZeroByteSink(md.Type) {
 			continue
 		}
-		authoritative := !md.Reflected && (md.ResponderIP == "" || hostOwnsIP(h.Client, md.ResponderIP))
-		if shouldProtectMDNSSinkPort(md.Type, port, authoritative, md.ResponderIP) {
+		authoritative := !md.Reflected && hostOwnsIP(h.Client, md.ResponderIP)
+		if shouldProtectMDNSSinkPort(md.Type, port, authoritative, md.Reflected && md.TrustedReflector) {
 			return true
 		}
 	}
 	return false
+}
+
+func (h *HostProfile) recordOpenPort(port int) bool {
+	h.OpenPorts = append(h.OpenPorts, port)
+	if !h.IsRawPrintPort(port) {
+		return false
+	}
+	if !slices.Contains(h.RawPrintPorts, port) {
+		h.RawPrintPorts = append(h.RawPrintPorts, port)
+		sort.Ints(h.RawPrintPorts)
+	}
+	h.ConnectOnlyPorts = append(h.ConnectOnlyPorts, port)
+	return true
 }
 
 func hostOwnsIP(cl unifi.Client, candidate string) bool {
@@ -281,6 +297,7 @@ func hostOwnsIP(cl unifi.Client, candidate string) bool {
 // publishing never mutate or race on shared slices or maps.
 func (h HostProfile) Clone() HostProfile {
 	cp := h
+	cp.ConnectOnlyPorts = slices.Clone(h.ConnectOnlyPorts)
 	if len(h.Client.IPv6) > 0 {
 		cp.Client.IPv6 = append([]string(nil), h.Client.IPv6...)
 	}
@@ -688,7 +705,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 				if idx, dup := mdnsIdx[key]; dup {
 					// Prefer an authoritative (non-reflected) observation when
 					// merging dual-stack addresses for the same service.
-					if profile.MDNSServices[idx].Reflected && !svc.Reflected {
+					if preferMDNSService(svc, profile.MDNSServices[idx]) {
 						profile.MDNSServices[idx] = svc
 					}
 					continue
@@ -775,11 +792,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 		consecutiveTimeouts = 0
 
-		rawPrint := isRawPrintSinkPortAny(port, f.discovery, allIPs) || profile.IsRawPrintPort(port)
-		if rawPrint && !profile.IsRawPrintPort(port) {
-			profile.RawPrintPorts = append(profile.RawPrintPorts, port)
-			sort.Ints(profile.RawPrintPorts)
-		}
+		rawPrint := profile.recordOpenPort(port)
 
 		// On SSH (port 22), passively read the server's initial identification
 		// banner before closing so version-based CVE checks have exact OpenSSH
@@ -788,7 +801,6 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 			profile.SSHBanner = readSSHBanner(conn, f.timeout)
 		}
 		_ = conn.Close()
-		profile.OpenPorts = append(profile.OpenPorts, port)
 
 		// Hard raw-printer zero-byte safety guard: never send HTTP or other
 		// application bytes to a raw print sink even if it overlaps a web port.
@@ -912,7 +924,7 @@ func (f *Fingerprinter) walkVNCDisplays(ctx context.Context, dialer net.Dialer, 
 			continue
 		}
 		_ = conn.Close()
-		profile.OpenPorts = append(profile.OpenPorts, port)
+		profile.recordOpenPort(port)
 		misses = 0
 	}
 }

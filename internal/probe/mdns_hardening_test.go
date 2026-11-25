@@ -98,6 +98,7 @@ func TestMDNSReflectedCustomSerialBridgeZeroByteAndRiskyPortsNotHidden(t *testin
 func TestMDNSGatewayReflectorPreservesTwoHundredServices(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	cache := NewDiscoveryCache()
+	cache.SetTrustedReflectors([]string{"192.168.1.1"})
 
 	for i := 1; i <= 100; i++ {
 		ip := []byte{192, 168, 20, byte(i)}
@@ -121,6 +122,7 @@ func TestMDNSGatewayReflectorPreservesTwoHundredServices(t *testing.T) {
 func TestMDNSAttackerFirstDoesNotSuppressReflectedVictimOrCoordinator(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	cache := NewDiscoveryCache()
+	cache.SetTrustedReflectors([]string{"192.168.1.1"})
 
 	// Single attacker tries to fill victim 192.168.20.40's per-target quota first.
 	for i := 0; i < 80; i++ {
@@ -180,5 +182,36 @@ func TestMDNS150SourceFloodEvictionCompletesQuickly(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("genuine host after 150-source flood was lost: %+v", snap.MDNS["192.168.1.25"])
+	}
+}
+
+func TestSinkPortTrustByResponder(t *testing.T) {
+	const target, gateway, neighbor = "192.168.20.10", "192.168.1.1", "192.168.1.66"
+	for _, tc := range []struct {
+		service    string
+		ports      []int
+		trustRelay bool
+	}{
+		{"_slzb-06._tcp", []int{1880, 5555, 8545, 8551, 8888, 9222, 9229, 16992, 59777}, false},
+		{"_slzb-06._tcp", []int{6638, 6639, 20108, 7777}, true},
+		{"_printer._tcp", []int{9101, 9107}, true},
+		{"_pdl-datastream._tcp", []int{8888}, false},
+	} {
+		for _, port := range tc.ports {
+			for _, sender := range []string{target, gateway, neighbor} {
+				cache := NewDiscoveryCache()
+				cache.SetTrustedReflectors([]string{gateway})
+				now := time.Now()
+				packet := buildMDNSTestPacket(tc.service, "device", "device.local", uint16(port), 60, net.ParseIP(target).To4(), nil, nil)
+				cache.IngestMDNSPacket(packet, sender, "eth0", "LAN", now)
+				snap := cache.Snapshot(now)
+				hp := HostProfile{Client: unifi.Client{IP: target}, MDNSServices: snap.MDNS[target]}
+				want := sender == target || (sender == gateway && tc.trustRelay)
+				_, protected := snap.RawPrintIPs[target][port]
+				if protected != want || hp.IsRawPrintPort(port) != want {
+					t.Fatalf("%s port %d from %s: snapshot=%t profile=%t, want %t", tc.service, port, sender, protected, hp.IsRawPrintPort(port), want)
+				}
+			}
+		}
 	}
 }

@@ -46,19 +46,19 @@ const (
 	ssdpFetchBudget = 2500 * time.Millisecond
 
 	// mDNS anti-DoS memory caps.
-	maxDNSNameWireBytes               = 255
-	maxDNSQuestionsPerPacket          = 64
-	maxDNSRecordsPerPacket            = 128
-	maxMDNSTXTEntriesPerRR            = 64
-	maxMDNSTXTBytesPerInst            = 512
-	maxMDNSServicesPerHost            = 64
-	maxMDNSServicesPerResponder       = 512
-	maxMDNSHostsPerResponder          = 512
-	maxMDNSReflectedPerSenderTarget   = 16
-	maxMDNSServicesTotal              = 4096
-	maxMDNSHostsTotal                 = 4096
-	maxMDNSIPsPerHost                 = 16
-	maxMDNSRespondersPerInst          = 8
+	maxDNSNameWireBytes             = 255
+	maxDNSQuestionsPerPacket        = 64
+	maxDNSRecordsPerPacket          = 128
+	maxMDNSTXTEntriesPerRR          = 64
+	maxMDNSTXTBytesPerInst          = 512
+	maxMDNSServicesPerHost          = 64
+	maxMDNSServicesPerResponder     = 512
+	maxMDNSHostsPerResponder        = 512
+	maxMDNSReflectedPerSenderTarget = 16
+	maxMDNSServicesTotal            = 4096
+	maxMDNSHostsTotal               = 4096
+	maxMDNSIPsPerHost               = 16
+	maxMDNSRespondersPerAddress     = 8
 
 	// SSDP anti-DoS caps and string length bounds.
 	maxSSDPHeaderLen        = 256
@@ -398,7 +398,7 @@ type DiscoveryCache struct {
 	respReflSinkKeys    map[string]map[string]struct{}
 	targetReflKeys      map[string]map[string]struct{}
 	respTargetInstCount map[string]map[string]int
-	hostIPs             map[string]map[string]cachedHostIP // hostname -> ip -> expiry + authority
+	hostIPs             map[string]map[string]cachedHostIP // hostname -> ip -> responder expirations
 	hostOwner           map[string]string                  // hostname -> first responderIP that created it
 	hostReflected       map[string]bool                    // hostname -> currently indexed as reflected
 	respHostCount       map[string]int
@@ -414,22 +414,21 @@ type DiscoveryCache struct {
 	unavail             map[string]string
 }
 
-type cachedHostIP struct {
-	expiresAt     time.Time
-	authoritative bool
+// Each source of an address record has an independent TTL.
+type cachedHostIP map[string]time.Time
+
+func (sources cachedHostIP) supports(ip, responder string, now time.Time) bool {
+	return now.Before(sources[responder]) || now.Before(sources[ip])
 }
 
 type cachedMDNSInst struct {
 	svc               MDNSService
-	targetHost        string
+	hasPTR            bool
 	createdBy         string
-	srvResponder      string
-	srvAuthoritative  bool
 	reflectedIndexed  bool
 	reflectedSink     bool
 	countedTargetIPs  []string
 	countedUnresolved bool
-	responderIPs      map[string]struct{}
 }
 
 // NewDiscoveryCache initializes an empty durable DiscoveryCache.
@@ -510,6 +509,9 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 		now = time.Now().UTC()
 	}
 	normResp := canonicalIPKey(responderIP)
+	if normResp == "" {
+		return
+	}
 
 	// Pre-scan packet SRV and A/AAAA hints so per-target-IP caps can be applied
 	// accurately even when PTR/SRV records precede A/AAAA in the datagram.
@@ -562,7 +564,7 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 		}
 		var out []string
 		for ip, entry := range c.hostIPs[th] {
-			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+			if !entry.supports(ip, normResp, now) {
 				continue
 			}
 			out = appendUniqueString(out, ip)
@@ -574,7 +576,11 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 		return out
 	}
 
-	// Pass 2: ingest PTR, SRV, and TXT records.
+	// Assemble records independently for each responder. Snapshot selects the
+	// best complete observation for each target without combining TXT or TTLs.
+	instanceKey := func(fullName string) string {
+		return strings.ToLower(observerVLAN + "|" + fullName + "|" + normResp)
+	}
 	for _, rr := range recs {
 		switch rr.rrType {
 		case 12: // PTR
@@ -589,54 +595,29 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 			if targetType == "" || !strings.EqualFold(targetType, svcType) {
 				continue
 			}
-			key := strings.ToLower(observerVLAN + "|" + rr.target)
-			if existing := c.mdnsInst[key]; existing != nil && existing.srvAuthoritative && normResp != "" && !containsString(existing.countedTargetIPs, normResp) {
-				// Never let a non-authoritative responder withdraw or tamper
-				// with an authoritative instance's TTL.
-				continue
-			}
+			key := instanceKey(rr.target)
 			targetIPs := resolveTargetIPs(rr.target, "")
 			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.target, svcType), normResp, observerIface, observerVLAN, targetIPs, now)
 			if inst == nil {
 				continue
 			}
+			inst.hasPTR = true
 			applyMDNSTTL(&inst.svc, rr.ttl, now)
 		case 33: // SRV
 			svcType := extractMDNSTypeFromFull(rr.name)
 			if svcType == "" {
 				continue
 			}
-			key := strings.ToLower(observerVLAN + "|" + rr.name)
+			key := instanceKey(rr.name)
 			targetHost := strings.ToLower(rr.target)
 			targetIPs := resolveTargetIPs(rr.name, targetHost)
-			srvIsAuth := normResp != "" && containsString(targetIPs, normResp)
-			if existing := c.mdnsInst[key]; existing != nil && existing.srvResponder != "" && existing.srvResponder != normResp {
-				if existing.srvAuthoritative && !srvIsAuth {
-					// Never let a third-party responder rewrite an authoritative
-					// instance's SRV port or targetHost (or inherit its authority).
-					continue
-				}
-				if !existing.srvAuthoritative && !srvIsAuth {
-					// Never let an unrelated third party overwrite another
-					// responder's existing reflected SRV.
-					continue
-				}
-				if !existing.srvAuthoritative && srvIsAuth {
-					// Authoritative host claims its own instance: replace the
-					// prior reflected entry cleanly so the forger is never merged.
-					c.deleteMDNSInstLocked(key)
-				}
-			}
 			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.name, svcType), normResp, observerIface, observerVLAN, targetIPs, now)
 			if inst == nil {
 				continue
 			}
 			inst.svc.Port = rr.port
-			inst.targetHost = targetHost
-			inst.svc.TargetHost = inst.targetHost
-			inst.srvResponder = normResp
-			if srvIsAuth {
-				inst.srvAuthoritative = true
+			inst.svc.TargetHost = targetHost
+			if containsString(targetIPs, normResp) {
 				c.unindexReflectedInstLocked(key, inst)
 			}
 			applyMDNSTTL(&inst.svc, rr.ttl, now)
@@ -645,12 +626,7 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 			if svcType == "" {
 				continue
 			}
-			key := strings.ToLower(observerVLAN + "|" + rr.name)
-			if existing := c.mdnsInst[key]; existing != nil && existing.srvAuthoritative && normResp != "" && !containsString(existing.countedTargetIPs, normResp) {
-				// Never let a non-authoritative responder poison TXT or TTL
-				// on an authoritative instance.
-				continue
-			}
+			key := instanceKey(rr.name)
 			targetIPs := resolveTargetIPs(rr.name, "")
 			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.name, svcType), normResp, observerIface, observerVLAN, targetIPs, now)
 			if inst == nil {
@@ -790,7 +766,7 @@ func (c *DiscoveryCache) deleteHostLocked(host string) {
 	owner := c.hostOwner[host]
 	for ip, entry := range ipMap {
 		decCountMap(c.ipHostCount, ip)
-		if !entry.authoritative {
+		if _, auth := entry[ip]; !auth {
 			delNestedSet(c.ipReflHosts, ip, host)
 			decNestedCount(c.respIPHostCount, owner, ip)
 		}
@@ -980,24 +956,7 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 	isAuth := responderIP != "" && responderIP == ip
 	isTrusted := c.isTrustedReflectorLocked(responderIP)
 	if ttl == 0 {
-		if m := c.hostIPs[host]; m != nil {
-			if prev, existed := m[ip]; existed {
-				if prev.authoritative && !isAuth {
-					// Never let a non-authoritative responder withdraw an authoritative host A/AAAA.
-					return
-				}
-				owner := c.hostOwner[host]
-				delete(m, ip)
-				decCountMap(c.ipHostCount, ip)
-				if !prev.authoritative {
-					delNestedSet(c.ipReflHosts, ip, host)
-					decNestedCount(c.respIPHostCount, owner, ip)
-				}
-			}
-			if len(m) == 0 {
-				c.deleteHostLocked(host)
-			}
-		}
+		c.removeHostIPSourceLocked(host, ip, responderIP)
 		return
 	}
 	maxRespHosts := maxMDNSHostsPerResponder
@@ -1034,7 +993,8 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 			}
 		}
 	}
-	if prev, exists := c.hostIPs[host][ip]; !exists {
+	sources := c.hostIPs[host][ip]
+	if sources == nil {
 		if !isAuth && !isTrusted && responderIP != "" && c.respIPHostCount[responderIP][ip] >= maxMDNSReflectedPerSenderTarget {
 			return
 		}
@@ -1047,7 +1007,7 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 			evicted := ""
 			if isAuth || isTrusted {
 				for candIP, candEntry := range c.hostIPs[host] {
-					if !candEntry.authoritative && (evicted == "" || candIP > evicted) {
+					if _, auth := candEntry[candIP]; !auth && (evicted == "" || candIP > evicted) {
 						evicted = candIP
 					}
 				}
@@ -1066,15 +1026,36 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 			addNestedSet(c.ipReflHosts, ip, host)
 			incNestedCount(c.respIPHostCount, c.hostOwner[host], ip)
 		}
-	} else {
-		if prev.authoritative {
-			isAuth = true
-		} else if isAuth {
-			// Promoted from reflected to authoritative for this IP.
+		sources = make(cachedHostIP)
+		c.hostIPs[host][ip] = sources
+	} else if _, exists := sources[responderIP]; !exists {
+		if len(sources) >= maxMDNSRespondersPerAddress {
+			// A self-announcement can displace any relay. A trusted
+			// reflector can displace an untrusted source.
+			var evict string
+			for other, expiry := range sources {
+				if other == ip {
+					continue
+				}
+				if !now.Before(expiry) || ((isAuth || isTrusted) && !c.isTrustedReflectorLocked(other)) {
+					evict = other
+					break
+				}
+				if isAuth {
+					evict = other
+				}
+			}
+			if evict == "" {
+				return
+			}
+			delete(sources, evict)
+		}
+		if isAuth {
 			delNestedSet(c.ipReflHosts, ip, host)
 			decNestedCount(c.respIPHostCount, c.hostOwner[host], ip)
 		}
 	}
+	sources[responderIP] = now.UTC().Add(time.Duration(ttl) * time.Second)
 	if isAuth && c.hostReflected[host] {
 		delete(c.hostReflected, host)
 		if owner := c.hostOwner[host]; owner != "" {
@@ -1082,9 +1063,40 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 			delNestedSet(c.respReflHostKeys, owner, host)
 		}
 	}
-	c.hostIPs[host][ip] = cachedHostIP{
-		expiresAt:     now.UTC().Add(time.Duration(ttl) * time.Second),
-		authoritative: isAuth,
+}
+
+// removeHostIPSourceLocked withdraws only the address claim from responderIP.
+func (c *DiscoveryCache) removeHostIPSourceLocked(host, ip, responderIP string) {
+	sources := c.hostIPs[host][ip]
+	if _, ok := sources[responderIP]; !ok {
+		return
+	}
+	delete(sources, responderIP)
+	owner := c.hostOwner[host]
+	if len(sources) == 0 {
+		delete(c.hostIPs[host], ip)
+		decCountMap(c.ipHostCount, ip)
+		if responderIP != ip {
+			delNestedSet(c.ipReflHosts, ip, host)
+			decNestedCount(c.respIPHostCount, owner, ip)
+		}
+		if len(c.hostIPs[host]) == 0 {
+			c.deleteHostLocked(host)
+			return
+		}
+	} else if responderIP == ip {
+		addNestedSet(c.ipReflHosts, ip, host)
+		incNestedCount(c.respIPHostCount, owner, ip)
+	}
+	if responderIP == ip {
+		for addr, remaining := range c.hostIPs[host] {
+			if _, auth := remaining[addr]; auth {
+				return
+			}
+		}
+		c.hostReflected[host] = true
+		c.reflHostBuckets.inc(owner)
+		addNestedSet(c.respReflHostKeys, owner, host)
 	}
 }
 
@@ -1150,11 +1162,9 @@ func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderI
 				ObserverVLAN:      observerVLAN,
 				ObservedAt:        &ts,
 			},
-			createdBy:    responderIP,
-			responderIPs: make(map[string]struct{}),
+			createdBy: responderIP,
 		}
 		if responderIP != "" {
-			inst.responderIPs[responderIP] = struct{}{}
 			c.respInstCount[responderIP]++
 			c.allInstBuckets.inc(responderIP)
 			addNestedSet(c.respInstKeys, responderIP, key)
@@ -1183,20 +1193,6 @@ func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderI
 		}
 		if inst.svc.Instance == "" {
 			inst.svc.Instance = instance
-		}
-		if responderIP != "" {
-			if inst.responderIPs == nil {
-				inst.responderIPs = make(map[string]struct{})
-			}
-			if _, exists := inst.responderIPs[responderIP]; !exists && len(inst.responderIPs) < maxMDNSRespondersPerInst {
-				inst.responderIPs[responderIP] = struct{}{}
-			}
-			if inst.svc.ResponderIP == "" {
-				inst.svc.ResponderIP = responderIP
-			}
-			if containsString(inst.countedTargetIPs, responderIP) {
-				c.unindexReflectedInstLocked(key, inst)
-			}
 		}
 	}
 	return inst
@@ -1275,11 +1271,11 @@ func isKnownNonSerialServicePort(port int) bool {
 		return true
 	}
 	switch port {
-	case 1080, 1433, 1521, 1883, 2049, 2181, 2375, 2376, 2379,
-		3000, 3128, 3306, 3389, 4444, 5000, 5001, 5432, 5601, 5672,
+	case 1080, 1433, 1521, 1880, 1883, 2049, 2181, 2375, 2376, 2379,
+		3000, 3128, 3306, 3389, 4444, 5000, 5001, 5432, 5555, 5601, 5672,
 		5984, 5985, 5986, 6379, 6443, 7001, 8000, 8006, 8008, 8080,
-		8081, 8086, 8088, 8123, 8200, 8443, 8883, 9000, 9090,
-		9200, 9300, 10000, 10250, 11211, 15672, 27017, 32400:
+		8081, 8086, 8088, 8123, 8200, 8443, 8545, 8551, 8883, 8888, 9000, 9090,
+		9200, 9222, 9229, 9300, 10000, 10250, 11211, 15672, 16992, 27017, 32400, 59777:
 		return true
 	default:
 		return false
@@ -1289,19 +1285,19 @@ func isKnownNonSerialServicePort(port int) bool {
 // shouldProtectMDNSSinkPort reports whether an mDNS zero-byte sink (raw print
 // or serial/Zigbee UART bridge) should enforce connect-only protection on port.
 // Authoritative self-announcements are always honored; reflected announcements
-// from a local reflector are honored for JetDirect raw print ports (9100-9107)
+// from a configured trusted reflector are honored for JetDirect raw print ports (9100-9107)
 // and for serial coordinator ports (6638, 6639, 20108, or custom high ports
 // outside well-known non-serial services) so legitimate relayed coordinators
 // and printers stay zero-byte protected while forged adverts cannot hide
 // Redis, Docker, RDP, VNC, SMB, SSH, or HTTP admin ports.
-func shouldProtectMDNSSinkPort(svcType string, port int, authoritative bool, responderIP string) bool {
+func shouldProtectMDNSSinkPort(svcType string, port int, authoritative, trustedReflector bool) bool {
 	if port <= 0 || !isMDNSZeroByteSink(svcType) {
 		return false
 	}
 	if authoritative {
 		return true
 	}
-	if responderIP != "" && !isAllowedProbeIPWithSubnets(responderIP, nil) {
+	if !trustedReflector {
 		return false
 	}
 	if isMDNSRawSerialSink(svcType) {
@@ -1323,19 +1319,12 @@ func (c *DiscoveryCache) PruneExpired(now time.Time) {
 		}
 	}
 	for host, ipMap := range c.hostIPs {
-		owner := c.hostOwner[host]
-		for ip, entry := range ipMap {
-			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
-				delete(ipMap, ip)
-				decCountMap(c.ipHostCount, ip)
-				if !entry.authoritative {
-					delNestedSet(c.ipReflHosts, ip, host)
-					decNestedCount(c.respIPHostCount, owner, ip)
+		for ip, sources := range ipMap {
+			for responder, expiry := range sources {
+				if !now.Before(expiry) {
+					c.removeHostIPSourceLocked(host, ip, responder)
 				}
 			}
-		}
-		if len(ipMap) == 0 {
-			c.deleteHostLocked(host)
 		}
 	}
 }
@@ -1369,12 +1358,7 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 		portSet[ip][port] = struct{}{}
 	}
 
-	type mdnsCandidate struct {
-		svc          MDNSService
-		directMatch  bool
-		noResponders bool
-	}
-	byIP := make(map[string][]mdnsCandidate)
+	byIP := make(map[string][]MDNSService)
 	seenIdx := make(map[string]int)
 
 	for _, inst := range c.mdnsInst {
@@ -1382,85 +1366,36 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 		if svc.Withdrawn || (svc.ExpiresAt != nil && now.After(*svc.ExpiresAt)) {
 			continue
 		}
-		allResponders := make([]string, 0, len(inst.responderIPs))
-		for rip := range inst.responderIPs {
-			allResponders = append(allResponders, rip)
-		}
-		sort.Strings(allResponders)
-
 		var ips []string
-		if inst.targetHost != "" {
-			for ip, entry := range c.hostIPs[inst.targetHost] {
-				if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
-					continue
-				}
-				ips = append(ips, ip)
-			}
-			sort.Strings(ips)
-			// Never attribute an unresolved SRV target host to ResponderIP as if
-			// the reflector hosted that service directly.
-			if len(ips) == 0 {
+		if svc.TargetHost == "" {
+			// Keep standalone TXT for later assembly. Only a PTR or SRV
+			// advertises a service instance.
+			if !inst.hasPTR {
 				continue
 			}
-		} else if len(allResponders) > 0 {
-			ips = allResponders
-		} else if svc.ResponderIP != "" {
-			ips = []string{svc.ResponderIP}
-		}
-		if len(ips) == 0 {
-			continue
+			ips = []string{inst.createdBy}
+		} else {
+			for ip, sources := range c.hostIPs[svc.TargetHost] {
+				if sources.supports(ip, inst.createdBy, now) {
+					ips = append(ips, ip)
+				}
+			}
+			sort.Strings(ips)
 		}
 		svc.TargetIPs = ips
 		svc.AddressFamily = IPFamily(ips)
-
-		hasResponder := func(ip string) bool {
-			if len(inst.responderIPs) == 0 {
-				return false
-			}
-			_, ok := inst.responderIPs[canonicalIPKey(ip)]
-			return ok
-		}
-
-		// Compute authority strictly per target IP and per SRV responder so a
-		// third-party SRV can never inherit another responder's authority.
 		for _, ip := range ips {
-			svcForIP := svc
-			var directMatch bool
-			if inst.srvResponder != "" {
-				directMatch = inst.srvAuthoritative && inst.srvResponder == canonicalIPKey(ip)
+			svc.Reflected = inst.createdBy != ip
+			svc.TrustedReflector = svc.Reflected && c.isTrustedReflectorLocked(inst.createdBy)
+			key := strings.ToLower(ip + "|" + svc.ObserverVLAN + "|" + svc.Type + "|" + svc.Instance)
+			if idx, ok := seenIdx[key]; ok {
+				if preferMDNSService(svc, byIP[ip][idx]) {
+					byIP[ip][idx] = svc
+				}
 			} else {
-				directMatch = hasResponder(ip)
+				seenIdx[key] = len(byIP[ip])
+				byIP[ip] = append(byIP[ip], svc)
 			}
-			if len(allResponders) > 0 {
-				if directMatch {
-					svcForIP.ResponderIP = ip
-					svcForIP.Reflected = false
-					svcForIP.TrustedReflector = false
-				} else {
-					if inst.srvResponder != "" {
-						svcForIP.ResponderIP = inst.srvResponder
-					} else {
-						svcForIP.ResponderIP = allResponders[0]
-					}
-					svcForIP.Reflected = true
-					svcForIP.TrustedReflector = c.isTrustedReflectorLocked(svcForIP.ResponderIP)
-				}
-			}
-
-			dedup := fmt.Sprintf("%s|%s|%s|%d|%s", ip, svcForIP.ObserverVLAN, svcForIP.Type, svcForIP.Port, svcForIP.Instance)
-			cand := mdnsCandidate{
-				svc:          svcForIP,
-				directMatch:  directMatch,
-				noResponders: len(allResponders) == 0,
-			}
-			if idx, dup := seenIdx[dedup]; dup {
-				if !byIP[ip][idx].directMatch && cand.directMatch {
-					byIP[ip][idx] = cand
-				}
-				continue
-			}
-			seenIdx[dedup] = len(byIP[ip])
-			byIP[ip] = append(byIP[ip], cand)
 		}
 	}
 
@@ -1469,32 +1404,33 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 		// services before enforcing the per-target-IP cap so spoofed reflected
 		// floods cannot evict a host's own announcements or sink protections.
 		sort.Slice(list, func(i, j int) bool {
-			if list[i].svc.Reflected != list[j].svc.Reflected {
-				return !list[i].svc.Reflected
+			if list[i].Reflected != list[j].Reflected {
+				return !list[i].Reflected
 			}
-			iSink := isMDNSZeroByteSink(list[i].svc.Type)
-			jSink := isMDNSZeroByteSink(list[j].svc.Type)
+			if list[i].TrustedReflector != list[j].TrustedReflector {
+				return list[i].TrustedReflector
+			}
+			iSink := isMDNSZeroByteSink(list[i].Type)
+			jSink := isMDNSZeroByteSink(list[j].Type)
 			if iSink != jSink {
 				return iSink
 			}
-			if list[i].svc.Type != list[j].svc.Type {
-				return list[i].svc.Type < list[j].svc.Type
+			if list[i].Type != list[j].Type {
+				return list[i].Type < list[j].Type
 			}
-			if list[i].svc.Port != list[j].svc.Port {
-				return list[i].svc.Port < list[j].svc.Port
+			if list[i].Port != list[j].Port {
+				return list[i].Port < list[j].Port
 			}
-			return list[i].svc.Instance < list[j].svc.Instance
+			return list[i].Instance < list[j].Instance
 		})
 		if len(list) > maxMDNSServicesPerHost {
 			list = list[:maxMDNSServicesPerHost]
 		}
-		for _, cand := range list {
-			svcForIP := cand.svc
+		for _, svcForIP := range list {
 			res.MDNS[ip] = append(res.MDNS[ip], svcForIP)
 
 			if isMDNSZeroByteSink(svcForIP.Type) {
-				isAuthoritative := cand.noResponders || cand.directMatch
-				if shouldProtectMDNSSinkPort(svcForIP.Type, svcForIP.Port, isAuthoritative, svcForIP.ResponderIP) {
+				if shouldProtectMDNSSinkPort(svcForIP.Type, svcForIP.Port, !svcForIP.Reflected, svcForIP.TrustedReflector) {
 					if res.RawPrintIPs[ip] == nil {
 						res.RawPrintIPs[ip] = make(map[int]struct{})
 					}
@@ -1526,6 +1462,21 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 		res.PortsByIP[ip] = list
 	}
 	return res
+}
+
+// Prefer a resolved SRV, then the target itself, then a configured reflector.
+// A stable tie break keeps equivalent sources independent of map iteration.
+func preferMDNSService(a, b MDNSService) bool {
+	if (a.TargetHost == "") != (b.TargetHost == "") {
+		return a.TargetHost != ""
+	}
+	if a.Reflected != b.Reflected {
+		return !a.Reflected
+	}
+	if a.TrustedReflector != b.TrustedReflector {
+		return a.TrustedReflector
+	}
+	return a.ResponderIP < b.ResponderIP
 }
 
 // IPFamily reports ipv4, ipv6, dual, or an empty string for an unknown family.

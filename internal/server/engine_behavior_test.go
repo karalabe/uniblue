@@ -790,10 +790,8 @@ func TestClientSkipReasonAndIPv6ClassLookup(t *testing.T) {
 	}
 }
 
-// TestHTTPAuthBruteForceLockout verifies per-IP lockout throttling on repeated
-// bad dashboard/API token attempts without locking out valid Bearer/session
-// holders behind a shared reverse proxy, without letting a valid Bearer reset
-// an attacker's failure counter, and with IPv6 /64 prefix bucketing.
+// TestHTTPAuthBruteForceLockout verifies per-address throttling of token
+// attempts while authenticated browser sessions continue to work.
 func TestHTTPAuthBruteForceLockout(t *testing.T) {
 	eng := NewDemoEngineForTest(t)
 	eng.opts.ListenAddr = "0.0.0.0:8080"
@@ -862,23 +860,29 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		}
 	}
 
-	// Valid Bearer token and valid session cookie from the SAME IP (e.g. shared
-	// reverse proxy) MUST still succeed while bad attempts are locked out.
-	reqBearer := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
-	reqBearer.RemoteAddr = "10.0.0.50:55557"
-	reqBearer.Header.Set("Authorization", "Bearer super-secret-token")
-	recBearer := httptest.NewRecorder()
-	h.ServeHTTP(recBearer, reqBearer)
-	if recBearer.Code != http.StatusOK {
-		t.Fatalf("valid Bearer while locked out expected 200, got %d", recBearer.Code)
+	// Correct and incorrect Bearer credentials receive the same lockout response.
+	for _, path := range []string{"/api/v1/state", "/api/v1/session"} {
+		for _, candidate := range []string{"super-secret-token", "wrong"} {
+			req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080"+path, nil)
+			req.RemoteAddr = "10.0.0.50:55557"
+			req.Header.Set("Authorization", "Bearer "+candidate)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("locked Bearer on %s returned %d, want 429", path, rec.Code)
+			}
+		}
 	}
-	reqCk := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
-	reqCk.RemoteAddr = "10.0.0.50:55558"
-	reqCk.AddCookie(validCookie)
-	recCk := httptest.NewRecorder()
-	h.ServeHTTP(recCk, reqCk)
-	if recCk.Code != http.StatusOK {
-		t.Fatalf("valid session cookie while locked out expected 200, got %d", recCk.Code)
+	for _, path := range []string{"/api/v1/state", "/api/v1/session"} {
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080"+path, nil)
+		req.RemoteAddr = "10.0.0.50:55558"
+		req.AddCookie(validCookie)
+		req.Header.Set("Authorization", "Bearer wrong")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || (path == "/api/v1/session" && !strings.Contains(rec.Body.String(), `"authenticated":true`)) {
+			t.Fatalf("valid session during lockout on %s: got %d", path, rec.Code)
+		}
 	}
 
 	// Another IP is unaffected and can authenticate normally.
@@ -941,21 +945,30 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("stale cookie %d: expected 401, got %d", i, rec.Code)
 		}
+		cookies := rec.Result().Cookies()
+		if len(cookies) != 1 || cookies[0].Name != sessionCookieName || cookies[0].MaxAge >= 0 {
+			t.Fatalf("stale cookie was not cleared: %v", cookies)
+		}
 	}
 
-	// IPv6 clients sharing a /64 prefix share a single rate-limit bucket so
-	// rotating privacy suffixes cannot bypass brute-force lockout.
-	for i := 1; i <= authMaxFailedAttempts; i++ {
-		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"wrong"}`))
-		req.RemoteAddr = fmt.Sprintf("[2001:db8:abcd:1::%x]:40000", i+10)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+	// Lock one IPv6 host and sign in from its neighbor in the same subnet.
+	for i := 1; i <= authMaxFailedAttempts+1; i++ {
+		candidate := "wrong"
+		remote := "[2001:db8:abcd:1::10]:40000"
 		want := http.StatusUnauthorized
 		if i == authMaxFailedAttempts {
 			want = http.StatusTooManyRequests
+		} else if i > authMaxFailedAttempts {
+			remote = "[2001:db8:abcd:1::11]:40000"
+			candidate = eng.opts.APIToken
+			want = http.StatusOK
 		}
+		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(fmt.Sprintf(`{"token":%q}`, candidate)))
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
 		if rec.Code != want {
-			t.Fatalf("ipv6 /64 attempt %d: expected %d, got %d", i, want, rec.Code)
+			t.Fatalf("IPv6 login %d from %s: got %d, want %d", i, remote, rec.Code, want)
 		}
 	}
 }
@@ -1531,6 +1544,7 @@ func TestPendingWebhooksSurviveRestartWithSameID(t *testing.T) {
 // caller's session on DELETE /api/v1/session.
 func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 	eng := NewDemoEngineForTest(t)
+	eng.cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
 	eng.opts.ListenAddr = "127.0.0.1:8080"
 	eng.opts.APIToken = "session-secret-token"
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
@@ -1559,15 +1573,18 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 	if strings.Contains(ck1.Value, eng.opts.APIToken) || strings.Contains(ck2.Value, eng.opts.APIToken) {
 		t.Fatalf("session cookie must never contain raw API token")
 	}
-	if len(strings.Split(ck1.Value, ".")) != 3 || len(strings.Split(ck2.Value, ".")) != 3 {
-		t.Fatalf("expected signed 3-part session cookies, got %q and %q", ck1.Value, ck2.Value)
+	for _, ck := range []*http.Cookie{ck1, ck2} {
+		if len(ck.Value) != 64 || strings.Trim(ck.Value, "0123456789abcdef") != "" {
+			t.Fatal("expected a hex-encoded 256-bit session cookie")
+		}
 	}
 	if ck1.Value == ck2.Value {
 		t.Fatalf("expected distinct random session cookies per login, both were %q", ck1.Value)
 	}
 
-	// Signed cookies survive a server restart with the same API token.
+	// Stored sessions survive a server restart with the same API token.
 	engRestarted := NewDemoEngineForTest(t)
+	engRestarted.cfg.State.Path = eng.cfg.State.Path
 	engRestarted.opts.ListenAddr = "127.0.0.1:8080"
 	engRestarted.opts.APIToken = "session-secret-token"
 	engRestarted.sessions.nowFn = func() time.Time { return now }
@@ -1575,23 +1592,10 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 	reqRestart.Host = "127.0.0.1:8080"
 	reqRestart.AddCookie(ck2)
 	recRestart := httptest.NewRecorder()
-	engRestarted.Handler().ServeHTTP(recRestart, reqRestart)
+	h = engRestarted.Handler()
+	h.ServeHTTP(recRestart, reqRestart)
 	if recRestart.Code != http.StatusOK {
-		t.Fatalf("signed cookie after restart with same token status = %d, want 200", recRestart.Code)
-	}
-
-	// Rotating the API token immediately invalidates prior signed cookies.
-	engRotated := NewDemoEngineForTest(t)
-	engRotated.opts.ListenAddr = "127.0.0.1:8080"
-	engRotated.opts.APIToken = "rotated-secret-token"
-	engRotated.sessions.nowFn = func() time.Time { return now }
-	reqRot := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
-	reqRot.Host = "127.0.0.1:8080"
-	reqRot.AddCookie(ck2)
-	recRot := httptest.NewRecorder()
-	engRotated.Handler().ServeHTTP(recRot, reqRot)
-	if recRot.Code != http.StatusUnauthorized {
-		t.Fatalf("signed cookie after token rotation status = %d, want 401", recRot.Code)
+		t.Fatalf("cookie after restart with same token status = %d, want 200", recRestart.Code)
 	}
 
 	checkState := func(ck *http.Cookie, want int) {
@@ -1634,6 +1638,22 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 	// Expired session cookie is rejected after sessionTTL.
 	now = now.Add(sessionTTL + time.Minute)
 	checkState(ck2, http.StatusUnauthorized)
+
+	fresh := login()
+	// Rotating the API token immediately invalidates prior sessions.
+	engRotated := NewDemoEngineForTest(t)
+	engRotated.cfg.State.Path = eng.cfg.State.Path
+	engRotated.opts.ListenAddr = "127.0.0.1:8080"
+	engRotated.opts.APIToken = "rotated-secret-token"
+	engRotated.sessions.nowFn = func() time.Time { return now }
+	reqRot := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
+	reqRot.Host = "127.0.0.1:8080"
+	reqRot.AddCookie(fresh)
+	recRot := httptest.NewRecorder()
+	engRotated.Handler().ServeHTTP(recRot, reqRot)
+	if recRot.Code != http.StatusUnauthorized {
+		t.Fatalf("cookie after token rotation status = %d, want 401", recRot.Code)
+	}
 }
 
 // TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise verifies:

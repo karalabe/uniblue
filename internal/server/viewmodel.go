@@ -114,8 +114,9 @@ type Entity struct {
 	IsBMC         bool                 `json:"is_bmc,omitempty"`
 	ExactCVECount int                  `json:"exact_cve_count,omitempty"`
 	PotCVECount   int                  `json:"pot_cve_count,omitempty"`
-	Services      []ServiceView        `json:"services,omitempty"`
-	ExactCVEs     []cve.ProductSummary `json:"exact_cves,omitempty"`
+	Services         []ServiceView        `json:"services,omitempty"`
+	ConnectOnlyPorts []int                `json:"connect_only_ports,omitempty"`
+	ExactCVEs        []cve.ProductSummary `json:"exact_cves,omitempty"`
 	PotentialCVEs []cve.ProductSummary `json:"potential_cves,omitempty"`
 
 	// Bridge-to-child and outbound dependency metadata.
@@ -765,6 +766,9 @@ func BuildPresentationModel(
 		}
 		behindCGNAT := isSnapshotWANBehindCGNAT(snap)
 		ent.Services = buildHostServices(cv, hp, lookupWANForIPs(cl.AllIPs()), netIsolated[strings.ToLower(cl.NetworkName)], behindCGNAT)
+		if len(hp.ConnectOnlyPorts) > 0 {
+			ent.ConnectOnlyPorts = append([]int(nil), hp.ConnectOnlyPorts...)
+		}
 		if len(hp.OutboundDependencies) > 0 {
 			ent.OutboundDependencies = hp.OutboundDependencies
 		}
@@ -2122,6 +2126,15 @@ func forwardMatchesAddressFamily(pf unifi.PortForward, svcFam string) bool {
 	return ff == sf
 }
 
+func hasOpenPort(ports []int, target int) bool {
+	for _, p := range ports {
+		if p == target {
+			return true
+		}
+	}
+	return false
+}
+
 func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureAssessment, vlanIsolated, behindCGNAT bool) []ServiceView {
 	type wanPortInfo struct {
 		restricted bool
@@ -2313,18 +2326,46 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 				srcRestricted = restr
 			}
 			name := commonPortLabel(port)
+			state := probe.ServiceStateCandidatePort
+			if transport == "tcp" && hasOpenPort(hp.ConnectOnlyPorts, port) {
+				state = "connect-only"
+			}
 			out = append(out, ServiceView{
 				Port:             port,
 				Proto:            transport,
 				Name:             name,
 				Reachable:        reach,
-				State:            probe.ServiceStateCandidatePort,
+				State:            state,
 				SourceRestricted: srcRestricted,
 				Label:            formatServiceLabel(name, transport, port, "", false),
 			})
 			return
 		}
-		multi := len(svcs) > 1
+		// If this open TCP port was only observed via IPv6 (for example from a
+		// passive flow record) on a dual-stack host that also has an IPv4 WAN
+		// port forward on the same port, synthesize the IPv4 WAN row so the
+		// internet-exposed IPv4 endpoint is never hidden as LAN-only.
+		addIPv4WAN := false
+		var ipv4WANReach string
+		var ipv4WANRestr bool
+		if transport == "tcp" && strings.TrimSpace(cv.Client.IP) != "" && hasOpenPort(cv.OpenPorts, port) {
+			hasIPv4OrGeneric := false
+			for _, svc := range svcs {
+				if svc.AddressFamily == "" || svc.AddressFamily == "ipv4" {
+					hasIPv4OrGeneric = true
+					break
+				}
+			}
+			if !hasIPv4OrGeneric {
+				if lbl, restr, ok := wanReachForEndpoint(port, transport, "ipv4"); ok {
+					addIPv4WAN = true
+					ipv4WANReach = lbl
+					ipv4WANRestr = restr
+				}
+			}
+		}
+
+		multi := len(svcs) > 1 || addIPv4WAN
 		for _, svc := range svcs {
 			reach := defaultReach
 			srcRestricted := false
@@ -2342,6 +2383,19 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 				State:            firstStr(svc.State, probe.ServiceStateObservedProtocol),
 				SourceRestricted: srcRestricted,
 				Label:            formatServiceLabel(name, transport, port, svc.AddressFamily, multi),
+			})
+		}
+		if addIPv4WAN {
+			name := commonPortLabel(port)
+			out = append(out, ServiceView{
+				Port:             port,
+				Proto:            transport,
+				AddressFamily:    "ipv4",
+				Name:             name,
+				Reachable:        ipv4WANReach,
+				State:            probe.ServiceStateCandidatePort,
+				SourceRestricted: ipv4WANRestr,
+				Label:            formatServiceLabel(name, transport, port, "ipv4", multi),
 			})
 		}
 	}

@@ -54,10 +54,30 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("webhook returned HTTP %d", e.StatusCode)
 }
 
-// Permanent reports whether the HTTP status represents a non-retryable client
-// rejection (4xx other than 408 Request Timeout and 429 Too Many Requests).
+// Permanent reports whether the HTTP status represents a malformed or oversized
+// payload rejection (400, 413, 414, 415, 422) that will never succeed on retry.
+// Auth and routing 4xx codes (401, 403, 404) are treated as short-retryable
+// client errors so transient proxy restarts, clock skew, or secret rotations do
+// not immediately drop alerts.
 func (e *HTTPStatusError) Permanent() bool {
+	switch e.StatusCode {
+	case http.StatusBadRequest,
+		http.StatusRequestEntityTooLarge,
+		http.StatusRequestURITooLong,
+		http.StatusUnsupportedMediaType,
+		http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}
+
+// TransientClientError reports whether the HTTP status is a non-permanent 4xx
+// response other than 408 Request Timeout and 429 Too Many Requests (such as
+// 401, 403, or 404), which should be retried briefly before dropping.
+func (e *HTTPStatusError) TransientClientError() bool {
 	return e.StatusCode >= 400 && e.StatusCode < 500 &&
+		!e.Permanent() &&
 		e.StatusCode != http.StatusRequestTimeout &&
 		e.StatusCode != http.StatusTooManyRequests
 }

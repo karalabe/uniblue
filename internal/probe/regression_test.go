@@ -45,6 +45,7 @@ import (
 func TestForgedMDNSRawPrintCannotHideVictimPort(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	cache := NewDiscoveryCache()
+	cache.SetTrustedReflectors([]string{"192.168.1.1"})
 
 	// Attacker 192.168.1.66 forges a _pdl-datastream._tcp reply pointing to victim 192.168.1.10:445.
 	forged := buildMDNSTestPacket("_pdl-datastream._tcp", "fake-printer", "nas.local", 445, 120, []byte{192, 168, 1, 10}, nil, nil)
@@ -863,6 +864,7 @@ func TestMDNSPerTargetAuthorityBlocksMultiAForgedPortHint(t *testing.T) {
 func TestReflectedSerialBridgeProtectedZeroBytesAndSpoofedAdminPortNotHidden(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	cache := NewDiscoveryCache()
+	cache.SetTrustedReflectors([]string{"192.168.1.1"})
 
 	// Gateway reflector 192.168.1.1 relays SLZB-06 coordinator on known port 6638.
 	reflectedSerial := buildMDNSTestPacket("_slzb-06._tcp", "slzb-coord", "slzb.local", 6638, 120, []byte{192, 168, 20, 40}, nil, nil)
@@ -955,6 +957,7 @@ func TestReflectedSerialBridgeProtectedZeroBytesAndSpoofedAdminPortNotHidden(t *
 		}()
 
 		loopCache := NewDiscoveryCache()
+		loopCache.SetTrustedReflectors([]string{"192.168.1.1"})
 		pkt := buildMDNSTestPacket("_slzb-06._tcp", "slzb-coord", "slzb.local", uint16(port), 120, []byte{127, 0, 0, 1}, nil, nil)
 		loopCache.IngestMDNSPacket(pkt, "192.168.1.1", "eth0", "IoT", now)
 		loopSnap := loopCache.Snapshot(now)
@@ -983,6 +986,7 @@ func TestMDNSReflectorLargeDeviceCountAndPerTargetCap(t *testing.T) {
 
 	// 1. Gateway reflector 192.168.1.1 relays 100 distinct IoT devices.
 	refCache := NewDiscoveryCache()
+	refCache.SetTrustedReflectors([]string{"192.168.1.1"})
 	for i := range 100 {
 		ip := []byte{192, 168, 20, byte(i + 1)}
 		pkt := buildMDNSTestPacket("_esphomelib._tcp", fmt.Sprintf("plug-%d", i), fmt.Sprintf("plug-%d.local", i), 6053, 120, ip, nil, []string{"platform=ESP32"})

@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -953,72 +954,87 @@ func IsolatedZones(snap *unifi.Snapshot) map[string]bool {
 	return isolatedZoneSet(snap)
 }
 
-// endpointCoversZoneNetworks reports whether ep broadly covers every LAN
-// network belonging to zone (either via AnyTarget or via positive NetworkIDs
-// naming all LAN networks in that zone, with no IP/MAC/negation narrowing).
-func endpointCoversZoneNetworks(ep unifi.PolicyEndpoint, zone string, snap *unifi.Snapshot) bool {
-	if ep.NegateTarget || ep.UnsupportedSelector != "" {
-		return false
-	}
-	if ep.AnyTarget {
-		return true
-	}
-	if len(ep.IPs) > 0 || len(ep.MACs) > 0 || len(ep.NetworkIDs) == 0 || snap == nil {
-		return false
-	}
-	zoneLow := strings.ToLower(strings.TrimSpace(zone))
-	matched := 0
+func zoneLANNetworks(snap *unifi.Snapshot, zone string) []unifi.Network {
+	var nets []unifi.Network
 	for _, n := range snap.Networks {
-		p := strings.ToLower(strings.TrimSpace(n.Purpose))
-		if p == "wan" || p == "wan2" || p == "remote-user-vpn" {
+		switch strings.ToLower(strings.TrimSpace(n.Purpose)) {
+		case "wan", "wan2", "remote-user-vpn":
 			continue
 		}
-		if strings.ToLower(strings.TrimSpace(n.ZoneName)) != zoneLow {
-			continue
+		if strings.EqualFold(strings.TrimSpace(n.ZoneName), zone) {
+			nets = append(nets, n)
 		}
-		if !((n.ID != "" && containsFold(ep.NetworkIDs, n.ID)) || (n.Name != "" && containsFold(ep.NetworkIDs, n.Name))) {
-			return false
-		}
-		matched++
 	}
-	return matched > 0
+	if len(nets) == 0 {
+		// With no inventory, only a zone-wide target proves coverage.
+		return []unifi.Network{{ZoneName: zone}}
+	}
+	return nets
 }
 
-// intendedIsolatedZoneSet returns the lowercase set of UniFi firewall zones
-// that express isolation intent from Internal: Hotspot, DMZ, and any custom
-// zone that has at least one enabled broad BLOCK/REJECT/DROP policy targeting
-// Internal (even if scheduled, IPv4-only, or shadowed by an earlier ALLOW).
-// Narrow host/port/protocol blocks on semi-trusted zones do not qualify.
-func intendedIsolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
-	zones := map[string]bool{
-		"hotspot": true,
-		"dmz":     true,
+func endpointCoversNetwork(ep unifi.PolicyEndpoint, n unifi.Network) bool {
+	return !ep.NegatePort && ep.CoversAllPorts() && !ep.NegateTarget &&
+		endpointUnconditionallyMatchesNetwork(ep, n.ZoneName, n, false)
+}
+
+func blocksCoverNetworkPairs(blocks []unifi.FirewallPolicy, srcNets, dstNets []unifi.Network) bool {
+	for _, src := range srcNets {
+		for _, dst := range dstNets {
+			if !slices.ContainsFunc(blocks, func(block unifi.FirewallPolicy) bool {
+				return endpointCoversNetwork(block.Source, src) && endpointCoversNetwork(block.Destination, dst)
+			}) {
+				return false
+			}
+		}
 	}
-	if snap == nil {
-		return zones
-	}
+	return true
+}
+
+// blanketBlockZones checks the union of unconditional blocks for every pair of
+// source and Internal networks. A single broad but conditional policy can
+// still express isolation intent for leak reporting.
+func blanketBlockZones(snap *unifi.Snapshot, intent bool) map[string]string {
+	zones := make(map[string]string)
+	blocks := make(map[string][]unifi.FirewallPolicy)
+	dstNets := zoneLANNetworks(snap, "Internal")
 	for _, pol := range snap.FirewallPolicies {
-		if !pol.Enabled {
+		if !pol.Enabled || pol.UnsupportedReason != "" || !strings.EqualFold(strings.TrimSpace(pol.Destination.ZoneName), "Internal") {
 			continue
 		}
-		act := strings.ToUpper(strings.TrimSpace(pol.Action))
-		if act != "BLOCK" && act != "REJECT" && act != "DROP" {
+		switch strings.ToUpper(strings.TrimSpace(pol.Action)) {
+		case "BLOCK", "REJECT", "DROP":
+		default:
 			continue
 		}
 		src := strings.ToLower(strings.TrimSpace(pol.Source.ZoneName))
-		dst := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
-		if src == "" || src == "internal" || src == "external" || src == "gateway" || src == "vpn" || dst != "internal" {
+		switch src {
+		case "", "internal", "external", "gateway", "vpn":
 			continue
 		}
-		if !endpointCoversZoneNetworks(pol.Source, src, snap) ||
-			!endpointCoversZoneNetworks(pol.Destination, "internal", snap) ||
-			!pol.Destination.CoversAllPorts() || pol.Destination.NegatePort {
-			continue
+		if pol.Schedule == "" && matchesIPFamily(pol.IPVersion, "ipv4") && matchesConnState(pol.ConnectionStates, "new") &&
+			matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "tcp") && matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "udp") {
+			blocks[src] = append(blocks[src], pol)
+		} else if intent && !pol.ProtocolNegated && matchesProtocol(pol.Protocol, "tcp") &&
+			blocksCoverNetworkPairs([]unifi.FirewallPolicy{pol}, zoneLANNetworks(snap, src), dstNets) {
+			zones[src] = strings.TrimSpace(pol.Source.ZoneName)
 		}
-		if pol.ProtocolNegated || !matchesProtocol(pol.Protocol, "tcp") {
-			continue
+	}
+	for src, rules := range blocks {
+		if blocksCoverNetworkPairs(rules, zoneLANNetworks(snap, src), dstNets) {
+			zones[src] = strings.TrimSpace(rules[0].Source.ZoneName)
 		}
-		zones[src] = true
+	}
+	return zones
+}
+
+// intendedIsolatedZoneSet includes built-in isolated zones and custom zones
+// with blanket block intent, even if earlier allows defeat enforcement.
+func intendedIsolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
+	zones := map[string]bool{"hotspot": true, "dmz": true}
+	if snap != nil {
+		for zone := range blanketBlockZones(snap, true) {
+			zones[zone] = true
+		}
 	}
 	return zones
 }
@@ -1050,52 +1066,8 @@ func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 		return i < j
 	})
 
-	candidates := make(map[string]string)
-	for _, pol := range sorted {
-		if !pol.Enabled {
-			continue
-		}
-		act := strings.ToUpper(strings.TrimSpace(pol.Action))
-		if act != "BLOCK" && act != "REJECT" && act != "DROP" {
-			continue
-		}
-		srcRaw := strings.TrimSpace(pol.Source.ZoneName)
-		src := strings.ToLower(srcRaw)
-		dst := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
-		if src == "" || src == "internal" || src == "external" || src == "gateway" || src == "vpn" || dst != "internal" {
-			continue
-		}
-		if pol.Schedule != "" ||
-			!endpointCoversZoneNetworks(pol.Source, src, snap) ||
-			!endpointCoversZoneNetworks(pol.Destination, "internal", snap) ||
-			!pol.Destination.CoversAllPorts() || pol.Destination.NegatePort {
-			continue
-		}
-		if !matchesIPFamily(pol.IPVersion, "ipv4") {
-			continue
-		}
-		if !matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "tcp") || !matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "udp") {
-			continue
-		}
-		if !matchesConnState(pol.ConnectionStates, "new") {
-			continue
-		}
-		candidates[src] = srcRaw
-	}
-
-	var intNets []unifi.Network
-	for _, n := range snap.Networks {
-		p := strings.ToLower(strings.TrimSpace(n.Purpose))
-		if p == "wan" || p == "wan2" || p == "remote-user-vpn" {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(n.ZoneName), "internal") {
-			intNets = append(intNets, n)
-		}
-	}
-	if len(intNets) == 0 {
-		intNets = []unifi.Network{{Name: "Internal", ZoneName: "Internal"}}
-	}
+	candidates := blanketBlockZones(snap, false)
+	intNets := zoneLANNetworks(snap, "Internal")
 
 	gwName, _ := findGatewayIdentity(snap)
 	switchACLStatus := "unavailable"
@@ -1111,20 +1083,7 @@ func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 	}
 
 	for srcLow, srcRaw := range candidates {
-		var srcNets []unifi.Network
-		for _, n := range snap.Networks {
-			p := strings.ToLower(strings.TrimSpace(n.Purpose))
-			if p == "wan" || p == "wan2" || p == "remote-user-vpn" {
-				continue
-			}
-			if strings.EqualFold(strings.TrimSpace(n.ZoneName), srcRaw) {
-				srcNets = append(srcNets, n)
-			}
-		}
-		if len(srcNets) == 0 {
-			srcNets = []unifi.Network{{Name: srcRaw, ZoneName: srcRaw}}
-		}
-
+		srcNets := zoneLANNetworks(snap, srcRaw)
 		pinholeIntent := config.IsolationIntent{
 			ApprovedPaths: narrowPinholePathsForZone(sorted, srcRaw),
 		}

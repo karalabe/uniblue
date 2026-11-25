@@ -12,6 +12,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -157,6 +159,7 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 
 	if *saveState {
+		warnLegacyCWDState(slog.New(slog.NewTextHandler(stderr, nil)), cfg.State.Path)
 		prev, _ := risk.LoadState(cfg.State.Path)
 		st := risk.BuildStateWithPrev(prev, snap, report, cfg.Network, probedHostKeys(profiles))
 		if err := risk.SaveState(cfg.State.Path, st); err != nil {
@@ -210,7 +213,9 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
-	warnLegacyCWDState(logger, cfg.State.Path)
+	if err := checkLegacyCWDState(logger, cfg.State.Path); err != nil {
+		return err
+	}
 	logger.Info("starting uniblue watch",
 		"site", cfg.UniFi.Site,
 		"interval", cfg.Scan.Interval,
@@ -255,19 +260,32 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 // and transient controller telemetry outages preserve last-known settings,
 // WLANs, and switch port profiles without dropping posture findings.
 type watchSession struct {
-	cfg              *config.Config
-	minSev           checks.Severity
-	logger           *slog.Logger
-	prevState        *risk.State
-	lastSnap         *unifi.Snapshot
-	stateLoaded      bool
-	pendingWebhookID string
+	cfg               *config.Config
+	minSev            checks.Severity
+	logger            *slog.Logger
+	prevState         *risk.State
+	lastSnap          *unifi.Snapshot
+	stateLoaded       bool
+	pendingWebhookID  string
+	pendingWebhookKey string
 
 	scanFn       func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
 	sendFn       func(ctx context.Context, site string, diff risk.Diff) error
 	sendWithIDFn func(ctx context.Context, id, site string, diff risk.Diff) error
 	loadFn       func(path string) (*risk.State, error)
 	saveFn       func(path string, st *risk.State) error
+}
+
+func watchDiffFingerprint(site string, diff risk.Diff) string {
+	raw, err := json.Marshal(struct {
+		Site string    `json:"site"`
+		Diff risk.Diff `json:"diff"`
+	}{Site: site, Diff: diff})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func (w *watchSession) runCycle(ctx context.Context) {
@@ -310,8 +328,10 @@ func (w *watchSession) runCycle(ctx context.Context) {
 	if diff.HasAlerts(w.minSev) {
 		var sendErr error
 		if w.sendWithIDFn != nil {
-			if w.pendingWebhookID == "" {
+			fp := watchDiffFingerprint(snap.Site, diff)
+			if w.pendingWebhookID == "" || fp == "" || w.pendingWebhookKey != fp {
 				w.pendingWebhookID = notify.NewWebhookID()
+				w.pendingWebhookKey = fp
 			}
 			sendErr = w.sendWithIDFn(ctx, w.pendingWebhookID, snap.Site, diff)
 		} else {
@@ -322,8 +342,10 @@ func (w *watchSession) runCycle(ctx context.Context) {
 			return
 		}
 		w.pendingWebhookID = ""
+		w.pendingWebhookKey = ""
 	} else {
 		w.pendingWebhookID = ""
+		w.pendingWebhookKey = ""
 	}
 
 	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedKeys)
@@ -893,30 +915,54 @@ func newSiteFingerprinter(ports []int, concurrency int, timeout time.Duration, e
 	return fp
 }
 
-// warnLegacyCWDState emits a startup warning when the resolved state.path does
-// not exist yet while a legacy ./uniblue-state.json exists in the current
-// working directory at a different location, helping operators notice after
-// upgrading without silently adopting an untrusted working-directory file.
+// checkLegacyCWDState fails fast when the resolved state.path does not exist
+// yet while a legacy ./uniblue-state.json exists in the current working
+// directory at a different location, preventing an upgrade from silently
+// creating an empty baseline and firing a full re-alert storm.
+func checkLegacyCWDState(logger *slog.Logger, resolvedPath string) error {
+	legacyAbs, found := detectLegacyCWDState(resolvedPath)
+	if !found {
+		return nil
+	}
+	if logger != nil {
+		logger.Warn("configured state file does not exist yet while a legacy state file exists in the current working directory; move it or set state.path explicitly to preserve baseline history",
+			"state_path", resolvedPath,
+			"legacy_cwd_state", legacyAbs,
+		)
+	}
+	return fmt.Errorf("state path %q does not exist yet while legacy state file %q exists in the current working directory (move it to %q or set state.path explicitly to avoid re-alerting existing findings)", resolvedPath, legacyAbs, resolvedPath)
+}
+
+// warnLegacyCWDState emits a warning when a legacy ./uniblue-state.json exists
+// at a different location than resolvedPath.
 func warnLegacyCWDState(logger *slog.Logger, resolvedPath string) {
-	if logger == nil || strings.TrimSpace(resolvedPath) == "" {
-		return
-	}
-	if _, err := os.Stat(resolvedPath); err == nil {
-		return
-	}
-	legacy := "uniblue-state.json"
-	if _, err := os.Stat(legacy); err != nil {
-		return
-	}
-	absResolved, err1 := filepath.Abs(resolvedPath)
-	absLegacy, err2 := filepath.Abs(legacy)
-	if err1 == nil && err2 == nil && absResolved == absLegacy {
+	legacyAbs, found := detectLegacyCWDState(resolvedPath)
+	if !found || logger == nil {
 		return
 	}
 	logger.Warn("configured state file does not exist yet while a legacy state file exists in the current working directory; set state.path explicitly or move it to preserve baseline history",
 		"state_path", resolvedPath,
-		"legacy_cwd_state", absLegacy,
+		"legacy_cwd_state", legacyAbs,
 	)
+}
+
+func detectLegacyCWDState(resolvedPath string) (string, bool) {
+	if strings.TrimSpace(resolvedPath) == "" {
+		return "", false
+	}
+	if _, err := os.Stat(resolvedPath); err == nil {
+		return "", false
+	}
+	legacy := "uniblue-state.json"
+	if _, err := os.Stat(legacy); err != nil {
+		return "", false
+	}
+	absResolved, err1 := filepath.Abs(resolvedPath)
+	absLegacy, err2 := filepath.Abs(legacy)
+	if err1 == nil && err2 == nil && absResolved == absLegacy {
+		return "", false
+	}
+	return absLegacy, true
 }
 
 // verifyStatePathWritable creates parent directories if needed and writes+removes
@@ -2002,7 +2048,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
-	warnLegacyCWDState(logger, cfg.State.Path)
+	if err := checkLegacyCWDState(logger, cfg.State.Path); err != nil {
+		return err
+	}
 	eng, err := server.NewEngine(cfg, checkList, scanPorts, server.Options{
 		ListenAddr:         *listen,
 		PollInterval:       *poll,

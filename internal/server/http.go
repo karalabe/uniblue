@@ -9,7 +9,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -20,11 +19,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,9 +39,9 @@ import (
 )
 
 const (
-	sessionCookieName  = "uniblue_session"
-	sessionTTL         = 30 * 24 * time.Hour
-	maxRevokedSessions = 1024
+	sessionCookieName = "uniblue_session"
+	sessionTTL        = 30 * 24 * time.Hour
+	maxActiveSessions = 1024
 
 	authMaxFailedAttempts  = 5
 	authFailureWindow      = 15 * time.Minute
@@ -49,15 +50,18 @@ const (
 	authMaxTrackedClients  = 1024
 )
 
-// sessionStore mints and validates per-login random-nonce HMAC-SHA256 session
-// cookies bound to the active UNIBLUE_API_TOKEN, plus a bounded in-memory
-// revocation set for explicit DELETE /api/v1/session logouts. Sessions survive
-// restarts with the same API token while token rotation invalidates all prior
-// cookies immediately.
+// Session cookies are independent random secrets. Only their digests and
+// expirations are stored alongside the digest of the configured API token.
+type sessionData struct {
+	TokenHash string           `json:"token_hash"`
+	Expires   map[string]int64 `json:"expires"`
+}
+
 type sessionStore struct {
-	mu      sync.Mutex
-	revoked map[string]time.Time
-	nowFn   func() time.Time
+	mu    sync.Mutex
+	path  string
+	data  sessionData
+	nowFn func() time.Time
 }
 
 func (s *sessionStore) now() time.Time {
@@ -67,110 +71,145 @@ func (s *sessionStore) now() time.Time {
 	return time.Now()
 }
 
-func deriveSessionMACKey(apiToken string) [32]byte {
-	return sha256.Sum256([]byte("uniblue-session-v1:" + apiToken))
+func sessionDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
-func signSessionToken(apiToken, nonce string, expUnix int64) string {
-	key := deriveSessionMACKey(apiToken)
-	mac := hmac.New(sha256.New, key[:])
-	_, _ = mac.Write([]byte(nonce))
-	_, _ = mac.Write([]byte("."))
-	_, _ = mac.Write([]byte(strconv.FormatInt(expUnix, 10)))
-	return hex.EncodeToString(mac.Sum(nil))
+func (s *sessionStore) configure(path, token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if path != s.path {
+		s.path = path
+		s.data = sessionData{}
+	}
+	return s.bindLocked(token)
 }
 
-func parseSessionToken(cookieVal string) (nonce string, expUnix int64, sigHex string, ok bool) {
-	parts := strings.Split(cookieVal, ".")
-	if len(parts) != 3 || len(parts[0]) != 64 || len(parts[2]) != 64 {
-		return "", 0, "", false
+func (s *sessionStore) loadLocked() error {
+	if s.data.Expires != nil || s.path == "" {
+		return nil
 	}
-	if _, err := hex.DecodeString(parts[0]); err != nil {
-		return "", 0, "", false
+	raw, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	if _, err := hex.DecodeString(parts[2]); err != nil {
-		return "", 0, "", false
+	if err != nil {
+		return err
 	}
-	exp, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil || exp <= 0 {
-		return "", 0, "", false
+	var data sessionData
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return err
 	}
-	return parts[0], exp, parts[2], true
+	if data.TokenHash == "" || data.Expires == nil || len(data.Expires) > maxActiveSessions {
+		return errors.New("invalid session store")
+	}
+	s.data = data
+	return nil
 }
 
-func (s *sessionStore) create(apiToken string) (string, error) {
+// bindLocked discards sessions when the configured API token changes.
+func (s *sessionStore) bindLocked(token string) error {
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	hash := sessionDigest(token)
+	if s.data.Expires == nil {
+		s.data = sessionData{TokenHash: hash, Expires: make(map[string]int64)}
+	} else if s.data.TokenHash != hash {
+		return s.commitLocked(sessionData{TokenHash: hash, Expires: make(map[string]int64)})
+	}
+	return nil
+}
+
+// commitLocked publishes a mutation in memory only after the atomic file
+// replacement succeeds. A failed logout can therefore be retried.
+func (s *sessionStore) commitLocked(next sessionData) error {
+	if s.path != "" {
+		dir := filepath.Dir(s.path)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(dir, ".uniblue-sessions-*")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(tmp.Name())
+		if err = json.NewEncoder(tmp).Encode(next); err == nil {
+			err = tmp.Sync()
+		}
+		closeErr := tmp.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := os.Rename(tmp.Name(), s.path); err != nil {
+			return err
+		}
+	}
+	s.data = next
+	return nil
+}
+
+func (s *sessionStore) create(token string) (string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
-		return "", fmt.Errorf("generate session token: %w", err)
+		return "", err
 	}
-	nonce := hex.EncodeToString(raw[:])
-	expUnix := s.now().Add(sessionTTL).Unix()
-	sigHex := signSessionToken(apiToken, nonce, expUnix)
-	return nonce + "." + strconv.FormatInt(expUnix, 10) + "." + sigHex, nil
-}
-
-func (s *sessionStore) validate(cookieVal, apiToken string) bool {
-	if cookieVal == "" || apiToken == "" {
-		return false
-	}
-	nonce, expUnix, sigHex, ok := parseSessionToken(cookieVal)
-	if !ok {
-		return false
+	cookie := hex.EncodeToString(raw[:])
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.bindLocked(token); err != nil {
+		return "", err
 	}
 	now := s.now()
-	if now.Unix() >= expUnix {
-		return false
+	next := sessionData{TokenHash: s.data.TokenHash, Expires: maps.Clone(s.data.Expires)}
+	var oldest string
+	for key, expiry := range next.Expires {
+		if expiry <= now.Unix() {
+			delete(next.Expires, key)
+		} else if oldest == "" || expiry < next.Expires[oldest] {
+			oldest = key
+		}
 	}
-	wantSig := signSessionToken(apiToken, nonce, expUnix)
-	if subtle.ConstantTimeCompare([]byte(sigHex), []byte(wantSig)) != 1 {
-		return false
+	if len(next.Expires) >= maxActiveSessions {
+		delete(next.Expires, oldest)
+	}
+	next.Expires[sessionDigest(cookie)] = now.Add(sessionTTL).Unix()
+	if err := s.commitLocked(next); err != nil {
+		return "", err
+	}
+	return cookie, nil
+}
+
+// lookup validates the cookie under the same lock used to revoke it.
+func (s *sessionStore) lookup(cookie, token string, revoke bool) (bool, error) {
+	if len(cookie) != 64 || token == "" {
+		return false, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if exp, isRevoked := s.revoked[nonce]; isRevoked {
-		if now.Before(exp) {
-			return false
-		}
-		delete(s.revoked, nonce)
+	if err := s.loadLocked(); err != nil {
+		return false, err
 	}
-	return true
-}
-
-func (s *sessionStore) revoke(cookieVal string) {
-	nonce, expUnix, _, ok := parseSessionToken(cookieVal)
-	if !ok {
-		return
+	if s.data.TokenHash != sessionDigest(token) {
+		return false, nil
 	}
-	now := s.now()
-	exp := time.Unix(expUnix, 0)
-	if !now.Before(exp) {
-		return
+	key := sessionDigest(cookie)
+	exp, ok := s.data.Expires[key]
+	if !ok || exp <= s.now().Unix() {
+		return false, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.revoked == nil {
-		s.revoked = make(map[string]time.Time)
-	}
-	for k, v := range s.revoked {
-		if !now.Before(v) {
-			delete(s.revoked, k)
+	if revoke {
+		next := sessionData{TokenHash: s.data.TokenHash, Expires: maps.Clone(s.data.Expires)}
+		delete(next.Expires, key)
+		if err := s.commitLocked(next); err != nil {
+			return false, err
 		}
 	}
-	for len(s.revoked) >= maxRevokedSessions {
-		var oldestKey string
-		var oldestExp time.Time
-		for k, v := range s.revoked {
-			if oldestKey == "" || v.Before(oldestExp) {
-				oldestKey = k
-				oldestExp = v
-			}
-		}
-		if oldestKey == "" {
-			break
-		}
-		delete(s.revoked, oldestKey)
-	}
-	s.revoked[nonce] = exp
+	return true, nil
 }
 
 type authAttemptState struct {
@@ -196,35 +235,23 @@ func (l *authFailureLimiter) now() time.Time {
 	return time.Now()
 }
 
-func (l *authFailureLimiter) checkLocked(ip string) (bool, time.Duration) {
+// verifyToken checks lockout, compares the credential and records a failure
+// under one lock, including when several attempts arrive concurrently.
+func (l *authFailureLimiter) verifyToken(ip, candidate, token string) (valid bool, retryAfter time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.clients == nil {
-		return false, 0
-	}
-	st, ok := l.clients[ip]
-	if !ok {
-		return false, 0
-	}
 	now := l.now()
+	st, ok := l.clients[ip]
 	if now.Before(st.lockedUntil) {
-		return true, st.lockedUntil.Sub(now)
+		return false, st.lockedUntil.Sub(now)
 	}
-	return false, 0
-}
-
-func (l *authFailureLimiter) recordFailure(ip string) (bool, time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	if candidate != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) == 1 {
+		return true, 0
+	}
 	if l.clients == nil {
 		l.clients = make(map[string]authAttemptState)
 	}
-	now := l.now()
-	st, ok := l.clients[ip]
 	if ok {
-		if now.Before(st.lockedUntil) {
-			return true, st.lockedUntil.Sub(now)
-		}
 		if st.windowStart.IsZero() || now.Sub(st.windowStart) > authFailureWindow {
 			st.failures = 0
 			st.windowStart = now
@@ -246,18 +273,10 @@ func (l *authFailureLimiter) recordFailure(ip string) (bool, time.Duration) {
 		st.lockedUntil = now.Add(dur)
 		st.failures = 0
 		l.clients[ip] = st
-		return true, dur
+		return false, dur
 	}
 	l.clients[ip] = st
 	return false, 0
-}
-
-func (l *authFailureLimiter) reset(ip string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.clients != nil {
-		delete(l.clients, ip)
-	}
 }
 
 func (l *authFailureLimiter) evictStaleLocked(now time.Time) {
@@ -306,13 +325,7 @@ func clientRemoteIP(r *http.Request) string {
 	}
 	host = strings.Trim(host, "[]")
 	if addr, err := netip.ParseAddr(host); err == nil {
-		addr = addr.Unmap()
-		if addr.Is6() && !addr.IsLoopback() {
-			// Bucket non-loopback IPv6 clients by /64 prefix so a single host
-			// rotating temporary IIDs cannot bypass per-client lockout.
-			return netip.PrefixFrom(addr, 64).Masked().String()
-		}
-		return addr.String()
+		return addr.Unmap().String()
 	}
 	return host
 }
@@ -412,6 +425,16 @@ func (e *Engine) Serve(ctx context.Context) error {
 // endpoints wrapped with Host (DNS-rebinding), Origin/Sec-Fetch-Site (CSRF),
 // and optional Bearer token / HttpOnly session cookie protection.
 func (e *Engine) Handler() http.Handler {
+	// Bind persistence to the same state file as the engine. Initializing here
+	// also invalidates saved sessions when starting with a rotated token.
+	var path string
+	if e.cfg != nil && e.cfg.State.Path != "" {
+		path = e.cfg.State.Path + ".sessions.json"
+	}
+	if err := e.sessions.configure(path, e.effectiveAPIToken()); err != nil {
+		e.logger.Error("failed to initialize sessions", "err", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", e.handleIndex)
 	mux.HandleFunc("GET /api/v1/health", e.handleHealth)
@@ -583,21 +606,30 @@ func requestHostName(hostHeader string) string {
 	return strings.Trim(h, "[]")
 }
 
-func (e *Engine) hasValidAPIAuth(r *http.Request, tok string) bool {
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	const prefix = "Bearer "
-	if strings.HasPrefix(auth, prefix) {
-		cand := strings.TrimSpace(auth[len(prefix):])
-		if subtle.ConstantTimeCompare([]byte(cand), []byte(tok)) == 1 {
-			return true
-		}
-	}
+// authenticateAPI checks a browser session before applying the per-IP token
+// limiter. handled indicates that a storage error or lockout response was sent.
+func (e *Engine) authenticateAPI(w http.ResponseWriter, r *http.Request, tok string) (authenticated, handled bool) {
 	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
-		if e.sessions.validate(ck.Value, tok) {
-			return true
+		valid, err := e.sessions.lookup(ck.Value, tok, false)
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "session_error", "failed to read session")
+			return false, true
 		}
+		if valid {
+			return true, false
+		}
+		clearSessionCookie(w, r)
 	}
-	return false
+	candidate, ok := strings.CutPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
+	if !ok {
+		return false, false
+	}
+	valid, retryAfter := e.authLimiter.verifyToken(clientRemoteIP(r), strings.TrimSpace(candidate), tok)
+	if retryAfter > 0 {
+		writeAuthLockedResponse(w, retryAfter)
+		return false, true
+	}
+	return valid, false
 }
 
 // protectHTTP rejects DNS-rebinding Host headers on both loopback and LAN
@@ -650,39 +682,15 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 			(r.Method == http.MethodGet || r.Method == http.MethodPost || r.Method == http.MethodDelete)
 		if isAPI && !isSessionEndpoint {
 			if tok := e.effectiveAPIToken(); tok != "" {
-				// Validate legitimate credentials BEFORE checking per-IP lockout
-				// so a valid owner/agent behind a shared reverse proxy or NAT is
-				// never locked out by another client's failed attempts. Do not
-				// reset the failure counter on routine valid requests either, so
-				// polling cannot clear an attacker's lockout progress.
-				if e.hasValidAPIAuth(r, tok) {
-					next.ServeHTTP(w, r)
+				authenticated, handled := e.authenticateAPI(w, r, tok)
+				if handled {
 					return
 				}
-
-				ip := clientRemoteIP(r)
-				hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
-				ck, ckErr := r.Cookie(sessionCookieName)
-				hasBadCookie := ckErr == nil && ck.Value != ""
-				if hasBadCookie {
-					// Clear stale or rotated session cookies silently without
-					// penalizing the lockout limiter (multiple open dashboard
-					// tabs after token rotation must not trigger a lockout).
-					clearSessionCookie(w, r)
+				if !authenticated {
+					w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
+					writeAPIError(w, http.StatusUnauthorized, "unauthorized", "valid bearer token or session cookie required")
+					return
 				}
-				if hasBearer {
-					if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
-						writeAuthLockedResponse(w, retryAfter)
-						return
-					}
-					if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
-						writeAuthLockedResponse(w, retryAfter)
-						return
-					}
-				}
-				w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
-				writeAPIError(w, http.StatusUnauthorized, "unauthorized", "valid bearer token or session cookie required")
-				return
 			}
 		}
 
@@ -713,28 +721,10 @@ func (e *Engine) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if e.hasValidAPIAuth(r, tok) {
-		writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": true})
-		return
+	authenticated, handled := e.authenticateAPI(w, r, tok)
+	if !handled {
+		writeJSON(w, http.StatusOK, map[string]any{"authenticated": authenticated, "required": true})
 	}
-
-	hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
-	ck, ckErr := r.Cookie(sessionCookieName)
-	if ckErr == nil && ck.Value != "" {
-		clearSessionCookie(w, r)
-	}
-	if hasBearer {
-		ip := clientRemoteIP(r)
-		if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
-			writeAuthLockedResponse(w, retryAfter)
-			return
-		}
-		if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
-			writeAuthLockedResponse(w, retryAfter)
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": false, "required": true})
 }
 
 func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
@@ -759,16 +749,12 @@ func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ip := clientRemoteIP(r)
-	if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
+	valid, retryAfter := e.authLimiter.verifyToken(clientRemoteIP(r), cand, tok)
+	if retryAfter > 0 {
 		writeAuthLockedResponse(w, retryAfter)
 		return
 	}
-	if cand == "" || subtle.ConstantTimeCompare([]byte(cand), []byte(tok)) != 1 {
-		if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
-			writeAuthLockedResponse(w, retryAfter)
-			return
-		}
+	if !valid {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
 		writeAPIError(w, http.StatusUnauthorized, "invalid_token", "invalid API token")
 		return
@@ -794,7 +780,10 @@ func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 
 func (e *Engine) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
-		e.sessions.revoke(ck.Value)
+		if _, err := e.sessions.lookup(ck.Value, e.effectiveAPIToken(), true); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "session_error", "failed to revoke session")
+			return
+		}
 	}
 	clearSessionCookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})

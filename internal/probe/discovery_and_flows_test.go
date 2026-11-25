@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"math/big"
 	"net"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -239,6 +240,9 @@ func TestRawPrinterReceivesZeroApplicationBytesAtSocketBoundary(t *testing.T) {
 
 	if len(profiles) != 1 || !profiles[0].HasPort(port) {
 		t.Fatalf("expected connect-only detection of raw printer port %d, got %+v", port, profiles)
+	}
+	if !slices.Equal(profiles[0].RawPrintPorts, []int{port}) || !slices.Equal(profiles[0].ConnectOnlyPorts, []int{port}) {
+		t.Fatalf("raw print ports %v, connect-only ports %v, want [%d]", profiles[0].RawPrintPorts, profiles[0].ConnectOnlyPorts, port)
 	}
 	if got := bytesRead.Load(); got != 0 {
 		t.Fatalf("SAFETY VIOLATION: fake raw printer received %d application bytes (must be strictly 0)", got)

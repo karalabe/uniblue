@@ -755,7 +755,11 @@ func observationIPs(cl unifi.Client, family string, targets []string) []string {
 
 func findingEndpoints(chk *Check, hp probe.HostProfile, port int) []findingEndpoint {
 	if chk.Probe.Type != "observe" {
-		return []findingEndpoint{{chk.DefaultTransport(), []string{hp.EffectiveProbeIP()}}}
+		ips := []string{}
+		if addr, err := netip.ParseAddr(hp.EffectiveProbeIP()); err == nil {
+			ips = append(ips, addr.Unmap().String())
+		}
+		return []findingEndpoint{{chk.DefaultTransport(), ips}}
 	}
 	byTransport := make(map[string][]string)
 	add := func(transport, family string, targets []string) {

@@ -378,3 +378,58 @@ func TestPreserveUnavailableTelemetryProfileManagedVsManualPort(t *testing.T) {
 		t.Fatalf("manual port direct edits must remain visible even when portconf unavailable, got %+v", p2)
 	}
 }
+
+func TestWebhookTransient4xxRetriesAndSameClientStableIPv6Only(t *testing.T) {
+	// 1. Transient 404/401 on attempt 1 retries and delivers on attempt 2.
+	var attempts atomic.Int32
+	delivered := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		select {
+		case delivered <- struct{}{}:
+		default:
+		}
+	}))
+	defer srv.Close()
+
+	eng := NewDemoEngineForTest(t)
+	eng.cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	eng.webhookRetryBase = 10 * time.Millisecond
+	n, err := notify.New(config.NotifyConfig{WebhookURL: srv.URL, Format: "json", MinSeverity: "medium"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.notifier = n
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eng.enqueueWebhook(ctx, pendingWebhook{
+		id:   "msg_transient_404",
+		site: "default",
+		diff: risk.Diff{NewTrustedClients: []unifi.Client{{MAC: "aa:bb:cc:dd:00:09", Name: "Box"}}},
+	})
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected transient 404 webhook to retry and deliver")
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("expected at least 2 attempts for transient 404, got %d", attempts.Load())
+	}
+
+	// 2. IPv6-only client rotating a temporary privacy address listed first
+	// still shares its stable ULA/GUA and must NOT count as a client move.
+	oldV6 := unifi.Client{MAC: "aa:bb:cc:dd:ee:61", IPv6: []string{"2001:db8::temp1", "fd00::61"}}
+	newV6 := unifi.Client{MAC: "aa:bb:cc:dd:ee:61", IPv6: []string{"2001:db8::temp2", "fd00::61"}}
+	if !sameClientStableIP(oldV6, newV6) {
+		t.Fatal("IPv6-only privacy rotation with unchanged stable address must not trigger client_moved")
+	}
+	movedV6 := unifi.Client{MAC: "aa:bb:cc:dd:ee:61", IPv6: []string{"2001:db8:99::1"}}
+	if sameClientStableIP(oldV6, movedV6) {
+		t.Fatal("IPv6-only host with completely disjoint routable IPv6 addresses should be detected as moved")
+	}
+}

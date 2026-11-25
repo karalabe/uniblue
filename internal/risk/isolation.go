@@ -1821,6 +1821,16 @@ func splitIdentityTokens(text string) map[string]struct{} {
 	return out
 }
 
+// pluralRoleToken handles regular plurals and role acronyms such as NASes.
+func pluralRoleToken(word string) string {
+	for _, ending := range []string{"s", "x", "z", "ch", "sh"} {
+		if strings.HasSuffix(word, ending) {
+			return word + "es"
+		}
+	}
+	return word + "s"
+}
+
 func hasAnyWordToken(tokSet map[string]struct{}, want ...string) bool {
 	for _, w := range want {
 		w = strings.ToLower(strings.TrimSpace(w))
@@ -1829,6 +1839,11 @@ func hasAnyWordToken(tokSet map[string]struct{}, want ...string) bool {
 		}
 		if _, ok := tokSet[w]; ok {
 			return true
+		}
+		if len(w) >= 3 {
+			if _, ok := tokSet[pluralRoleToken(w)]; ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -1913,12 +1928,25 @@ func clientMatchesApprovedRole(cl unifi.Client, rawFindings []checks.Finding, ro
 		return hasFindingPort(5060, 5061) || hasFindingToken("sip", "pbx", "voip") ||
 			hasAnyWordToken(nameTokens, "pbx", "sip", "voip", "asterisk", "freepbx", "grandstream", "yealink", "polycom")
 	default:
+		matches := func(tok string) bool {
+			return hasAnyWordToken(nameTokens, tok) || hasFindingToken(tok)
+		}
 		for tok := range hintTokens {
-			if hasAnyWordToken(nameTokens, tok) || hasFindingToken(tok) {
-				return true
+			if matches(tok) {
+				continue
+			}
+			found := false
+			for _, suffix := range []string{"es", "s"} {
+				if stem, ok := strings.CutSuffix(tok, suffix); ok && len(stem) >= 3 && pluralRoleToken(stem) == tok && matches(stem) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
 			}
 		}
-		return false
+		return len(hintTokens) > 0
 	}
 }
 

@@ -1326,6 +1326,28 @@ func TestDualStackIPv4PortForwardDoesNotMarkIPv6ServiceWAN(t *testing.T) {
 			t.Fatalf("expected IPv6 HTTPS to remain vlan-only (not wan), got %+v", byFam["ipv6"])
 		}
 	})
+
+	t.Run("ipv6_only_passive_service_with_open_ipv4_forwarded_port", func(t *testing.T) {
+		cvOpen := ClientView{Client: cl, OpenPorts: []int{443}}
+		hp := probe.HostProfile{
+			Client:    cl,
+			OpenPorts: []int{443},
+			Services: []probe.Service{
+				{Port: 443, Transport: "tcp", Protocol: "https", AddressFamily: "ipv6", State: probe.ServiceStateObservedProtocol},
+			},
+		}
+		svcs := buildHostServices(cvOpen, hp, wanV4Only, false, false)
+		byFam := map[string]ServiceView{}
+		for _, s := range svcs {
+			byFam[s.AddressFamily] = s
+		}
+		if byFam["ipv4"].Reachable != "wan" {
+			t.Fatalf("expected synthesized IPv4 WAN row for open forwarded port, got %+v", svcs)
+		}
+		if byFam["ipv6"].Reachable != "lan" {
+			t.Fatalf("expected IPv6 passive service row to remain lan, got %+v", svcs)
+		}
+	})
 }
 
 func TestDualStackHomeKitFindingDashboardRowFollowsObservedEndpoint(t *testing.T) {
@@ -1409,5 +1431,40 @@ func TestDualStackHomeKitFindingDashboardRowFollowsObservedEndpoint(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestConnectOnlyPortsSurfacedOnEntityAndCoverage(t *testing.T) {
+	cl := unifi.Client{
+		MAC:         "aa:bb:cc:dd:ee:91",
+		IP:          "192.168.1.91",
+		Name:        "Brother Laser",
+		NetworkName: "LAN",
+	}
+	snap := &unifi.Snapshot{
+		Site:    "default",
+		Clients: []unifi.Client{cl},
+	}
+	hp := probe.HostProfile{
+		Client:           cl,
+		OpenPorts:        []int{9100},
+		RawPrintPorts:    []int{9100},
+		ConnectOnlyPorts: []int{9100},
+	}
+	report := risk.Evaluate(snap, nil, config.NetworkConfig{})
+	topo := topology.Build(snap, nil, config.NetworkConfig{})
+	pm := BuildPresentationModel(snap, report, topo, []ClientView{{Client: cl, OpenPorts: []int{9100}}}, nil, nil, []probe.HostProfile{hp})
+	if pm.ServiceCoverage == nil || pm.ServiceCoverage.ConnectOnlyPorts != 1 {
+		t.Fatalf("expected service coverage connect_only_ports=1, got %+v", pm.ServiceCoverage)
+	}
+	ent := pm.Entities[hostEntityID(cl)]
+	if ent == nil {
+		t.Fatalf("missing host entity for %s", cl.MAC)
+	}
+	if len(ent.ConnectOnlyPorts) != 1 || ent.ConnectOnlyPorts[0] != 9100 {
+		t.Fatalf("expected entity ConnectOnlyPorts=[9100], got %v", ent.ConnectOnlyPorts)
+	}
+	if len(ent.Services) != 1 || ent.Services[0].State != "connect-only" {
+		t.Fatalf("expected connect-only service state for port 9100, got %+v", ent.Services)
 	}
 }

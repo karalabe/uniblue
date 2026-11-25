@@ -146,7 +146,7 @@ Everything works out of the box with just your UniFi console. For deeper visibil
 
 ## Where to run UniBlue
 
-UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_RAW` required), so you can run it on demand or leave it running 24/7:
+UniBlue is a single unprivileged Go binary (~30-50 MB steady-state RAM, spiking during periodic NVD CVE index rebuilds; pass `-no-cve` or `-cve-refresh 0` on memory-constrained hosts, no root or `CAP_NET_RAW` required), so you can run it on demand or leave it running 24/7:
 
 - **On your laptop:** Fastest way to try UniBlue or run ad-hoc audits (`./uniblue serve`) with zero extra hardware. Monitoring stops when your laptop sleeps or leaves home, and cross-VLAN probes from a workstation can trigger your own UniFi IPS alerts.
 - **In a Docker container:** Easy to run 24/7 on a server or NAS with a small volume for `config.yaml`, `state.json`, and the CVE/OUI cache. Use **`macvlan`** for a dedicated static IP and native mDNS/UPnP; default `bridge` blocks multicast and NATs probes behind the host IP, while `host` mode shares the host's IP in UniFi IPS logs.
@@ -171,7 +171,7 @@ UniBlue can run with a `config.yaml` or purely from environment variables. In Do
 | `UNIBLUE_WEBHOOK_FORMAT` | Optional | Payload format: `json` (default), `ntfy`, `discord`, or `slack` |
 | `UNIBLUE_WEBHOOK_MIN_SEVERITY` | Optional | Minimum severity to push: `info`, `low`, `medium` (default), `high`, or `critical` |
 
-> Literal IPs, `localhost`, single-label hostnames, and local suffixes (`.local`, `.lan`, `.home`, `.internal`, `.home.arpa`) are accepted automatically without setting `UNIBLUE_ALLOWED_HOSTS`. When `UNIBLUE_API_TOKEN` is set, failed logins are rate-limited per IP (5 failed attempts within 15 minutes triggers a 15-minute lockout, doubling up to 1 hour).
+> On non-loopback listeners (such as `-listen 0.0.0.0:8080`), literal IPs, `localhost`, single-label hostnames, and local suffixes (`.local`, `.lan`, `.home`, `.internal`, `.home.arpa`) are accepted automatically without setting `UNIBLUE_ALLOWED_HOSTS`. On the default loopback listener (`-listen 127.0.0.1:8080`), only loopback `Host` headers are accepted automatically, so set `UNIBLUE_ALLOWED_HOSTS` when proxying a custom hostname from Caddy or nginx on the same host. Generate a strong random `UNIBLUE_API_TOKEN` (for example `openssl rand -hex 32`); failed token logins are rate-limited per client address (5 failed attempts within 15 minutes triggers a 15-minute lockout, doubling up to 1 hour), while valid browser sessions remain usable and persist alongside `state.json`.
 
 Common `uniblue serve` flags:
 
@@ -200,9 +200,9 @@ All `/api/v1/*` endpoints return JSON (except the SSE stream) and share one erro
 | `GET /api/v1/findings` | Active findings (`?severity=high&host=<ip\|mac>&category=...`) |
 | `GET /api/v1/cves` | Exact and potential CVE rollups (`?host=<ip\|mac>&kev=true&severity=...`) |
 | `GET /api/v1/hosts` | Host inventory (`?vlan=<name>&state=exposed\|review\|ok\|unknown&role=...`) |
-| `GET /api/v1/hosts/{id}` | Single host or UniFi device detail by entity ID (`host:<mac>` / `infra:<mac>`), MAC, or IPv4/IPv6 (including gateway WAN IP) |
+| `GET /api/v1/hosts/{id}` | Single host or UniFi device detail by entity ID (`host:<mac>` / `dev:<mac>`), MAC, or IPv4/IPv6 (including gateway WAN IP) |
 | `GET /api/v1/devices` | UniFi infrastructure device inventory (gateways, switches, APs) |
-| `GET /api/v1/devices/{id}` | Single UniFi device detail by entity ID (`infra:<mac>`), MAC, or LAN/WAN IP |
+| `GET /api/v1/devices/{id}` | Single UniFi device detail by entity ID (`dev:<mac>`), MAC, or LAN/WAN IP |
 | `GET /api/v1/isolation` | Effective VLAN/zone isolation matrix (`?verdict=violation&source=...&dest=...`) |
 | `GET /api/v1/events` | Recent live events as JSON (`?since_id=42&type=...&severity=...&limit=50`) |
 | `GET /api/v1/events/stream` | Live Server-Sent Events stream (`Last-Event-ID` replay supported) |

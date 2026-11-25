@@ -1148,6 +1148,7 @@
         <svg class="icon" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
         Scan
       </button>
+      <button id="logout-btn" class="btn sm ghost" type="button" style="display:none" title="Sign out of dashboard session">Sign out</button>
     </div>
   </div>
 </header>
@@ -3177,9 +3178,25 @@ function plainSummaryForEntity(vm, ent) {
   return `Review this security rule below to make sure it matches what you want allowed on your network.`;
 }
 
-function isPrivateIPv4(ip) {
+function isInternalIP(ip) {
   if (!ip) return false;
-  return ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+  const s = String(ip).trim().toLowerCase();
+  if (!s) return false;
+  if (s.startsWith("10.") || s.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(s) || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(s) || s.startsWith("127.") || s.startsWith("169.254.")) {
+    return true;
+  }
+  if (s === "::1" || /^f[cd][0-9a-f]{2}:/.test(s) || /^fe[89ab][0-9a-f]:/.test(s)) {
+    return true;
+  }
+  const entities = state?.view?.entities || {};
+  for (const ent of Object.values(entities)) {
+    if (!ent) continue;
+    if (ent.ip && String(ent.ip).toLowerCase() === s) return true;
+    for (const ip6 of (ent.ipv6 || [])) {
+      if (ip6 && String(ip6).toLowerCase() === s) return true;
+    }
+  }
+  return false;
 }
 
 function hostSecurityLogs(ent) {
@@ -3272,7 +3289,7 @@ function renderDrawer() {
           : `Blocked inbound threat${al.src_ip ? " from " + al.src_ip : ""}`);
       let hint = "Verify no unnecessary ports are forwarded to this device from the internet.";
       if (al.direction === "outbound") {
-        hint = isPrivateIPv4(al.dst_ip)
+        hint = isInternalIP(al.dst_ip)
           ? `Your router's IPS blocked traffic from this device to internal IP ${al.dst_ip}. If UniBlue or another network scanner is running on this machine, its probes can trigger UniFi IPS. Otherwise, check what app on this device is scanning your LAN.`
           : `Your router's IPS blocked suspicious outbound traffic from this device${al.dst_ip ? " to " + al.dst_ip : ""}. Inspect running apps and recent downloads on this device.`;
       }
@@ -3566,6 +3583,7 @@ function renderCoveragePanelDrawer(vm) {
     ["Owner-declared", "Supplied via passive/config feed", byS["owner-declared"] || 0, "ok"],
     ["Advertised (mDNS/UPnP)", "Announced locally, not actively verified", byS["advertised-service"] || 0, "blue"],
     ["Encrypted TLS (app unknown)", "TLS verified; inner app kept unknown", byS["tls-unknown-app"] || 0, "neutral"],
+    ["Connect-only sink ports", "TCP verified; application probes skipped", sc.connect_only_ports || 0, "neutral"],
     ["Open port (app unknown)", "Port responded without protocol match", byS["candidate-port"] || 0, "warn"]
   ];
   b += `<div class="dsec"><div class="dsec-t">Local Endpoint Evidence</div><div class="card"><div class="checklist">
@@ -3662,6 +3680,37 @@ function hideAuthOverlay() {
   }
 }
 
+function updateLogoutControl(visible) {
+  const btn = document.getElementById("logout-btn");
+  if (btn) btn.style.display = (!isStaticMode && visible) ? "" : "none";
+}
+
+async function refreshSessionControl() {
+  if (isStaticMode) return;
+  try {
+    const resp = await fetch("/api/v1/session", { cache: "no-store" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    updateLogoutControl(Boolean(data && data.required && data.authenticated));
+  } catch (_) {}
+}
+
+const logoutBtn = document.getElementById("logout-btn");
+if (logoutBtn) {
+  logoutBtn.addEventListener("click", async () => {
+    logoutBtn.disabled = true;
+    try {
+      await fetch("/api/v1/session", {
+        method: "DELETE",
+        headers: { "X-UniBlue-Request": "1" }
+      });
+    } catch (_) {}
+    updateLogoutControl(false);
+    logoutBtn.disabled = false;
+    showAuthOverlay("");
+  });
+}
+
 const authForm = document.getElementById("auth-form");
 if (authForm) {
   authForm.addEventListener("submit", async (e) => {
@@ -3692,6 +3741,7 @@ if (authForm) {
       }
       if (inp) inp.value = "";
       hideAuthOverlay();
+      updateLogoutControl(true);
       sseDisconnected = false;
       sseRetryMs = 1000;
       await fetchState(false);
@@ -3909,6 +3959,7 @@ if (staticEl && staticEl.textContent.trim()) {
   renderActiveTab();
 } else {
   fetchState();
+  refreshSessionControl();
   connectSSE();
   setInterval(fetchState, 15000);
 }

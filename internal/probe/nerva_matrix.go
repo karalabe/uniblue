@@ -34,6 +34,7 @@ type ServiceCoverageReport struct {
 	ByState                map[string]int `json:"by_state"`
 	ByTransport            map[string]int `json:"by_transport"`
 	ByAddressFamily        map[string]int `json:"by_address_family"`
+	ConnectOnlyPorts       int            `json:"connect_only_ports,omitempty"`
 	OutboundDependencies   int            `json:"outbound_dependencies"`
 	PinnedNervaTotal       int            `json:"pinned_nerva_total"`
 	PinnedNervaTCPCapable  int            `json:"pinned_nerva_tcp_capable"`
@@ -143,6 +144,7 @@ func ComputeServiceCoverage(profiles []HostProfile) ServiceCoverageReport {
 	}
 
 	for _, hp := range profiles {
+		rep.ConnectOnlyPorts += len(hp.ConnectOnlyPorts)
 		rep.OutboundDependencies += len(hp.OutboundDependencies)
 		hostFamily := ipFamilyOf(hp.Client.PrimaryIP())
 		if hostFamily == "" {

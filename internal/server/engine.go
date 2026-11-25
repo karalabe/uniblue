@@ -57,22 +57,33 @@ const (
 	defaultLeaveGrace = 60 * time.Second
 
 	// maxWebhookCVEsPerBatch caps how many CVEAlert entries are packed into a
-	// single webhook delivery so large initial or update bursts stay well below
-	// typical 1 MB reverse-proxy body limits.
-	maxWebhookCVEsPerBatch = 50
+	// single webhook delivery (~40 KB JSON, well below typical 1 MB proxy body
+	// limits while keeping large fleet CVE bursts within the pending queue cap).
+	maxWebhookCVEsPerBatch = 150
 
 	// maxCoalescedEventsPerBatch caps how many live events can be merged into
 	// a single queued live-event batch during extended webhook outages.
 	maxCoalescedEventsPerBatch = 200
 
 	// exactCVETransientGrace retains exact CVE baseline keys across brief banner
-	// or probe misses so a single flaky scan does not drop and immediately
-	// re-alert the same CVE on the next cycle.
-	exactCVETransientGrace = 15 * time.Minute
+	// misses or single hourly CVE sync hiccups (exceeding both the default 30m
+	// full-scan interval and 1h CVE refresh interval) so known CVEs do not flap.
+	exactCVETransientGrace = 2 * time.Hour
 
 	// exactCVEOfflineTTL bounds how long exact CVE baseline keys are carried
 	// forward for offline or unprobed hosts before aging out.
 	exactCVEOfflineTTL = 7 * 24 * time.Hour
+
+	// maxTransient4xxRetries bounds retries for non-permanent 4xx webhook
+	// rejections (such as 401/403/404 during proxy restarts, clock skew, or
+	// secret rotation) so brief receiver glitches recover without stalling the
+	// queue for 24 hours.
+	maxTransient4xxRetries = 5
+
+	// webhookShutdownGrace gives an already-started in-flight webhook POST a
+	// brief grace window to finish cleanly when the engine context cancels so
+	// completed deliveries are removed from disk and not duplicated on restart.
+	webhookShutdownGrace = 2 * time.Second
 )
 
 // Options tunes the live server daemon's polling, reconciliation, and HTTP settings.
@@ -1493,7 +1504,8 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 
 // sameClientStableIP reports whether a and b have the same primary routing
 // identity without treating IPv6 temporary privacy-address rotations on a
-// dual-stack host (where IPv4 is unchanged) as a client move.
+// dual-stack or IPv6-only host (where a stable IPv4 or non-link-local IPv6
+// address remains present) as a client move.
 func sameClientStableIP(a, b unifi.Client) bool {
 	ipA := strings.ToLower(strings.TrimSpace(a.IP))
 	ipB := strings.ToLower(strings.TrimSpace(b.IP))
@@ -1505,7 +1517,34 @@ func sameClientStableIP(a, b unifi.Client) bool {
 		// addresses on the same VLAN is normal and not a client move.
 		return true
 	}
-	// IPv6-only client: compare the primary routable IPv6 address.
+	// IPv6-only client: if both snapshots carry non-link-local IPv6 addresses
+	// and share at least one stable address, a rotating temporary privacy
+	// address (even when listed first by UniFi) is not a client move.
+	routableV6 := func(cl unifi.Client) map[netip.Addr]struct{} {
+		set := make(map[netip.Addr]struct{}, len(cl.IPv6))
+		for _, raw := range cl.IPv6 {
+			addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+			if err != nil {
+				continue
+			}
+			addr = addr.Unmap()
+			if !addr.Is6() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+				continue
+			}
+			set[addr] = struct{}{}
+		}
+		return set
+	}
+	setA := routableV6(a)
+	setB := routableV6(b)
+	if len(setA) > 0 && len(setB) > 0 {
+		for addr := range setA {
+			if _, ok := setB[addr]; ok {
+				return true
+			}
+		}
+		return false
+	}
 	return strings.EqualFold(strings.TrimSpace(a.PrimaryIP()), strings.TrimSpace(b.PrimaryIP()))
 }
 
@@ -1954,12 +1993,17 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 			nextState.ExactCVELastSeen = nextExactCVELastSeen
 		}
 		// Persist any outbound alert batches to disk BEFORE advancing the
-		// saved state baseline so a crash between the two writes never loses
+		// saved state baseline so a crash or disk write failure never loses
 		// an alert. The async drainer starts right after publishing state below.
+		webhookPersistOK := true
 		if len(webhooksToSend) > 0 {
-			e.enqueueWebhooks(ctx, webhooksToSend, false)
+			if err := e.enqueueWebhooks(ctx, webhooksToSend, false); err != nil {
+				webhookPersistOK = false
+				nextState = prevRisk
+				e.logger.Error("failed to persist pending webhooks; retaining previous baseline to prevent alert loss", "err", err)
+			}
 		}
-		if e.cfg != nil && e.cfg.State.Path != "" {
+		if webhookPersistOK && e.cfg != nil && e.cfg.State.Path != "" {
 			if err := risk.SaveState(e.cfg.State.Path, nextState); err != nil {
 				e.logger.Error("failed to persist state baseline", "path", e.cfg.State.Path, "err", err)
 			}
@@ -2023,16 +2067,17 @@ func (e *Engine) pendingWebhooksPath() string {
 	return p + ".pending-webhooks.json"
 }
 
-func (e *Engine) persistPendingWebhooksLocked() {
+func (e *Engine) persistPendingWebhooksLocked() error {
 	path := e.pendingWebhooksPath()
 	if path == "" {
-		return
+		return nil
 	}
 	if len(e.pendingWebhooks) == 0 {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			e.logger.Warn("failed to remove empty pending webhooks file", "path", path, "err", err)
+			return err
 		}
-		return
+		return nil
 	}
 	out := make([]persistedWebhook, 0, len(e.pendingWebhooks))
 	for _, item := range e.pendingWebhooks {
@@ -2048,19 +2093,19 @@ func (e *Engine) persistPendingWebhooksLocked() {
 	raw, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
 		e.logger.Error("failed to marshal pending webhooks", "err", err)
-		return
+		return err
 	}
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			e.logger.Error("failed to create pending webhooks directory", "dir", dir, "err", err)
-			return
+			return err
 		}
 	}
 	tmp, err := os.CreateTemp(dir, ".pending-webhooks-*.tmp")
 	if err != nil {
 		e.logger.Error("failed to create pending webhooks temp file", "path", path, "err", err)
-		return
+		return err
 	}
 	tmpPath := tmp.Name()
 	cleanup := func() {
@@ -2070,27 +2115,29 @@ func (e *Engine) persistPendingWebhooksLocked() {
 	if err := tmp.Chmod(0o600); err != nil {
 		cleanup()
 		e.logger.Error("failed to chmod pending webhooks temp file", "path", path, "err", err)
-		return
+		return err
 	}
 	if _, err := tmp.Write(raw); err != nil {
 		cleanup()
 		e.logger.Error("failed to write pending webhooks temp file", "path", path, "err", err)
-		return
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		cleanup()
 		e.logger.Error("failed to sync pending webhooks temp file", "path", path, "err", err)
-		return
+		return err
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
 		e.logger.Error("failed to close pending webhooks temp file", "path", path, "err", err)
-		return
+		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		e.logger.Error("failed to persist pending webhooks", "path", path, "err", err)
+		return err
 	}
+	return nil
 }
 
 func (e *Engine) resumePendingWebhooks(ctx context.Context) {
@@ -2185,15 +2232,25 @@ func isLiveEventOnlyDiff(d risk.Diff) bool {
 		len(d.Events) > 0
 }
 
-func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
-	e.enqueueWebhooks(ctx, []pendingWebhook{item}, true)
+func isCVEOnlyDiff(d risk.Diff) bool {
+	return len(d.NewFindings) == 0 &&
+		len(d.EscalatedFindings) == 0 &&
+		len(d.NewTrustedClients) == 0 &&
+		len(d.NewPortForwards) == 0 &&
+		len(d.Events) == 0 &&
+		len(d.NewCVEs) > 0
 }
 
-func (e *Engine) enqueueWebhooks(ctx context.Context, items []pendingWebhook, startDrainer bool) {
+func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
+	_ = e.enqueueWebhooks(ctx, []pendingWebhook{item}, true)
+}
+
+func (e *Engine) enqueueWebhooks(ctx context.Context, items []pendingWebhook, startDrainer bool) error {
 	if len(items) == 0 {
-		return
+		return nil
 	}
 	e.webhookMu.Lock()
+	defer e.webhookMu.Unlock()
 	// Merge any coalesced live events into the first immediate webhook so bursts
 	// are delivered together without a duplicate follow-up push.
 	if len(e.coalescedEvents) > 0 {
@@ -2206,10 +2263,13 @@ func (e *Engine) enqueueWebhooks(ctx context.Context, items []pendingWebhook, st
 		e.coalescedEvents = nil
 		e.coalescedSite = ""
 	}
+	var persistErr error
 	for _, item := range items {
-		e.enqueueWebhookLocked(ctx, item, startDrainer)
+		if err := e.enqueueWebhookLocked(ctx, item, startDrainer); err != nil && persistErr == nil {
+			persistErr = err
+		}
 	}
-	e.webhookMu.Unlock()
+	return persistErr
 }
 
 func (e *Engine) startWebhookDrainer(ctx context.Context) {
@@ -2221,7 +2281,7 @@ func (e *Engine) startWebhookDrainer(ctx context.Context) {
 	e.webhookMu.Unlock()
 }
 
-func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, startDrainer bool) {
+func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, startDrainer bool) error {
 	if item.id == "" {
 		item.id = notify.NewWebhookID()
 	}
@@ -2235,11 +2295,12 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 			startIdx = 1
 		}
 		if isLiveEventOnlyDiff(item.diff) {
-			// Prefer merging into an existing non-in-flight live-event batch so
-			// steady live-event bursts during an outage never evict queued diffs.
+			// Prefer merging into an unattempted non-in-flight live-event batch
+			// so steady live-event bursts never evict queued diffs and never
+			// mutate a batch whose webhook-id was already sent.
 			merged := false
 			for i := len(e.pendingWebhooks) - 1; i >= startIdx; i-- {
-				if isLiveEventOnlyDiff(e.pendingWebhooks[i].diff) && e.pendingWebhooks[i].site == item.site {
+				if e.pendingWebhooks[i].attempts == 0 && isLiveEventOnlyDiff(e.pendingWebhooks[i].diff) && e.pendingWebhooks[i].site == item.site {
 					combined := appendUniqueAlertEvents(e.pendingWebhooks[i].diff.Events, item.diff.Events)
 					if len(combined) > maxCoalescedEventsPerBatch {
 						combined = combined[len(combined)-maxCoalescedEventsPerBatch:]
@@ -2250,12 +2311,12 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 				}
 			}
 			if merged {
-				e.persistPendingWebhooksLocked()
+				err := e.persistPendingWebhooksLocked()
 				if startDrainer && !e.webhookRunning && e.notifier != nil {
 					e.webhookRunning = true
 					go e.drainWebhooks(ctx)
 				}
-				return
+				return err
 			}
 			// Otherwise evict the oldest non-in-flight live-event batch if one exists;
 			// never evict a queued diff/finding batch for a live-event-only batch.
@@ -2268,17 +2329,51 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 			}
 			if evictIdx < 0 {
 				e.logger.Warn("webhook queue full of state-diff alerts; dropping live-event-only batch to preserve queued findings")
-				return
+				return nil
 			}
 			e.pendingWebhooks = append(e.pendingWebhooks[:evictIdx], e.pendingWebhooks[evictIdx+1:]...)
-		} else {
-			// Incoming diff-bearing batch: evict the oldest non-in-flight
-			// live-event-only batch first, falling back to startIdx.
-			evictIdx := startIdx
+		} else if isCVEOnlyDiff(item.diff) {
+			// Incoming split CVE-only batch: evict a live-event batch first,
+			// then an older CVE-only batch, never evicting finding/forward/trusted
+			// client batches during a mass CVE update.
+			evictIdx := -1
 			for i := startIdx; i < len(e.pendingWebhooks); i++ {
 				if isLiveEventOnlyDiff(e.pendingWebhooks[i].diff) {
 					evictIdx = i
 					break
+				}
+			}
+			if evictIdx < 0 {
+				for i := startIdx; i < len(e.pendingWebhooks); i++ {
+					if isCVEOnlyDiff(e.pendingWebhooks[i].diff) {
+						evictIdx = i
+						break
+					}
+				}
+			}
+			if evictIdx < 0 {
+				e.logger.Warn("webhook queue full of higher-priority finding alerts; dropping overflow CVE-only batch")
+				return nil
+			}
+			e.pendingWebhooks = append(e.pendingWebhooks[:evictIdx], e.pendingWebhooks[evictIdx+1:]...)
+		} else {
+			// Incoming finding/forward/trusted-client batch: evict the oldest
+			// non-in-flight live-event-only batch first, then CVE-only, else startIdx.
+			evictIdx := startIdx
+			foundLower := false
+			for i := startIdx; i < len(e.pendingWebhooks); i++ {
+				if isLiveEventOnlyDiff(e.pendingWebhooks[i].diff) {
+					evictIdx = i
+					foundLower = true
+					break
+				}
+			}
+			if !foundLower {
+				for i := startIdx; i < len(e.pendingWebhooks); i++ {
+					if isCVEOnlyDiff(e.pendingWebhooks[i].diff) {
+						evictIdx = i
+						break
+					}
 				}
 			}
 			e.pendingWebhooks = append(e.pendingWebhooks[:evictIdx], e.pendingWebhooks[evictIdx+1:]...)
@@ -2287,11 +2382,12 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 	e.webhookSeq++
 	item.seq = e.webhookSeq
 	e.pendingWebhooks = append(e.pendingWebhooks, item)
-	e.persistPendingWebhooksLocked()
+	err := e.persistPendingWebhooksLocked()
 	if startDrainer && !e.webhookRunning && e.notifier != nil {
 		e.webhookRunning = true
 		go e.drainWebhooks(ctx)
 	}
+	return err
 }
 
 // enqueueLiveEvents buffers high-signal live security events for
@@ -2673,7 +2769,26 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 			return
 		}
 
-		err := e.notifier.SendWithID(ctx, item.id, item.site, item.diff)
+		// Give an already-started HTTP delivery a brief shutdown grace window so
+		// a response completing concurrently with ctx cancellation finishes and
+		// removes the batch from disk instead of aborting and resending on restart.
+		sendCtx, cancelSend := context.WithCancel(context.Background())
+		var graceTimer *time.Timer
+		var graceMu sync.Mutex
+		stopWatch := context.AfterFunc(ctx, func() {
+			graceMu.Lock()
+			graceTimer = time.AfterFunc(webhookShutdownGrace, cancelSend)
+			graceMu.Unlock()
+		})
+		err := e.notifier.SendWithID(sendCtx, item.id, item.site, item.diff)
+		stopWatch()
+		graceMu.Lock()
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+		graceMu.Unlock()
+		cancelSend()
+
 		if err == nil {
 			// Always remove a successfully delivered batch even if ctx was
 			// cancelled concurrently during shutdown so restart never resends it.
@@ -2681,7 +2796,7 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 			for i := range e.pendingWebhooks {
 				if e.pendingWebhooks[i].seq == item.seq {
 					e.pendingWebhooks = append(e.pendingWebhooks[:i], e.pendingWebhooks[i+1:]...)
-					e.persistPendingWebhooksLocked()
+					_ = e.persistPendingWebhooksLocked()
 					break
 				}
 			}
@@ -2709,22 +2824,28 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 			}
 		}
 		var statusErr *notify.HTTPStatusError
-		if errors.As(err, &statusErr) && statusErr.Permanent() {
+		isPermanent := errors.As(err, &statusErr) && statusErr.Permanent()
+		isTransient4xx := errors.As(err, &statusErr) && statusErr.TransientClientError()
+		if isPermanent {
 			e.logger.Error("webhook rejected permanently by receiver; dropping alert batch to prevent queue stall", "status", statusErr.StatusCode, "err", err)
 			if idx >= 0 {
 				e.pendingWebhooks = append(e.pendingWebhooks[:idx], e.pendingWebhooks[idx+1:]...)
-				e.persistPendingWebhooksLocked()
+				_ = e.persistPendingWebhooksLocked()
 			}
 			e.webhookMu.Unlock()
 			continue
 		}
 		item.attempts++
-		expired := item.attempts >= maxWebhookRetries || (!item.queuedAt.IsZero() && time.Since(item.queuedAt) >= maxWebhookAge)
+		maxAttempts := maxWebhookRetries
+		if isTransient4xx {
+			maxAttempts = maxTransient4xxRetries
+		}
+		expired := item.attempts >= maxAttempts || (!item.queuedAt.IsZero() && time.Since(item.queuedAt) >= maxWebhookAge)
 		if expired {
 			e.logger.Error("webhook notification failed after retries; dropping alert batch", "attempts", item.attempts, "err", err)
 			if idx >= 0 {
 				e.pendingWebhooks = append(e.pendingWebhooks[:idx], e.pendingWebhooks[idx+1:]...)
-				e.persistPendingWebhooksLocked()
+				_ = e.persistPendingWebhooksLocked()
 			}
 			e.webhookMu.Unlock()
 			continue
@@ -2740,7 +2861,7 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 		item.nextAttempt = time.Now().Add(delay)
 		if idx >= 0 {
 			e.pendingWebhooks[idx] = item
-			e.persistPendingWebhooksLocked()
+			_ = e.persistPendingWebhooksLocked()
 		}
 		e.logger.Error("webhook notification failed; scheduling async retry", "attempt", item.attempts, "retry_in", delay, "err", err)
 		e.webhookMu.Unlock()

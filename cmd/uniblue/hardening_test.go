@@ -74,7 +74,65 @@ func TestWatchSessionPreservesWebhookIDAcrossRetryCycles(t *testing.T) {
 	}
 }
 
-func TestWarnLegacyCWDStateLogsWhenMissingTargetAndCWDExists(t *testing.T) {
+func TestWatchSessionMintsFreshWebhookIDWhenRetriedDiffChanges(t *testing.T) {
+	var sentIDs []string
+	cycle := 0
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Clients: []unifi.Client{
+			{MAC: "aa:bb:cc:dd:ee:01", Name: "Laptop", IP: "192.168.1.20", NetworkName: "Main"},
+		},
+	}
+	f1 := checks.Finding{
+		CheckID:           "UB-0001",
+		Title:             "RDP Forward",
+		Client:            snap.Clients[0],
+		Port:              3389,
+		BaseSeverity:      checks.SeverityHigh,
+		EffectiveSeverity: checks.SeverityHigh,
+	}
+	f2 := checks.Finding{
+		CheckID:           "UB-0002",
+		Title:             "SMB Forward",
+		Client:            snap.Clients[0],
+		Port:              445,
+		BaseSeverity:      checks.SeverityCritical,
+		EffectiveSeverity: checks.SeverityCritical,
+	}
+	session := &watchSession{
+		cfg:    &config.Config{State: config.StateConfig{Path: filepath.Join(t.TempDir(), "state.json")}},
+		minSev: checks.SeverityMedium,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		scanFn: func(context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
+			cycle++
+			if cycle == 1 {
+				return snap, nil, risk.Report{ClientCount: 1, Findings: []checks.Finding{f1}}, nil
+			}
+			return snap, nil, risk.Report{ClientCount: 1, Findings: []checks.Finding{f1, f2}}, nil
+		},
+		sendWithIDFn: func(_ context.Context, id, _ string, _ risk.Diff) error {
+			sentIDs = append(sentIDs, id)
+			if len(sentIDs) == 1 {
+				return errors.New("temporary 503")
+			}
+			return nil
+		},
+		loadFn: func(string) (*risk.State, error) { return nil, nil },
+		saveFn: func(string, *risk.State) error { return nil },
+	}
+
+	session.runCycle(context.Background())
+	session.runCycle(context.Background())
+
+	if len(sentIDs) != 2 {
+		t.Fatalf("expected 2 delivery attempts, got %d", len(sentIDs))
+	}
+	if sentIDs[0] == "" || sentIDs[1] == "" || sentIDs[0] == sentIDs[1] {
+		t.Fatalf("expected changed diff on retry to mint a fresh webhook-id, got %q then %q", sentIDs[0], sentIDs[1])
+	}
+}
+
+func TestCheckLegacyCWDStateFailsFastWhenMissingTargetAndCWDExists(t *testing.T) {
 	cwd := t.TempDir()
 	origDir, err := os.Getwd()
 	if err != nil {
@@ -92,8 +150,9 @@ func TestWarnLegacyCWDStateLogsWhenMissingTargetAndCWDExists(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	warnLegacyCWDState(logger, cfgStatePath)
-
+	if err := checkLegacyCWDState(logger, cfgStatePath); err == nil {
+		t.Fatal("expected checkLegacyCWDState to fail fast when only legacy CWD state file exists")
+	}
 	out := buf.String()
 	if !strings.Contains(out, "legacy_cwd_state") || !strings.Contains(out, cfgStatePath) {
 		t.Fatalf("expected startup warning naming both resolved state_path and legacy CWD state file, got: %q", out)

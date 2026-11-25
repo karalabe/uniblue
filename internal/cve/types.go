@@ -79,6 +79,14 @@ type CPEMatch struct {
 	EndExcl string `json:"end_excl,omitempty"`
 }
 
+// FeedFileMeta records the size and modification timestamp of a verified local
+// yearly NVD feed archive so unchanged hourly refreshes can skip re-hashing
+// the full uncompressed payload.
+type FeedFileMeta struct {
+	Size            int64 `json:"size"`
+	ModTimeUnixNano int64 `json:"mtime_ns"`
+}
+
 // CacheStats records disk footprint, counts, and per-year NVD SHA256 hashes so
 // incremental syncs only re-download feeds that actually changed upstream.
 type CacheStats struct {
@@ -115,6 +123,11 @@ type CacheStats struct {
 	// YearSHAs maps each NVD feed key (e.g., "2025", "modified") to its last
 	// synced .meta SHA256 checksum.
 	YearSHAs map[string]string `json:"year_shas"`
+
+	// YearMeta maps each NVD feed key to the verified local file's size and
+	// modification time so unchanged hourly refreshes avoid re-gunzipping all
+	// yearly archives on disk.
+	YearMeta map[string]FeedFileMeta `json:"year_meta,omitempty"`
 }
 
 // Product describes a software service or hardware appliance identified on a
