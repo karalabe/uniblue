@@ -119,6 +119,9 @@ type SiteVisibility struct {
 	GatewayPoliciesAvailable bool     `json:"gateway_policies_available" yaml:"gateway_policies_available"`
 	SwitchACLsAvailable      bool     `json:"switch_acls_available" yaml:"switch_acls_available"`
 	WLANsAvailable           bool     `json:"wlans_available" yaml:"wlans_available"`
+	SettingsAvailable        bool     `json:"settings_available" yaml:"settings_available"`
+	VPNAvailable             bool     `json:"vpn_available" yaml:"vpn_available"`
+	PortForwardsAvailable    bool     `json:"port_forwards_available" yaml:"port_forwards_available"`
 	DHCPAvailable            bool     `json:"dhcp_available" yaml:"dhcp_available"`
 	MDNSReflectorKnown       bool     `json:"mdns_reflector_known" yaml:"mdns_reflector_known"`
 	MissingFeeds             []string `json:"missing_feeds,omitempty" yaml:"missing_feeds,omitempty"`
@@ -700,6 +703,10 @@ type FirewallPolicy struct {
 	// Protocol is the matched IP protocol ("all", "tcp", "udp", "tcp_udp", "icmp", "icmpv6", etc.).
 	Protocol string `json:"protocol,omitempty"`
 
+	// ProtocolNegated is true when protocolFilter.matchOpposite inverts the
+	// protocol match (e.g., all protocols except UDP).
+	ProtocolNegated bool `json:"protocol_negated,omitempty"`
+
 	// ConnectionStates restricts matching to specific conntrack states
 	// ("new", "established", "related", "invalid"). Empty matches all states.
 	ConnectionStates []string `json:"connection_states,omitempty"`
@@ -725,6 +732,12 @@ type FirewallPolicy struct {
 	LoggingEnabled bool `json:"logging_enabled,omitempty"`
 }
 
+// PortRange represents an inclusive TCP/UDP port range [Start, End] in 1..65535.
+type PortRange struct {
+	Start int `json:"start" yaml:"start"`
+	End   int `json:"end" yaml:"end"`
+}
+
 // PolicyEndpoint captures the zone and optional IP/port constraints on one side
 // of a UniFi FirewallPolicy.
 type PolicyEndpoint struct {
@@ -746,6 +759,10 @@ type PolicyEndpoint struct {
 	// Ports holds explicit port numbers matched by this endpoint, if filtered.
 	Ports []int `json:"ports,omitempty" yaml:"ports,omitempty"`
 
+	// PortRanges holds inclusive port ranges (including ranges wider than 16 ports)
+	// matched by this endpoint so wide ranges are never silently dropped.
+	PortRanges []PortRange `json:"port_ranges,omitempty" yaml:"port_ranges,omitempty"`
+
 	// AnyTarget is true when no IP/network/MAC target filter narrows the zone.
 	AnyTarget bool `json:"any_target" yaml:"any_target"`
 
@@ -761,6 +778,44 @@ type PolicyEndpoint struct {
 	// UnsupportedSelector records any opaque controller selector (e.g., dynamic
 	// region/app/schedule group) that UniBlue cannot evaluate deterministically.
 	UnsupportedSelector string `json:"unsupported_selector,omitempty" yaml:"unsupported_selector,omitempty"`
+}
+
+// MatchesPort reports whether port matches either Ports or PortRanges (ignoring NegatePort).
+func (ep PolicyEndpoint) MatchesPort(port int) bool {
+	if port < 1 || port > 65535 {
+		return false
+	}
+	for _, p := range ep.Ports {
+		if p == port {
+			return true
+		}
+	}
+	for _, r := range ep.PortRanges {
+		if port >= r.Start && port <= r.End {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPortConstraint reports whether this endpoint carries any concrete port or port range.
+func (ep PolicyEndpoint) HasPortConstraint() bool {
+	return len(ep.Ports) > 0 || len(ep.PortRanges) > 0
+}
+
+// CoversAllPorts reports whether this endpoint matches all ports 1..65535.
+func (ep PolicyEndpoint) CoversAllPorts() bool {
+	if ep.AnyPort || (!ep.HasPortConstraint() && !ep.NegatePort) {
+		return true
+	}
+	if !ep.NegatePort {
+		for _, r := range ep.PortRanges {
+			if r.Start <= 1 && r.End >= 65535 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PortForward represents a gateway NAT rule exposing an internal host and port
@@ -1000,6 +1055,8 @@ type rawPort struct {
 	Forward             string       `json:"forward"`
 	TaggedVLANMgmt      string       `json:"tagged_vlan_mgmt"`
 	NativeNetworkConfID string       `json:"native_networkconf_id"`
+	PortConfID          string       `json:"portconf_id"`
+	SettingPreference   string       `json:"setting_preference"`
 	PoEEnable           bool         `json:"poe_enable"`
 	PoEMode             string       `json:"poe_mode"`
 	PoEPower            flexString   `json:"poe_power"`
@@ -1015,6 +1072,20 @@ type rawPort struct {
 	TXDropped           int64        `json:"tx_dropped"`
 }
 
+// rawPortConf maps a UniFi switch port profile from /api/s/<site>/rest/portconf.
+type rawPortConf struct {
+	ID                  string   `json:"_id"`
+	Name                string   `json:"name"`
+	OpMode              string   `json:"op_mode"`
+	Forward             string   `json:"forward"`
+	TaggedVLANMgmt      string   `json:"tagged_vlan_mgmt"`
+	NativeNetworkConfID string   `json:"native_networkconf_id"`
+	PoEMode             string   `json:"poe_mode"`
+	PortSecurityEnabled *bool    `json:"port_security_enabled"`
+	PortSecurityMACs    []string `json:"port_security_mac_address"`
+	Isolation           *bool    `json:"isolation"`
+}
+
 // rawNetwork maps the wire fields returned by /api/s/<site>/rest/networkconf.
 type rawNetwork struct {
 	ID                      string     `json:"_id"`
@@ -1026,6 +1097,7 @@ type rawNetwork struct {
 	NetworkIsolationEnabled bool       `json:"network_isolation_enabled"`
 	GatewayType             string     `json:"gateway_type"`
 	GatewayDevice           string     `json:"gateway_device"`
+	DHCPDEnabled            *bool      `json:"dhcpd_enabled"`
 	DHCPDStart              string     `json:"dhcpd_start"`
 	DHCPDStop               string     `json:"dhcpd_stop"`
 	DHCPGuardEnabled        *bool      `json:"dhcpguard_enabled"`
@@ -1111,6 +1183,8 @@ type integrationNetwork struct {
 		HostIPAddress     string `json:"hostIpAddress"`
 		PrefixLength      int    `json:"prefixLength"`
 		DHCPConfiguration *struct {
+			Mode           string `json:"mode"`
+			Enabled        *bool  `json:"enabled"`
 			IPAddressRange *struct {
 				Start string `json:"start"`
 				Stop  string `json:"stop"`
@@ -1158,6 +1232,7 @@ type integrationFirewallPolicy struct {
 		IPVersion      string `json:"ipVersion"`
 		ProtocolFilter *struct {
 			Type          string          `json:"type"`
+			MatchOpposite bool            `json:"matchOpposite"`
 			Protocol      json.RawMessage `json:"protocol"`
 			NamedProtocol string          `json:"namedProtocol"`
 			Preset        json.RawMessage `json:"preset"`

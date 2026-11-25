@@ -9,7 +9,10 @@ package unifi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -118,32 +121,46 @@ type siteTelemetry struct {
 	wlansOK    bool
 	rogueAPs   []rawRogueAP
 	settings   *SiteSecuritySettings
+	settingsOK bool
 	health     *SystemHealth
+	vpnOK      bool
 	knownUsers []rawHistoricalUser
 	recentLogs []ControllerLogEvent
+	portConfs  []rawPortConf
 }
 
 // fetchSiteTelemetry concurrently retrieves Wi-Fi configs, neighboring rogue APs,
-// non-secret security settings, WAN/VPN health, historical clients, and recent
-// controller security/admin logs. Every sub-call is best-effort so older
-// controllers or restricted permissions never break core snapshot collection.
+// non-secret security settings, WAN/VPN health, historical clients, switch port
+// profiles, and recent controller security/admin logs. Every sub-call is
+// best-effort so older controllers or restricted permissions never break core
+// snapshot collection.
 func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	type wlanRes struct {
 		items []rawWLAN
 		ok    bool
 	}
+	type settingRes struct {
+		settings *SiteSecuritySettings
+		ok       bool
+	}
+	type healthRes struct {
+		health *SystemHealth
+		vpnOK  bool
+	}
 	var (
-		wlanCh    = make(chan wlanRes, 1)
-		rogueCh   = make(chan []rawRogueAP, 1)
-		settingCh = make(chan *SiteSecuritySettings, 1)
-		healthCh  = make(chan *SystemHealth, 1)
-		usersCh   = make(chan []rawHistoricalUser, 1)
-		logsCh    = make(chan []ControllerLogEvent, 1)
+		wlanCh     = make(chan wlanRes, 1)
+		rogueCh    = make(chan []rawRogueAP, 1)
+		settingCh  = make(chan settingRes, 1)
+		healthCh   = make(chan healthRes, 1)
+		usersCh    = make(chan []rawHistoricalUser, 1)
+		logsCh     = make(chan []ControllerLogEvent, 1)
+		portConfCh = make(chan []rawPortConf, 1)
 	)
+	apiPrefix, site := c.sessionPrefixAndSite()
 
 	go func() {
 		var env apiEnvelope[rawWLAN]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/wlanconf", c.site), &env); err == nil {
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/wlanconf", site), &env); err == nil {
 			wlanCh <- wlanRes{items: env.Data, ok: true}
 			return
 		}
@@ -151,7 +168,7 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	}()
 	go func() {
 		var env apiEnvelope[rawRogueAP]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/rogueap", c.site), &env); err == nil {
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/rogueap", site), &env); err == nil {
 			rogueCh <- env.Data
 			return
 		}
@@ -159,17 +176,18 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	}()
 	go func() {
 		var env apiEnvelope[map[string]any]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/setting", c.site), &env); err == nil && len(env.Data) > 0 {
-			settingCh <- parseSecuritySettings(env.Data)
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/setting", site), &env); err == nil && len(env.Data) > 0 {
+			settingCh <- settingRes{settings: parseSecuritySettings(env.Data), ok: true}
 			return
 		}
-		settingCh <- nil
+		settingCh <- settingRes{}
 	}()
 	go func() {
 		var env apiEnvelope[rawHealth]
 		var h SystemHealth
 		got := false
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/health", c.site), &env); err == nil && len(env.Data) > 0 {
+		vpnOK := false
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/health", site), &env); err == nil && len(env.Data) > 0 {
 			got = true
 			for _, item := range env.Data {
 				switch strings.ToLower(item.Subsystem) {
@@ -182,8 +200,9 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 			}
 		}
 		var vpn rawVPNConnectionsResponse
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/v2/api/site/%s/vpn/connections", c.site), &vpn); err == nil {
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/v2/api/site/%s/vpn/connections", site), &vpn); err == nil {
 			got = true
+			vpnOK = true
 			for _, vc := range vpn.Connections {
 				user := vc.User
 				if user == "" {
@@ -210,18 +229,26 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 			}
 		}
 		if got {
-			healthCh <- &h
+			healthCh <- healthRes{health: &h, vpnOK: vpnOK}
 			return
 		}
-		healthCh <- nil
+		healthCh <- healthRes{}
 	}()
 	go func() {
 		var env apiEnvelope[rawHistoricalUser]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/user", c.site), &env); err == nil {
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/user", site), &env); err == nil {
 			usersCh <- env.Data
 			return
 		}
 		usersCh <- nil
+	}()
+	go func() {
+		var env apiEnvelope[rawPortConf]
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/portconf", site), &env); err == nil {
+			portConfCh <- env.Data
+			return
+		}
+		portConfCh <- nil
 	}()
 	go func() {
 		logs, _ := c.FetchRecentLogs(ctx, time.Now().UTC().Add(-24*time.Hour))
@@ -229,14 +256,19 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	}()
 
 	wr := <-wlanCh
+	sr := <-settingCh
+	hr := <-healthCh
 	return siteTelemetry{
 		wlans:      wr.items,
 		wlansOK:    wr.ok,
 		rogueAPs:   <-rogueCh,
-		settings:   <-settingCh,
-		health:     <-healthCh,
+		settings:   sr.settings,
+		settingsOK: sr.ok,
+		health:     hr.health,
+		vpnOK:      hr.vpnOK,
 		knownUsers: <-usersCh,
 		recentLogs: <-logsCh,
+		portConfs:  <-portConfCh,
 	}
 }
 
@@ -244,11 +276,12 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 // alerts, network anomalies, and admin activity) since the given timestamp.
 // Returns newest-first normalized events and fails gracefully on older consoles.
 func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]ControllerLogEvent, error) {
-	if c.controllerType == "" {
+	if c.currentControllerType() == "" {
 		if err := c.Login(ctx); err != nil {
 			return nil, err
 		}
 	}
+	apiPrefix, site := c.sessionPrefixAndSite()
 	nowMs := time.Now().UTC().UnixMilli()
 	fromMs := since.UTC().UnixMilli()
 	if fromMs <= 0 || fromMs > nowMs {
@@ -275,7 +308,7 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		var resp struct {
 			Data []rawSystemLogEntry `json:"data"`
 		}
-		if err := c.postJSON(ctx, c.apiPrefix+fmt.Sprintf("/v2/api/site/%s/system-log/all", c.site), payload, &resp); err == nil {
+		if err := c.postJSON(ctx, apiPrefix+fmt.Sprintf("/v2/api/site/%s/system-log/all", site), payload, &resp); err == nil {
 			allCh <- allRes{items: resp.Data}
 			return
 		}
@@ -285,7 +318,7 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		var resp struct {
 			Data []rawAdminActivityEntry `json:"data"`
 		}
-		if err := c.postJSON(ctx, c.apiPrefix+fmt.Sprintf("/v2/api/site/%s/system-log/admin-activity", c.site), payload, &resp); err == nil {
+		if err := c.postJSON(ctx, apiPrefix+fmt.Sprintf("/v2/api/site/%s/system-log/admin-activity", site), payload, &resp); err == nil {
 			adminCh <- adminRes{items: resp.Data}
 			return
 		}
@@ -305,8 +338,12 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		if msg == "" {
 			msg = interpolateLogTemplate(entry.TitleRaw, params)
 		}
+		logID := strings.TrimSpace(entry.ID)
+		if logID == "" {
+			logID = "syslog:" + stableHashID(fmt.Sprintf("%d|%s|%s|%s", entry.Timestamp, entry.Key, entry.Event, msg))
+		}
 		events = append(events, ControllerLogEvent{
-			ID:        entry.ID,
+			ID:        logID,
 			Timestamp: time.UnixMilli(entry.Timestamp).UTC(),
 			Category:  strings.ToUpper(entry.Category),
 			Event:     strings.ToUpper(entry.Event),
@@ -338,8 +375,12 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		if strings.Contains(keyUp, "FAIL") || strings.Contains(keyUp, "DELETE") || strings.Contains(keyUp, "SSH") {
 			sev = "high"
 		}
+		adminID := strings.TrimSpace(entry.ID)
+		if adminID == "" {
+			adminID = stableHashID(fmt.Sprintf("%d|%s|%s|%s|%s", entry.Timestamp, entry.Key, adminName, entry.IP, msg))
+		}
 		events = append(events, ControllerLogEvent{
-			ID:        "admin:" + entry.ID,
+			ID:        "admin:" + adminID,
 			Timestamp: time.UnixMilli(entry.Timestamp).UTC(),
 			Category:  "ADMIN",
 			Event:     keyUp,
@@ -357,13 +398,42 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 	return events, nil
 }
 
+func stableHashID(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:8])
+}
+
 // postJSON performs a read-only query POST (used by UniFi v2 system-log endpoints)
-// and decodes its JSON response into dst.
+// and decodes its JSON response into dst, transparently re-logging in once if
+// the cookie session expired.
 func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any, dst any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
+	relogged := false
+	for attempt := 0; attempt < 2; attempt++ {
+		epoch := c.currentAuthEpoch()
+		err := c.postJSONOnce(ctx, fullPath, raw, dst)
+		if err == nil {
+			return nil
+		}
+		if !relogged && c.canRelogin() && isSessionExpiredError(err) {
+			relogged = true
+			if loginErr := c.relogin(ctx, epoch); loginErr == nil {
+				continue
+			}
+		}
+		var httpErr *httpStatusError
+		if errors.As(err, &httpErr) && (httpErr.status == http.StatusTooManyRequests || httpErr.status >= 500) && attempt == 0 {
+			continue
+		}
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) postJSONOnce(ctx context.Context, fullPath string, raw []byte, dst any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+fullPath, bytes.NewReader(raw))
 	if err != nil {
 		return err
@@ -373,8 +443,8 @@ func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any,
 	if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	if c.csrfToken != "" {
-		req.Header.Set("X-CSRF-Token", c.csrfToken)
+	if tok := c.currentCSRFToken(); tok != "" {
+		req.Header.Set("X-CSRF-Token", tok)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -383,12 +453,19 @@ func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any,
 	}
 	defer resp.Body.Close()
 
+	if tok := resp.Header.Get("X-CSRF-Token"); tok != "" {
+		c.setCSRFToken(tok)
+	}
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxControllerBodyBytes))
 	if err != nil {
 		return fmt.Errorf("read %s: %w", fullPath, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &httpStatusError{path: fullPath, status: resp.StatusCode}
+	}
+	if err := checkAPIEnvelopeError(fullPath, body); err != nil {
+		return err
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
 		return fmt.Errorf("decode %s: %w", fullPath, err)

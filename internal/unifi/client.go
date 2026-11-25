@@ -17,9 +17,11 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/netip"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/karalabe/uniblue/internal/config"
@@ -46,6 +48,10 @@ const (
 	// trips on medium-to-large home and SMB networks.
 	integrationPageLimit = 200
 
+	// maxIntegrationPages caps pagination so a malfunctioning or hostile
+	// controller reporting a huge totalCount cannot cause an endless loop.
+	maxIntegrationPages = 250
+
 	// maxControllerBodyBytes caps JSON payloads read from the controller so a
 	// misconfigured URL cannot exhaust memory.
 	maxControllerBodyBytes = 16 << 20
@@ -69,8 +75,21 @@ type Controller struct {
 	// apiKey is sent via X-API-Key when token-based authentication is configured.
 	apiKey string
 
+	// insecureSkipVerify mirrors unifi.insecure_skip_verify for both REST and WebSocket TLS.
+	insecureSkipVerify bool
+
 	// httpClient carries TLS configuration, timeouts, and the session cookie jar.
 	httpClient *http.Client
+
+	// authMu guards apiPrefix, controllerType, site, siteID, csrfToken, and authEpoch.
+	authMu sync.RWMutex
+
+	// loginMu serializes Login/relogin calls so concurrent 401s re-authenticate once.
+	loginMu sync.Mutex
+
+	// authEpoch increments on every completed Login so single-flight relogin callers
+	// know whether another goroutine already refreshed the session.
+	authEpoch uint64
 
 	// apiPrefix is "/proxy/network" for UniFi OS consoles or "" for classic
 	// controllers, discovered automatically during Login.
@@ -91,6 +110,12 @@ func New(cfg config.UniFiConfig) (*Controller, error) {
 		return nil, fmt.Errorf("init cookie jar: %w", err)
 	}
 
+	baseURL := strings.TrimRight(cfg.URL, "/")
+	parsedBase, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse controller url: %w", err)
+	}
+
 	transport := &http.Transport{
 		MaxIdleConnsPerHost: 4,
 		MaxConnsPerHost:     4,
@@ -100,17 +125,77 @@ func New(cfg config.UniFiConfig) (*Controller, error) {
 	}
 
 	return &Controller{
-		baseURL:  strings.TrimRight(cfg.URL, "/"),
-		site:     cfg.Site,
-		username: cfg.Username,
-		password: cfg.Password,
-		apiKey:   cfg.APIKey,
+		baseURL:            baseURL,
+		site:               cfg.Site,
+		username:           cfg.Username,
+		password:           cfg.Password,
+		apiKey:             cfg.APIKey,
+		insecureSkipVerify: cfg.InsecureSkipVerify,
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
 			Jar:       jar,
 			Transport: transport,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return errors.New("stopped after 5 redirects")
+				}
+				if !strings.EqualFold(req.URL.Hostname(), parsedBase.Hostname()) ||
+					!strings.EqualFold(req.URL.Scheme, parsedBase.Scheme) {
+					return fmt.Errorf("refusing cross-host redirect to %s://%s", req.URL.Scheme, req.URL.Host)
+				}
+				return nil
+			},
 		},
 	}, nil
+}
+
+func (c *Controller) currentControllerType() string {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.controllerType
+}
+
+func (c *Controller) sessionPrefixAndSite() (string, string) {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.apiPrefix, c.site
+}
+
+func (c *Controller) currentSiteID() string {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.siteID
+}
+
+func (c *Controller) currentCSRFToken() string {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.csrfToken
+}
+
+func (c *Controller) setCSRFToken(tok string) {
+	c.authMu.Lock()
+	c.csrfToken = tok
+	c.authMu.Unlock()
+}
+
+func (c *Controller) currentAuthEpoch() uint64 {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.authEpoch
+}
+
+func (c *Controller) canRelogin() bool {
+	return c.apiKey == "" && c.username != "" && c.password != ""
+}
+
+func (c *Controller) relogin(ctx context.Context, seenEpoch uint64) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	if c.currentAuthEpoch() != seenEpoch {
+		return nil
+	}
+	return c.loginLocked(ctx)
 }
 
 // Login authenticates against the controller and auto-detects the appropriate
@@ -120,28 +205,43 @@ func New(cfg config.UniFiConfig) (*Controller, error) {
 //   - Otherwise it authenticates with local credentials against UniFi OS
 //     (/api/auth/login) and falls back to classic controllers (/api/login).
 func (c *Controller) Login(ctx context.Context) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	return c.loginLocked(ctx)
+}
+
+func (c *Controller) loginLocked(ctx context.Context) error {
 	if c.apiKey != "" {
 		return c.loginWithAPIKey(ctx)
 	}
 
 	// Attempt UniFi OS authentication first (UDM Pro / Cloud Gateway / modern
-	// Cloud Key). A 404 signals an older standalone/Cloud Key controller that
-	// uses the classic /api/login endpoint instead.
-	status, err := c.postLogin(ctx, "/api/auth/login")
-	if err == nil {
+	// Cloud Key). A 404 (or 400/401/405 on self-hosted Network apps that do not
+	// serve /api/auth/login) falls back to classic /api/login.
+	status, uosErr := c.postLogin(ctx, "/api/auth/login")
+	if uosErr == nil {
+		c.authMu.Lock()
 		c.apiPrefix = "/proxy/network"
 		c.controllerType = controllerUniFiOS
+		c.authEpoch++
+		c.authMu.Unlock()
 		return nil
 	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("unifi-os login failed: %w", err)
+	if status == http.StatusTooManyRequests || status >= 500 || status == 0 {
+		return fmt.Errorf("unifi-os login failed: %w", uosErr)
 	}
 
-	if _, err := c.postLogin(ctx, "/api/login"); err != nil {
-		return fmt.Errorf("classic unifi login failed: %w", err)
+	if _, classicErr := c.postLogin(ctx, "/api/login"); classicErr != nil {
+		if status == http.StatusNotFound {
+			return fmt.Errorf("classic unifi login failed: %w", classicErr)
+		}
+		return fmt.Errorf("unifi-os login failed: %w (classic fallback: %v)", uosErr, classicErr)
 	}
+	c.authMu.Lock()
 	c.apiPrefix = ""
 	c.controllerType = controllerClassic
+	c.authEpoch++
+	c.authMu.Unlock()
 	return nil
 }
 
@@ -152,13 +252,20 @@ func (c *Controller) Login(ctx context.Context) error {
 func (c *Controller) loginWithAPIKey(ctx context.Context) error {
 	sites, err := fetchAllPages[integrationSite](ctx, c, integrationV1Prefix+"/sites")
 	if err == nil {
-		site, resolveErr := resolveIntegrationSite(sites, c.site)
+		_, currentSite := c.sessionPrefixAndSite()
+		site, resolveErr := resolveIntegrationSite(sites, currentSite)
 		if resolveErr != nil {
 			return resolveErr
 		}
+		c.authMu.Lock()
 		c.siteID = site.ID
+		if ref := strings.TrimSpace(site.InternalReference); ref != "" {
+			c.site = ref
+		}
 		c.controllerType = controllerIntegrationV1
 		c.apiPrefix = "/proxy/network"
+		c.authEpoch++
+		c.authMu.Unlock()
 		return nil
 	}
 
@@ -177,11 +284,17 @@ func (c *Controller) loginWithAPIKey(ctx context.Context) error {
 		{prefix: "", kind: controllerClassic},
 	}
 	var lastErr error
+	_, currentSite := c.sessionPrefixAndSite()
 	for _, p := range probes {
+		c.authMu.Lock()
 		c.apiPrefix = p.prefix
 		c.controllerType = p.kind
+		c.authMu.Unlock()
 		var out apiEnvelope[rawNetwork]
-		if probeErr := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &out); probeErr == nil {
+		if probeErr := c.getJSON(ctx, p.prefix+fmt.Sprintf("/api/s/%s/rest/networkconf", currentSite), &out); probeErr == nil {
+			c.authMu.Lock()
+			c.authEpoch++
+			c.authMu.Unlock()
 			return nil
 		} else {
 			lastErr = probeErr
@@ -246,7 +359,7 @@ func (c *Controller) postLogin(ctx context.Context, path string) (int, error) {
 		return resp.StatusCode, fmt.Errorf("HTTP %d from %s", resp.StatusCode, path)
 	}
 	if token := resp.Header.Get("X-CSRF-Token"); token != "" {
-		c.csrfToken = token
+		c.setCSRFToken(token)
 	}
 	return resp.StatusCode, nil
 }
@@ -255,12 +368,12 @@ func (c *Controller) postLogin(ctx context.Context, path string) (int, error) {
 // forwards concurrently, then cross-links client records with resolved VLAN
 // names so downstream risk scoring has complete topology context.
 func (c *Controller) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
-	if c.controllerType == "" {
+	if c.currentControllerType() == "" {
 		if err := c.Login(ctx); err != nil {
 			return nil, err
 		}
 	}
-	if c.controllerType == controllerIntegrationV1 {
+	if c.currentControllerType() == controllerIntegrationV1 {
 		return c.fetchIntegrationSnapshot(ctx)
 	}
 	return c.fetchLegacySnapshot(ctx)
@@ -296,9 +409,11 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	}
 	type legacyClientsRes struct {
 		items []rawClient
+		err   error
 	}
 	type legacyDevicesRes struct {
 		items []rawDevice
+		err   error
 	}
 
 	clientsCh := make(chan clientsRes, 1)
@@ -311,7 +426,8 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	legacyDevicesCh := make(chan legacyDevicesRes, 1)
 	telemetryCh := make(chan siteTelemetry, 1)
 
-	siteBase := fmt.Sprintf("%s/sites/%s", integrationV1Prefix, c.siteID)
+	apiPrefix, site := c.sessionPrefixAndSite()
+	siteBase := fmt.Sprintf("%s/sites/%s", integrationV1Prefix, c.currentSiteID())
 
 	go func() {
 		telemetryCh <- c.fetchSiteTelemetry(ctx)
@@ -339,7 +455,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		// Port forwards are not yet exposed under /integration/v1 on all versions;
 		// opportunistically attempt the legacy endpoint and record failures in Visibility.
 		var env apiEnvelope[rawPortForward]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/portforward", c.site), &env); err == nil {
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/portforward", site), &env); err == nil {
 			forwardsCh <- forwardsRes{items: env.Data}
 			return
 		} else {
@@ -361,20 +477,14 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		// Opportunistically fetch legacy stat/sta to enrich Integration v1 clients
 		// with true DHCP hostnames, OUI strings, Wi-Fi SSIDs, and switch port links.
 		var env apiEnvelope[rawClient]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/sta", c.site), &env); err == nil {
-			legacyClientsCh <- legacyClientsRes{items: env.Data}
-			return
-		}
-		legacyClientsCh <- legacyClientsRes{}
+		err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/sta", site), &env)
+		legacyClientsCh <- legacyClientsRes{items: env.Data, err: err}
 	}()
 	go func() {
-		// Opportunistically fetch legacy stat/device to attach physical LLDP uplinks.
+		// Opportunistically fetch legacy stat/device to attach physical LLDP uplinks and switch ports.
 		var env apiEnvelope[rawDevice]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/device", c.site), &env); err == nil {
-			legacyDevicesCh <- legacyDevicesRes{items: env.Data}
-			return
-		}
-		legacyDevicesCh <- legacyDevicesRes{}
+		err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/device", site), &env)
+		legacyDevicesCh <- legacyDevicesRes{items: env.Data, err: err}
 	}()
 
 	cr := <-clientsCh
@@ -522,8 +632,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			cl.SwitchMAC = strings.ToLower(strings.TrimSpace(lc.SwMAC))
 			cl.SwitchPort = lc.SwPort
 			cl.APMAC = strings.ToLower(strings.TrimSpace(lc.APMAC))
-			cl.TxBytes = lc.TxBytes + lc.WiredTxBytes
-			cl.RxBytes = lc.RxBytes + lc.WiredRxBytes
+			cl.TxBytes, cl.RxBytes = clientByteCounters(cl.IsWired || lc.IsWired, lc.TxBytes, lc.RxBytes, lc.WiredTxBytes, lc.WiredRxBytes)
 			cl.FirstSeen = lc.FirstSeen
 			cl.LastSeen = lc.LastSeen
 		}
@@ -558,6 +667,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		if name == "" && ip != "" {
 			name = userNameByFixedIP[ip]
 		}
+		txBytes, rxBytes := clientByteCounters(lc.IsWired, lc.TxBytes, lc.RxBytes, lc.WiredTxBytes, lc.WiredRxBytes)
 		cl := Client{
 			MAC:        mac,
 			IP:         ip,
@@ -570,8 +680,8 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			SwitchMAC:  strings.ToLower(strings.TrimSpace(lc.SwMAC)),
 			SwitchPort: lc.SwPort,
 			APMAC:      strings.ToLower(strings.TrimSpace(lc.APMAC)),
-			TxBytes:    lc.TxBytes + lc.WiredTxBytes,
-			RxBytes:    lc.RxBytes + lc.WiredRxBytes,
+			TxBytes:    txBytes,
+			RxBytes:    rxBytes,
 			FirstSeen:  lc.FirstSeen,
 			LastSeen:   lc.LastSeen,
 		}
@@ -611,6 +721,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		}
 	}
 
+	portConfByID := indexPortConfs(telem.portConfs)
 	devices := make([]Device, 0, len(dr.items))
 	for _, rd := range dr.items {
 		mac := strings.ToLower(strings.TrimSpace(rd.MACAddress))
@@ -619,7 +730,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			IP:         strings.TrimSpace(rd.IPAddress),
 			Name:       strings.TrimSpace(rd.Name),
 			Model:      rd.Model,
-			Type:       strings.ToLower(rd.State),
+			Type:       inferDeviceTypeFromModel(rd.Model),
 			Version:    rd.FirmwareVersion,
 			Upgradable: rd.FirmwareUpdatable,
 		}
@@ -632,33 +743,15 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 				dev.UplinkName = strings.TrimSpace(ld.Uplink.UplinkDeviceName)
 				dev.UplinkPort = ld.Uplink.UplinkRemotePort
 			}
-			dev.Ports = convertSwitchPorts(ld, netByID, defaultNetName)
+			dev.Ports = convertSwitchPorts(ld, netByID, portConfByID, defaultNetName)
 		}
 		devices = append(devices, dev)
 	}
 
 	forwards := convertPortForwards(fr.items)
 
-	// Populate active client lease counts on networks with DHCP ranges.
-	clientsPerNetID := make(map[string]int, len(networks))
-	for _, cl := range clients {
-		if cl.NetworkID != "" {
-			clientsPerNetID[cl.NetworkID]++
-		}
-	}
-	hasDHCP := false
-	hasMDNS := false
-	for i := range networks {
-		if networks[i].DHCPStart != "" && networks[i].DHCPEnd != "" {
-			hasDHCP = true
-			if networks[i].ActiveLeases == 0 {
-				networks[i].ActiveLeases = clientsPerNetID[networks[i].ID]
-			}
-		}
-		if networks[i].MDNSReflectorEnabled != nil {
-			hasMDNS = true
-		}
-	}
+	// Populate active client lease counts strictly for clients inside each DHCP pool.
+	hasDHCP, hasMDNS := populateNetworkDHCPAndMDNS(networks, clients)
 
 	gwPoliciesAvailable := zr.err == nil && pr.err == nil
 	var missingFeeds []string
@@ -671,15 +764,24 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	if fr.err != nil {
 		missingFeeds = append(missingFeeds, fmt.Sprintf("port-forwards (%s)", shortFetchErr(fr.err)))
 	}
+	if ldr.err != nil {
+		missingFeeds = append(missingFeeds, fmt.Sprintf("switch-ports (%s)", shortFetchErr(ldr.err)))
+	}
+	if lcr.err != nil {
+		missingFeeds = append(missingFeeds, fmt.Sprintf("client-enrichment (%s)", shortFetchErr(lcr.err)))
+	}
 	if !telem.wlansOK {
 		missingFeeds = append(missingFeeds, "wlan-config (unavailable)")
+	}
+	if !telem.settingsOK {
+		missingFeeds = append(missingFeeds, "security-settings (unavailable)")
 	}
 	missingFeeds = append(missingFeeds, "switch-acls (not exposed by controller API)")
 
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
-		Site:             c.site,
-		ControllerType:   c.controllerType,
+		Site:             site,
+		ControllerType:   c.currentControllerType(),
 		Clients:          clients,
 		Devices:          devices,
 		Networks:         networks,
@@ -697,10 +799,13 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			Reason: "UniFi controller API does not expose switch ACL tables",
 		},
 		Visibility: &SiteVisibility{
-			APIMode:                  c.controllerType,
+			APIMode:                  c.currentControllerType(),
 			GatewayPoliciesAvailable: gwPoliciesAvailable,
 			SwitchACLsAvailable:      false,
 			WLANsAvailable:           telem.wlansOK,
+			SettingsAvailable:        telem.settingsOK,
+			VPNAvailable:             telem.vpnOK,
+			PortForwardsAvailable:    fr.err == nil,
 			DHCPAvailable:            hasDHCP,
 			MDNSReflectorKnown:       hasMDNS,
 			MissingFeeds:             missingFeeds,
@@ -734,28 +839,30 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	forwardsCh := make(chan forwardsRes, 1)
 	telemetryCh := make(chan siteTelemetry, 1)
 
+	apiPrefix, site := c.sessionPrefixAndSite()
+
 	go func() {
 		telemetryCh <- c.fetchSiteTelemetry(ctx)
 	}()
 
 	go func() {
 		var env apiEnvelope[rawClient]
-		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/sta", c.site), &env)
+		err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/sta", site), &env)
 		clientsCh <- clientsRes{items: env.Data, err: err}
 	}()
 	go func() {
 		var env apiEnvelope[rawDevice]
-		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/stat/device", c.site), &env)
+		err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/device", site), &env)
 		devicesCh <- devicesRes{items: env.Data, err: err}
 	}()
 	go func() {
 		var env apiEnvelope[rawNetwork]
-		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &env)
+		err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", site), &env)
 		networksCh <- networksRes{items: env.Data, err: err}
 	}()
 	go func() {
 		var env apiEnvelope[rawPortForward]
-		err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/portforward", c.site), &env)
+		err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/portforward", site), &env)
 		forwardsCh <- forwardsRes{items: env.Data, err: err}
 	}()
 
@@ -785,6 +892,11 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		if strings.EqualFold(strings.TrimSpace(rn.GatewayType), "switch") && rn.GatewayDevice != "" {
 			routerMAC = strings.ToLower(strings.TrimSpace(rn.GatewayDevice))
 		}
+		dhcpStart, dhcpEnd := "", ""
+		if rn.DHCPDEnabled == nil || *rn.DHCPDEnabled {
+			dhcpStart = strings.TrimSpace(rn.DHCPDStart)
+			dhcpEnd = strings.TrimSpace(rn.DHCPDStop)
+		}
 		n := Network{
 			ID:                   rn.ID,
 			Name:                 rn.Name,
@@ -798,8 +910,8 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			MDNSReflectorEnabled: rn.MDNSEnabled,
 			IGMPSnooping:         rn.IGMPSnooping,
 			DNSServers:           dnsServers,
-			DHCPStart:            strings.TrimSpace(rn.DHCPDStart),
-			DHCPEnd:              strings.TrimSpace(rn.DHCPDStop),
+			DHCPStart:            dhcpStart,
+			DHCPEnd:              dhcpEnd,
 		}
 		networks = append(networks, n)
 		if n.ID != "" {
@@ -812,6 +924,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 
 	clients := make([]Client, 0, len(cr.items))
 	for _, rc := range cr.items {
+		txBytes, rxBytes := clientByteCounters(rc.IsWired, rc.TxBytes, rc.RxBytes, rc.WiredTxBytes, rc.WiredRxBytes)
 		cl := Client{
 			MAC:         strings.ToLower(strings.TrimSpace(rc.MAC)),
 			IP:          strings.TrimSpace(rc.IP),
@@ -827,8 +940,8 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			SwitchMAC:   strings.ToLower(strings.TrimSpace(rc.SwMAC)),
 			SwitchPort:  rc.SwPort,
 			APMAC:       strings.ToLower(strings.TrimSpace(rc.APMAC)),
-			TxBytes:     rc.TxBytes + rc.WiredTxBytes,
-			RxBytes:     rc.RxBytes + rc.WiredRxBytes,
+			TxBytes:     txBytes,
+			RxBytes:     rxBytes,
 			FirstSeen:   rc.FirstSeen,
 			LastSeen:    rc.LastSeen,
 		}
@@ -850,18 +963,25 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		clients = append(clients, cl)
 	}
 
+	telem := <-telemetryCh
+	portConfByID := indexPortConfs(telem.portConfs)
+
 	defaultNetName := defaultLANName(networks)
 	devices := make([]Device, 0, len(dr.items))
 	for _, rd := range dr.items {
+		devType := strings.ToLower(strings.TrimSpace(rd.Type))
+		if devType == "" {
+			devType = inferDeviceTypeFromModel(rd.Model)
+		}
 		dev := Device{
 			MAC:        strings.ToLower(strings.TrimSpace(rd.MAC)),
 			IP:         strings.TrimSpace(rd.IP),
 			Name:       strings.TrimSpace(rd.Name),
 			Model:      rd.Model,
-			Type:       rd.Type,
+			Type:       devType,
 			Version:    rd.Version,
 			Upgradable: rd.Upgradable,
-			Ports:      convertSwitchPorts(rd, netByID, defaultNetName),
+			Ports:      convertSwitchPorts(rd, netByID, portConfByID, defaultNetName),
 		}
 		if rd.Uplink != nil {
 			dev.UplinkMAC = strings.ToLower(strings.TrimSpace(rd.Uplink.UplinkMAC))
@@ -871,27 +991,8 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 		devices = append(devices, dev)
 	}
 
-	clientsPerNetID := make(map[string]int, len(networks))
-	for _, cl := range clients {
-		if cl.NetworkID != "" {
-			clientsPerNetID[cl.NetworkID]++
-		}
-	}
-	hasDHCP := false
-	hasMDNS := false
-	for i := range networks {
-		if networks[i].DHCPStart != "" && networks[i].DHCPEnd != "" {
-			hasDHCP = true
-			if networks[i].ActiveLeases == 0 {
-				networks[i].ActiveLeases = clientsPerNetID[networks[i].ID]
-			}
-		}
-		if networks[i].MDNSReflectorEnabled != nil {
-			hasMDNS = true
-		}
-	}
+	hasDHCP, hasMDNS := populateNetworkDHCPAndMDNS(networks, clients)
 
-	telem := <-telemetryCh
 	missingFeeds := []string{
 		"firewall-policies (legacy API does not expose Zone-Based Firewall policies)",
 		"switch-acls (legacy API does not expose switch ACLs)",
@@ -899,10 +1000,13 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	if !telem.wlansOK {
 		missingFeeds = append(missingFeeds, "wlan-config (unavailable)")
 	}
+	if !telem.settingsOK {
+		missingFeeds = append(missingFeeds, "security-settings (unavailable)")
+	}
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
-		Site:             c.site,
-		ControllerType:   c.controllerType,
+		Site:             site,
+		ControllerType:   c.currentControllerType(),
 		Clients:          clients,
 		Devices:          devices,
 		Networks:         networks,
@@ -918,10 +1022,13 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			Reason: "classic UniFi API does not expose switch ACL tables",
 		},
 		Visibility: &SiteVisibility{
-			APIMode:                  c.controllerType,
+			APIMode:                  c.currentControllerType(),
 			GatewayPoliciesAvailable: false,
 			SwitchACLsAvailable:      false,
 			WLANsAvailable:           telem.wlansOK,
+			SettingsAvailable:        telem.settingsOK,
+			VPNAvailable:             telem.vpnOK,
+			PortForwardsAvailable:    fr.err == nil,
 			DHCPAvailable:            hasDHCP,
 			MDNSReflectorKnown:       hasMDNS,
 			MissingFeeds:             missingFeeds,
@@ -934,7 +1041,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 func fetchAllPages[T any](ctx context.Context, c *Controller, path string) ([]T, error) {
 	var all []T
 	offset := 0
-	for {
+	for pageNum := 0; pageNum < maxIntegrationPages; pageNum++ {
 		pagePath := fmt.Sprintf("%s?offset=%d&limit=%d", path, offset, integrationPageLimit)
 		var page integrationPage[T]
 		if err := c.getJSON(ctx, pagePath, &page); err != nil {
@@ -947,6 +1054,101 @@ func fetchAllPages[T any](ctx context.Context, c *Controller, path string) ([]T,
 		offset += len(page.Data)
 	}
 	return all, nil
+}
+
+// clientByteCounters picks the single appropriate TX/RX byte counter pair for a
+// client so wired hosts do not double-count tx_bytes + wired-tx_bytes.
+func clientByteCounters(isWired bool, tx, rx, wiredTx, wiredRx int64) (int64, int64) {
+	if isWired && (wiredTx > 0 || wiredRx > 0) {
+		return wiredTx, wiredRx
+	}
+	if tx > 0 || rx > 0 {
+		return tx, rx
+	}
+	return wiredTx, wiredRx
+}
+
+// inferDeviceTypeFromModel maps a UniFi device model code to a normalized
+// controller device type ("udm", "ugw", "usw", "uap", "uck") when legacy
+// stat/device telemetry is absent, instead of misusing device state ("online").
+func inferDeviceTypeFromModel(model string) string {
+	m := strings.ToUpper(strings.TrimSpace(model))
+	switch {
+	case m == "":
+		return ""
+	case strings.HasPrefix(m, "UDM"), strings.HasPrefix(m, "UDR"), strings.HasPrefix(m, "UDW"),
+		strings.HasPrefix(m, "UCG"), strings.HasPrefix(m, "EFG"):
+		return "udm"
+	case strings.HasPrefix(m, "UXG"), strings.HasPrefix(m, "USG"), m == "UX" || strings.HasPrefix(m, "UX-"):
+		return "ugw"
+	case strings.HasPrefix(m, "USW"), strings.HasPrefix(m, "USL"), strings.HasPrefix(m, "USC"),
+		strings.HasPrefix(m, "US8"), strings.HasPrefix(m, "US16"), strings.HasPrefix(m, "US24"),
+		strings.HasPrefix(m, "US48"), strings.HasPrefix(m, "US-"):
+		return "usw"
+	case strings.HasPrefix(m, "UAP"), strings.HasPrefix(m, "UAL"), strings.HasPrefix(m, "U6"),
+		strings.HasPrefix(m, "U7"), strings.HasPrefix(m, "UWB"), strings.HasPrefix(m, "UDB"),
+		strings.HasPrefix(m, "UK"), strings.HasPrefix(m, "AC"):
+		return "uap"
+	case strings.HasPrefix(m, "UCK"), strings.HasPrefix(m, "UNVR"):
+		return "uck"
+	default:
+		return ""
+	}
+}
+
+// populateNetworkDHCPAndMDNS computes active DHCP lease counts strictly from
+// clients whose IPv4 address falls within each network's [DHCPStart, DHCPEnd]
+// pool (excluding static IPs outside the pool), and reports whether DHCP and
+// mDNS reflector telemetry were observed.
+func populateNetworkDHCPAndMDNS(networks []Network, clients []Client) (hasDHCP, hasMDNS bool) {
+	for i := range networks {
+		if networks[i].DHCPStart != "" && networks[i].DHCPEnd != "" {
+			hasDHCP = true
+			if networks[i].ActiveLeases == 0 {
+				startAddr, err1 := netip.ParseAddr(strings.TrimSpace(networks[i].DHCPStart))
+				endAddr, err2 := netip.ParseAddr(strings.TrimSpace(networks[i].DHCPEnd))
+				if err1 == nil && err2 == nil && startAddr.Is4() && endAddr.Is4() {
+					start4 := startAddr.As4()
+					end4 := endAddr.As4()
+					startNum := uint32(start4[0])<<24 | uint32(start4[1])<<16 | uint32(start4[2])<<8 | uint32(start4[3])
+					endNum := uint32(end4[0])<<24 | uint32(end4[1])<<16 | uint32(end4[2])<<8 | uint32(end4[3])
+					count := 0
+					for _, cl := range clients {
+						if cl.NetworkID != "" && networks[i].ID != "" && cl.NetworkID != networks[i].ID {
+							continue
+						}
+						addr, err := netip.ParseAddr(strings.TrimSpace(cl.IP))
+						if err != nil || !addr.Is4() {
+							continue
+						}
+						b := addr.As4()
+						v := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+						if v >= startNum && v <= endNum {
+							count++
+						}
+					}
+					networks[i].ActiveLeases = count
+				}
+			}
+		}
+		if networks[i].MDNSReflectorEnabled != nil {
+			hasMDNS = true
+		}
+	}
+	return hasDHCP, hasMDNS
+}
+
+func indexPortConfs(confs []rawPortConf) map[string]rawPortConf {
+	if len(confs) == 0 {
+		return nil
+	}
+	out := make(map[string]rawPortConf, len(confs))
+	for _, pc := range confs {
+		if pc.ID != "" {
+			out[pc.ID] = pc
+		}
+	}
+	return out
 }
 
 // defaultLANName returns the site's primary untagged management/LAN network
@@ -968,8 +1170,9 @@ func defaultLANName(networks []Network) string {
 }
 
 // convertSwitchPorts normalizes a UniFi device's port_table merged with
-// port_overrides into sorted SwitchPort entries with resolved native VLAN names.
-func convertSwitchPorts(rd rawDevice, netByID map[string]Network, defaultNetName string) []SwitchPort {
+// port_overrides and optional port profiles (rest/portconf) into sorted
+// SwitchPort entries with resolved native VLAN names.
+func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID map[string]rawPortConf, defaultNetName string) []SwitchPort {
 	if len(rd.PortTable) == 0 {
 		return nil
 	}
@@ -989,6 +1192,12 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, defaultNetName
 		if ov, ok := ovByIdx[rp.PortIdx]; ok {
 			if ov.Name != "" {
 				rp.Name = ov.Name
+			}
+			if ov.PortConfID != "" {
+				rp.PortConfID = ov.PortConfID
+			}
+			if ov.SettingPreference != "" {
+				rp.SettingPreference = ov.SettingPreference
 			}
 			if ov.OpMode != "" {
 				rp.OpMode = ov.OpMode
@@ -1013,6 +1222,36 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, defaultNetName
 			}
 			if ov.Isolation != nil {
 				rp.Isolation = ov.Isolation
+			}
+		}
+		// Apply referenced switch port profile defaults when setting_preference is
+		// not "manual" (or when individual port fields were omitted).
+		if rp.PortConfID != "" && !strings.EqualFold(strings.TrimSpace(rp.SettingPreference), "manual") {
+			if pc, ok := portConfByID[rp.PortConfID]; ok {
+				if rp.OpMode == "" && pc.OpMode != "" {
+					rp.OpMode = pc.OpMode
+				}
+				if rp.Forward == "" && pc.Forward != "" {
+					rp.Forward = pc.Forward
+				}
+				if rp.TaggedVLANMgmt == "" && pc.TaggedVLANMgmt != "" {
+					rp.TaggedVLANMgmt = pc.TaggedVLANMgmt
+				}
+				if rp.NativeNetworkConfID == "" && pc.NativeNetworkConfID != "" {
+					rp.NativeNetworkConfID = pc.NativeNetworkConfID
+				}
+				if rp.PoEMode == "" && pc.PoEMode != "" {
+					rp.PoEMode = pc.PoEMode
+				}
+				if rp.PortSecurityEnabled == nil && pc.PortSecurityEnabled != nil {
+					rp.PortSecurityEnabled = pc.PortSecurityEnabled
+				}
+				if len(rp.PortSecurityMACs) == 0 && len(pc.PortSecurityMACs) > 0 {
+					rp.PortSecurityMACs = pc.PortSecurityMACs
+				}
+				if rp.Isolation == nil && pc.Isolation != nil {
+					rp.Isolation = pc.Isolation
+				}
 			}
 		}
 
@@ -1170,7 +1409,22 @@ func extractIntegrationIPv6Subnet(rn integrationNetwork) string {
 	return ""
 }
 
+func integrationDHCPDisabled(rn integrationNetwork) bool {
+	if rn.IPv4Configuration == nil || rn.IPv4Configuration.DHCPConfiguration == nil {
+		return false
+	}
+	dc := rn.IPv4Configuration.DHCPConfiguration
+	if dc.Enabled != nil && !*dc.Enabled {
+		return true
+	}
+	mode := strings.ToUpper(strings.TrimSpace(dc.Mode))
+	return mode == "NONE" || mode == "DISABLED" || mode == "OFF"
+}
+
 func extractIntegrationDHCPStart(rn integrationNetwork) string {
+	if integrationDHCPDisabled(rn) {
+		return ""
+	}
 	if s := strings.TrimSpace(rn.DHCPStart); s != "" {
 		return s
 	}
@@ -1181,6 +1435,9 @@ func extractIntegrationDHCPStart(rn integrationNetwork) string {
 }
 
 func extractIntegrationDHCPEnd(rn integrationNetwork) string {
+	if integrationDHCPDisabled(rn) {
+		return ""
+	}
 	if s := strings.TrimSpace(rn.DHCPEnd); s != "" {
 		return s
 	}
@@ -1240,6 +1497,7 @@ func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[s
 			origin = rp.Metadata.Origin
 		}
 		proto := "all"
+		protoNegated := false
 		ipVersion := "both"
 		unsupported := ""
 		if rp.IPProtocolScope != nil {
@@ -1264,6 +1522,7 @@ func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[s
 				switch {
 				case pName != "":
 					proto = strings.ToLower(strings.TrimSpace(pName))
+					protoNegated = pf.MatchOpposite
 				case pf.Type != "" && !strings.EqualFold(pf.Type, "ALL") && !strings.EqualFold(pf.Type, "ANY"):
 					unsupported = fmt.Sprintf("protocol filter type %q", pf.Type)
 				}
@@ -1294,6 +1553,7 @@ func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[s
 			Index:              idx,
 			IPVersion:          ipVersion,
 			Protocol:           proto,
+			ProtocolNegated:    protoNegated,
 			ConnectionStates:   states,
 			MatchReturnTraffic: rp.MatchReturnTraffic || rp.Action.AllowReturnTraffic,
 			Schedule:           schedule,
@@ -1345,46 +1605,86 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 	}
 
 	recognized := false
-	if tf.IPAddressFilter != nil && len(tf.IPAddressFilter.Items) > 0 {
-		recognized = true
-		out.AnyTarget = false
-		out.NegateTarget = out.NegateTarget || tf.IPAddressFilter.MatchOpposite
-		for _, item := range tf.IPAddressFilter.Items {
-			if v := strings.TrimSpace(string(item.Value)); v != "" {
-				out.IPs = append(out.IPs, v)
-			}
-		}
-	}
-	if tf.NetworkFilter != nil && len(tf.NetworkFilter.NetworkIDs) > 0 {
-		recognized = true
-		out.AnyTarget = false
-		out.NegateTarget = out.NegateTarget || tf.NetworkFilter.MatchOpposite
-		out.NetworkIDs = append(out.NetworkIDs, tf.NetworkFilter.NetworkIDs...)
-	}
-	if tf.MACAddressFilter != nil && len(tf.MACAddressFilter.MACAddresses) > 0 {
-		recognized = true
-		out.AnyTarget = false
-		out.NegateTarget = out.NegateTarget || tf.MACAddressFilter.MatchOpposite
-		for _, m := range tf.MACAddressFilter.MACAddresses {
-			if norm := strings.ToLower(strings.TrimSpace(m)); norm != "" {
-				out.MACs = append(out.MACs, norm)
-			}
-		}
-	}
-	if tf.PortFilter != nil && len(tf.PortFilter.Items) > 0 {
-		recognized = true
-		out.AnyPort = false
-		out.NegatePort = out.NegatePort || tf.PortFilter.MatchOpposite
-		for _, item := range tf.PortFilter.Items {
-			if item.Start > 0 && item.End >= item.Start && (item.End-item.Start+1) <= 16 {
-				for p := item.Start; p <= item.End; p++ {
-					out.Ports = append(out.Ports, p)
+	if tf.IPAddressFilter != nil {
+		if len(tf.IPAddressFilter.Items) > 0 {
+			recognized = true
+			out.AnyTarget = false
+			out.NegateTarget = out.NegateTarget || tf.IPAddressFilter.MatchOpposite
+			for _, item := range tf.IPAddressFilter.Items {
+				if v := strings.TrimSpace(string(item.Value)); v != "" {
+					out.IPs = append(out.IPs, v)
 				}
-				continue
 			}
-			if v := strings.TrimSpace(string(item.Value)); v != "" {
-				out.Ports = append(out.Ports, expandPortSpec(v, 16)...)
+			if len(out.IPs) == 0 {
+				out.UnsupportedSelector = fmt.Sprintf("opaque ipAddressFilter (%q)", tf.IPAddressFilter.Type)
 			}
+		} else {
+			out.AnyTarget = false
+			out.UnsupportedSelector = fmt.Sprintf("reference ipAddressFilter (%q)", firstNonEmpty(tf.IPAddressFilter.Type, "empty"))
+		}
+	}
+	if tf.NetworkFilter != nil {
+		if len(tf.NetworkFilter.NetworkIDs) > 0 {
+			recognized = true
+			out.AnyTarget = false
+			out.NegateTarget = out.NegateTarget || tf.NetworkFilter.MatchOpposite
+			out.NetworkIDs = append(out.NetworkIDs, tf.NetworkFilter.NetworkIDs...)
+		} else {
+			out.AnyTarget = false
+			out.UnsupportedSelector = "reference networkFilter (empty)"
+		}
+	}
+	if tf.MACAddressFilter != nil {
+		if len(tf.MACAddressFilter.MACAddresses) > 0 {
+			recognized = true
+			out.AnyTarget = false
+			out.NegateTarget = out.NegateTarget || tf.MACAddressFilter.MatchOpposite
+			for _, m := range tf.MACAddressFilter.MACAddresses {
+				if norm := strings.ToLower(strings.TrimSpace(m)); norm != "" {
+					out.MACs = append(out.MACs, norm)
+				}
+			}
+		} else {
+			out.AnyTarget = false
+			out.UnsupportedSelector = "reference macAddressFilter (empty)"
+		}
+	}
+	if tf.PortFilter != nil {
+		if len(tf.PortFilter.Items) > 0 {
+			recognized = true
+			out.AnyPort = false
+			out.NegatePort = out.NegatePort || tf.PortFilter.MatchOpposite
+			for _, item := range tf.PortFilter.Items {
+				if item.Start >= 1 && item.End >= item.Start && item.End <= 65535 {
+					if item.End-item.Start+1 <= 16 {
+						for p := item.Start; p <= item.End; p++ {
+							out.Ports = append(out.Ports, p)
+						}
+					} else {
+						out.PortRanges = append(out.PortRanges, PortRange{Start: item.Start, End: item.End})
+					}
+					continue
+				}
+				if item.Start != 0 || item.End != 0 {
+					// Out-of-range port bounds (e.g., > 65535 or negative) cannot be trusted.
+					out.UnsupportedSelector = fmt.Sprintf("invalid port range %d-%d", item.Start, item.End)
+					continue
+				}
+				if v := strings.TrimSpace(string(item.Value)); v != "" {
+					ports, ranges, bad := parsePolicyPortSpec(v)
+					out.Ports = append(out.Ports, ports...)
+					out.PortRanges = append(out.PortRanges, ranges...)
+					if bad {
+						out.UnsupportedSelector = fmt.Sprintf("unrecognized port spec %q", v)
+					}
+				}
+			}
+			if !out.HasPortConstraint() && out.UnsupportedSelector == "" {
+				out.UnsupportedSelector = fmt.Sprintf("opaque portFilter (%q)", tf.PortFilter.Type)
+			}
+		} else {
+			out.AnyPort = false
+			out.UnsupportedSelector = fmt.Sprintf("reference portFilter (%q)", firstNonEmpty(tf.PortFilter.Type, "empty"))
 		}
 	}
 	// If the controller supplied a non-empty trafficFilter type (e.g., REGION,
@@ -1392,11 +1692,47 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 	// mark it unsupported so the evaluator yields "unknown" rather than treating
 	// it as AnyTarget=true.
 	tfType := strings.ToUpper(strings.TrimSpace(tf.Type))
-	if !recognized && tfType != "" && tfType != "ANY" && tfType != "ALL" {
+	if !recognized && out.UnsupportedSelector == "" && tfType != "" && tfType != "ANY" && tfType != "ALL" {
 		out.AnyTarget = false
 		out.UnsupportedSelector = fmt.Sprintf("traffic filter type %q", tf.Type)
 	}
 	return out
+}
+
+// parsePolicyPortSpec decodes a port specification string ("443", "80,443",
+// "400-500", "1-65535") without dropping ranges wider than 16 ports: small
+// ranges <=16 expand into concrete ports while wider valid ranges are preserved
+// in PortRanges.
+func parsePolicyPortSpec(spec string) (ports []int, ranges []PortRange, hadInvalid bool) {
+	for _, token := range strings.Split(spec, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if startStr, endStr, ok := strings.Cut(token, "-"); ok {
+			start, err1 := strconv.Atoi(strings.TrimSpace(startStr))
+			end, err2 := strconv.Atoi(strings.TrimSpace(endStr))
+			if err1 != nil || err2 != nil || start < 1 || end > 65535 || end < start {
+				hadInvalid = true
+				continue
+			}
+			if end-start+1 <= 16 {
+				for p := start; p <= end; p++ {
+					ports = append(ports, p)
+				}
+			} else {
+				ranges = append(ranges, PortRange{Start: start, End: end})
+			}
+			continue
+		}
+		p, err := strconv.Atoi(token)
+		if err != nil || p < 1 || p > 65535 {
+			hadInvalid = true
+			continue
+		}
+		ports = append(ports, p)
+	}
+	return ports, ranges, hadInvalid
 }
 
 // enrichIntegrationNetworks fills in missing IPv4 subnets, isolation flags,
@@ -1418,10 +1754,11 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 		return nil
 	}
 
+	apiPrefix, site := c.sessionPrefixAndSite()
 	legacyCh := make(chan []rawNetwork, 1)
 	go func() {
 		var env apiEnvelope[rawNetwork]
-		if err := c.getJSON(ctx, c.apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", c.site), &env); err == nil {
+		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/networkconf", site), &env); err == nil {
 			legacyCh <- env.Data
 			return
 		}
@@ -1508,11 +1845,16 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 		if items[i].RouterDeviceMAC == "" && strings.EqualFold(strings.TrimSpace(rn.GatewayType), "switch") && rn.GatewayDevice != "" {
 			items[i].RouterDeviceMAC = strings.ToLower(strings.TrimSpace(rn.GatewayDevice))
 		}
-		if extractIntegrationDHCPStart(items[i]) == "" && rn.DHCPDStart != "" {
-			items[i].DHCPStart = rn.DHCPDStart
-		}
-		if extractIntegrationDHCPEnd(items[i]) == "" && rn.DHCPDStop != "" {
-			items[i].DHCPEnd = rn.DHCPDStop
+		if rn.DHCPDEnabled == nil || *rn.DHCPDEnabled {
+			if extractIntegrationDHCPStart(items[i]) == "" && rn.DHCPDStart != "" {
+				items[i].DHCPStart = rn.DHCPDStart
+			}
+			if extractIntegrationDHCPEnd(items[i]) == "" && rn.DHCPDStop != "" {
+				items[i].DHCPEnd = rn.DHCPDStop
+			}
+		} else {
+			items[i].DHCPStart = ""
+			items[i].DHCPEnd = ""
 		}
 		if items[i].DHCPGuardEnabled == nil && rn.DHCPGuardEnabled != nil {
 			items[i].DHCPGuardEnabled = rn.DHCPGuardEnabled
@@ -1547,10 +1889,54 @@ func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("GET %s returned HTTP %d", e.path, e.status)
 }
 
+// apiEnvelopeError reports a UniFi REST envelope carrying meta.rc == "error"
+// even when the controller replied with HTTP 200.
+type apiEnvelopeError struct {
+	path string
+	msg  string
+}
+
+func (e *apiEnvelopeError) Error() string {
+	if e.msg != "" {
+		return fmt.Sprintf("API %s returned error: %s", e.path, e.msg)
+	}
+	return fmt.Sprintf("API %s returned meta.rc=error", e.path)
+}
+
+func checkAPIEnvelopeError(path string, body []byte) error {
+	var metaOnly struct {
+		Meta *struct {
+			RC  string `json:"rc"`
+			Msg string `json:"msg"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(body, &metaOnly); err == nil && metaOnly.Meta != nil {
+		if strings.EqualFold(strings.TrimSpace(metaOnly.Meta.RC), "error") {
+			return &apiEnvelopeError{path: path, msg: strings.TrimSpace(metaOnly.Meta.Msg)}
+		}
+	}
+	return nil
+}
+
+func isSessionExpiredError(err error) bool {
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) && httpErr.status == http.StatusUnauthorized {
+		return true
+	}
+	var apiErr *apiEnvelopeError
+	if errors.As(err, &apiErr) && strings.Contains(strings.ToLower(apiErr.msg), "loginrequired") {
+		return true
+	}
+	return false
+}
+
 // getJSON performs a read-only GET request against a full controller path and
-// decodes its JSON response into dst, retrying once on transient 429/5xx bursts.
+// decodes its JSON response into dst, transparently re-logging in once if a
+// cookie session expired (HTTP 401 or api.err.LoginRequired) and retrying once
+// on transient 429/5xx bursts.
 func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) error {
 	var lastErr error
+	relogged := false
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
 			timer := time.NewTimer(250 * time.Millisecond)
@@ -1561,14 +1947,31 @@ func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) erro
 			case <-timer.C:
 			}
 		}
+		epoch := c.currentAuthEpoch()
 		err := c.getJSONOnce(ctx, fullPath, dst)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
+		if !relogged && c.canRelogin() && isSessionExpiredError(err) {
+			relogged = true
+			if loginErr := c.relogin(ctx, epoch); loginErr == nil {
+				// Retry immediately with the fresh session without consuming the transient retry slot.
+				if retryErr := c.getJSONOnce(ctx, fullPath, dst); retryErr == nil {
+					return nil
+				} else {
+					lastErr = retryErr
+				}
+			}
+			return lastErr
+		}
+		var apiErr *apiEnvelopeError
+		if errors.As(lastErr, &apiErr) {
+			return lastErr
+		}
 		var httpErr *httpStatusError
-		if errors.As(err, &httpErr) && httpErr.status != http.StatusTooManyRequests && httpErr.status < 500 {
-			return err
+		if errors.As(lastErr, &httpErr) && httpErr.status != http.StatusTooManyRequests && httpErr.status < 500 {
+			return lastErr
 		}
 	}
 	return lastErr
@@ -1584,8 +1987,8 @@ func (c *Controller) getJSONOnce(ctx context.Context, fullPath string, dst any) 
 	if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	if c.csrfToken != "" {
-		req.Header.Set("X-CSRF-Token", c.csrfToken)
+	if tok := c.currentCSRFToken(); tok != "" {
+		req.Header.Set("X-CSRF-Token", tok)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -1594,12 +1997,19 @@ func (c *Controller) getJSONOnce(ctx context.Context, fullPath string, dst any) 
 	}
 	defer resp.Body.Close()
 
+	if tok := resp.Header.Get("X-CSRF-Token"); tok != "" {
+		c.setCSRFToken(tok)
+	}
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxControllerBodyBytes))
 	if err != nil {
 		return fmt.Errorf("read %s: %w", fullPath, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &httpStatusError{path: fullPath, status: resp.StatusCode}
+	}
+	if err := checkAPIEnvelopeError(fullPath, body); err != nil {
+		return err
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
 		return fmt.Errorf("decode %s: %w", fullPath, err)
