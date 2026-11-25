@@ -37,15 +37,25 @@ const (
 	maxBannerReadBytes = 2048
 )
 
+// SwitchPortRef identifies a physical socket independently of any attached host.
+type SwitchPortRef struct {
+	// SwitchMAC is the normalized MAC address of the owning switch.
+	SwitchMAC string `json:"switch_mac"`
+
+	// PortIdx is the one-based physical port number on the switch.
+	PortIdx int `json:"port_idx"`
+}
+
 // Finding records a confirmed security issue discovered on a specific LAN host.
 type Finding struct {
 	// CheckID is the identifier of the check that triggered (e.g., "UB-0003").
 	CheckID string `json:"check_id"`
 
-	// AffectedClientMACs lists lowercase client MAC addresses linked to a
-	// network-scoped isolation finding so dashboards can highlight both the
-	// affected hosts and their attached switch ports.
+	// AffectedClientMACs lists concrete client endpoints of permitted peer paths.
 	AffectedClientMACs []string `json:"affected_client_macs,omitempty"`
+
+	// AffectedSwitchPorts lists wired sockets with actionable isolation settings.
+	AffectedSwitchPorts []SwitchPortRef `json:"affected_switch_ports,omitempty"`
 
 	// Title summarizes the detected exposure or vulnerability.
 	Title string `json:"title"`

@@ -1334,8 +1334,11 @@ func BuildPresentationModel(
 			}
 			if target != nil {
 				expected := "Deny unapproved access"
+				observed := f.Evidence
 				if f.CheckID == "UB-UNIFI-ISO-SAME-VLAN" {
 					expected = "Block traffic between VLAN peers"
+					// Both drawers already render the self-contained peer summary.
+					observed = ""
 				}
 				reason := Reason{
 					ID:          fid,
@@ -1345,28 +1348,28 @@ func BuildPresentationModel(
 					Title:       f.Title,
 					Severity:    sev,
 					Expected:    expected,
-					Observed:    f.Evidence,
+					Observed:    observed,
 					Evidence:    f.Evidence,
 					Remediation: f.Remediation.Summary,
 					Source:      "unifi-isolation",
 					Port:        f.Port,
 				}
 				target.Reasons = append(target.Reasons, reason)
-				// Keep one primary fix-queue item on the VLAN while surfacing the
-				// same peer-isolation evidence on each affected client and switch port.
+				// Hosts can be exposed behind compliant sockets. Only the evaluator
+				// knows which physical settings contribute to the peer finding.
 				reason.Secondary = true
 				seen := map[string]bool{target.ID: true}
+				attach := func(id string) {
+					if entity := pm.Entities[id]; entity != nil && !seen[id] {
+						entity.Reasons = append(entity.Reasons, reason)
+						seen[id] = true
+					}
+				}
 				for _, mac := range f.AffectedClientMACs {
-					host := pm.Entities[hostIDByMAC[strings.ToLower(mac)]]
-					if host == nil {
-						continue
-					}
-					for _, id := range []string{host.ID, host.PortID} {
-						if entity := pm.Entities[id]; entity != nil && !seen[id] {
-							entity.Reasons = append(entity.Reasons, reason)
-							seen[id] = true
-						}
-					}
+					attach(hostIDByMAC[strings.ToLower(mac)])
+				}
+				for _, ref := range f.AffectedSwitchPorts {
+					attach(portEntityID(ref.SwitchMAC, ref.PortIdx))
 				}
 			}
 
@@ -1505,27 +1508,24 @@ func BuildPresentationModel(
 	// Surface missing same-VLAN peer evidence as a Review reason on the network
 	// entity so incomplete telemetry is never presented as verified isolation.
 	if report.Isolation != nil {
-		missing := make(map[string]string)
+		missing := make(map[string]bool)
 		for _, c := range report.Isolation.Cells {
 			if c.Verdict == risk.IsolationUnknown && c.SourceNetwork == c.DestNetwork {
-				if _, seen := missing[c.SourceNetwork]; !seen {
-					missing[c.SourceNetwork] = c.MissingInput
-				}
+				missing[c.SourceNetwork] = true
 			}
 		}
 		for _, n := range report.Isolation.Containment {
-			detail := missing[n.NetworkName]
-			if detail == "" && n.Peers.State == "unknown" {
-				detail = n.Peers.Detail
+			if !missing[n.NetworkName] && n.Peers.State != "unknown" {
+				continue
 			}
-			if ent := pm.Entities[netEntByName[strings.ToLower(n.NetworkName)]]; ent != nil && detail != "" {
+			if ent := pm.Entities[netEntByName[strings.ToLower(n.NetworkName)]]; ent != nil {
 				ent.Reasons = append(ent.Reasons, Reason{
 					ID:          "peer-coverage:" + ent.ID,
 					Kind:        "coverage",
 					State:       VerdictReview,
 					Severity:    "unknown",
 					Title:       "Peer isolation unverified",
-					Evidence:    detail,
+					Evidence:    n.Peers.Detail,
 					Remediation: "Verify switch and wireless attachment data for this network.",
 					Source:      "unifi-isolation",
 				})

@@ -7,6 +7,9 @@
 package risk
 
 import (
+	"fmt"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -476,6 +479,11 @@ func TestDualStackPeersWithIPv4OnlyDeny(t *testing.T) {
 		Source:      unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
 		Destination: unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
 	}}
+	_, _, findings := evaluatePeerContainmentAxis(s, s.Networks[2], "complete", "")
+	f := findPeerGap(t, findings, "isolation-wired-sensors")
+	if !strings.Contains(f.Evidence, "Switch L2/L3 Default permits IPv6") || strings.Contains(f.Evidence, "IPv4") || strings.Contains(f.Remediation.Summary, "IPv4") {
+		t.Fatalf("incorrect family attribution: %+v", f)
+	}
 	r := sensorContainment(t, s, c)
 	if r.Peers.State == "isolated" {
 		t.Fatalf("IPv6 switched peers remain unrestricted: %+v", r.Peers)
@@ -526,8 +534,246 @@ func TestWiredPeerACLUsesBothRealEndpoints(t *testing.T) {
 	if p := sensorContainment(t, s, cfg).Peers; !p.Violation {
 		t.Fatalf("missed reverse connection: %+v", p)
 	}
+	_, _, findings := evaluatePeerContainmentAxis(s, s.Networks[2], "complete", "")
+	f := findPeerGap(t, findings, "isolation-wired-sensors")
+	flow := "IPv4 TCP/8554 from " + b.IP + " ("
+	if !strings.Contains(f.Evidence, flow) || !strings.Contains(f.Evidence, "to "+a.IP) ||
+		!strings.Contains(f.Remediation.Summary, "Narrow Return camera connection") ||
+		!slices.Equal(f.AffectedClientMACs, []string{a.MAC, b.MAC}) {
+		t.Fatalf("missing directional ACL witness: %+v", f)
+	}
 	s.SwitchACLs[0].Destination.IPs = []string{"198.51.100.77"}
 	if p := sensorContainment(t, s, cfg).Peers; p.Violation || p.State != "isolated" {
 		t.Fatalf("unrelated exception affected cameras: %+v", p)
+	}
+}
+
+// findPeerGap checks that a VLAN has exactly one primary finding for the kind.
+func findPeerGap(t *testing.T, findings []checks.Finding, property string) checks.Finding {
+	t.Helper()
+	var matches []checks.Finding
+	for _, f := range findings {
+		if f.CheckID == "UB-UNIFI-ISO-SAME-VLAN" && f.Property == property {
+			matches = append(matches, f)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one %s finding, got %+v", property, matches)
+	}
+	return matches[0]
+}
+
+// wiredPeerSite returns a dual-stack VLAN with one camera per physical port.
+func wiredPeerSite(count int) *unifi.Snapshot {
+	const sw = "00:00:5e:00:53:01"
+	s := &unifi.Snapshot{
+		Networks:          []unifi.Network{{ID: "c", Name: "Cameras", Subnet: "192.0.2.0/24", IPv6Subnet: "2001:db8::/64"}},
+		Devices:           []unifi.Device{{MAC: sw, Name: "Network POE Switch", Type: "usw"}},
+		SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
+	}
+	for i := 1; i <= count; i++ {
+		s.Devices[0].Ports = append(s.Devices[0].Ports, unifi.SwitchPort{PortIdx: i, Enabled: true, Up: true, MACTableCount: 1})
+		s.Clients = append(s.Clients, unifi.Client{
+			MAC: fmt.Sprintf("02:00:00:00:00:%02x", i), IP: fmt.Sprintf("192.0.2.%d", i+10),
+			IPv6: []string{fmt.Sprintf("2001:db8::%x", i+10)}, NetworkName: "Cameras",
+			Name: fmt.Sprintf("Camera %d", i), IsWired: true, SwitchMAC: sw, SwitchPort: i,
+		})
+	}
+	return s
+}
+
+// TestWiredPeerAttributionAndSummary reproduces the five-camera faceplate case.
+// IPv4 and IPv6 share a single pair count and stable physical remediation list.
+func TestWiredPeerAttributionAndSummary(t *testing.T) {
+	s := wiredPeerSite(5)
+	var macs []string
+	for i, name := range []string{"Camera - Fence", "Camera - Street", "Camera - Terrace", "Camera - Garden", "Doorbell"} {
+		s.Clients[i].Name = name
+		s.Devices[0].Ports[i].Isolation = i >= 2
+		macs = append(macs, s.Clients[i].MAC)
+	}
+	axis, _, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	f := findPeerGap(t, findings, "isolation-wired-cameras")
+	wantPorts := []checks.SwitchPortRef{{SwitchMAC: s.Devices[0].MAC, PortIdx: 1}, {SwitchMAC: s.Devices[0].MAC, PortIdx: 2}}
+	if !slices.Equal(f.AffectedClientMACs, macs) || !slices.Equal(f.AffectedSwitchPorts, wantPorts) {
+		t.Fatalf("incorrect attribution: %+v", f)
+	}
+	if axis.State != "partial" || !axis.Violation || axis.Detail != "7 of 10 wired peer pairs permit traffic. Port isolation is off on Network POE Switch ports 1 and 2." {
+		t.Fatalf("peer axis: %+v", axis)
+	}
+	if f.Evidence != "Switch Port Isolation is off on Network POE Switch ports 1 (Camera - Fence) and 2 (Camera - Street). Switch L2/L3 Default permits IPv4 and IPv6 traffic across 7 of 10 wired peer pairs." ||
+		f.Remediation.Summary != "Enable Switch Port Isolation on Network POE Switch ports 1 and 2, or apply a Cameras peer isolation ACL covering IPv4 and IPv6." {
+		t.Fatalf("unexpected operator copy: %s / %s", f.Evidence, f.Remediation.Summary)
+	}
+	slices.Reverse(s.Clients)
+	slices.Reverse(s.Devices[0].Ports)
+	next, _, nextFindings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	if next != axis || !reflect.DeepEqual(nextFindings, findings) {
+		t.Fatal("controller ordering changed the peer summary")
+	}
+}
+
+// TestPeerRuleSummaries keeps the two directions and families associated with
+// their own rules, even when the first direction already establishes exposure.
+func TestPeerRuleSummaries(t *testing.T) {
+	s := wiredPeerSite(2)
+	for i, cl := range s.Clients {
+		rule := fmt.Sprintf("Allow peer %d", i+1)
+		s.SwitchACLs = append(s.SwitchACLs, unifi.SwitchACL{
+			ID: rule, Name: rule, Enabled: true, Action: "ALLOW", IPVersion: "ipv4", Protocol: "all",
+			Source:      unifi.PolicyEndpoint{MACs: []string{cl.MAC}, AnyPort: true},
+			Destination: unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
+		})
+	}
+	_, cells, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	f := findPeerGap(t, findings, "isolation-wired-cameras")
+	if len(cells) != 2 || !strings.Contains(f.Evidence, "Allow peer 1 on Network POE Switch permits IPv4") ||
+		!strings.Contains(f.Evidence, "Allow peer 2 on Network POE Switch permits IPv4") ||
+		!strings.Contains(f.Evidence, "Switch L2/L3 Default on Network POE Switch permits IPv6") ||
+		strings.Contains(f.Evidence, "permits IPv4 and IPv6") {
+		t.Fatalf("rule, family or direction lost: %s", f.Evidence)
+	}
+}
+
+// TestSharedWiredPeerCoverage separates the upstream crossing from uncertainty
+// about traffic forwarded locally behind a shared access socket.
+func TestSharedWiredPeerCoverage(t *testing.T) {
+	for _, tc := range []struct{ macs, attached int }{{3, 1}, {1, 3}, {3, 3}} {
+		t.Run(fmt.Sprintf("%d-macs-%d-clients", tc.macs, tc.attached), func(t *testing.T) {
+			s := wiredPeerSite(1 + tc.attached)
+			for i := range s.Clients {
+				s.Devices[0].Ports[i].Isolation = true
+				if i > 0 {
+					s.Clients[i].SwitchPort = 2
+				}
+			}
+			s.Devices[0].Ports[1].MACTableCount = tc.macs
+			axis, cells, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+			unknown, blocked := 0, 0
+			for _, c := range cells {
+				switch c.Verdict {
+				case IsolationUnknown:
+					unknown++
+					if !strings.Contains(c.MissingInput, "Network POE Switch port 2") {
+						t.Fatalf("unattributed downstream gap: %+v", c)
+					}
+				case IsolationBlockedOK:
+					blocked++
+				}
+			}
+			if len(findings) != 0 || axis.State != "partial" || axis.Violation || unknown != 1 || blocked != tc.attached {
+				t.Fatalf("shared socket incorrectly changed upstream verdict: %+v, cells %+v", axis, cells)
+			}
+		})
+	}
+}
+
+// TestWiFiPeerRemediation keeps AP trunks out of port attribution and prevents
+// offering an isolated wired socket as a complete fix when its AP peer is open.
+func TestWiFiPeerRemediation(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		wiredOn, apOn, infra bool
+		wantPort, portFix    bool
+	}{
+		{"both off", false, false, false, true, false},
+		{"only wired off", false, true, false, true, true},
+		{"only AP off", true, false, false, false, false},
+		{"learned behind infrastructure", false, false, true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := wiredPeerSite(1)
+			sw := &s.Devices[0]
+			sw.Ports[0].Isolation = tc.wiredOn
+			for _, idx := range []int{9, 10} {
+				sw.Ports = append(sw.Ports, unifi.SwitchPort{PortIdx: idx, Isolation: tc.apOn, TaggedVLANMgmt: "auto", MACTableCount: 12})
+			}
+			s.Devices = append(s.Devices,
+				unifi.Device{Type: "uap", MAC: "02:00:00:01:00:09", UplinkMAC: sw.MAC, UplinkPort: 9, Name: "AP A"},
+				unifi.Device{Type: "uap", MAC: "02:00:00:01:00:10", UplinkMAC: sw.MAC, UplinkPort: 10, Name: "AP B"})
+			if tc.infra {
+				s.Clients[0].SwitchPort = 9
+			}
+			s.Clients = append(s.Clients, unifi.Client{MAC: "02:00:00:02:00:11", APMAC: s.Devices[1].MAC, NetworkName: "Cameras"})
+			s.WLANs = []unifi.WLANConfig{{Name: "Patio", NetworkName: "Cameras", Enabled: true}}
+			axis, cells, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+			if strings.Contains(axis.Detail, "Downstream") {
+				t.Fatalf("AP trunk treated as a shared access socket: %+v", axis)
+			}
+			mixed := findPeerGap(t, findings, "isolation-mixed-cameras")
+			var want []checks.SwitchPortRef
+			if tc.wantPort {
+				want = []checks.SwitchPortRef{{SwitchMAC: sw.MAC, PortIdx: 1}}
+			}
+			if !slices.Equal(mixed.AffectedSwitchPorts, want) || !slices.Equal(mixed.AffectedClientMACs, []string{s.Clients[0].MAC}) ||
+				slices.Contains(mixed.Remediation.UniFiActions, "enable_switch_port_isolation") != tc.portFix ||
+				strings.Contains(mixed.Remediation.Summary, "Enable Switch Port Isolation") != tc.portFix {
+				t.Fatalf("wrong mixed attribution or fix: %+v", mixed)
+			}
+			for _, c := range cells {
+				if c.PathKind == "mixed-same-vlan" && c.Verdict == IsolationViolation &&
+					strings.Contains(c.RecommendedFix, "Enable Switch Port Isolation") != tc.portFix {
+					t.Fatalf("wrong matrix remediation: %+v", c)
+				}
+			}
+			if !tc.apOn {
+				f := findPeerGap(t, findings, "isolation-cross-ap-cameras")
+				if len(f.AffectedClientMACs)+len(f.AffectedSwitchPorts) != 0 || !slices.Equal(f.Remediation.UniFiActions, []string{"add_switch_l2_isolation_acl"}) {
+					t.Fatalf("cross-AP gap escaped the VLAN: %+v", f)
+				}
+			}
+			s.Clients = nil
+			_, _, findings = evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+			f := findPeerGap(t, findings, "isolation-same-ap-cameras")
+			if f.Evidence != "Client Device Isolation is off on SSID Patio." || f.Remediation.Summary != "Enable Client Device Isolation on Patio." ||
+				len(f.AffectedClientMACs)+len(f.AffectedSwitchPorts) != 0 {
+				t.Fatalf("wrong same-AP finding without active clients: %+v", f)
+			}
+		})
+	}
+}
+
+// TestPeerSummaryBounds checks the display limit independently of attribution
+// and ensures a truncated pair search still surfaces its missing coverage.
+func TestPeerSummaryBounds(t *testing.T) {
+	s := wiredPeerSite(20)
+	for i := range s.Clients {
+		s.Clients[i].Name = strings.Repeat("x", 100)
+	}
+	axis, _, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	f := findPeerGap(t, findings, "isolation-wired-cameras")
+	if len(f.AffectedClientMACs) != 20 || len(f.AffectedSwitchPorts) != 20 || !strings.Contains(f.Evidence, "190 of 190 wired peer pairs") ||
+		!strings.Contains(f.Evidence, "+14 more ports") || !strings.Contains(f.Remediation.Summary, "+14 more ports") ||
+		!strings.Contains(axis.Detail, "+18 more ports") || strings.Contains(f.Evidence, strings.Repeat("x", 65)) ||
+		strings.Count(f.Evidence, "Switch L2/L3 Default") != 1 || len(f.Evidence) > 700 {
+		t.Fatalf("unbounded or incomplete summary: %+v, %s", f, axis.Detail)
+	}
+	// Many distinct rule and SSID names must respect the same display bound.
+	for i, cl := range s.Clients {
+		name := fmt.Sprintf("Allow %02d", i+1)
+		s.SwitchACLs = append(s.SwitchACLs, unifi.SwitchACL{
+			ID: name, Name: name, Enabled: true, Action: "ALLOW", IPVersion: "both", Protocol: "all",
+			Source:      unifi.PolicyEndpoint{MACs: []string{cl.MAC}, AnyPort: true},
+			Destination: unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
+		})
+		s.WLANs = append(s.WLANs, unifi.WLANConfig{Name: fmt.Sprintf("SSID %02d", i+1), Enabled: true, NetworkName: "Cameras"})
+	}
+	_, _, findings = evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	f = findPeerGap(t, findings, "isolation-wired-cameras")
+	if !strings.Contains(f.Evidence, "+14 more rules") || !strings.Contains(f.Remediation.Summary, "+14 more rules") {
+		t.Fatalf("rule display limit missing: %+v", f)
+	}
+	f = findPeerGap(t, findings, "isolation-same-ap-cameras")
+	if !strings.Contains(f.Evidence, "+14 more SSIDs") || !strings.Contains(f.Remediation.Summary, "+14 more SSIDs") {
+		t.Fatalf("SSID display limit missing: %+v", f)
+	}
+	s = wiredPeerSite(65)
+	for i := range s.Devices[0].Ports {
+		s.Devices[0].Ports[i].Isolation = i != 0
+	}
+	axis, _, findings = evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	f = findPeerGap(t, findings, "isolation-wired-cameras")
+	if !strings.Contains(f.Evidence, "64 of 2048 evaluated wired peer pairs") || !strings.Contains(axis.Detail, "limit reached") || !axis.Violation {
+		t.Fatalf("lost partial coverage: %+v, %s", f, axis.Detail)
 	}
 }

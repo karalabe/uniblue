@@ -725,24 +725,67 @@ func TestCameraPeerGapReachesInventory(t *testing.T) {
 
 	vm := evaluate()
 	nc := vm.Logical[0].Containment
-	if nc == nil || !nc.Peers.Violation || nc.Peers.State != "partial" || !strings.Contains(nc.Peers.Detail, "Port 3") {
+	if nc == nil || !nc.Peers.Violation || nc.Peers.State != "partial" || !strings.Contains(nc.Peers.Detail, "Camera switch port 3") {
 		t.Fatalf("mixed port isolation: %+v", nc)
 	}
+	const checkID = "UB-UNIFI-ISO-SAME-VLAN"
+	// Check this finding's ownership even when a socket has another policy reason.
+	checkEntity := func(id string, want int, secondary bool) {
+		t.Helper()
+		e := vm.Entities[id]
+		if e == nil {
+			t.Fatalf("missing entity %s", id)
+		}
+		count := 0
+		for _, r := range e.Reasons {
+			if r.Ref == checkID {
+				count++
+				if r.Secondary != secondary || r.State != VerdictExposed || r.Observed != "" || r.Evidence == "" {
+					t.Errorf("unexpected peer reason on %s: %+v", id, r)
+				}
+			}
+		}
+		if count != want || (want > 0 && e.State != VerdictExposed) {
+			t.Errorf("%s has state %s and %d peer reasons, want %d reasons", id, e.State, count, want)
+		}
+	}
+	netID := netEntityID("cam", "Cameras")
+	checkEntity(netID, 1, false)
 	for _, cl := range snap.Clients {
-		for _, id := range []string{hostEntityID(cl), portEntityID(sw, cl.SwitchPort)} {
-			if e := vm.Entities[id]; e == nil || e.State != VerdictExposed {
-				t.Fatalf("missing peer warning on %s", id)
+		checkEntity(hostEntityID(cl), 1, true)
+		want := 0
+		if cl.SwitchPort == 3 {
+			want = 1
+		}
+		checkEntity(portEntityID(sw, cl.SwitchPort), want, true)
+	}
+	queueCount := 0
+	for _, item := range vm.Queue {
+		if item.ReasonRef == checkID {
+			queueCount++
+			if item.SubjectID != netID {
+				t.Errorf("secondary entity owns a queue item: %+v", item)
 			}
 		}
 	}
-	count := 0
-	for _, reason := range vm.Entities[netEntityID("cam", "Cameras")].Reasons {
-		if reason.Ref == "UB-UNIFI-ISO-SAME-VLAN" {
-			count++
+	if queueCount != 1 {
+		t.Fatalf("got %d peer items in fix queue", queueCount)
+	}
+
+	// Port references still resolve with no host inventory. Older findings that
+	// contain only host MACs must never restore the host-to-socket inference.
+	rep := risk.Evaluate(snap, nil, config.NetworkConfig{})
+	vm = BuildPresentationModel(snap, rep, nil, nil, nil, nil, nil)
+	checkEntity(portEntityID(sw, 3), 1, true)
+	for i := range rep.Findings {
+		if rep.Findings[i].CheckID == checkID {
+			rep.Findings[i].AffectedSwitchPorts = nil
 		}
 	}
-	if count != 1 {
-		t.Fatalf("expected one primary network alert, got %d", count)
+	vm = BuildPresentationModel(snap, rep, nil, views, nil, nil, nil)
+	for _, cl := range snap.Clients {
+		checkEntity(hostEntityID(cl), 1, true)
+		checkEntity(portEntityID(sw, cl.SwitchPort), 0, true)
 	}
 
 	snap.Devices[0].Ports[2].Isolation = true
@@ -750,10 +793,26 @@ func TestCameraPeerGapReachesInventory(t *testing.T) {
 	if p := vm.Logical[0].Containment.Peers; p.State != "isolated" || p.Violation {
 		t.Fatalf("all ports isolated: %+v", p)
 	}
+	for _, cl := range snap.Clients {
+		checkEntity(hostEntityID(cl), 0, true)
+		checkEntity(portEntityID(sw, cl.SwitchPort), 0, true)
+	}
 
 	snap.Devices[0].Ports[2].IsolationUnknown = true
 	vm = evaluate()
 	if p := vm.Logical[0].Containment.Peers; p.State == "isolated" || vm.Entities[netEntityID("cam", "Cameras")].State == VerdictOK {
 		t.Fatalf("missing profile produced clean verdict: %+v", p)
 	}
+
+	// A second coverage gap must remain visible alongside the unresolved profile.
+	snap.Devices[0].Ports[0].MACTableCount = 3
+	vm = evaluate()
+	for _, r := range vm.Entities[netID].Reasons {
+		if r.ID == "peer-coverage:"+netID && r.State == VerdictReview &&
+			strings.Contains(r.Evidence, "Camera switch port 1") && strings.Contains(r.Evidence, "settings") {
+			checkEntity(portEntityID(sw, 1), 0, true)
+			return
+		}
+	}
+	t.Fatalf("VLAN Review missing shared socket and unknown settings: %+v", vm.Entities[netID].Reasons)
 }

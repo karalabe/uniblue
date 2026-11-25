@@ -7,9 +7,13 @@
 package risk
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/karalabe/uniblue/internal/checks"
@@ -404,44 +408,288 @@ func evaluateNetworkContainment(
 	return containments, cells, findings, notes
 }
 
+// peerGap accumulates report facts for one path kind. Counts are per attachment
+// path, while the matrix retains each evaluated address family's decision.
+type peerGap struct {
+	kind, property, title, unit, function string
+
+	evaluated, permitted int
+	clients              map[string]bool
+	ports                map[checks.SwitchPortRef]string
+	ssids                map[string]bool
+	rules                map[[3]string]*peerPermit // switch MAC, rule ID, rule name
+	requiresACL, limited bool
+}
+
+// peerPermit keeps the actual permitting families together with one directional
+// witness for a named ACL exception. Default forwarding needs no example.
+type peerPermit struct {
+	name, example string
+	v4, v6        int
+}
+
+// peerFamilies names just the IP families for which an allow was witnessed.
+func peerFamilies(v4, v6 bool) string {
+	if v4 && v6 {
+		return "IPv4 and IPv6"
+	}
+	if v6 {
+		return "IPv6"
+	}
+	return "IPv4"
+}
+
+// comparePeerPorts orders sockets numerically within a physical switch.
+func comparePeerPorts(a, b checks.SwitchPortRef) int {
+	if n := cmp.Compare(a.SwitchMAC, b.SwitchMAC); n != 0 {
+		return n
+	}
+	return cmp.Compare(a.PortIdx, b.PortIdx)
+}
+
+// peerLabel bounds controller-supplied labels in dashboard summaries.
+func peerLabel(s string) string {
+	if r := []rune(s); len(r) > 64 {
+		return string(r[:61]) + "..."
+	}
+	return s
+}
+
+// peerList caps a sorted display list while keeping omitted items visible.
+func peerList(items []string, limit int, noun string) string {
+	if len(items) > limit {
+		omitted := len(items) - limit
+		if omitted == 1 {
+			noun = strings.TrimSuffix(noun, "s")
+		}
+		return fmt.Sprintf("%s, +%d more %s", strings.Join(items[:limit], ", "), omitted, noun)
+	}
+	if len(items) == 2 {
+		return items[0] + " and " + items[1]
+	}
+	return strings.Join(items, ", ")
+}
+
+// peerPortList groups sockets by switch and caps physical ports across switches.
+// The caller sorts by switch MAC and numeric port so trimming is deterministic.
+func peerPortList(snap *unifi.Snapshot, refs []checks.SwitchPortRef, labels map[checks.SwitchPortRef]string, limit int) string {
+	var groups []string
+	shown := refs[:min(limit, len(refs))]
+	for len(shown) > 0 {
+		sw := shown[0].SwitchMAC
+		var numbers []string
+		for len(shown) > 0 && shown[0].SwitchMAC == sw {
+			ref := shown[0]
+			number := strconv.Itoa(ref.PortIdx)
+			if label := labels[ref]; label != "" {
+				number += " (" + peerLabel(label) + ")"
+			}
+			numbers = append(numbers, number)
+			shown = shown[1:]
+		}
+		noun := " port "
+		if len(numbers) > 1 {
+			noun = " ports "
+		}
+		groups = append(groups, peerLabel(deviceNameByMAC(snap, sw))+noun+peerList(numbers, limit, "ports"))
+	}
+	if len(refs) > limit {
+		noun := "ports"
+		if len(refs)-limit == 1 {
+			noun = "port"
+		}
+		groups = append(groups, fmt.Sprintf("+%d more %s", len(refs)-limit, noun))
+	}
+	return strings.Join(groups, ", ")
+}
+
+// peerRemediation offers a port change only when it closes every reported
+// crossing. A permissive rule may need narrowing before a VLAN deny can work.
+func peerRemediation(network, families, ports, exceptions string, defaultAllow bool) checks.Remediation {
+	var steps, actions []string
+	if defaultAllow {
+		acl := "a " + peerLabel(network) + " peer isolation ACL covering " + families
+		if ports == "" {
+			steps = append(steps, "Apply "+acl+".")
+		} else {
+			steps = append(steps, "Enable Switch Port Isolation on "+ports+", or apply "+acl+".")
+			actions = append(actions, "enable_switch_port_isolation")
+		}
+		actions = append(actions, "add_switch_l2_isolation_acl")
+	}
+	if exceptions != "" {
+		steps = append(steps, "Narrow "+exceptions+" and ensure remaining peer traffic on "+peerLabel(network)+" is denied.")
+		actions = append(actions, "restrict_switch_acl")
+	}
+	return checks.Remediation{Summary: strings.Join(steps, " "), UniFiActions: actions}
+}
+
+// recordPermit keeps a representative flow for an explicit rule. The caller
+// submits a rule once per pair and family even if both directions match it.
+func (g *peerGap) recordPermit(cell *IsolationCell, sw, from, to, fixPorts string) {
+	key := [3]string{sw, cell.DecisiveRuleID, cell.DecisiveRuleName}
+	rule := g.rules[key]
+	if rule == nil {
+		name := firstNonEmptyStr(cell.DecisiveRuleName, cell.DecisiveRuleID, "Unnamed switch ACL")
+		rule = &peerPermit{name: peerLabel(name)}
+		g.rules[key] = rule
+	}
+	if cell.IPFamily == "ipv4" {
+		rule.v4++
+	} else {
+		rule.v6++
+	}
+	protocol := strings.ToUpper(cell.Transport)
+	if cell.Port != 0 {
+		protocol += "/" + strconv.Itoa(cell.Port)
+	}
+	family := peerFamilies(cell.IPFamily == "ipv4", cell.IPFamily == "ipv6")
+	witness := fmt.Sprintf("%s %s from %s to %s", family, protocol, from, to)
+	cell.DecisiveReason = rule.name + " permits " + witness
+	isDefault := cell.DecisiveRuleID == "" && cell.DecisiveRuleName == "Switch L2/L3 Default"
+	var exception string
+	if !isDefault {
+		exception = rule.name
+		if rule.example == "" {
+			rule.example = witness
+		}
+	}
+	cell.RecommendedFix = peerRemediation(cell.SourceNetwork, family, fixPorts, exception, isDefault).Summary
+}
+
+// finding renders one VLAN-owned alert and a shorter containment-axis detail.
+// Only the display lists are capped; entity references remain complete.
+func (g *peerGap) finding(snap *unifi.Snapshot, n unifi.Network) (checks.Finding, string) {
+	f := checks.Finding{
+		CheckID:            "UB-UNIFI-ISO-SAME-VLAN",
+		Title:              g.title + " peer isolation gap on " + n.Name,
+		Category:           "isolation-policy",
+		ClaimKind:          checks.ClaimConfiguredAccess,
+		Property:           "isolation-" + g.property + "-" + strings.ToLower(n.Name),
+		BaseSeverity:       checks.SeverityMedium,
+		EffectiveSeverity:  checks.SeverityMedium,
+		Client:             unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
+		AffectedClientMACs: slices.Sorted(maps.Keys(g.clients)),
+	}
+	if len(g.ssids) > 0 {
+		names := slices.Sorted(maps.Keys(g.ssids))
+		for i := range names {
+			names[i] = peerLabel(names[i])
+		}
+		ssids := "SSID "
+		if len(names) > 1 {
+			ssids = "SSIDs "
+		}
+		detail := "Client Device Isolation is off on " + ssids
+		f.Evidence = detail + peerList(names, 6, "SSIDs") + "."
+		f.Remediation = checks.Remediation{
+			Summary:      "Enable Client Device Isolation on " + peerList(names, 6, "SSIDs") + ".",
+			UniFiActions: []string{"enable_wlan_l2_isolation"},
+		}
+		return f, detail + peerList(names, 2, "SSIDs") + "."
+	}
+
+	unit := g.unit
+	if g.limited {
+		unit = "evaluated " + unit
+	}
+	paths := fmt.Sprintf("%d of %d %ss", g.permitted, g.evaluated, unit)
+	count := paths + " permit traffic."
+	if g.permitted == 1 {
+		count = paths + " permits traffic."
+	}
+	if g.evaluated == 1 {
+		paths = "the evaluated " + unit
+		count = "The evaluated " + unit + " permits traffic."
+	}
+	refs := slices.SortedFunc(maps.Keys(g.ports), comparePeerPorts)
+	f.AffectedSwitchPorts = refs
+	detail := count
+	var evidence []string
+	var fixPorts string
+	if len(refs) > 0 {
+		evidence = append(evidence, "Switch Port Isolation is off on "+peerPortList(snap, refs, g.ports, 6)+".")
+		detail += " Port isolation is off on " + peerPortList(snap, refs, nil, 2) + "."
+		if !g.requiresACL {
+			fixPorts = peerPortList(snap, refs, nil, 6)
+		}
+	}
+
+	var permits, exceptions []string
+	var v4, v6, defaultAllow, countInRule bool
+	for key, rule := range g.rules {
+		families := peerFamilies(rule.v4 > 0, rule.v6 > 0)
+		v4, v6 = v4 || rule.v4 > 0, v6 || rule.v6 > 0
+		name := rule.name
+		if len(g.rules) > 1 {
+			name += " on " + peerLabel(deviceNameByMAC(snap, key[0]))
+		}
+		desc := name + " permits " + families + " traffic"
+		if rule.example != "" {
+			desc += " (e.g. " + rule.example + ")"
+			exceptions = append(exceptions, name)
+		} else {
+			defaultAllow = true
+			// Combine the count with the rule only if every named family
+			// was permitted on every one of the counted paths.
+			if len(g.rules) == 1 && (rule.v4 == 0 || rule.v4 == g.permitted) && (rule.v6 == 0 || rule.v6 == g.permitted) {
+				desc += " across " + paths
+				countInRule = true
+			}
+		}
+		permits = append(permits, desc)
+	}
+	if !countInRule {
+		evidence = append(evidence, count)
+	}
+	slices.Sort(permits)
+	evidence = append(evidence, peerList(permits, 6, "rules")+".")
+	f.Evidence = strings.Join(evidence, " ")
+	if len(refs) == 0 {
+		if countInRule {
+			detail = peerList(permits, 2, "rules") + "."
+		} else {
+			detail += " " + peerList(permits, 2, "rules") + "."
+		}
+	}
+	slices.Sort(exceptions)
+	f.Remediation = peerRemediation(n.Name, peerFamilies(v4, v6), fixPorts, peerList(exceptions, 6, "rules"), defaultAllow)
+	return f, detail
+}
+
 // evaluatePeerContainmentAxis assesses Layer-2 client-to-client isolation on n
 // across same-AP Wi-Fi l2_isolation, wired switch port isolation, mixed wired-to-AP
 // paths, cross-AP uplinks, and directional IPv4/IPv6 switch ACLs.
 func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, missing string) (ContainmentAxis, []IsolationCell, []checks.Finding) {
-	// peerAttachment identifies one wired client or AP uplink attached to a switch port.
+	// A wireless attachment represents the AP uplink, so its ACL endpoint is
+	// network-wide. Only wired attachments identify a concrete client.
 	type peerAttachment struct {
-		label string
-		sw    string
-		mac   string
-		port  int
-		wired bool
+		label  string
+		ref    checks.SwitchPortRef
+		client unifi.Client
 	}
-	type switchPortKey struct {
-		sw  string
-		idx int
+	// Normalize both LLDP and client references before using them as map keys.
+	portRef := func(mac string, idx int) checks.SwitchPortRef {
+		return checks.SwitchPortRef{SwitchMAC: strings.ToLower(strings.TrimSpace(mac)), PortIdx: idx}
 	}
-	type peerGap struct {
-		clients  []string
-		evidence []string
-		fixes    []string
-	}
-
-	clients := make(map[string]unifi.Client)
 	var wired, aps []peerAttachment
+	wiredCount := make(map[checks.SwitchPortRef]int)
+	seenClients := make(map[string]bool)
 	wifiClients, unresolvedMedium := false, false
 	for _, cl := range snap.Clients {
 		if !(n.ID != "" && cl.NetworkID == n.ID) && !strings.EqualFold(cl.NetworkName, n.Name) {
 			continue
 		}
 		if cl.IsWired {
-			clients[cl.MAC] = cl
-			wired = append(wired, peerAttachment{
-				label: cl.DisplayName(),
-				sw:    strings.ToLower(cl.SwitchMAC),
-				mac:   cl.MAC,
-				port:  cl.SwitchPort,
-				wired: true,
-			})
+			ref := portRef(cl.SwitchMAC, cl.SwitchPort)
+			cl.MAC = strings.ToLower(strings.TrimSpace(cl.MAC))
+			id := firstNonEmptyStr(cl.MAC, cl.PrimaryIP())
+			if id != "" && seenClients[id] {
+				continue
+			}
+			seenClients[id] = true
+			wiredCount[ref]++
+			wired = append(wired, peerAttachment{label: cl.DisplayName(), ref: ref, client: cl})
 		} else if cl.APMAC != "" || cl.ESSID != "" {
 			wifiClients = true
 		} else {
@@ -449,36 +697,44 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 		}
 	}
 
-	ports := make(map[switchPortKey]unifi.SwitchPort)
+	ports := make(map[checks.SwitchPortRef]unifi.SwitchPort)
+	infrastructure := make(map[checks.SwitchPortRef]bool)
 	for _, d := range snap.Devices {
 		for _, p := range d.Ports {
-			ports[switchPortKey{strings.ToLower(d.MAC), p.PortIdx}] = p
+			ref := portRef(d.MAC, p.PortIdx)
+			ports[ref] = p
+			if p.IsUplink {
+				infrastructure[ref] = true
+			}
+		}
+		uplink := portRef(d.UplinkMAC, d.UplinkPort)
+		if uplink.SwitchMAC != "" && uplink.PortIdx > 0 {
+			infrastructure[uplink] = true
 		}
 		if strings.EqualFold(d.Type, "uap") {
-			aps = append(aps, peerAttachment{
-				label: firstNonEmptyStr(d.Name, d.MAC),
-				sw:    strings.ToLower(d.UplinkMAC),
-				port:  d.UplinkPort,
-			})
+			aps = append(aps, peerAttachment{label: firstNonEmptyStr(d.Name, d.MAC), ref: uplink})
 		}
 	}
 
-	var (
-		cells         []IsolationCell
-		findings      []checks.Finding
-		gapKinds      []string
-		detail        string
-		affectedPorts []string
-	)
-	gaps := make(map[string]*peerGap)
+	wiredGap := peerGap{kind: "wired-same-vlan", property: "wired", title: "Same-VLAN wired", unit: "wired peer pair", function: "same-vlan-wired-peers"}
+	mixed := peerGap{kind: "mixed-same-vlan", property: "mixed", title: "Wired-to-Wi-Fi", unit: "wired-to-AP path", function: "same-vlan-mixed-peers"}
+	crossAP := peerGap{kind: "cross-ap-wifi", property: "cross-ap", title: "Cross-AP Wi-Fi", unit: "cross-AP path", function: "cross-ap-wifi-peers"}
+	sameAP := peerGap{kind: "same-ap-wifi", property: "same-ap", title: "Same-AP Wi-Fi", ssids: make(map[string]bool)}
+	gaps := []*peerGap{&crossAP, &mixed, &sameAP, &wiredGap}
+	for _, g := range gaps {
+		g.clients = make(map[string]bool)
+		g.ports = make(map[checks.SwitchPortRef]string)
+		g.rules = make(map[[3]string]*peerPermit)
+	}
+	var cells []IsolationCell
+	var findings []checks.Finding
+	coverage := make(map[string]bool)
 	allowed, blocked, unknown := false, false, false
 	zone := firstNonEmptyStr(n.ZoneName, n.Name)
-
-	record := func(c IsolationCell, refs []string) {
-		c.SourceZone = zone
-		c.DestZone = zone
-		c.SourceNetwork = n.Name
-		c.DestNetwork = n.Name
+	// Matrix verdicts drive the axis state independently of summary counts.
+	record := func(c IsolationCell) {
+		c.SourceZone, c.DestZone = zone, zone
+		c.SourceNetwork, c.DestNetwork = n.Name, n.Name
 		c.Expected = "deny"
 		cells = append(cells, c)
 		switch c.Verdict {
@@ -486,23 +742,8 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 			blocked = true
 		case IsolationUnknown:
 			unknown = true
-			if detail == "" {
-				detail = c.MissingInput
-			}
 		case IsolationViolation:
-			if !allowed {
-				detail = c.DecisiveReason
-			}
 			allowed = true
-			g := gaps[c.PathKind]
-			if g == nil {
-				g = &peerGap{}
-				gaps[c.PathKind] = g
-				gapKinds = append(gapKinds, c.PathKind)
-			}
-			g.clients = append(g.clients, refs...)
-			g.evidence = append(g.evidence, c.DecisiveReason)
-			g.fixes = append(g.fixes, c.RecommendedFix)
 		}
 	}
 
@@ -534,142 +775,203 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 			c.Effective = "unknown"
 			c.MissingInput = "Current WLAN isolation settings unavailable for " + wlan.Name
 		}
-		record(c, nil)
+		record(c)
+		if c.Verdict == IsolationViolation {
+			sameAP.ssids[firstNonEmptyStr(wlan.Name, wlan.ID, "unnamed SSID")] = true
+			sameAP.permitted++
+		} else if c.Verdict == IsolationUnknown {
+			coverage["current WLAN isolation settings"] = true
+		}
 	}
 	if unresolvedMedium || (wifiClients && (!hasWiFi || len(aps) == 0)) {
+		coverage["peer attachments"] = true
 		record(IsolationCell{
 			PathKind:     "peer-attachment",
 			Effective:    "unknown",
 			Verdict:      IsolationUnknown,
 			MissingInput: "Controller did not resolve all peer attachments on " + n.Name,
-		}, nil)
+		})
 	}
 
-	// evaluatePair checks one switched peer pair (or a single wired host against
-	// the VLAN when only one wired host is currently online). Port isolation only
-	// isolates peers on the same switch when both ports are isolated and neither
-	// wired port hides multiple MACs behind an unmanaged downstream switch.
-	evaluatePair := func(a, b peerAttachment, kind string, single bool) {
-		pa, okA := ports[switchPortKey{a.sw, a.port}]
-		pb, okB := ports[switchPortKey{b.sw, b.port}]
-		label := func(x peerAttachment) string {
-			if x.sw != "" && x.port > 0 {
-				return fmt.Sprintf("%s (%s Port %d)", x.label, deviceNameByMAC(snap, x.sw), x.port)
-			}
-			return x.label
+	// A downstream segment can switch locally. Record its uncertainty once,
+	// independently of crossings that the upstream switch can conclusively block.
+	shared := make(map[checks.SwitchPortRef]bool)
+	var downstream []checks.SwitchPortRef
+	for _, ref := range slices.SortedFunc(maps.Keys(wiredCount), comparePeerPorts) {
+		count := wiredCount[ref]
+		p := ports[ref]
+		if ref.SwitchMAC == "" || ref.PortIdx <= 0 || infrastructure[ref] {
+			continue
+		}
+		if count <= 1 && (p.IsolationUnknown || !p.Isolation || p.MACTableCount <= 1) {
+			continue
+		}
+		shared[ref] = true
+		socket := fmt.Sprintf("%s port %d", peerLabel(deviceNameByMAC(snap, ref.SwitchMAC)), ref.PortIdx)
+		reason := fmt.Sprintf("%d attached clients", count)
+		if p.MACTableCount > 1 {
+			reason = fmt.Sprintf("%d learned MACs", p.MACTableCount)
+		}
+		downstream = append(downstream, ref)
+		record(IsolationCell{
+			PathKind:       wiredGap.kind,
+			DestFunction:   wiredGap.function,
+			IPFamily:       "both",
+			Transport:      "all",
+			Verdict:        IsolationUnknown,
+			Effective:      "unknown",
+			MissingInput:   "Downstream peer isolation is unverified on " + socket + " (" + reason + ").",
+			RecommendedFix: "Verify downstream isolation or move peers to separate isolated access ports.",
+		})
+	}
+
+	families := []string{"ipv4"}
+	if siteHasIPv6Context(snap, n, n, unifi.Client{}) {
+		families = append(families, "ipv6")
+	}
+	// Include the physical attachment so similarly named peers remain identifiable.
+	label := func(x peerAttachment) string {
+		if x.ref.SwitchMAC != "" && x.ref.PortIdx > 0 {
+			return fmt.Sprintf("%s (%s port %d)", peerLabel(x.label), peerLabel(deviceNameByMAC(snap, x.ref.SwitchMAC)), x.ref.PortIdx)
+		}
+		return peerLabel(x.label)
+	}
+	// Evaluate ACLs only for traffic that can actually cross the switch fabric.
+	// The lone-client check models a client-to-VLAN path with an unconstrained peer.
+	evaluatePair := func(a, b peerAttachment, g *peerGap, single bool) {
+		g.evaluated++
+		if a.ref == b.ref && shared[a.ref] {
+			return
 		}
 		path := label(a)
 		if !single {
 			path += " and " + label(b)
 		}
-
-		destFn := "same-vlan-wired-peers"
-		if kind == "cross-ap-wifi" {
-			destFn = "cross-ap-wifi-peers"
-		} else if kind == "mixed-same-vlan" {
-			destFn = "same-vlan-mixed-peers"
-		}
+		pa, okA := ports[a.ref]
+		pb, okB := ports[b.ref]
+		sameSwitch := a.ref.SwitchMAC != "" && a.ref.SwitchMAC == b.ref.SwitchMAC && a.ref.PortIdx > 0 && b.ref.PortIdx > 0
 		c := IsolationCell{
-			PathKind:     kind,
-			DestFunction: destFn,
+			PathKind:     g.kind,
+			DestFunction: g.function,
 			Enforcer:     "Switch port isolation",
 			Transport:    "all",
 			IPFamily:     "both",
 		}
-
-		shared := !single && a.sw == b.sw && a.port == b.port
-		if okA && okB && !pa.IsolationUnknown && !pb.IsolationUnknown &&
-			a.sw == b.sw && !shared && pa.Isolation && pb.Isolation &&
-			(!a.wired || pa.MACTableCount <= 1) && (!b.wired || pb.MACTableCount <= 1) {
-			c.Verdict = IsolationBlockedOK
-			c.Effective = "deny"
+		if sameSwitch && (single || a.ref != b.ref) && !pa.IsolationUnknown && !pb.IsolationUnknown && pa.Isolation && pb.Isolation {
+			c.Verdict, c.Effective = IsolationBlockedOK, "deny"
 			c.DecisiveReason = "Isolated switch ports: " + path
-			record(c, nil)
+			record(c)
 			return
 		}
-
-		var fixPorts []string
-		if okA && !pa.Isolation && !pa.IsolationUnknown {
-			fixPorts = append(fixPorts, label(a))
-		}
-		if !single && okB && !pb.Isolation && !pb.IsolationUnknown {
-			fixPorts = append(fixPorts, label(b))
-		}
-		c.RecommendedFix = "Verify switch port isolation and switch ACLs for " + path + "."
-		if len(fixPorts) > 0 {
-			c.RecommendedFix = "Enable port isolation on " + strings.Join(fixPorts, " and ") + ", or apply a switch peer isolation ACL."
-		}
-
-		if a.sw == "" || a.port <= 0 || b.port <= 0 || a.sw != b.sw || shared || status != "complete" {
-			c.Verdict = IsolationUnknown
-			c.Effective = "unknown"
+		if !sameSwitch || (!single && a.ref == b.ref) || status != "complete" {
+			c.Verdict, c.Effective = IsolationUnknown, "unknown"
 			c.MissingInput = "Cannot verify the complete switched path for " + path
+			why := "complete switched paths"
 			if status != "complete" {
 				c.MissingInput += ". Switch ACL unavailable: " + missing
+				why = "switch ACLs (" + peerLabel(missing) + ")"
 			}
-			record(c, nil)
+			coverage[why] = true
+			record(c)
 			return
 		}
 
 		swNet := n
-		swNet.RouterDeviceMAC = a.sw
-		fams := []string{"ipv4"}
-		if siteHasIPv6Context(snap, n, n, unifi.Client{}) {
-			fams = append(fams, "ipv6")
+		swNet.RouterDeviceMAC = a.ref.SwitchMAC
+		endpoints := []peerAttachment{a}
+		if !single {
+			endpoints = append(endpoints, b)
 		}
-		for _, fam := range fams {
-			// A unidirectional ACL can block A -> B while still permitting B -> A.
-			// Evaluate both directions when two distinct endpoints are present.
+		var fixPorts []peerAttachment
+		requiresACL := false
+		for _, x := range endpoints {
+			if ports[x.ref].Isolation {
+				continue
+			}
+			if x.client.IsWired && !infrastructure[x.ref] {
+				fixPorts = append(fixPorts, x)
+			} else {
+				// Enabling isolation on an AP trunk affects every carried VLAN.
+				requiresACL = true
+			}
+		}
+		var names []string
+		if !requiresACL {
+			for _, x := range fixPorts {
+				names = append(names, label(x))
+			}
+		}
+		fixSockets := strings.Join(names, " and ")
+		knownPorts := okA && okB && !pa.IsolationUnknown && !pb.IsolationUnknown
+		permitted := false
+		for _, fam := range families {
+			// A lone client and an AP both leave one side of the ACL query network-wide.
 			checkDir := func(src, dst peerAttachment) IsolationCell {
-				peers := peerEndpoints{src: clients[src.mac], dst: clients[dst.mac]}
+				peers := peerEndpoints{src: src.client, dst: dst.client}
 				if single {
 					peers.dst = unifi.Client{}
 				}
-				return evaluateBoundary(
-					snap, nil, nil, config.IsolationIntent{}, false, "",
-					status, missing, "", swNet, swNet, zone, zone, fam, "deny", &peers,
-				)
+				return evaluateBoundary(snap, nil, nil, config.IsolationIntent{}, false, "",
+					status, missing, "", swNet, swNet, zone, zone, fam, "deny", &peers)
 			}
+			from, to := label(a), label(b)
 			cell := checkDir(a, b)
-			if !single && cell.Verdict != IsolationViolation {
+			if single {
+				to = "a VLAN peer"
+			} else if cell.Verdict != IsolationViolation || len(snap.SwitchACLs) > 0 {
 				reverse := checkDir(b, a)
-				if reverse.Verdict == IsolationViolation || reverse.Verdict == IsolationUnknown {
-					cell = reverse
-				}
-			}
-
-			cell.PathKind = kind
-			cell.DestFunction = c.DestFunction
-			cell.Enforcer = deviceNameByMAC(snap, a.sw) + " (switch ACL)"
-			cell.RecommendedFix = c.RecommendedFix
-			if cell.Verdict == IsolationViolation && (!okA || !okB || pa.IsolationUnknown || pb.IsolationUnknown) {
-				cell.Verdict = IsolationUnknown
-				cell.Effective = "unknown"
-				cell.MissingInput = "Effective switch port settings unavailable for " + path
-			}
-
-			var refs []string
-			if cell.Verdict == IsolationViolation {
-				affectedPorts = append(affectedPorts, fixPorts...)
-				cell.DecisiveReason = fmt.Sprintf("%s: peer traffic permitted by %s on %s", path, cell.DecisiveRuleName, strings.ToUpper(fam))
-				for _, x := range []peerAttachment{a, b} {
-					if x.wired && x.mac != "" && !containsFold(refs, x.mac) {
-						refs = append(refs, strings.ToLower(x.mac))
+				// Keep one matrix cell per family. A different permitting ACL in
+				// the other direction is also relevant to the operator's fix.
+				if cell.Verdict == IsolationViolation {
+					if knownPorts && reverse.Verdict == IsolationViolation &&
+						(reverse.DecisiveRuleID != cell.DecisiveRuleID || reverse.DecisiveRuleName != cell.DecisiveRuleName) {
+						g.recordPermit(&reverse, a.ref.SwitchMAC, to, from, fixSockets)
 					}
+				} else if reverse.Verdict == IsolationViolation || reverse.Verdict == IsolationUnknown {
+					cell, from, to = reverse, to, from
 				}
-				sort.Strings(refs)
 			}
-			record(cell, refs)
+			cell.PathKind, cell.DestFunction = g.kind, g.function
+			cell.Enforcer = deviceNameByMAC(snap, a.ref.SwitchMAC) + " (switch ACL)"
+			if cell.Verdict == IsolationViolation && !knownPorts {
+				cell.Verdict, cell.Effective = IsolationUnknown, "unknown"
+				cell.MissingInput = "Effective switch port settings unavailable for " + path
+				coverage["effective switch port settings"] = true
+			} else if cell.Verdict == IsolationUnknown {
+				coverage[peerLabel(cell.MissingInput)] = true
+			}
+			if cell.Verdict == IsolationViolation {
+				permitted = true
+				g.recordPermit(&cell, a.ref.SwitchMAC, from, to, fixSockets)
+			}
+			record(cell)
+		}
+		if permitted {
+			g.permitted++
+			g.requiresACL = g.requiresACL || requiresACL
+			for _, x := range endpoints {
+				if x.client.MAC != "" {
+					g.clients[x.client.MAC] = true
+				}
+			}
+			for _, x := range fixPorts {
+				if wiredCount[x.ref] > 1 {
+					g.ports[x.ref] = ports[x.ref].Name
+				} else {
+					g.ports[x.ref] = x.label
+				}
+			}
 		}
 	}
 
-	// Sort attachments deterministically so evidence, findings, and webhook keys stay stable.
-	sort.Slice(wired, func(i, j int) bool { return wired[i].mac < wired[j].mac })
+	sort.Slice(wired, func(i, j int) bool {
+		return firstNonEmptyStr(wired[i].client.MAC, wired[i].label) < firstNonEmptyStr(wired[j].client.MAC, wired[j].label)
+	})
 	sort.Slice(aps, func(i, j int) bool {
-		if aps[i].sw != aps[j].sw {
-			return aps[i].sw < aps[j].sw
+		if order := comparePeerPorts(aps[i].ref, aps[j].ref); order != 0 {
+			return order < 0
 		}
-		return aps[i].port < aps[j].port
+		return aps[i].label < aps[j].label
 	})
 
 	// Step 2: Evaluate wired-to-wired, mixed wired-to-AP, and cross-AP pairs.
@@ -677,49 +979,50 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 	// violations and marking overflow explicitly as unverified.
 	const maxPeerPaths = 2048
 	pathCount := 0
-	checkPair := func(a, b peerAttachment, kind string, single bool) bool {
+	limitReached := false
+	checkPair := func(a, b peerAttachment, g *peerGap, single bool) bool {
 		if pathCount == maxPeerPaths {
-			if !unknown || detail == "" {
-				detail = "Peer path evaluation limit reached"
-			}
+			limitReached = true
+			g.limited = true
 			record(IsolationCell{
-				PathKind:     kind,
+				PathKind:     g.kind,
 				Effective:    "unknown",
 				Verdict:      IsolationUnknown,
 				MissingInput: "Peer path evaluation limit reached",
-			}, nil)
+			})
 			return false
 		}
 		pathCount++
-		evaluatePair(a, b, kind, single)
+		evaluatePair(a, b, g, single)
 		return true
 	}
 
 evalPairs:
 	for i, a := range wired {
 		if len(wired) == 1 {
-			if !checkPair(a, a, "wired-same-vlan", true) {
+			wiredGap.unit = "wired client-to-VLAN path"
+			if !checkPair(a, a, &wiredGap, true) {
 				break evalPairs
 			}
 		}
 		for _, b := range wired[i+1:] {
-			if !checkPair(a, b, "wired-same-vlan", false) {
+			if !checkPair(a, b, &wiredGap, false) {
 				break evalPairs
 			}
 		}
 		if wifiClients {
 			for _, b := range aps {
-				if !checkPair(a, b, "mixed-same-vlan", false) {
+				if !checkPair(a, b, &mixed, false) {
 					break evalPairs
 				}
 			}
 		}
 	}
-	if hasWiFi && pathCount < maxPeerPaths {
+	if hasWiFi && !limitReached {
 	evalAPs:
 		for i, a := range aps {
 			for _, b := range aps[i+1:] {
-				if !checkPair(a, b, "cross-ap-wifi", false) {
+				if !checkPair(a, b, &crossAP, false) {
 					break evalAPs
 				}
 			}
@@ -736,66 +1039,31 @@ evalPairs:
 		state = "isolated"
 	}
 
-	// Emit at most one UB-UNIFI-ISO-SAME-VLAN finding per path kind anchored to
-	// the VLAN entity, linking AffectedClientMACs so the UI highlights each
-	// participating wired client and switch port without duplicating queue items.
-	peerKindMeta := map[string]struct {
-		prop    string
-		title   string
-		actions []string
-	}{
-		"wired-same-vlan": {
-			prop:    "wired",
-			title:   "Same-VLAN wired peer isolation gap on " + n.Name,
-			actions: []string{"enable_switch_port_isolation", "add_switch_l2_isolation_acl"},
-		},
-		"cross-ap-wifi": {
-			prop:    "cross-ap",
-			title:   "Cross-AP Wi-Fi peer isolation gap on " + n.Name,
-			actions: []string{"add_switch_l2_isolation_acl", "enable_switch_port_isolation"},
-		},
-		"same-ap-wifi": {
-			prop:    "same-ap",
-			title:   "Same-AP Wi-Fi peer isolation gap on " + n.Name,
-			actions: []string{"enable_wlan_l2_isolation"},
-		},
-		"mixed-same-vlan": {
-			prop:    "mixed",
-			title:   "Wired-to-Wi-Fi peer isolation gap on " + n.Name,
-			actions: []string{"enable_switch_port_isolation", "add_switch_l2_isolation_acl"},
-		},
-	}
-	sort.Strings(gapKinds)
-	for _, kind := range gapKinds {
-		g := gaps[kind]
-		meta := peerKindMeta[kind]
-		findings = append(findings, checks.Finding{
-			CheckID:            "UB-UNIFI-ISO-SAME-VLAN",
-			Title:              meta.title,
-			Category:           "isolation-policy",
-			ClaimKind:          checks.ClaimConfiguredAccess,
-			Property:           "isolation-" + meta.prop + "-" + strings.ToLower(n.Name),
-			BaseSeverity:       checks.SeverityMedium,
-			EffectiveSeverity:  checks.SeverityMedium,
-			Client:             unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
-			AffectedClientMACs: dedupeSortedStrings(g.clients),
-			Evidence:           strings.Join(dedupeSortedStrings(g.evidence), "; "),
-			Remediation: checks.Remediation{
-				Summary:      strings.Join(dedupeSortedStrings(g.fixes), " "),
-				UniFiActions: meta.actions,
-			},
-		})
-	}
-
-	if unisolated := dedupeSortedStrings(affectedPorts); len(unisolated) > 0 {
-		detail = "Peer access permitted. Port isolation is disabled on " + strings.Join(unisolated, ", ")
-	} else if detail == "" {
-		detail = "No peer attachment evidence"
-		if blocked {
-			detail = "Peer isolation verified for the evaluated paths"
+	var details []string
+	for _, g := range gaps {
+		if g.permitted > 0 {
+			f, detail := g.finding(snap, n)
+			findings = append(findings, f)
+			details = append(details, detail)
 		}
 	}
-	return ContainmentAxis{State: state, Detail: detail, Violation: allowed}, cells, findings
+	if len(downstream) > 0 {
+		details = append(details, "Downstream peer isolation is unverified on "+peerPortList(snap, downstream, nil, 2)+".")
+	}
+	if len(coverage) > 0 {
+		details = append(details, "Unverified peer evidence ("+peerList(slices.Sorted(maps.Keys(coverage)), 2, "coverage gaps")+").")
+	}
+	if limitReached {
+		details = append(details, "Peer path evaluation limit reached.")
+	}
+	if len(details) == 0 {
+		if blocked {
+			details = append(details, "Peer isolation verified for the evaluated paths")
+		} else {
+			details = append(details, "No peer attachment evidence")
+		}
+	}
+	return ContainmentAxis{State: state, Detail: strings.Join(details, " "), Violation: allowed}, cells, findings
 }
 
 // summarizeLANEgressAxis rolls up the already-evaluated LAN transit and
