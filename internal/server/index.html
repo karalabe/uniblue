@@ -1008,6 +1008,7 @@ let deviceFilter = "all";     // "all" | "issues" | "bmc" | "cve" | "wan" | "che
 let deviceSearch = "";
 let activityFilter = "all";
 let drawerStack = [];
+let initialHashApplied = false;
 
 /* ============================================================================
    CRISP INLINE SVG ICONS (No external dependencies, works offline)
@@ -1397,14 +1398,45 @@ function currentDrawerID() {
   return drawerStack.length ? drawerStack[drawerStack.length - 1] : null;
 }
 
+function navStateSnapshot() {
+  return {
+    tab: activeTab,
+    drawerStack: [...drawerStack],
+    portFilter,
+    deviceFilter,
+    activityFilter
+  };
+}
+
+function setActiveTabDOM(tab) {
+  activeTab = tab;
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
+}
+
+function setDrawerOpenDOM(open) {
+  const dr = document.getElementById("drawer");
+  const bd = document.getElementById("backdrop");
+  if (open) {
+    renderDrawer();
+    dr.classList.add("open");
+    dr.setAttribute("aria-hidden", "false");
+    bd.classList.add("open");
+  } else {
+    dr.classList.remove("open");
+    dr.setAttribute("aria-hidden", "true");
+    bd.classList.remove("open");
+  }
+}
+
 function switchTab(tab, updateHash = true) {
   const mapOld = { overview: "checkup", physical: "house", logical: "devices" };
   tab = mapOld[tab] || tab;
   if (!["checkup", "house", "devices", "activity"].includes(tab)) tab = "checkup";
-  activeTab = tab;
-  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
-  document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
-  if (updateHash) syncHash();
+  drawerStack = [];
+  setDrawerOpenDOM(false);
+  setActiveTabDOM(tab);
+  if (updateHash) syncHash(true);
   renderActiveTab();
   window.scrollTo({ top: 0, behavior: "instant" });
 }
@@ -1413,64 +1445,99 @@ function openEntity(id) {
   if (!id) return;
   const isPanel = id.startsWith("panel:");
   if (!isPanel && !state?.view?.entities?.[id]) return;
-  if (currentDrawerID() !== id) drawerStack.push(id);
-  syncHash();
-  renderDrawer();
-  document.getElementById("drawer").classList.add("open");
-  document.getElementById("drawer").setAttribute("aria-hidden", "false");
-  document.getElementById("backdrop").classList.add("open");
+  const cur = currentDrawerID();
+  if (cur !== id) {
+    // Switching filter tabs inside the isolation panel updates the current panel view cleanly.
+    if (cur && cur.startsWith("panel:isolation:") && id.startsWith("panel:isolation:")) {
+      drawerStack[drawerStack.length - 1] = id;
+    } else {
+      drawerStack.push(id);
+    }
+  }
+  syncHash(true);
+  setDrawerOpenDOM(true);
   if (activeTab === "house") renderHouse();
 }
 
 function popDrawer() {
   drawerStack.pop();
-  syncHash();
-  if (!drawerStack.length) closeDrawer();
-  else {
-    renderDrawer();
-    if (activeTab === "house") renderHouse();
+  if (!drawerStack.length) {
+    closeDrawer(true);
+    return;
   }
-}
-
-function closeDrawer() {
-  drawerStack = [];
-  syncHash();
-  document.getElementById("drawer").classList.remove("open");
-  document.getElementById("drawer").setAttribute("aria-hidden", "true");
-  document.getElementById("backdrop").classList.remove("open");
+  syncHash(true);
+  setDrawerOpenDOM(true);
   if (activeTab === "house") renderHouse();
 }
 
-function syncHash() {
-  const sel = currentDrawerID();
-  const next = sel ? ("#/" + activeTab + "/" + encodeURIComponent(sel)) : ("#/" + activeTab);
-  if (location.hash !== next) history.replaceState(null, "", next);
+function closeDrawer(updateHash = true) {
+  drawerStack = [];
+  if (updateHash) syncHash(true);
+  setDrawerOpenDOM(false);
+  if (activeTab === "house") renderHouse();
 }
 
-function applyHash() {
+function syncHash(push = true) {
+  const sel = currentDrawerID();
+  const next = sel ? ("#/" + activeTab + "/" + encodeURIComponent(sel)) : ("#/" + activeTab);
+  const snap = navStateSnapshot();
+  if (!push) {
+    history.replaceState(snap, "", next);
+    return;
+  }
+  const cur = history.state;
+  const sameDrawer = cur && Array.isArray(cur.drawerStack)
+    && cur.drawerStack.length === snap.drawerStack.length
+    && cur.drawerStack.every((v, i) => v === snap.drawerStack[i]);
+  if (location.hash === next && cur && cur.tab === snap.tab && sameDrawer && cur.deviceFilter === snap.deviceFilter && cur.portFilter === snap.portFilter) {
+    return;
+  }
+  history.pushState(snap, "", next);
+}
+
+function applyHash(histState) {
+  if (histState && typeof histState === "object" && histState.tab) {
+    const tab = ["checkup", "house", "devices", "activity"].includes(histState.tab) ? histState.tab : "checkup";
+    if (histState.portFilter) portFilter = histState.portFilter;
+    if (histState.deviceFilter) deviceFilter = histState.deviceFilter;
+    if (histState.activityFilter) activityFilter = histState.activityFilter;
+    setActiveTabDOM(tab);
+    const stack = Array.isArray(histState.drawerStack)
+      ? histState.drawerStack.filter(id => id && (id.startsWith("panel:") || state?.view?.entities?.[id]))
+      : [];
+    drawerStack = stack;
+    setDrawerOpenDOM(drawerStack.length > 0);
+    return;
+  }
+
   const h = (location.hash || "").replace(/^#\/?/, "");
-  if (!h) return;
+  if (!h) {
+    setActiveTabDOM("checkup");
+    drawerStack = [];
+    setDrawerOpenDOM(false);
+    return;
+  }
   const slash = h.indexOf("/");
   let tab = slash === -1 ? h : h.slice(0, slash);
   const mapOld = { overview: "checkup", physical: "house", logical: "devices" };
   tab = mapOld[tab] || tab;
   const ent = slash === -1 ? "" : decodeURIComponent(h.slice(slash + 1));
   if (["checkup", "house", "devices", "activity"].includes(tab)) {
-    activeTab = tab;
-    document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
-    document.querySelectorAll(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + tab));
+    setActiveTabDOM(tab);
   }
   if (ent && (ent.startsWith("panel:") || state?.view?.entities?.[ent])) {
     drawerStack = [ent];
-    renderDrawer();
-    document.getElementById("drawer").classList.add("open");
-    document.getElementById("backdrop").classList.add("open");
+    setDrawerOpenDOM(true);
+  } else {
+    drawerStack = [];
+    setDrawerOpenDOM(false);
   }
 }
 
 document.querySelectorAll(".nav-btn").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
-document.addEventListener("keydown", e => { if (e.key === "Escape" && drawerStack.length) closeDrawer(); });
-window.addEventListener("hashchange", () => { applyHash(); renderActiveTab(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && drawerStack.length) closeDrawer(true); });
+window.addEventListener("popstate", e => { applyHash(e.state); renderActiveTab(); });
+window.addEventListener("hashchange", () => { applyHash(history.state); renderActiveTab(); });
 // Safe delegated click handler for entity/panel navigation (prevents quote/script injection in dynamic IDs).
 document.addEventListener("click", e => {
   const portEl = e.target.closest("[data-stop-entity-id]");
@@ -2763,7 +2830,11 @@ async function fetchState() {
   const r = await fetch("/api/state", {cache: "no-store"});
   if (!r.ok) return;
   state = await r.json();
-  if (!drawerStack.length && location.hash) applyHash();
+  if (!initialHashApplied) {
+    initialHashApplied = true;
+    applyHash();
+    syncHash(false);
+  }
   renderActiveTab();
 }
 
@@ -2786,7 +2857,9 @@ const staticEl = document.getElementById("uniblue-static-state");
 if (staticEl && staticEl.textContent.trim()) {
   isStaticMode = true;
   state = JSON.parse(staticEl.textContent);
+  initialHashApplied = true;
   applyHash();
+  syncHash(false);
   renderActiveTab();
 } else {
   fetchState();

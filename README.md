@@ -22,9 +22,7 @@ Most network scanners dump hundreds of cryptic port numbers and leave you guessi
   <img alt="How UniBlue works" src="docs/how-it-works-light.svg">
 </picture>
 
-## Take a look inside
-
-UniBlue ships with a built-in web dashboard that automatically adapts to light and dark mode. Want to click around before connecting your own UniFi console? Run `./uniblue demo` for an instant offline preview with zero network traffic.
+<br>
 
 <p align="center">
   <picture>
@@ -33,43 +31,6 @@ UniBlue ships with a built-in web dashboard that automatically adapts to light a
     <img alt="UniBlue Network Checkup dashboard" src="docs/demo/checkup-light.png">
   </picture>
 </p>
-
-<table>
-  <tr>
-    <td width="50%">
-      <strong>House &amp; Outdoor Cables</strong><br>
-      <sub>Maps indoor switches, outdoor feeder cables, and exterior wall ports so you know which sockets need locking down.</sub>
-      <br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/demo/house-cables-dark.png">
-        <source media="(prefers-color-scheme: light)" srcset="docs/demo/house-cables-light.png">
-        <img alt="UniBlue House and Cables cutaway view" src="docs/demo/house-cables-light.png">
-      </picture>
-    </td>
-    <td width="50%">
-      <strong>Plain-English Fix Steps &amp; CVEs</strong><br>
-      <sub>Click any alert or device to slide open concrete fix steps, exact-version CVE rollups, and raw technical details underneath.</sub>
-      <br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/demo/drawer-fix-steps-dark.png">
-        <source media="(prefers-color-scheme: light)" srcset="docs/demo/drawer-fix-steps-light.png">
-        <img alt="UniBlue plain-English fix steps and CVE drawer" src="docs/demo/drawer-fix-steps-light.png">
-      </picture>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <strong>Network Isolation Boundaries (IPv4 + IPv6)</strong><br>
-      <sub>Evaluates your real UniFi Zone-Based Firewall rules in order, catching subtle leaks (like an IPv6 rule reaching a server BMC) while keeping approved workflows (like guest IPPS printing) green.</sub>
-      <br><br>
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/demo/drawer-isolation-dark.png">
-        <source media="(prefers-color-scheme: light)" srcset="docs/demo/drawer-isolation-light.png">
-        <img alt="UniBlue Network Isolation Boundaries drawer" src="docs/demo/drawer-isolation-light.png">
-      </picture>
-    </td>
-  </tr>
-</table>
 
 ## What makes UniBlue different?
 
@@ -100,6 +61,9 @@ export UNIBLUE_UNIFI_API_KEY="your-local-api-key"
 
 # 3. Start the live web dashboard (opens a clean UI at http://127.0.0.1:8080)
 ./uniblue serve -config config.yaml -listen 127.0.0.1:8080
+
+# Or preview the dashboard offline with synthetic demo data (no UniFi login needed)
+./uniblue demo -listen 127.0.0.1:8080
 ```
 
 Prefer the terminal or scheduled reports? Every feature works from the CLI too:
