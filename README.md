@@ -63,7 +63,7 @@ export UNIBLUE_UNIFI_API_KEY="your-local-api-key"
 ./uniblue serve -config config.yaml -listen 127.0.0.1:8080
 ```
 
-You can also skip `config.yaml` completely by setting `UNIBLUE_UNIFI_URL` and `UNIBLUE_UNIFI_API_KEY` in your environment.
+You can also skip `config.yaml` entirely by setting `UNIBLUE_UNIFI_URL` and `UNIBLUE_UNIFI_API_KEY`.
 
 Prefer the terminal or scheduled checks? Every feature works from the CLI too:
 
@@ -95,7 +95,7 @@ UniBlue evaluates your UniFi Zone-Based Firewall rules in order, respecting IPv4
 
 ### 2. Outdoor cables & physical switch ports
 
-UniBlue inspects every switch, gateway, and In-Wall AP port, including link state, VLAN tagging (`Block All` vs. `Allow All`), PoE wattage, connected devices, and MAC port security:
+UniBlue inspects every switch, gateway, and In-Wall AP port, including link state, PoE wattage, connected devices, MAC port security, and VLAN tagging (`Block All` vs. `Allow All`):
 
 - **Outdoor switches & feeder cables (`network.external_devices`):** Mark any switch or AP installed outside (garage, shed, exterior wall). UniBlue flags active unused sockets on it **and** traces the indoor feeder cable back to the parent switch so you know whether an outdoor cable carries all of your home networks.
 - **Live tamper & health alerts (`uniblue serve`):** Watches for physical link changes, PoE power drops (cable-swap indicator), inline hub MAC-table surges, STP loops, Evil-Twin Wi-Fi SSIDs, dormant devices waking up, wired/Wi-Fi swaps, and UniFi firewall or port-forward drift.
@@ -143,25 +143,25 @@ Everything works out of the box with just your UniFi console. For deeper visibil
 
 UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_RAW` required), so you can run it on demand or leave it running 24/7:
 
-- **On your laptop:** Fastest way to try UniBlue or run ad-hoc checkups (`./uniblue serve`) with zero extra hardware. The trade-off is that monitoring stops when your laptop sleeps or leaves home, and cross-VLAN probes from a personal workstation can trigger your own UniFi IPS alerts.
-- **In a Docker container:** Lightweight and easy to run 24/7 on an existing server or NAS, with a small mounted volume for `config.yaml`, `state.json`, and the CVE/OUI cache. Use **`macvlan`** networking so UniBlue gets its own dedicated static LAN IP and native mDNS/UPnP discovery; default `bridge` networking blocks link-local multicast discovery and NATs probes behind the host IP, while `network_mode: host` shares the Docker host's IP in UniFi firewall and IPS logs.
-- **In a VM or Proxmox LXC (recommended):** Gives UniBlue its own static LAN IP, clean OS isolation, native mDNS/UPnP discovery (plus optional extra VLAN interfaces), and straightforward per-IP UniFi firewall and IPS rules. LXC gives you VM-like networking with container-level memory overhead.
-- **On a dedicated machine (e.g., Raspberry Pi or mini PC):** A standalone 24/7 security appliance plugged directly into your switch on a fixed IP. It keeps catching cable swaps, new devices, and firewall drift even while your main server or hypervisor is down for maintenance, at the cost of one more box to keep updated.
+- **On your laptop:** Fastest way to try UniBlue or run ad-hoc audits (`./uniblue serve`) with zero extra hardware. Monitoring stops when your laptop sleeps or leaves home, and cross-VLAN probes from a workstation can trigger your own UniFi IPS alerts.
+- **In a Docker container:** Easy to run 24/7 on a server or NAS with a small volume for `config.yaml`, `state.json`, and the CVE/OUI cache. Use **`macvlan`** for a dedicated static IP and native mDNS/UPnP; default `bridge` blocks multicast and NATs probes behind the host IP, while `host` mode shares the host's IP in UniFi IPS logs.
+- **In a VM or Proxmox LXC (recommended):** Gives UniBlue its own static LAN IP, OS isolation, native mDNS/UPnP (plus optional extra VLAN NICs), and clean per-IP UniFi firewall and IPS rules. LXC gives you VM-like networking with container-level memory overhead.
+- **On a dedicated machine (Raspberry Pi or mini PC):** A standalone 24/7 appliance plugged into your switch on a fixed IP. Keeps catching cable swaps, new devices, and firewall drift even while your main server or hypervisor is down, at the cost of one more box to maintain.
 
 ### Integrating with AI agents
 
-Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes, can discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
+Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes, discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
 
-- **Push alerts via webhooks:** Configure `notify.webhook_url` (`format: "json"`) in `config.yaml` to target your agent's webhook listener (for example, `hermes webhook subscribe`). Whenever UniBlue detects a new exposure, severity escalation, new port forward, or unexpected device on a trusted VLAN, it wakes your agent to summarize what happened and ping you.
-- **Inspect and verify via API:** Allow your agent to reach UniBlue's HTTP endpoints (`GET /api/state`, `GET /api/events`) to inspect specific hosts, CVEs, and remediation steps. Once you approve a fix (applied manually in UniFi or by your agent on a managed host), the agent can call `POST /api/rescan?ip=<ip>` to confirm the issue is actually resolved.
+- **Push alerts via webhooks:** Point `notify.webhook_url` (`format: "json"`) at your agent's webhook listener (e.g., `hermes webhook subscribe`). Whenever UniBlue finds a new exposure, severity escalation, new port forward, or unexpected device on a trusted VLAN, it wakes your agent to summarize the alert and notify you.
+- **Inspect and verify via API:** Let your agent query `GET /api/state` and `GET /api/events` to pull host findings, CVEs, and remediation steps. Once you approve a fix (applied manually in UniFi or by your agent on a managed host), it can call `POST /api/rescan?ip=<ip>` to verify the issue is closed.
 
 ### Why not run UniBlue inside your agent?
 
-It can be tempting to run UniBlue inside the same container or process as your AI agent, but keeping them separate is strongly recommended:
+Keeping UniBlue separate from your AI agent container or process is strongly recommended:
 
-- **Blast-radius and credential isolation:** UniBlue needs a UniFi API key and L3 reachability across your VLANs (IoT, servers, cameras, BMCs). An LLM agent has shell, web, and chat access and presents a much larger prompt-injection surface; co-locating them exposes your UniFi credentials and internal VLANs to the agent.
+- **Blast-radius and credential isolation:** UniBlue needs a UniFi API key and L3 reachability across your VLANs (IoT, servers, cameras, BMCs). An LLM agent has shell, web, and chat access and a much larger prompt-injection surface; co-locating them exposes your UniFi credentials and internal VLANs to the agent.
 - **Independent 24/7 uptime:** When you restart your agent, break a skill, or hit an LLM outage, a separate UniBlue container, VM, or appliance keeps monitoring your network and sending fallback alerts uninterrupted.
-- **Clean read/write boundary:** Keep UniBlue strictly read-only on its own IP, expose only its narrow HTTP/webhook interface to your agent, and keep any remediation changes explicitly human-approved on the agent side.
+- **Clean read/write boundary:** Keep UniBlue strictly read-only on its own IP, expose only its narrow HTTP/webhook interface to your agent, and keep any remediation writes explicitly human-approved on the agent side.
 
 ## Controller compatibility
 
@@ -170,6 +170,13 @@ UniBlue automatically detects how to talk to your UniFi console:
 - **UniFi Network Integration API v1** (`X-API-Key`, recommended with 2FA): `/proxy/network/integration/v1/...`
 - **UniFi OS** (UDM Pro, UDM SE, Cloud Gateways, modern Cloud Keys): `/api/auth/login` + `/proxy/network/...`
 - **Classic Network Controller** (older Cloud Key / standalone Network App): `/api/login` + `/api/s/<site>/...`
+
+## Contributing
+
+This applies to both humans and AI agents:
+
+- **New features & core changes:** Please open an issue instead of sending a pull request. UniBlue is built primarily with agents, so implementing features from a clear issue is simpler than reviewing large PRs.
+- **New checks, device fingerprints & filters:** Open an issue or send a focused PR touching **only** the specific check(s), classifier rule(s), or fingerprint(s) you are adding (under `checks/`, `classify/`, or `fingerprints/`), and verify with `./uniblue check validate`.
 
 ## License
 
