@@ -49,7 +49,7 @@ func TestIntegrationACLRulesInternetToggleDomainAndPostAuthScoping(t *testing.T)
 				{"id":"z-ext","name":"External","networkIds":[]}
 			]}`))
 		case "/proxy/network/integration/v1/sites/site-1/firewall/policies":
-			_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":1,"totalCount":1,"data":[
+			_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":2,"totalCount":2,"data":[
 				{
 					"id":"p-postauth","name":"Post-Authorization Restrictions","enabled":true,"index":30002,
 					"action":{"type":"BLOCK"},
@@ -57,6 +57,26 @@ func TestIntegrationACLRulesInternetToggleDomainAndPostAuthScoping(t *testing.T)
 					"destination":{"zoneId":"z-ext"},
 					"ipProtocolScope":{"ipVersion":"IPV4"},
 					"metadata":{"origin":"SYSTEM_DEFINED"}
+				},
+				{
+					"id":"p-protect","name":"Allow UniFi Protect","enabled":true,"index":10002,
+					"action":{"type":"ALLOW"},
+					"source":{"zoneId":"z-hot"},
+					"destination":{
+						"zoneId":"z-ext",
+						"trafficFilter":{
+							"type":"PORT",
+							"portFilter":{"type":"TRAFFIC_MATCHING_LIST","matchOpposite":false,"trafficMatchingListId":"tml-protect"}
+						}
+					},
+					"ipProtocolScope":{"ipVersion":"IPV4_AND_IPV6","protocolFilter":{"type":"NAMED_PROTOCOL","protocol":{"name":"TCP"}}}
+				}
+			]}`))
+		case "/proxy/network/integration/v1/sites/site-1/traffic-matching-lists":
+			_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":1,"totalCount":1,"data":[
+				{
+					"id":"tml-protect","type":"PORTS","name":"UniFi Protect (TCP)",
+					"items":[{"type":"PORT_NUMBER","value":7080},{"type":"PORT_NUMBER","value":7442},{"type":"PORT_NUMBER","value":7444}]
 				}
 			]}`))
 		case "/proxy/network/integration/v1/sites/site-1/acl-rules":
@@ -121,11 +141,15 @@ func TestIntegrationACLRulesInternetToggleDomainAndPostAuthScoping(t *testing.T)
 		t.Fatalf("expected Guest Devices DomainName=guest, got %q", guest.DomainName)
 	}
 
-	if len(snap.FirewallPolicies) != 1 {
-		t.Fatalf("expected 1 policy, got %d", len(snap.FirewallPolicies))
+	if len(snap.FirewallPolicies) != 2 {
+		t.Fatalf("expected 2 policies, got %d", len(snap.FirewallPolicies))
 	}
 	postAuth := snap.FirewallPolicies[0]
 	if postAuth.Destination.AnyTarget || !slices.Equal(postAuth.Destination.IPs, []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}) {
 		t.Fatalf("expected SYSTEM_DEFINED Post-Authorization Restrictions on External to be scoped to RFC1918, got %+v", postAuth.Destination)
+	}
+	prot := snap.FirewallPolicies[1]
+	if prot.Destination.UnsupportedSelector != "" || prot.Destination.AnyPort || !slices.Equal(prot.Destination.Ports, []int{7080, 7442, 7444}) {
+		t.Fatalf("expected TRAFFIC_MATCHING_LIST port list to resolve cleanly, got %+v", prot.Destination)
 	}
 }

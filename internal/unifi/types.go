@@ -1277,33 +1277,47 @@ type integrationFirewallPolicy struct {
 // integrationPolicyEndpoint maps the source or destination filter block of an
 // Integration v1 firewall policy.
 type integrationPolicyEndpoint struct {
-	ZoneID        string `json:"zoneId"`
-	TrafficFilter *struct {
-		Type            string `json:"type"`
-		IPAddressFilter *struct {
-			Type          string `json:"type"`
-			MatchOpposite bool   `json:"matchOpposite"`
-			Items         []struct {
-				Type  string     `json:"type"`
-				Value flexString `json:"value"`
-			} `json:"items"`
-		} `json:"ipAddressFilter"`
-		PortFilter *struct {
-			Type          string `json:"type"`
-			MatchOpposite bool   `json:"matchOpposite"`
-			Items         []struct {
-				Type  string     `json:"type"`
-				Value flexString `json:"value"`
-				Start int        `json:"start"`
-				End   int        `json:"end"`
-			} `json:"items"`
-		} `json:"portFilter"`
-		NetworkFilter *struct {
-			MatchOpposite bool     `json:"matchOpposite"`
-			NetworkIDs    []string `json:"networkIds"`
-		} `json:"networkFilter"`
-		MACAddressFilter *flexMACFilter `json:"macAddressFilter"`
-	} `json:"trafficFilter"`
+	ZoneID        string                    `json:"zoneId"`
+	TrafficFilter *integrationTrafficFilter `json:"trafficFilter"`
+}
+
+type integrationTrafficFilter struct {
+	Type             string                      `json:"type"`
+	IPAddressFilter  *integrationIPAddressFilter `json:"ipAddressFilter"`
+	PortFilter       *integrationPortFilter      `json:"portFilter"`
+	NetworkFilter    *integrationNetworkFilter   `json:"networkFilter"`
+	MACAddressFilter *flexMACFilter              `json:"macAddressFilter"`
+}
+
+type integrationIPAddressFilter struct {
+	Type                  string                   `json:"type"`
+	MatchOpposite         bool                     `json:"matchOpposite"`
+	TrafficMatchingListID string                   `json:"trafficMatchingListId"`
+	Items                 []integrationFilterValue `json:"items"`
+}
+
+type integrationFilterValue struct {
+	Type  string     `json:"type"`
+	Value flexString `json:"value"`
+}
+
+type integrationPortFilter struct {
+	Type                  string                      `json:"type"`
+	MatchOpposite         bool                        `json:"matchOpposite"`
+	TrafficMatchingListID string                      `json:"trafficMatchingListId"`
+	Items                 []integrationPortFilterItem `json:"items"`
+}
+
+type integrationPortFilterItem struct {
+	Type  string     `json:"type"`
+	Value flexString `json:"value"`
+	Start int        `json:"start"`
+	End   int        `json:"end"`
+}
+
+type integrationNetworkFilter struct {
+	MatchOpposite bool     `json:"matchOpposite"`
+	NetworkIDs    []string `json:"networkIds"`
 }
 
 // flexMACFilter decodes UniFi Integration API v1's macAddressFilter, which may
@@ -1368,6 +1382,21 @@ type integrationACLEndpoint struct {
 		Type  string     `json:"type"`
 		Value flexString `json:"value"`
 		Start int        `json:"start"`
+		End   int        `json:"end"`
+	} `json:"items"`
+}
+
+// integrationTrafficMatchingList maps a Network List (Port List or IP List)
+// returned by GET /integration/v1/sites/{id}/traffic-matching-lists.
+type integrationTrafficMatchingList struct {
+	ID    string `json:"id"`
+	Type  string `json:"type"` // "PORTS" | "IPV4_ADDRESSES" | "IPV6_ADDRESSES"
+	Name  string `json:"name"`
+	Items []struct {
+		Type  string     `json:"type"`
+		Value flexString `json:"value"`
+		Start flexString `json:"start"`
+		Stop  flexString `json:"stop"`
 		End   int        `json:"end"`
 	} `json:"items"`
 }

@@ -693,10 +693,16 @@ func EvaluateIsolation(
 			if len(depDstIPs) == 0 {
 				depDstIPs = []string{""}
 			}
-			for _, dep := range []endpointSpec{
-				{proto: "udp", port: 53, function: "gateway-dns"},
+			deps := []endpointSpec{
 				{proto: "udp", port: 67, function: "gateway-dhcp"},
-			} {
+			}
+			// Offline networks (Allow Internet Access disabled) may intentionally
+			// block DNS to prevent DNS tunneling; only treat Gateway DNS as a
+			// required dependency when internet access is not disabled.
+			if srcNet.InternetAccessEnabled == nil || *srcNet.InternetAccessEnabled {
+				deps = append([]endpointSpec{{proto: "udp", port: 53, function: "gateway-dns"}}, deps...)
+			}
+			for _, dep := range deps {
 				srcPort := 0
 				if dep.function == "gateway-dhcp" {
 					// DHCPv4 clients originate requests from UDP port 68 to server port 67.

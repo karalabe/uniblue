@@ -461,54 +461,15 @@ func TestPolicyDecodingWideRangesBoundsNegationAndSiteRef(t *testing.T) {
 	// Wide port range (>16) and MaxInt overflow bound check.
 	ep := convertPolicyEndpoint(integrationPolicyEndpoint{
 		ZoneID: "z1",
-		TrafficFilter: &struct {
-			Type            string `json:"type"`
-			IPAddressFilter *struct {
-				Type          string `json:"type"`
-				MatchOpposite bool   `json:"matchOpposite"`
-				Items         []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-				} `json:"items"`
-			} `json:"ipAddressFilter"`
-			PortFilter *struct {
-				Type          string `json:"type"`
-				MatchOpposite bool   `json:"matchOpposite"`
-				Items         []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-					Start int        `json:"start"`
-					End   int        `json:"end"`
-				} `json:"items"`
-			} `json:"portFilter"`
-			NetworkFilter *struct {
-				MatchOpposite bool     `json:"matchOpposite"`
-				NetworkIDs    []string `json:"networkIds"`
-			} `json:"networkFilter"`
-			MACAddressFilter *flexMACFilter `json:"macAddressFilter"`
-		}{
-			PortFilter: &struct {
-				Type          string `json:"type"`
-				MatchOpposite bool   `json:"matchOpposite"`
-				Items         []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-					Start int        `json:"start"`
-					End   int        `json:"end"`
-				} `json:"items"`
-			}{
-				Items: []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-					Start int        `json:"start"`
-					End   int        `json:"end"`
-				}{
+		TrafficFilter: &integrationTrafficFilter{
+			PortFilter: &integrationPortFilter{
+				Items: []integrationPortFilterItem{
 					{Value: "22"},
 					{Start: 400, End: 500},
 				},
 			},
 		},
-	}, map[string]string{"z1": "Internal"})
+	}, map[string]string{"z1": "Internal"}, nil)
 	if !ep.MatchesPort(22) || !ep.MatchesPort(443) || ep.MatchesPort(80) {
 		t.Fatalf("expected wide range 400-500 + 22 to match 22 and 443, got %+v", ep)
 	}
@@ -516,61 +477,15 @@ func TestPolicyDecodingWideRangesBoundsNegationAndSiteRef(t *testing.T) {
 	// Overflow / out-of-range port bounds must not loop or produce invalid ports.
 	badEp := convertPolicyEndpoint(integrationPolicyEndpoint{
 		ZoneID: "z1",
-		TrafficFilter: &struct {
-			Type            string `json:"type"`
-			IPAddressFilter *struct {
-				Type          string `json:"type"`
-				MatchOpposite bool   `json:"matchOpposite"`
-				Items         []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-				} `json:"items"`
-			} `json:"ipAddressFilter"`
-			PortFilter *struct {
-				Type          string `json:"type"`
-				MatchOpposite bool   `json:"matchOpposite"`
-				Items         []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-					Start int        `json:"start"`
-					End   int        `json:"end"`
-				} `json:"items"`
-			} `json:"portFilter"`
-			NetworkFilter *struct {
-				MatchOpposite bool     `json:"matchOpposite"`
-				NetworkIDs    []string `json:"networkIds"`
-			} `json:"networkFilter"`
-			MACAddressFilter *flexMACFilter `json:"macAddressFilter"`
-		}{
-			IPAddressFilter: &struct {
-				Type          string `json:"type"`
-				MatchOpposite bool   `json:"matchOpposite"`
-				Items         []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-				} `json:"items"`
-			}{Type: "TRAFFIC_MATCHING_LIST"},
-			PortFilter: &struct {
-				Type          string `json:"type"`
-				MatchOpposite bool   `json:"matchOpposite"`
-				Items         []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-					Start int        `json:"start"`
-					End   int        `json:"end"`
-				} `json:"items"`
-			}{
-				Items: []struct {
-					Type  string     `json:"type"`
-					Value flexString `json:"value"`
-					Start int        `json:"start"`
-					End   int        `json:"end"`
-				}{
+		TrafficFilter: &integrationTrafficFilter{
+			IPAddressFilter: &integrationIPAddressFilter{Type: "TRAFFIC_MATCHING_LIST"},
+			PortFilter: &integrationPortFilter{
+				Items: []integrationPortFilterItem{
 					{Start: math.MaxInt - 1, End: math.MaxInt},
 				},
 			},
 		},
-	}, map[string]string{"z1": "Internal"})
+	}, map[string]string{"z1": "Internal"}, nil)
 	if badEp.UnsupportedSelector == "" {
 		t.Fatalf("expected empty reference IPAddressFilter / invalid port range to mark UnsupportedSelector, got %+v", badEp)
 	}
@@ -876,52 +791,13 @@ func TestConvertPolicyEndpointUnrecognizedTypeWithPortSibling(t *testing.T) {
 	for _, filterType := range []string{"REGION", "DOMAIN", "APPLICATION"} {
 		ep := convertPolicyEndpoint(integrationPolicyEndpoint{
 			ZoneID: "z1",
-			TrafficFilter: &struct {
-				Type            string `json:"type"`
-				IPAddressFilter *struct {
-					Type          string `json:"type"`
-					MatchOpposite bool   `json:"matchOpposite"`
-					Items         []struct {
-						Type  string     `json:"type"`
-						Value flexString `json:"value"`
-					} `json:"items"`
-				} `json:"ipAddressFilter"`
-				PortFilter *struct {
-					Type          string `json:"type"`
-					MatchOpposite bool   `json:"matchOpposite"`
-					Items         []struct {
-						Type  string     `json:"type"`
-						Value flexString `json:"value"`
-						Start int        `json:"start"`
-						End   int        `json:"end"`
-					} `json:"items"`
-				} `json:"portFilter"`
-				NetworkFilter *struct {
-					MatchOpposite bool     `json:"matchOpposite"`
-					NetworkIDs    []string `json:"networkIds"`
-				} `json:"networkFilter"`
-				MACAddressFilter *flexMACFilter `json:"macAddressFilter"`
-			}{
+			TrafficFilter: &integrationTrafficFilter{
 				Type: filterType,
-				PortFilter: &struct {
-					Type          string `json:"type"`
-					MatchOpposite bool   `json:"matchOpposite"`
-					Items         []struct {
-						Type  string     `json:"type"`
-						Value flexString `json:"value"`
-						Start int        `json:"start"`
-						End   int        `json:"end"`
-					} `json:"items"`
-				}{
-					Items: []struct {
-						Type  string     `json:"type"`
-						Value flexString `json:"value"`
-						Start int        `json:"start"`
-						End   int        `json:"end"`
-					}{{Value: "443"}},
+				PortFilter: &integrationPortFilter{
+					Items: []integrationPortFilterItem{{Value: "443"}},
 				},
 			},
-		}, map[string]string{"z1": "Internal"})
+		}, map[string]string{"z1": "Internal"}, nil)
 		if ep.UnsupportedSelector == "" || ep.AnyTarget {
 			t.Fatalf("filterType=%s with portFilter sibling must mark UnsupportedSelector and AnyTarget=false, got %+v", filterType, ep)
 		}

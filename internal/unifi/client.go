@@ -639,6 +639,10 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		items []integrationACLRule
 		err   error
 	}
+	type tmlRes struct {
+		items []integrationTrafficMatchingList
+		err   error
+	}
 	type legacyClientsRes struct {
 		items []rawClient
 		err   error
@@ -655,6 +659,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	zonesCh := make(chan zonesRes, 1)
 	policiesCh := make(chan policiesRes, 1)
 	aclsCh := make(chan aclsRes, 1)
+	tmlCh := make(chan tmlRes, 1)
 	legacyClientsCh := make(chan legacyClientsRes, 1)
 	legacyDevicesCh := make(chan legacyDevicesRes, 1)
 	telemetryCh := make(chan siteTelemetry, 1)
@@ -714,6 +719,12 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		aclsCh <- aclsRes{items: items, err: err}
 	}()
 	go func() {
+		// Traffic Matching Lists (Network Lists / Port Lists / IP Lists) resolve
+		// TRAFFIC_MATCHING_LIST references inside Zone-Based Firewall policies.
+		items, err := fetchAllPages[integrationTrafficMatchingList](ctx, c, siteBase+"/traffic-matching-lists")
+		tmlCh <- tmlRes{items: items, err: err}
+	}()
+	go func() {
 		// Opportunistically fetch legacy stat/sta to enrich Integration v1 clients
 		// with true DHCP hostnames, OUI strings, Wi-Fi SSIDs, and switch port links.
 		var env apiEnvelope[rawClient]
@@ -734,6 +745,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	zr := <-zonesCh
 	pr := <-policiesCh
 	ar := <-aclsCh
+	tr := <-tmlCh
 	lcr := <-legacyClientsCh
 	ldr := <-legacyDevicesCh
 
@@ -817,7 +829,13 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		}
 	}
 
-	policies := convertIntegrationPolicies(pr.items, zoneNameByID)
+	tmlByID := make(map[string]integrationTrafficMatchingList, len(tr.items))
+	for _, list := range tr.items {
+		if id := strings.TrimSpace(list.ID); id != "" {
+			tmlByID[id] = list
+		}
+	}
+	policies := convertIntegrationPolicies(pr.items, zoneNameByID, tmlByID)
 
 	legacyClientByMAC := make(map[string]rawClient, len(lcr.items))
 	for _, lc := range lcr.items {
@@ -1823,7 +1841,7 @@ func shortFetchErr(err error) string {
 // convertIntegrationPolicies normalizes wire Integration v1 firewall policies
 // into domain FirewallPolicy values with resolved zone names, explicit ordering,
 // connection-state/return-traffic semantics, negation, and unsupported selector markers.
-func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[string]string) []FirewallPolicy {
+func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[string]string, tmlByID map[string]integrationTrafficMatchingList) []FirewallPolicy {
 	out := make([]FirewallPolicy, 0, len(raw))
 	for i, rp := range raw {
 		origin := ""
@@ -1878,8 +1896,8 @@ func convertIntegrationPolicies(raw []integrationFirewallPolicy, zoneNames map[s
 			schedule = firstNonEmpty(rp.Schedule.Name, rp.Schedule.Mode)
 		}
 
-		srcEP := convertPolicyEndpoint(rp.Source, zoneNames)
-		dstEP := convertPolicyEndpoint(rp.Destination, zoneNames)
+		srcEP := convertPolicyEndpoint(rp.Source, zoneNames, tmlByID)
+		dstEP := convertPolicyEndpoint(rp.Destination, zoneNames, tmlByID)
 		// UniFi's Integration API v1 emits the system-defined "Post-Authorization
 		// Restrictions" rule on Hotspot -> External without its built-in RFC1918
 		// destination filter. Scope it to private address space so public internet
@@ -2089,7 +2107,7 @@ func extractProtocolName(raw json.RawMessage) string {
 // convertPolicyEndpoint extracts zone identity, IP addresses, network IDs, MACs,
 // port numbers, negation flags, and unsupported traffic filters from an
 // Integration v1 firewall policy endpoint.
-func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]string) PolicyEndpoint {
+func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]string, tmlByID map[string]integrationTrafficMatchingList) PolicyEndpoint {
 	out := PolicyEndpoint{
 		ZoneID:    ep.ZoneID,
 		ZoneName:  zoneNames[ep.ZoneID],
@@ -2114,6 +2132,20 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 			}
 			if len(out.IPs) == 0 {
 				out.UnsupportedSelector = fmt.Sprintf("opaque ipAddressFilter (%q)", tf.IPAddressFilter.Type)
+			}
+		} else if list, ok := tmlByID[strings.TrimSpace(tf.IPAddressFilter.TrafficMatchingListID)]; ok && len(list.Items) > 0 {
+			recognized = true
+			out.AnyTarget = false
+			out.NegateTarget = out.NegateTarget || tf.IPAddressFilter.MatchOpposite
+			for _, item := range list.Items {
+				if v := strings.TrimSpace(string(item.Value)); v != "" {
+					out.IPs = append(out.IPs, v)
+				} else if s, e := strings.TrimSpace(string(item.Start)), strings.TrimSpace(string(item.Stop)); s != "" && e != "" {
+					out.IPs = append(out.IPs, s+"-"+e)
+				}
+			}
+			if len(out.IPs) == 0 {
+				out.UnsupportedSelector = fmt.Sprintf("opaque ipAddressFilter list (%q)", list.Name)
 			}
 		} else {
 			out.AnyTarget = false
@@ -2178,6 +2210,40 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 			}
 			if !out.HasPortConstraint() && out.UnsupportedSelector == "" {
 				out.UnsupportedSelector = fmt.Sprintf("opaque portFilter (%q)", tf.PortFilter.Type)
+			}
+		} else if list, ok := tmlByID[strings.TrimSpace(tf.PortFilter.TrafficMatchingListID)]; ok && len(list.Items) > 0 {
+			recognized = true
+			out.AnyPort = false
+			out.NegatePort = out.NegatePort || tf.PortFilter.MatchOpposite
+			for _, item := range list.Items {
+				startNum, sErr := strconv.Atoi(strings.TrimSpace(string(item.Start)))
+				stopNum := item.End
+				if stopNum == 0 {
+					if parsed, err := strconv.Atoi(strings.TrimSpace(string(item.Stop))); err == nil {
+						stopNum = parsed
+					}
+				}
+				if sErr == nil && startNum >= 1 && stopNum >= startNum && stopNum <= 65535 {
+					if stopNum-startNum+1 <= 16 {
+						for p := startNum; p <= stopNum; p++ {
+							out.Ports = append(out.Ports, p)
+						}
+					} else {
+						out.PortRanges = append(out.PortRanges, PortRange{Start: startNum, End: stopNum})
+					}
+					continue
+				}
+				if v := strings.TrimSpace(string(item.Value)); v != "" {
+					ports, ranges, bad := parsePolicyPortSpec(v)
+					out.Ports = append(out.Ports, ports...)
+					out.PortRanges = append(out.PortRanges, ranges...)
+					if bad {
+						out.UnsupportedSelector = fmt.Sprintf("unrecognized port list item %q", v)
+					}
+				}
+			}
+			if !out.HasPortConstraint() && out.UnsupportedSelector == "" {
+				out.UnsupportedSelector = fmt.Sprintf("opaque portFilter list (%q)", list.Name)
 			}
 		} else {
 			out.AnyPort = false
