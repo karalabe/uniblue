@@ -223,9 +223,10 @@ type HostProfile struct {
 var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 // IsRawPrintPort reports whether port on this host is protected by the raw
-// print or raw serial sink zero-byte guard. Non-well-known sink ports learned
-// from mDNS are honored only when the advertisement was not reflected and its
-// responder IP (when present) matches one of this host's own IPs.
+// print or raw serial sink zero-byte guard. Self-announced sinks are always
+// honored; reflected sinks from a local reflector are honored for known
+// serial-bridge types on non-privileged ports and for standard raw print ports
+// (515, 9100-9107).
 func (h HostProfile) IsRawPrintPort(port int) bool {
 	if port == 9100 || port == 515 {
 		return true
@@ -239,13 +240,10 @@ func (h HostProfile) IsRawPrintPort(port int) bool {
 		if md.Withdrawn || md.Port != port || !isMDNSZeroByteSink(md.Type) {
 			continue
 		}
-		if md.Reflected {
-			continue
+		authoritative := !md.Reflected && (md.ResponderIP == "" || hostOwnsIP(h.Client, md.ResponderIP))
+		if shouldProtectMDNSSinkPort(md.Type, port, authoritative, md.ResponderIP) {
+			return true
 		}
-		if md.ResponderIP != "" && !hostOwnsIP(h.Client, md.ResponderIP) {
-			continue
-		}
-		return true
 	}
 	return false
 }
@@ -413,9 +411,10 @@ func (f *Fingerprinter) Discovery() *LANDiscovery {
 	return f.discovery
 }
 
-// isAllowedProbeIP enforces that active probing only targets private/local LAN
-// ranges or explicitly configured site subnets, never arbitrary public IPs.
-func (f *Fingerprinter) isAllowedProbeIP(rawIP string) bool {
+// isAllowedProbeIPWithSubnets enforces that active probing and discovery
+// fetches only target private/local LAN ranges or explicitly configured site
+// subnets, never arbitrary public internet addresses.
+func isAllowedProbeIPWithSubnets(rawIP string, allowedSubnets []netip.Prefix) bool {
 	addr, err := netip.ParseAddr(strings.TrimSpace(rawIP))
 	if err != nil {
 		return false
@@ -424,12 +423,18 @@ func (f *Fingerprinter) isAllowedProbeIP(rawIP string) bool {
 	if addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback() || cgnatPrefix.Contains(addr) {
 		return true
 	}
-	for _, pfx := range f.allowedSubnets {
+	for _, pfx := range allowedSubnets {
 		if pfx.Contains(addr) {
 			return true
 		}
 	}
 	return false
+}
+
+// isAllowedProbeIP enforces that active probing only targets private/local LAN
+// ranges or explicitly configured site subnets, never arbitrary public IPs.
+func (f *Fingerprinter) isAllowedProbeIP(rawIP string) bool {
+	return isAllowedProbeIPWithSubnets(rawIP, f.allowedSubnets)
 }
 
 // SetProgressFunc registers an optional callback invoked on the collector
@@ -519,7 +524,7 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	// service metadata enrich every matching HostProfile with zero blind dials.
 	if f.discovery == nil && !f.skipDiscovery && hasNonLoopbackTarget(targets) {
 		f.reportProgress("discovery", 0, len(targets), "")
-		f.discovery = DiscoverLANWithExclusions(ctx, f.httpClient, f.excludeIPs)
+		f.discovery = discoverLANWithOptions(ctx, f.httpClient, f.excludeIPs, f.allowedSubnets)
 	}
 	return f.collectProfiles(ctx, targets, workers)
 }
@@ -600,10 +605,39 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	}
 	if f.discovery != nil {
 		rawSeen := make(map[int]struct{})
+		mdnsIdx := make(map[string]int)
+		upnpSeen := make(map[string]struct{})
+		wsdSeen := make(map[string]struct{})
 		for _, ip := range allIPs {
-			profile.MDNSServices = append(profile.MDNSServices, f.discovery.MDNS[ip]...)
-			profile.UPnPDevices = append(profile.UPnPDevices, f.discovery.UPnP[ip]...)
-			profile.WSDiscovery = append(profile.WSDiscovery, f.discovery.WSDiscovery[ip]...)
+			for _, svc := range f.discovery.MDNS[ip] {
+				key := strings.ToLower(fmt.Sprintf("%s|%s|%d|%s|%s", svc.ObserverVLAN, svc.Type, svc.Port, svc.Transport, svc.Instance))
+				if idx, dup := mdnsIdx[key]; dup {
+					// Prefer an authoritative (non-reflected) observation when
+					// merging dual-stack addresses for the same service.
+					if profile.MDNSServices[idx].Reflected && !svc.Reflected {
+						profile.MDNSServices[idx] = svc
+					}
+					continue
+				}
+				mdnsIdx[key] = len(profile.MDNSServices)
+				profile.MDNSServices = append(profile.MDNSServices, svc)
+			}
+			for _, dev := range f.discovery.UPnP[ip] {
+				key := strings.ToLower(fmt.Sprintf("%s|%s|%d|%s|%s|%s|%s", dev.ObserverVLAN, dev.ST, dev.Port, dev.DeviceType, dev.Manufacturer, dev.ModelName, dev.Server))
+				if _, dup := upnpSeen[key]; dup {
+					continue
+				}
+				upnpSeen[key] = struct{}{}
+				profile.UPnPDevices = append(profile.UPnPDevices, dev)
+			}
+			for _, rec := range f.discovery.WSDiscovery[ip] {
+				key := strings.ToLower(fmt.Sprintf("%s|%s|%s|%v", rec.ObserverVLAN, strings.Join(rec.Types, ","), strings.Join(rec.Scopes, ","), rec.Ports))
+				if _, dup := wsdSeen[key]; dup {
+					continue
+				}
+				wsdSeen[key] = struct{}{}
+				profile.WSDiscovery = append(profile.WSDiscovery, rec)
+			}
 			for rp := range f.discovery.RawPrintIPs[ip] {
 				if _, dup := rawSeen[rp]; !dup {
 					rawSeen[rp] = struct{}{}

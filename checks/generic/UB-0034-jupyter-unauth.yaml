@@ -30,11 +30,7 @@ probe:
   match:
     status: [200]
     headers_absent: ["WWW-Authenticate"]
-    json_match:
-      - path: "$.type"
-        equals: "directory"
-      - path: "$.content"
-        exists: true
+    body_regex: '(?s)\A\s*\{.*(?:"content"\s*:\s*\[.*"type"\s*:\s*"(?:directory|notebook|file)"|"type"\s*:\s*"directory".*"content"\s*:\s*\[)'
     redact_body: true
 
 remediation:

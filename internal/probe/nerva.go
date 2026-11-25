@@ -73,11 +73,10 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 		idxByIP[canonIP] = i
 		allIPs := hp.Client.AllIPs()
 		for _, port := range hp.OpenPorts {
-			// Hard raw-printer safety guard: NEVER send application-layer probe
-			// bytes to JetDirect (9100), LPD (515), or any port advertised via
-			// mDNS _pdl-datastream._tcp, because non-PJL printers can print raw
-			// probe bytes onto physical paper.
-			if isRawPrintSinkPortAny(port, f.discovery, allIPs) {
+			// Hard zero-byte sink safety guard: NEVER send application-layer probe
+			// bytes to JetDirect (9100), LPD (515), or any raw print or serial-bridge
+			// port (including reflected Zigbee UART coordinators).
+			if hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
 				continue
 			}
 			targets = append(targets, plugins.Target{
@@ -276,10 +275,13 @@ func convertNervaService(rawSvc plugins.Service, now time.Time) (Service, nervaM
 			Evidence:    strings.TrimSpace(sf.Evidence),
 		})
 	}
-	// If Nerva's only auth-related signal was a synthetic HTTP product-detection
-	// placeholder that we filtered out, do not carry over AnonymousAccess.
-	if droppedSyntheticAnon && !keptAuthFinding && len(rawSvc.SecurityFindings) > 0 && len(svc.Findings) == 0 {
-		svc.AnonymousAccess = false
+	// Clear AnonymousAccess when its only basis was a dropped synthetic HTTP
+	// product-detection placeholder, or when Nerva's HTTP plugin set the flag
+	// alongside only non-auth findings (such as os-eol or php version checks).
+	if !keptAuthFinding {
+		if droppedSyntheticAnon || ((proto == "http" || proto == "https") && len(rawSvc.SecurityFindings) > 0) {
+			svc.AnonymousAccess = false
+		}
 	}
 	return svc, meta, proto
 }

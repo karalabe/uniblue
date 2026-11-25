@@ -23,6 +23,7 @@ metadata:
 
 preconditions:
   ports_any: [3478, 5349]
+  service_proto_any: ["stun", "turn"]
   discovery_only: true
 
 probe:

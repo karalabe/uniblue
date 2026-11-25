@@ -32,13 +32,8 @@ probe:
   match:
     status: [200]
     headers_absent: ["WWW-Authenticate"]
-    body_not_contains:
-      - 'type="password"'
-      - "type='password'"
-      - 'type=password'
-      - 'TYPE="PASSWORD"'
-      - "TYPE='PASSWORD'"
-      - 'autocomplete="current-password"'
+    body_regex: '(?is)<(button|form|table|select|input|a\s+href)\b'
+    body_not_regex: '(?is)(type\s*=\s*["'']?password\b|autocomplete\s*=\s*["'']?current-password|name\s*=\s*["'']?(password|passwd|passcode)\b|<form[^>]*(login|signin|sign-in|auth)|<div\s+id\s*=\s*["'']?(app|root)["'']?[^>]*>\s*</div>|<noscript[^>]*>[^<]*(javascript|enable\s+js)|<script[^>]+(login|auth|signin|bundle|chunk))'
     redact_body: true
 
 remediation:

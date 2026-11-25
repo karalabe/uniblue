@@ -98,6 +98,23 @@ func TestJupyterSpacingAndValetudoMatches(t *testing.T) {
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
 			t.Fatal("UB-0034 must still match compact JSON")
 		}
+		// Large (>64 KiB) Jupyter root listing truncated before the trailing top-level "type": "directory".
+		var large strings.Builder
+		large.WriteString(`{"name": "", "path": "", "last_modified": "2026-11-25T12:00:00Z", "content": [`)
+		for i := range 350 {
+			if i > 0 {
+				large.WriteString(", ")
+			}
+			large.WriteString(`{"name": "notebook-` + strconv.Itoa(i) + `.ipynb", "path": "notebook-` + strconv.Itoa(i) + `.ipynb", "last_modified": "2026-11-25T12:00:00.000000Z", "created": "2026-11-25T12:00:00.000000Z", "content": null, "format": null, "mimetype": null, "size": 1024, "writable": true, "type": "notebook"}`)
+		}
+		large.WriteString(`], "format": "json", "writable": true, "type": "directory"}`)
+		if large.Len() <= maxProbeBodyBytes {
+			t.Fatalf("expected large Jupyter body > %d bytes, got %d", maxProbeBodyBytes, large.Len())
+		}
+		body = large.String()
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
+			t.Fatal("UB-0034 must match large (>64 KiB) truncated Jupyter root listing")
+		}
 		body = `<html><body>Login</body></html>`
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); ok {
 			t.Fatal("UB-0034 must reject non-JSON login page")
@@ -124,9 +141,10 @@ func TestJupyterSpacingAndValetudoMatches(t *testing.T) {
 	})
 }
 
-// TestNervaTLSCipherPropertySeverityDedupAndUnauthMapping verifies that Nerva
-// TLS cipher findings use a distinct tls-cipher property, higher-severity Nerva
-// findings win deduplication per key, and unauth Nerva IDs map to auth-anon.
+// TestNervaTLSCipherPropertySeverityDedupAndUnauthMapping verifies that distinct
+// Nerva TLS cipher classes (anon, null, export) receive distinct properties and
+// all survive alongside UB-0009, unrelated findings on AnonymousAccess services
+// keep their real titles, and unauth Nerva IDs map to auth-anon.
 func TestNervaTLSCipherPropertySeverityDedupAndUnauthMapping(t *testing.T) {
 	cl := unifi.Client{IP: "192.0.2.40", MAC: "aa:bb:cc:dd:00:40"}
 	profiles := []probe.HostProfile{
@@ -137,11 +155,14 @@ func TestNervaTLSCipherPropertySeverityDedupAndUnauthMapping(t *testing.T) {
 					Port:            443,
 					Protocol:        "https",
 					TLS:             true,
-					AnonymousAccess: true, // simulates legacy substring mis-set on tls-anon-cipher
+					AnonymousAccess: true, // simulates service-level flag alongside unrelated findings
 					Findings: []probe.ServiceFinding{
 						{ID: "tls-weak-version-10", Severity: "low", Evidence: "TLS 1.0"},
-						{ID: "tls-weak-cipher", Severity: "low", Evidence: "3DES"},
 						{ID: "tls-anon-cipher", Severity: "high", Title: "Anonymous TLS Cipher", Evidence: "ADH cipher"},
+						{ID: "tls-null-cipher", Severity: "high", Title: "NULL TLS Cipher", Evidence: "NULL cipher"},
+						{ID: "tls-export-cipher", Severity: "high", Title: "EXPORT TLS Cipher", Evidence: "EXPORT cipher"},
+						{ID: "os-eol", Severity: "medium", Title: "End-of-Life OS", Description: "Ubuntu 18.04 reached EOL", Evidence: "Ubuntu 18.04"},
+						{ID: "php-vulnerable-php2shell", Severity: "high", Title: "Vulnerable PHP Version", Description: "PHP 8.1 CGI exposure", Evidence: "PHP/8.1"},
 					},
 				},
 				{
@@ -169,8 +190,8 @@ func TestNervaTLSCipherPropertySeverityDedupAndUnauthMapping(t *testing.T) {
 	}
 
 	got := FindingsFromProfiles(profiles, existing)
-	if len(got) != 2 {
-		t.Fatalf("expected 2 findings (tls-cipher on 443 + rtsp-unauth on 554), got %d: %+v", len(got), got)
+	if len(got) != 6 {
+		t.Fatalf("expected 6 findings (anon/null/export ciphers + os-eol + php + rtsp-unauth), got %d: %+v", len(got), got)
 	}
 
 	byCheck := make(map[string]Finding, len(got))
@@ -178,15 +199,37 @@ func TestNervaTLSCipherPropertySeverityDedupAndUnauthMapping(t *testing.T) {
 		byCheck[f.CheckID] = f
 	}
 
-	cipher, ok := byCheck["NERVA-TLS-ANON-CIPHER"]
-	if !ok {
-		t.Fatalf("expected high-severity NERVA-TLS-ANON-CIPHER to survive UB-0009 and beat low tls-weak-cipher, got %+v", got)
+	wantCiphers := map[string]string{
+		"NERVA-TLS-ANON-CIPHER":   "tls-cipher-anon",
+		"NERVA-TLS-NULL-CIPHER":   "tls-cipher-null",
+		"NERVA-TLS-EXPORT-CIPHER": "tls-cipher-export",
 	}
-	if cipher.Property != "tls-cipher" || cipher.Category != "misconfig" || cipher.ClaimKind != ClaimServiceObserved {
-		t.Fatalf("tls-anon-cipher misclassified: prop=%q cat=%q claim=%q", cipher.Property, cipher.Category, cipher.ClaimKind)
+	for id, wantProp := range wantCiphers {
+		cipher, ok := byCheck[id]
+		if !ok {
+			t.Fatalf("expected %s to survive alongside other TLS cipher findings and UB-0009, got %+v", id, got)
+		}
+		if cipher.Property != wantProp || cipher.Category != "misconfig" || cipher.ClaimKind != ClaimServiceObserved {
+			t.Fatalf("%s misclassified: prop=%q (want %q) cat=%q claim=%q", id, cipher.Property, wantProp, cipher.Category, cipher.ClaimKind)
+		}
+		if strings.Contains(cipher.Title, "Unauthenticated / Anonymous") {
+			t.Fatalf("%s must not be retitled as unauthenticated service access: %q", id, cipher.Title)
+		}
 	}
-	if strings.Contains(cipher.Title, "Unauthenticated / Anonymous") {
-		t.Fatalf("tls-anon-cipher must not be retitled as unauthenticated service access: %q", cipher.Title)
+
+	for _, id := range []string{"NERVA-OS-EOL", "NERVA-PHP-VULNERABLE-PHP2SHELL"} {
+		f, ok := byCheck[id]
+		if !ok {
+			t.Fatalf("expected unrelated finding %s to survive", id)
+		}
+		if strings.Contains(f.Title, "Unauthenticated / Anonymous") {
+			t.Fatalf("unrelated finding %s must not be retitled as anonymous access: %q", id, f.Title)
+		}
+		for _, act := range f.Remediation.UniFiActions {
+			if act == "disable_anonymous_access" {
+				t.Fatalf("unrelated finding %s must not receive disable_anonymous_access remediation: %v", id, f.Remediation.UniFiActions)
+			}
+		}
 	}
 
 	rtsp, ok := byCheck["NERVA-RTSP-UNAUTHENTICATED-STREAM"]
@@ -317,13 +360,27 @@ func TestEmbeddedPanelAndCUPSAuthGuards(t *testing.T) {
 			t.Fatal("UB-0040 must not match generic 'Controller' title")
 		}
 
-		// Password form on Smart Meter page must be rejected by body_not_contains.
-		page = `<html><title>Smart Meter</title><body><form><input type="password" name="pw"></form></body></html>`
-		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); ok {
-			t.Fatal("UB-0040 must reject page containing a password input")
+		// Password form variants and JS/SPA login shells must all be rejected.
+		rejectPages := []struct {
+			name string
+			html string
+		}{
+			{"lowercase password input", `<html><title>Smart Meter</title><body><form><input type="password" name="pw"></form></body></html>`},
+			{"uppercase PASSWORD input", `<html><title>Smart Meter Controller</title><body><form><input type="PASSWORD" name="pw"></form></body></html>`},
+			{"spaced type attribute", `<html><title>Smart Meter</title><body><form><input type = "password" name="pw"></form></body></html>`},
+			{"unquoted mixed-case type", `<html><title>Smart Meter</title><body><form><input type=Password name="pw"></form></body></html>`},
+			{"SPA empty root shell", `<html><head><title>Shelly</title><script type="module" src="/assets/index.js"></script></head><body><div id="app"></div></body></html>`},
+			{"JS-only shell without controls", `<html><head><title>Shelly</title></head><body><script>window.bootLogin();</script></body></html>`},
+			{"auth bundle script", `<html><head><title>Shelly</title></head><body><a href="/login">Sign in</a><script src="/static/auth-bundle.js"></script></body></html>`},
+		}
+		for _, tc := range rejectPages {
+			page = tc.html
+			if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); ok {
+				t.Fatalf("UB-0040 must reject %s", tc.name)
+			}
 		}
 
-		// True unauthenticated panel without password input still matches.
+		// True unauthenticated static control panel still matches.
 		page = `<html><title>Smart Meter</title><body><button>Toggle Relay</button></body></html>`
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
 			t.Fatal("UB-0040 must match unauthenticated panel without password input")
@@ -538,6 +595,23 @@ probe:
 	if _, err := Parse([]byte(emptyMatch), "empty.yaml"); err == nil {
 		t.Fatal("expected Validate to reject http probe with empty MatchSpec")
 	}
+
+	// Negative-only HTTP matchers must be rejected because they would match 404/500 responses.
+	negativeOnlyCases := []struct {
+		name  string
+		match string
+	}{
+		{"headers_absent only", "    headers_absent: [\"WWW-Authenticate\"]"},
+		{"body_not_contains only", "    body_not_contains: [\"login\"]"},
+		{"body_not_regex only", "    body_not_regex: \"(?i)login\""},
+		{"negative combination only", "    headers_absent: [\"WWW-Authenticate\"]\n    body_not_contains: [\"password\"]"},
+	}
+	for _, tc := range negativeOnlyCases {
+		raw := "id: UB-TEST-NEG-ONLY\ntitle: Negative Only\nseverity: high\nsafety: read-only\npreconditions:\n  ports_any: [80]\nprobe:\n  type: http\n  method: GET\n  path: /api/secret\n  match:\n" + tc.match + "\n"
+		if _, err := Parse([]byte(raw), "neg.yaml"); err == nil {
+			t.Fatalf("expected Validate to reject negative-only HTTP matcher (%s)", tc.name)
+		}
+	}
 }
 
 // TestMPDStatusAuthCheck verifies probeMPD sends a read-only status command
@@ -595,6 +669,74 @@ func TestHTTPProbeInfersHTTPSForTLSPortsAndFingerprintedTLS(t *testing.T) {
 	if len(got) != 1 || got[0].CheckID != "UB-2026-0003" {
 		t.Fatalf("expected Intel AMT over TLS to match via Services TLS flag, got %+v", got)
 	}
+
+	// Verify legacy TLS 1.2 RSA-kex-only and TLS 1.1 RSA-CBC servers (typical of
+	// older Intel AMT firmware) are also detected by probeHTTP.
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	rsaCert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+
+	legacyCases := []struct {
+		name   string
+		minVer uint16
+		maxVer uint16
+		cipher uint16
+	}{
+		{"TLS 1.2 RSA-AES128-GCM", tls.VersionTLS12, tls.VersionTLS12, tls.TLS_RSA_WITH_AES_128_GCM_SHA256},
+		{"TLS 1.1 RSA-AES128-CBC", tls.VersionTLS11, tls.VersionTLS11, tls.TLS_RSA_WITH_AES_128_CBC_SHA},
+	}
+	for _, tc := range legacyCases {
+		t.Run(tc.name, func(t *testing.T) {
+			legacySrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/logon.htm" {
+					_, _ = io.WriteString(w, "<html><title>Intel(R) AMT</title><body>Intel Active Management Technology</body></html>")
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			legacySrv.TLS = &tls.Config{
+				Certificates: []tls.Certificate{rsaCert},
+				MinVersion:   tc.minVer,
+				MaxVersion:   tc.maxVer,
+				CipherSuites: []uint16{tc.cipher},
+			}
+			legacySrv.StartTLS()
+			defer legacySrv.Close()
+
+			_, lpStr, _ := net.SplitHostPort(legacySrv.Listener.Addr().String())
+			lPort, _ := strconv.Atoi(lpStr)
+
+			chkCopy := *byID["UB-2026-0003"]
+			chkCopy.Preconditions.PortsAny = []int{lPort}
+			if err := chkCopy.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			lhp := probe.HostProfile{
+				Client:    unifi.Client{IP: "127.0.0.1", Hostname: "workstation-amt"},
+				OpenPorts: []int{lPort},
+				Services:  []probe.Service{{Port: lPort, Protocol: "http", TLS: true}},
+			}
+			res := NewRunner([]*Check{&chkCopy}, 1).RunHost(context.Background(), lhp)
+			if len(res) != 1 || res[0].CheckID != "UB-2026-0003" {
+				t.Fatalf("%s: expected UB-2026-0003 match, got %+v", tc.name, res)
+			}
+		})
+	}
 }
 
 // TestBuiltinCheckFixes_HomeKit_deCONZ_VNC_STUN_OT_ActiveMQ verifies the
@@ -603,7 +745,7 @@ func TestHTTPProbeInfersHTTPSForTLSPortsAndFingerprintedTLS(t *testing.T) {
 func TestBuiltinCheckFixes_HomeKit_deCONZ_VNC_STUN_OT_ActiveMQ(t *testing.T) {
 	byID := loadBuiltinMap(t)
 
-	// #118 HomeKit HAP odd sf bitmask (bit 0 set).
+	// HomeKit HAP odd sf bitmask (bit 0 set).
 	hk := byID["UB-2026-0022"]
 	for _, sf := range []string{"sf=1", "sf=3", "sf=5", "sf=7", "sf=11"} {
 		hp := probe.HostProfile{MDNSServices: []probe.MDNSService{{Type: "_hap._tcp", Port: 51826, TXT: []string{sf}}}}
@@ -618,7 +760,7 @@ func TestBuiltinCheckFixes_HomeKit_deCONZ_VNC_STUN_OT_ActiveMQ(t *testing.T) {
 		}
 	}
 
-	// #119 deCONZ matches captured UPnP fields + modelid=deCONZ and rejects Philips Hue.
+	// deCONZ matches captured UPnP fields + modelid=deCONZ and rejects Philips Hue.
 	deconz := byID["UB-2026-0024"]
 	var apiBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -649,7 +791,7 @@ func TestBuiltinCheckFixes_HomeKit_deCONZ_VNC_STUN_OT_ActiveMQ(t *testing.T) {
 		t.Fatalf("UB-2026-0024 must NOT match genuine Philips Hue bridge, got %+v", got)
 	}
 
-	// #120 VNC UB-0002 only schedules [5900, 5901] globally, yet still probes walked displays.
+	// VNC UB-0002 only schedules [5900, 5901] globally, yet still probes walked displays.
 	vnc := byID["UB-0002"]
 	global := PlanGlobalPorts([]int{80}, []*Check{vnc})
 	if len(global) != 3 || global[1] != 5900 || global[2] != 5901 {
@@ -661,19 +803,79 @@ func TestBuiltinCheckFixes_HomeKit_deCONZ_VNC_STUN_OT_ActiveMQ(t *testing.T) {
 		t.Fatalf("UB-0002 must probe walked VNC displays alongside 5900, got ok=%v ports=%v", ok, ports)
 	}
 
-	// #121 STUN UB-0017 uses TCP ports 3478/5349 + discovery_only; UB-0049 drops dead UDP protos.
+	// Passive-flow UDP STUN/TURN and BACnet/KNXip match UB-0017 and UB-0049
+	// without requiring TCP open ports or expanding the global TCP sweep.
 	stun := byID["UB-0017"]
-	if !stun.Preconditions.DiscoveryOnly || len(stun.Preconditions.PortsAny) != 2 {
+	if !stun.Preconditions.DiscoveryOnly || len(stun.Preconditions.PortsAny) != 2 || len(stun.Preconditions.ServiceProtoAny) != 2 {
 		t.Fatalf("UB-0017 preconditions unexpected: %+v", stun.Preconditions)
 	}
-	ot := byID["UB-0049"]
-	for _, p := range ot.Preconditions.ServiceProtoAny {
-		if p == "bacnet" || p == "knxip" {
-			t.Fatalf("UB-0049 must not include dead UDP-only Nerva protocol %q", p)
+	// Start a local UDP STUN responder and verify UDP-only passive flow triggers UB-0017.
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer pc.Close()
+	_, stunPortStr, _ := net.SplitHostPort(pc.LocalAddr().String())
+	stunPort, _ := strconv.Atoi(stunPortStr)
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			if n >= 20 {
+				rep := make([]byte, 20)
+				binary.BigEndian.PutUint16(rep[0:2], 0x0101)
+				copy(rep[4:20], buf[4:20])
+				_, _ = pc.WriteTo(rep, addr)
+			}
 		}
+	}()
+	stunTestChk := *stun
+	stunTestChk.Probe.Port = stunPort
+	if err := stunTestChk.Validate(); err != nil {
+		t.Fatalf("validate stun clone: %v", err)
+	}
+	udpOnlySTUN := probe.HostProfile{
+		Client:   unifi.Client{IP: "127.0.0.1", Name: "coturn-udp"},
+		Services: []probe.Service{{Port: 3478, Transport: "udp", Protocol: "stun"}},
+	}
+	if got := NewRunner([]*Check{&stunTestChk}, 1).RunHost(context.Background(), udpOnlySTUN); len(got) != 1 || got[0].CheckID != "UB-0017" || got[0].Transport != "udp" {
+		t.Fatalf("UDP-only passive-flow STUN server must trigger UB-0017, got %+v", got)
+	}
+	udpPortOnlySTUN := probe.HostProfile{
+		Client:   unifi.Client{IP: "127.0.0.1", Name: "stun-port-only"},
+		Services: []probe.Service{{Port: 3478, Transport: "udp", Protocol: "unknown"}},
+	}
+	if got := NewRunner([]*Check{&stunTestChk}, 1).RunHost(context.Background(), udpPortOnlySTUN); len(got) != 1 || got[0].CheckID != "UB-0017" {
+		t.Fatalf("UDP-only port 3478 observation must trigger UB-0017, got %+v", got)
+	}
+	unrelatedSTUN := probe.HostProfile{
+		Client:    unifi.Client{IP: "127.0.0.1", Name: "regular-host"},
+		OpenPorts: []int{80, 443},
+	}
+	if got := NewRunner([]*Check{&stunTestChk}, 1).RunHost(context.Background(), unrelatedSTUN); len(got) != 0 {
+		t.Fatalf("unrelated host must NOT trigger UB-0017, got %+v", got)
 	}
 
-	// #122 ActiveMQ matches Nerva's activemq-openwire protocol name.
+	ot := byID["UB-0049"]
+	bacnetHP := probe.HostProfile{
+		Client:   unifi.Client{IP: "192.0.2.91", Name: "bms-plc"},
+		Services: []probe.Service{{Port: 47808, Transport: "udp", Protocol: "bacnet"}},
+	}
+	if got := NewRunner([]*Check{ot}, 1).RunHost(context.Background(), bacnetHP); len(got) != 1 || got[0].CheckID != "UB-0049" || got[0].Transport != "udp" {
+		t.Fatalf("passive UDP bacnet service must match UB-0049 with udp transport, got %+v", got)
+	}
+	knxHP := probe.HostProfile{
+		Client:   unifi.Client{IP: "192.0.2.92", Name: "knx-gw"},
+		Services: []probe.Service{{Port: 3671, Transport: "udp", Protocol: "knxip"}},
+	}
+	if got := NewRunner([]*Check{ot}, 1).RunHost(context.Background(), knxHP); len(got) != 1 || got[0].CheckID != "UB-0049" || got[0].Transport != "udp" {
+		t.Fatalf("passive UDP knxip service must match UB-0049 with udp transport, got %+v", got)
+	}
+
+	// ActiveMQ matches Nerva's activemq-openwire protocol name.
 	broker := byID["UB-0028"]
 	hpAMQ := probe.HostProfile{Services: []probe.Service{{Port: 61616, Protocol: "activemq-openwire"}}}
 	if _, ok := matchPreconditions(broker, hpAMQ); !ok {
@@ -731,5 +933,109 @@ probe:
 	evWS, ok := probeObserve(wsChk, hp, 0)
 	if !ok || !strings.Contains(evWS, "NetworkVideoTransmitter") || strings.Contains(evWS, "PrintDeviceType") {
 		t.Fatalf("WS-Discovery observe evidence must include only matching records, got %q", evWS)
+	}
+}
+
+// TestHTTPMatchersAndPassiveUDPPreconditionsInMemory exercises UB-0034 large
+// truncated JSON matching, UB-0040 body_not_regex / SPA filtering, and UB-0017
+// / UB-0049 passive UDP preconditions without requiring loopback sockets.
+func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
+	byID := loadBuiltinMap(t)
+
+	// 1. UB-0034 Jupyter matching including >64 KiB truncated listings.
+	jup := byID["UB-0034"]
+	okResp := &http.Response{StatusCode: 200, Header: make(http.Header)}
+	var large strings.Builder
+	large.WriteString(`{"name": "", "path": "", "content": [`)
+	for i := range 350 {
+		if i > 0 {
+			large.WriteString(", ")
+		}
+		large.WriteString(`{"name": "nb-` + strconv.Itoa(i) + `.ipynb", "path": "nb-` + strconv.Itoa(i) + `.ipynb", "last_modified": "2026-11-25T12:00:00.000000Z", "created": "2026-11-25T12:00:00.000000Z", "content": null, "writable": true, "type": "notebook"}`)
+	}
+	large.WriteString(`], "type": "directory"}`)
+	truncLarge := []byte(large.String()[:maxProbeBodyBytes])
+
+	for _, body := range [][]byte{
+		[]byte(`{"name": "", "path": "", "type": "directory", "content": []}`),
+		[]byte(`{"name":"","type":"directory","content":[]}`),
+		truncLarge,
+	} {
+		if !matchHTTPResponse(okResp, body, jup) {
+			t.Fatalf("UB-0034 must match valid/truncated Jupyter listing (len=%d)", len(body))
+		}
+	}
+	for _, body := range [][]byte{
+		[]byte(`<html><body>Login</body></html>`),
+		[]byte(`{"message": "Forbidden", "reason": null}`),
+	} {
+		if matchHTTPResponse(okResp, body, jup) {
+			t.Fatalf("UB-0034 must reject non-Jupyter response %q", string(body))
+		}
+	}
+
+	// 2. UB-0040 Embedded panel rejects password markup variants and SPA/JS shells.
+	panel := byID["UB-0040"]
+	for _, html := range []string{
+		`<html><title>Smart Meter</title><body><form><input type="password" name="pw"></form></body></html>`,
+		`<html><title>Smart Meter Controller</title><body><form><input type="PASSWORD" name="pw"></form></body></html>`,
+		`<html><title>Smart Meter</title><body><form><input type = "password" name="pw"></form></body></html>`,
+		`<html><title>Smart Meter</title><body><form><input type=Password name="pw"></form></body></html>`,
+		`<html><head><title>Shelly</title><script type="module" src="/assets/index.js"></script></head><body><div id="app"></div></body></html>`,
+		`<html><head><title>Shelly</title></head><body><script>window.bootLogin();</script></body></html>`,
+		`<html><head><title>Shelly</title></head><body><a href="/login">Sign in</a><script src="/static/auth-bundle.js"></script></body></html>`,
+	} {
+		if matchHTTPResponse(okResp, []byte(html), panel) {
+			t.Fatalf("UB-0040 must reject login/SPA page %q", html)
+		}
+	}
+	for _, html := range []string{
+		`<html><title>Smart Meter</title><body><button>Toggle Relay</button></body></html>`,
+		`<html><title>Tasmota</title><body><table><tr><td>OFF</td></tr></table><button>Toggle</button></body></html>`,
+	} {
+		if !matchHTTPResponse(okResp, []byte(html), panel) {
+			t.Fatalf("UB-0040 must match unauthenticated static control panel %q", html)
+		}
+	}
+
+	// 3. UB-0017 STUN/TURN preconditions match UDP-only passive flows and TCP hints, not unrelated hosts.
+	stun := byID["UB-0017"]
+	if ports, ok := matchPreconditions(stun, probe.HostProfile{
+		Services: []probe.Service{{Port: 3478, Transport: "udp", Protocol: "stun"}},
+	}); !ok || len(ports) != 1 || ports[0] != 3478 {
+		t.Fatalf("UB-0017 must match UDP-only passive stun flow, got ok=%v ports=%v", ok, ports)
+	}
+	if ports, ok := matchPreconditions(stun, probe.HostProfile{
+		Services: []probe.Service{{Port: 3478, Transport: "udp", Protocol: "unknown"}},
+	}); !ok || len(ports) != 1 || ports[0] != 3478 {
+		t.Fatalf("UB-0017 must match UDP-only port 3478 observation, got ok=%v ports=%v", ok, ports)
+	}
+	if ports, ok := matchPreconditions(stun, probe.HostProfile{
+		OpenPorts: []int{5349},
+	}); !ok || len(ports) != 1 || ports[0] != 3478 {
+		t.Fatalf("UB-0017 must match TCP 5349 hint and target UDP 3478, got ok=%v ports=%v", ok, ports)
+	}
+	if _, ok := matchPreconditions(stun, probe.HostProfile{OpenPorts: []int{80, 443}}); ok {
+		t.Fatal("UB-0017 must NOT match unrelated host without STUN/TURN ports or services")
+	}
+
+	// 4. UB-0049 OT observe check matches passive UDP bacnet and knxip with udp transport.
+	ot := byID["UB-0049"]
+	r := NewRunner([]*Check{ot}, 1)
+	for _, tc := range []struct {
+		proto string
+		port  int
+	}{
+		{"bacnet", 47808},
+		{"knxip", 3671},
+	} {
+		hp := probe.HostProfile{
+			Client:   unifi.Client{IP: "192.0.2.95"},
+			Services: []probe.Service{{Port: tc.port, Transport: "udp", Protocol: tc.proto}},
+		}
+		got := r.RunHost(context.Background(), hp)
+		if len(got) != 1 || got[0].CheckID != "UB-0049" || got[0].Transport != "udp" || got[0].Port != tc.port {
+			t.Fatalf("UB-0049 failed for passive UDP %s: got %+v", tc.proto, got)
+		}
 	}
 }

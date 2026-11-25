@@ -370,6 +370,9 @@ type MatchSpec struct {
 	// BodyRegex matches a regular expression against the response body.
 	BodyRegex string `yaml:"body_regex"`
 
+	// BodyNotRegex rejects the match if the regular expression matches the response body.
+	BodyNotRegex string `yaml:"body_not_regex"`
+
 	// JSONMatch evaluates typed JSONPath predicates against a JSON response body.
 	JSONMatch []JSONPredicate `yaml:"json_match"`
 
@@ -414,6 +417,7 @@ type compiledPatterns struct {
 	upnpService *regexp.Regexp
 	wsType      *regexp.Regexp
 	body        *regexp.Regexp
+	bodyNot     *regexp.Regexp
 	banner      *regexp.Regexp
 }
 
@@ -589,7 +593,7 @@ func (c *Check) Validate() error {
 			}
 		}
 		if !c.Probe.Match.hasHTTPMatcher() {
-			return errors.New("http probe requires at least one response matcher in probe.match")
+			return errors.New("http probe requires at least one positive response matcher in probe.match (status, body_contains_all, body_contains_any, body_regex, json_match, headers_present, or header_contains)")
 		}
 	default:
 		return fmt.Errorf("unsupported probe.type %q", c.Probe.Type)
@@ -652,6 +656,11 @@ func (c *Check) Validate() error {
 			return fmt.Errorf("probe.match.body_regex: %w", err)
 		}
 	}
+	if c.Probe.Match.BodyNotRegex != "" {
+		if c.compiled.bodyNot, err = regexp.Compile(c.Probe.Match.BodyNotRegex); err != nil {
+			return fmt.Errorf("probe.match.body_not_regex: %w", err)
+		}
+	}
 	if c.Probe.Match.BannerRegex != "" {
 		if c.compiled.banner, err = regexp.Compile(c.Probe.Match.BannerRegex); err != nil {
 			return fmt.Errorf("probe.match.banner_regex: %w", err)
@@ -670,16 +679,16 @@ func (c *Check) Validate() error {
 	return nil
 }
 
-// hasHTTPMatcher reports whether MatchSpec defines at least one active HTTP
-// response matching condition (beyond non-matching metadata like redact_body).
+// hasHTTPMatcher reports whether MatchSpec defines at least one positive HTTP
+// response matching condition. Negative-only matchers (headers_absent,
+// body_not_contains, body_not_regex) do not qualify on their own because they
+// would match arbitrary 404 or 500 error responses.
 func (m MatchSpec) hasHTTPMatcher() bool {
 	return len(m.Status) > 0 ||
 		len(m.BodyContainsAll) > 0 ||
 		len(m.BodyContainsAny) > 0 ||
-		len(m.BodyNotContains) > 0 ||
 		strings.TrimSpace(m.BodyRegex) != "" ||
 		len(m.JSONMatch) > 0 ||
-		len(m.HeadersAbsent) > 0 ||
 		len(m.HeadersPresent) > 0 ||
 		len(m.HeaderContains) > 0
 }

@@ -162,6 +162,8 @@ func NewRunner(list []*Check, concurrency int) *Runner {
 				IdleConnTimeout:   5 * time.Second,
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true, //nolint:gosec // local LAN appliances routinely use self-signed certificates
+					MinVersion:         tls.VersionTLS10,
+					CipherSuites:       allLegacyTLSCipherSuites(),
 				},
 			},
 			// Never follow redirects: prevents a hostile or misconfigured device
@@ -330,20 +332,26 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 // metadata without sending any network packets. It returns the target port(s)
 // to probe when all preconditions hold.
 func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
+	allowUDPPortMatch := isNonTCPProbe(chk.Probe.Type) && chk.Probe.Type != "observe"
+
 	// Match open ports first since it is the cheapest filter and also selects
 	// which concrete ports the verification probe should target.
 	for _, p := range chk.Preconditions.PortsAll {
-		if !hp.HasPort(p) {
+		if !hostHasObservedPort(hp, p, allowUDPPortMatch) {
 			return nil, false
 		}
 	}
 	var matchedPorts []int
 	for _, p := range chk.Preconditions.PortsAny {
-		if hp.HasPort(p) {
+		if hostHasObservedPort(hp, p, allowUDPPortMatch) {
 			matchedPorts = append(matchedPorts, p)
 		}
 	}
-	if len(chk.Preconditions.PortsAny) > 0 && len(matchedPorts) == 0 {
+	// For UDP probes that declare both ports_any and service_proto_any (such as
+	// STUN/TURN), either an observed port or a matching passive-flow protocol
+	// satisfies the trigger so UDP-only servers work without TCP open ports.
+	portsOrServiceProto := allowUDPPortMatch && len(chk.Preconditions.PortsAny) > 0 && len(chk.Preconditions.ServiceProtoAny) > 0
+	if !portsOrServiceProto && len(chk.Preconditions.PortsAny) > 0 && len(matchedPorts) == 0 {
 		return nil, false
 	}
 	if len(matchedPorts) == 0 && len(chk.Preconditions.PortsAll) > 0 {
@@ -467,7 +475,7 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 		}
 	}
 
-	// Match Nerva-detected application-layer protocol names.
+	// Match Nerva-detected or passive-flow application-layer protocol names.
 	if len(chk.Preconditions.ServiceProtoAny) > 0 {
 		svcMatched := false
 		for _, svc := range hp.Services {
@@ -481,7 +489,7 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 				}
 			}
 		}
-		if !svcMatched {
+		if !svcMatched && (!portsOrServiceProto || len(matchedPorts) == 0) {
 			return nil, false
 		}
 	}
@@ -859,10 +867,33 @@ func matchHTTPResponse(resp *http.Response, bodyBytes []byte, chk *Check) bool {
 	if chk.compiled.body != nil && !chk.compiled.body.MatchString(body) {
 		return false
 	}
+	if chk.compiled.bodyNot != nil && chk.compiled.bodyNot.MatchString(body) {
+		return false
+	}
 	if !matchJSONPredicates(bodyBytes, m.JSONMatch) {
 		return false
 	}
 	return true
+}
+
+func hostHasObservedPort(hp probe.HostProfile, port int, allowUDP bool) bool {
+	if hp.HasPort(port) {
+		return true
+	}
+	if !allowUDP {
+		return false
+	}
+	for _, svc := range hp.Services {
+		if svc.Port == port {
+			return true
+		}
+	}
+	for _, md := range hp.MDNSServices {
+		if !md.Withdrawn && md.Port == port {
+			return true
+		}
+	}
+	return false
 }
 
 // probeMQTT sends a minimal MQTT 3.1.1 CONNECT packet with no credentials and

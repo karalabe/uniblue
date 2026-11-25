@@ -137,7 +137,7 @@ func nervaFindingProperty(rawID string) string {
 	case strings.Contains(id, "weak-key") || strings.Contains(id, "key-size"):
 		return "tls-weak-key"
 	case isTLSCipherFinding(id):
-		return "tls-cipher"
+		return nervaTLSCipherProperty(id)
 	case strings.HasPrefix(id, "tls-"):
 		return "tls-protocol"
 	case id == "smb-v1-enabled":
@@ -148,6 +148,26 @@ func nervaFindingProperty(rawID string) string {
 		return "auth-anon"
 	default:
 		return id
+	}
+}
+
+// nervaTLSCipherProperty separates distinct weak TLS cipher classes (anonymous,
+// null, export, RC4, DES/3DES) so multiple distinct cipher findings on the same
+// port never deduplicate each other.
+func nervaTLSCipherProperty(id string) string {
+	switch {
+	case strings.Contains(id, "anon"):
+		return "tls-cipher-anon"
+	case strings.Contains(id, "null"):
+		return "tls-cipher-null"
+	case strings.Contains(id, "export"):
+		return "tls-cipher-export"
+	case strings.Contains(id, "rc4"):
+		return "tls-cipher-rc4"
+	case strings.Contains(id, "3des") || strings.Contains(id, "-des"):
+		return "tls-cipher-des"
+	default:
+		return "tls-cipher"
 	}
 }
 
@@ -221,14 +241,20 @@ func describeNervaFinding(sf probe.ServiceFinding, svc probe.Service) (title, su
 		return "Expired Local TLS Certificate",
 			"Service presents an expired TLS certificate. Renew or regenerate the local certificate so clients can verify identity cleanly.",
 			[]string{"renew_tls_certificate"}
-	case strings.Contains(id, "anon-access") || (isNervaUnauthFinding(id) && sf.Title == "") || (svc.AnonymousAccess && !strings.HasPrefix(id, "tls-") && !strings.HasPrefix(id, "smb-")):
+	case isNervaUnauthFinding(id):
 		label := strings.ToUpper(svc.Protocol)
 		if name, _, ok := strings.Cut(sf.ID, ":"); ok && name != "" {
 			label = strings.ToUpper(name[:1]) + name[1:]
 		}
-		return fmt.Sprintf("Unauthenticated / Anonymous %s Access", label),
-			fmt.Sprintf("%s responded to an unauthenticated endpoint query without credentials. Disable anonymous access if this service exposes dashboards, metrics, or control endpoints.", label),
-			[]string{"disable_anonymous_access", "restrict_inter_vlan_access"}
+		title = sf.Title
+		if title == "" || strings.Contains(id, "anon-access") {
+			title = fmt.Sprintf("Unauthenticated / Anonymous %s Access", label)
+		}
+		summary = sf.Description
+		if summary == "" {
+			summary = fmt.Sprintf("%s responded to an unauthenticated endpoint query without credentials. Disable anonymous access if this service exposes dashboards, metrics, or control endpoints.", label)
+		}
+		return title, summary, []string{"disable_anonymous_access", "restrict_inter_vlan_access"}
 	default:
 		title = sf.Title
 		if title == "" {

@@ -15,6 +15,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"fmt"
 	"io/fs"
 	"math/big"
@@ -190,7 +191,7 @@ func TestMDNSNameLengthLimitAndCacheCaps(t *testing.T) {
 
 	// Global flood across many distinct responders must be capped at maxMDNSServicesTotal.
 	globalCache := NewDiscoveryCache()
-	for hostIdx := range 40 {
+	for hostIdx := range 70 {
 		respIP := fmt.Sprintf("10.1.%d.%d", hostIdx/250, (hostIdx%250)+1)
 		for svcIdx := range 64 {
 			pkt := buildMDNSTestPacket("_http._tcp", fmt.Sprintf("h%d-s%d", hostIdx, svcIdx), fmt.Sprintf("h%d.local", hostIdx), uint16(8000+svcIdx), 120, []byte{10, 1, byte(hostIdx / 250), byte((hostIdx % 250) + 1)}, nil, nil)
@@ -199,6 +200,9 @@ func TestMDNSNameLengthLimitAndCacheCaps(t *testing.T) {
 	}
 	if len(globalCache.mdnsInst) > maxMDNSServicesTotal {
 		t.Fatalf("global mDNS instance cap exceeded: got %d, max %d", len(globalCache.mdnsInst), maxMDNSServicesTotal)
+	}
+	if len(globalCache.mdnsInst) != maxMDNSServicesTotal {
+		t.Fatalf("expected global mDNS cap to saturate at %d, got %d", maxMDNSServicesTotal, len(globalCache.mdnsInst))
 	}
 }
 
@@ -759,5 +763,402 @@ func TestFingerprinterTransportDisablesKeepAlivesAndSupportsCachedDiscovery(t *t
 	fp.SetCachedDiscovery(cached)
 	if !fp.skipDiscovery || fp.Discovery() != cached {
 		t.Fatalf("expected SetCachedDiscovery to inject cached snapshot and skip multicast discovery")
+	}
+}
+
+func buildMDNSRawPTRPacket(ownerName, targetName string, ttl uint32) []byte {
+	var pkt bytes.Buffer
+	pkt.Write([]byte{0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00})
+	writeName := func(buf *bytes.Buffer, name string) {
+		for _, lbl := range bytes.Split([]byte(name), []byte(".")) {
+			if len(lbl) == 0 {
+				continue
+			}
+			buf.WriteByte(byte(len(lbl)))
+			buf.Write(lbl)
+		}
+		buf.WriteByte(0)
+	}
+	writeName(&pkt, ownerName)
+	var rdata bytes.Buffer
+	writeName(&rdata, targetName)
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(12)) // PTR
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(1))
+	_ = binary.Write(&pkt, binary.BigEndian, ttl)
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(rdata.Len()))
+	pkt.Write(rdata.Bytes())
+	return pkt.Bytes()
+}
+
+// TestMDNSPTRTypeConfusionCannotHideVictimPort verifies that a forged PTR
+// pointing from a raw-print service type to a victim's non-print instance name
+// is ignored and cannot suppress probing of the victim's own advertised port.
+func TestMDNSPTRTypeConfusionCannotHideVictimPort(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	cache := NewDiscoveryCache()
+
+	// Attacker injects a mismatched PTR before the victim responds.
+	forgedPTR := buildMDNSRawPTRPacket("_pdl-datastream._tcp.local", "NAS._smb._tcp.local", 120)
+	cache.IngestMDNSPacket(forgedPTR, "192.168.1.66", "eth0", "LAN", now)
+
+	// Victim announces its own legitimate SMB service.
+	victimPkt := buildMDNSTestPacket("_smb._tcp", "NAS", "nas.local", 445, 120, []byte{192, 168, 1, 10}, nil, nil)
+	cache.IngestMDNSPacket(victimPkt, "192.168.1.10", "eth0", "LAN", now)
+
+	snap := cache.Snapshot(now)
+	if _, hidden := snap.RawPrintIPs["192.168.1.10"][445]; hidden {
+		t.Fatalf("forged PTR type confusion must not mark victim port 445 as raw print: %+v", snap.RawPrintIPs)
+	}
+	foundPort := false
+	for _, p := range snap.PortsByIP["192.168.1.10"] {
+		if p == 445 {
+			foundPort = true
+		}
+	}
+	if !foundPort {
+		t.Fatalf("victim SMB port 445 must remain in PortsByIP, got %v", snap.PortsByIP["192.168.1.10"])
+	}
+	hp := HostProfile{
+		Client:       unifi.Client{IP: "192.168.1.10"},
+		MDNSServices: snap.MDNS["192.168.1.10"],
+	}
+	if hp.IsRawPrintPort(445) {
+		t.Fatal("HostProfile.IsRawPrintPort(445) must remain false after PTR type-confusion attempt")
+	}
+}
+
+// TestMDNSPerTargetAuthorityBlocksMultiAForgedPortHint verifies that a forged
+// SRV whose target hostname resolves to both a victim IP and the attacker's own
+// IP is treated as reflected for the victim and never injects ports into PortsByIP.
+func TestMDNSPerTargetAuthorityBlocksMultiAForgedPortHint(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	cache := NewDiscoveryCache()
+
+	// Attacker 192.168.1.66 advertises evil.local pointing to both victim and itself.
+	pktVictimA := buildMDNSTestPacket("_http._tcp", "bait", "evil.local", 6638, 120, []byte{192, 168, 1, 10}, nil, nil)
+	pktAttackerA := buildMDNSTestPacket("_http._tcp", "bait", "evil.local", 6638, 120, []byte{192, 168, 1, 66}, nil, nil)
+	cache.IngestMDNSPacket(pktVictimA, "192.168.1.66", "eth0", "LAN", now)
+	cache.IngestMDNSPacket(pktAttackerA, "192.168.1.66", "eth0", "LAN", now)
+
+	snap := cache.Snapshot(now)
+	if len(snap.PortsByIP["192.168.1.10"]) != 0 {
+		t.Fatalf("forged multi-A SRV must not inject ports into victim PortsByIP, got %v", snap.PortsByIP["192.168.1.10"])
+	}
+	svcs := snap.MDNS["192.168.1.10"]
+	if len(svcs) != 1 || !svcs[0].Reflected {
+		t.Fatalf("victim service from multi-A forged SRV must be marked Reflected=true, got %+v", svcs)
+	}
+	// Attacker's own IP matches the responder and may remain non-reflected.
+	attackerSvcs := snap.MDNS["192.168.1.66"]
+	if len(attackerSvcs) != 1 || attackerSvcs[0].Reflected {
+		t.Fatalf("attacker's own target IP should remain authoritative, got %+v", attackerSvcs)
+	}
+}
+
+// TestReflectedSerialBridgeProtectedZeroBytesAndSpoofedAdminPortNotHidden
+// verifies that a Zigbee UART coordinator advertised through an mDNS reflector
+// receives zero payload bytes even when its port is hinted, while a spoofed
+// reflected raw-print or serial advert cannot hide privileged admin ports.
+func TestReflectedSerialBridgeProtectedZeroBytesAndSpoofedAdminPortNotHidden(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	var bytesRead atomic.Int64
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+				buf := make([]byte, 512)
+				n, _ := conn.Read(buf)
+				if n > 0 {
+					bytesRead.Add(int64(n))
+				}
+			}(c)
+		}
+	}()
+
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	cache := NewDiscoveryCache()
+
+	// Gateway reflector 192.168.1.1 relays SLZB-06 coordinator on 127.0.0.1:port.
+	reflectedSerial := buildMDNSTestPacket("_slzb-06._tcp", "slzb-coord", "slzb.local", uint16(port), 120, []byte{127, 0, 0, 1}, nil, nil)
+	cache.IngestMDNSPacket(reflectedSerial, "192.168.1.1", "eth0", "IoT", now)
+
+	// Gateway reflector also relays a raw printer on JetDirect port 9101.
+	reflectedPrint := buildMDNSTestPacket("_pdl-datastream._tcp", "office-prn", "prn.local", 9101, 120, []byte{192, 168, 20, 50}, nil, nil)
+	cache.IngestMDNSPacket(reflectedPrint, "192.168.1.1", "eth0", "IoT", now)
+
+	// Attacker tries to hide victim's SMB (445) and SSH (22) via spoofed reflected adverts.
+	spoofedSMB := buildMDNSTestPacket("_pdl-datastream._tcp", "fake-prn", "nas.local", 445, 120, []byte{192, 168, 1, 10}, nil, nil)
+	spoofedSSH := buildMDNSTestPacket("_slzb-06._tcp", "fake-zigbee", "nas.local", 22, 120, []byte{192, 168, 1, 10}, nil, nil)
+	cache.IngestMDNSPacket(spoofedSMB, "192.168.1.66", "eth0", "LAN", now)
+	cache.IngestMDNSPacket(spoofedSSH, "192.168.1.66", "eth0", "LAN", now)
+
+	snap := cache.Snapshot(now)
+	if _, ok := snap.RawPrintIPs["127.0.0.1"][port]; !ok {
+		t.Fatalf("reflected SLZB-06 serial port %d must be protected in RawPrintIPs: %+v", port, snap.RawPrintIPs)
+	}
+	if _, ok := snap.RawPrintIPs["192.168.20.50"][9101]; !ok {
+		t.Fatalf("reflected raw print port 9101 must be protected in RawPrintIPs: %+v", snap.RawPrintIPs)
+	}
+	if _, poisoned := snap.RawPrintIPs["192.168.1.10"][445]; poisoned {
+		t.Fatalf("spoofed reflected _pdl-datastream must not hide port 445")
+	}
+	if _, poisoned := snap.RawPrintIPs["192.168.1.10"][22]; poisoned {
+		t.Fatalf("spoofed reflected _slzb-06 must not hide privileged port 22")
+	}
+
+	// End-to-end socket verification: even with a firewall-policy port hint,
+	// zero application bytes reach the reflected serial bridge.
+	fp := NewFingerprinter([]int{80}, 1, 500*time.Millisecond, nil)
+	fp.SetCachedDiscovery(snap)
+	fp.SetHostPortHints(map[string][]int{"127.0.0.1": {port}})
+
+	profiles := fp.FingerprintAll(context.Background(), []unifi.Client{{IP: "127.0.0.1", Name: "SLZB-06"}})
+	time.Sleep(100 * time.Millisecond)
+
+	if len(profiles) != 1 || !profiles[0].HasPort(port) {
+		t.Fatalf("expected connect-only detection on reflected serial port %d, got %+v", port, profiles)
+	}
+	if got := bytesRead.Load(); got != 0 {
+		t.Fatalf("SAFETY VIOLATION: reflected serial coordinator received %d bytes (must be 0)", got)
+	}
+}
+
+// TestMDNSReflectorLargeDeviceCountAndPerTargetCap verifies that a single mDNS
+// reflector relaying 100+ distinct devices is not truncated at 64, while a
+// multi-source flood targeting a single victim is capped at maxMDNSServicesPerHost.
+func TestMDNSReflectorLargeDeviceCountAndPerTargetCap(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+	// 1. Gateway reflector 192.168.1.1 relays 100 distinct IoT devices.
+	refCache := NewDiscoveryCache()
+	for i := range 100 {
+		ip := []byte{192, 168, 20, byte(i + 1)}
+		pkt := buildMDNSTestPacket("_esphomelib._tcp", fmt.Sprintf("plug-%d", i), fmt.Sprintf("plug-%d.local", i), 6053, 120, ip, nil, []string{"platform=ESP32"})
+		refCache.IngestMDNSPacket(pkt, "192.168.1.1", "eth0", "IoT", now)
+	}
+	refSnap := refCache.Snapshot(now)
+	if len(refSnap.MDNS) != 100 {
+		t.Fatalf("expected all 100 reflected devices to remain visible, got %d", len(refSnap.MDNS))
+	}
+
+	// 2. Multi-source attacker (40 source IPs x 64 services = 2560) targets one victim.
+	floodCache := NewDiscoveryCache()
+	victimOwn := buildMDNSTestPacket("_smb._tcp", "RealNAS", "realnas.local", 445, 120, []byte{192, 168, 1, 10}, nil, nil)
+	floodCache.IngestMDNSPacket(victimOwn, "192.168.1.10", "eth0", "LAN", now)
+	for src := range 40 {
+		respIP := fmt.Sprintf("fd00:dead::%x", src+1)
+		for svc := range 64 {
+			pkt := buildMDNSTestPacket("_http._tcp", fmt.Sprintf("f-%d-%d", src, svc), fmt.Sprintf("fh-%d-%d.local", src, svc), uint16(10000+svc), 120, []byte{192, 168, 1, 10}, nil, nil)
+			floodCache.IngestMDNSPacket(pkt, respIP, "eth0", "LAN", now)
+		}
+	}
+	floodSnap := floodCache.Snapshot(now)
+	if got := len(floodSnap.MDNS["192.168.1.10"]); got > maxMDNSServicesPerHost {
+		t.Fatalf("per-target mDNS service cap exceeded under multi-source flood: got %d, max %d", got, maxMDNSServicesPerHost)
+	}
+	foundReal := false
+	for _, s := range floodSnap.MDNS["192.168.1.10"] {
+		if s.Type == "_smb._tcp" && s.Instance == "RealNAS" && !s.Reflected {
+			foundReal = true
+			break
+		}
+	}
+	if !foundReal {
+		t.Fatalf("victim's own authoritative service was evicted by multi-source flood")
+	}
+}
+
+type recordingRoundTripper struct {
+	reqs []string
+}
+
+func (rt *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.reqs = append(rt.reqs, req.URL.String())
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       http.NoBody,
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+// TestSSDPFetchRefusesPublicRespondersUnlessAllowed verifies that a spoofed
+// SSDP reply from a public internet address never triggers an outbound HTTP GET
+// unless that prefix is explicitly permitted via allowedSubnets.
+func TestSSDPFetchRefusesPublicRespondersUnlessAllowed(t *testing.T) {
+	rt := &recordingRoundTripper{}
+	client := &http.Client{Transport: rt}
+	hits := []ssdpHit{{
+		ip:       "203.0.113.7",
+		st:       "upnp:rootdevice",
+		location: "http://203.0.113.7:8080/desc.xml",
+	}}
+	noLoc := map[string][]ssdpHit{
+		"203.0.113.7": {{ip: "203.0.113.7", st: "ssdp:all", server: "Spoof/1.0"}},
+	}
+
+	res := fetchSSDPDescriptions(context.Background(), client, hits, noLoc, nil, nil)
+	if len(rt.reqs) != 0 {
+		t.Fatalf("public SSDP responder must never trigger HTTP GET, got %v", rt.reqs)
+	}
+	if len(res["203.0.113.7"]) != 0 {
+		t.Fatalf("public SSDP responder must not be recorded, got %+v", res["203.0.113.7"])
+	}
+
+	// Explicit site subnet allows the fetch.
+	allowed := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}
+	_ = fetchSSDPDescriptionsWithSubnets(context.Background(), client, hits, nil, nil, nil, allowed)
+	if len(rt.reqs) != 1 || rt.reqs[0] != "http://203.0.113.7:8080/desc.xml" {
+		t.Fatalf("expected explicitly allowed subnet SSDP fetch to proceed, got %v", rt.reqs)
+	}
+}
+
+// TestSSDPMultiSourceFloodDoesNotStarveGatewayIGD verifies that multi-source
+// SSDP LOCATION floods cannot evict or starve the gateway's IGD LOCATION.
+func TestSSDPMultiSourceFloodDoesNotStarveGatewayIGD(t *testing.T) {
+	t.Run("many multi-location sources", func(t *testing.T) {
+		c := newSSDPCollector()
+		// 40 distinct flooder IPs x 8 LOCATIONs each = 320 > maxSSDPLocHitsTotal.
+		for src := range 40 {
+			ip := fmt.Sprintf("192.168.10.%d", src+10)
+			for i := range maxSSDPLocHitsPerIP {
+				raw := fmt.Sprintf("HTTP/1.1 200 OK\r\nLOCATION: http://%s:%d/d.xml\r\nST: upnp:rootdevice\r\nSERVER: Flood/1.0\r\n\r\n", ip, 10000+i)
+				c.ingest(ip, raw)
+			}
+		}
+		routerRaw := "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1:49000/igd.xml\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nSERVER: MiniUPnPd/2.3\r\n\r\n"
+		c.ingest("192.168.1.1", routerRaw)
+
+		hits, _ := c.result()
+		if len(hits) > maxSSDPLocHitsTotal {
+			t.Fatalf("global SSDP cap exceeded: %d > %d", len(hits), maxSSDPLocHitsTotal)
+		}
+		if len(hits) == 0 || hits[0].ip != "192.168.1.1" {
+			t.Fatalf("expected gateway IGD hit to survive multi-source flood and sort first, got first=%+v", hits[:min(3, len(hits))])
+		}
+	})
+
+	t.Run("single-location flood exceeding global cap", func(t *testing.T) {
+		c := newSSDPCollector()
+		for src := range maxSSDPLocHitsTotal + 50 {
+			ip := fmt.Sprintf("10.50.%d.%d", src/250, (src%250)+1)
+			raw := fmt.Sprintf("HTTP/1.1 200 OK\r\nLOCATION: http://%s:8080/d.xml\r\nST: upnp:rootdevice\r\nSERVER: Flood/1.0\r\n\r\n", ip)
+			c.ingest(ip, raw)
+		}
+		routerRaw := "HTTP/1.1 200 OK\r\nLOCATION: http://192.168.1.1:49000/igd.xml\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nSERVER: MiniUPnPd/2.3\r\n\r\n"
+		c.ingest("192.168.1.1", routerRaw)
+
+		hits, _ := c.result()
+		if len(hits) == 0 || hits[0].ip != "192.168.1.1" {
+			t.Fatalf("expected gateway IGD hit to survive full single-slot flood via reserved IGD priority, got first=%+v", hits[:min(3, len(hits))])
+		}
+	})
+}
+
+// TestDualStackFingerprintHostDeduplicatesDiscoveryEntries verifies that a
+// dual-stack client with matching mDNS, UPnP, and WS-Discovery observations
+// across IPv4 and IPv6 does not receive duplicate discovery records in HostProfile.
+func TestDualStackFingerprintHostDeduplicatesDiscoveryEntries(t *testing.T) {
+	fp := NewFingerprinter(nil, 1, 200*time.Millisecond, nil)
+	fp.SetCachedDiscovery(&LANDiscovery{
+		MDNS: map[string][]MDNSService{
+			"127.0.0.1": {{Type: "_home-assistant._tcp", Instance: "Home", Port: 8123, Transport: "tcp", ObserverVLAN: "LAN", Reflected: true}},
+			"::1":       {{Type: "_home-assistant._tcp", Instance: "Home", Port: 8123, Transport: "tcp", ObserverVLAN: "LAN", Reflected: false}},
+		},
+		UPnP: map[string][]UPnPDevice{
+			"127.0.0.1": {{ST: "upnp:rootdevice", Port: 1900, Manufacturer: "Sonos", ModelName: "Beam"}},
+			"::1":       {{ST: "upnp:rootdevice", Port: 1900, Manufacturer: "Sonos", ModelName: "Beam"}},
+		},
+		WSDiscovery: map[string][]WSDiscoveryRecord{
+			"127.0.0.1": {{Types: []string{"NetworkVideoTransmitter"}, Ports: []int{8000}}},
+			"::1":       {{Types: []string{"NetworkVideoTransmitter"}, Ports: []int{8000}}},
+		},
+	})
+
+	hp := fp.FingerprintHost(context.Background(), unifi.Client{
+		IP:   "127.0.0.1",
+		IPv6: []string{"::1"},
+		Name: "ha-dual-stack",
+	})
+	if len(hp.MDNSServices) != 1 {
+		t.Fatalf("expected 1 deduplicated mDNS service on dual-stack host, got %d: %+v", len(hp.MDNSServices), hp.MDNSServices)
+	}
+	if hp.MDNSServices[0].Reflected {
+		t.Fatalf("expected authoritative non-reflected mDNS record to win dual-stack dedupe, got %+v", hp.MDNSServices[0])
+	}
+	if len(hp.UPnPDevices) != 1 {
+		t.Fatalf("expected 1 deduplicated UPnP device on dual-stack host, got %d: %+v", len(hp.UPnPDevices), hp.UPnPDevices)
+	}
+	if len(hp.WSDiscovery) != 1 {
+		t.Fatalf("expected 1 deduplicated WS-Discovery record on dual-stack host, got %d: %+v", len(hp.WSDiscovery), hp.WSDiscovery)
+	}
+}
+
+// TestConvertNervaServiceClearsHTTPAnonymousFlagForUnrelatedFindings verifies
+// that Nerva's HTTP AnonymousAccess flag is cleared when the only anonymous
+// finding was a dropped synthetic placeholder or when only non-auth findings
+// (such as os-eol or php version checks) are present.
+func TestConvertNervaServiceClearsHTTPAnonymousFlagForUnrelatedFindings(t *testing.T) {
+	now := time.Now().UTC()
+
+	// Synthetic grafana-anon-access dropped + unrelated os-eol kept.
+	svc1, _, _ := convertNervaService(plugins.Service{
+		IP:              "192.168.1.20",
+		Port:            3000,
+		Protocol:        "http",
+		AnonymousAccess: true,
+		SecurityFindings: []plugins.SecurityFinding{
+			{ID: "grafana-anon-access", Severity: plugins.SeverityMedium, Evidence: "Successfully queried endpoint without credentials"},
+			{ID: "os-eol", Severity: plugins.SeverityMedium, Title: "End-of-Life OS", Evidence: "Ubuntu 18.04"},
+		},
+	}, now)
+	if svc1.AnonymousAccess {
+		t.Fatal("AnonymousAccess must be cleared when synthetic HTTP anon finding was dropped and only os-eol remains")
+	}
+	if len(svc1.Findings) != 1 || svc1.Findings[0].ID != "os-eol" {
+		t.Fatalf("expected os-eol finding to remain, got %+v", svc1.Findings)
+	}
+
+	// HTTP fingerprinter sets AnonymousAccess=true with only a non-auth custom finding.
+	svc2, _, _ := convertNervaService(plugins.Service{
+		IP:              "192.168.1.21",
+		Port:            80,
+		Protocol:        "http",
+		AnonymousAccess: true,
+		SecurityFindings: []plugins.SecurityFinding{
+			{ID: "php-vulnerable-php2shell", Severity: plugins.SeverityHigh, Title: "PHP CGI Vulnerable", Evidence: "X-Powered-By: PHP/8.1"},
+		},
+	}, now)
+	if svc2.AnonymousAccess {
+		t.Fatal("AnonymousAccess must be cleared for HTTP services with only non-auth findings")
+	}
+	if len(svc2.Findings) != 1 || svc2.Findings[0].ID != "php-vulnerable-php2shell" {
+		t.Fatalf("expected php-vulnerable-php2shell to remain, got %+v", svc2.Findings)
+	}
+
+	// Real unauthenticated HTTP finding still preserves AnonymousAccess=true.
+	svc3, _, _ := convertNervaService(plugins.Service{
+		IP:              "192.168.1.22",
+		Port:            8080,
+		Protocol:        "http",
+		AnonymousAccess: true,
+		SecurityFindings: []plugins.SecurityFinding{
+			{ID: "jenkins-unauth-console", Severity: plugins.SeverityCritical, Evidence: "GET /script 200 OK"},
+		},
+	}, now)
+	if !svc3.AnonymousAccess {
+		t.Fatal("real unauth HTTP finding must preserve AnonymousAccess=true")
 	}
 }
