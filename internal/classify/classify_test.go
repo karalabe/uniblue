@@ -101,3 +101,83 @@ func TestClassifyDeterministicSignals(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyPreservesHardwareIdentityOverServicesAndWAN verifies that specific
+// hardware roles (printers with SMB, WAN-forwarded cameras, Hue/AirPlay mDNS
+// receivers, SIP endpoints, hypervisors, and backup servers) are not overwritten
+// by generic file-sharing ports or WAN web exposure flags.
+func TestClassifyPreservesHardwareIdentityOverServicesAndWAN(t *testing.T) {
+	c, err := Load(classifydata.BuiltinFS, oui.New(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// 1. Multifunction IPPS printer with Scan-to-SMB (445) stays CategoryPrinter.
+	prn := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.20", MAC: "00:11:22:00:00:20", IsWired: true},
+		&probe.HostProfile{
+			OpenPorts:    []int{445, 631},
+			MDNSServices: []probe.MDNSService{{Type: "_ipps._tcp", Port: 631}},
+		},
+		false,
+	)
+	if prn.Category != CategoryPrinter {
+		t.Fatalf("IPPS+SMB printer classified as %q (%q), want %q", prn.Category, prn.Role, CategoryPrinter)
+	}
+
+	// 2. RTSP camera with a forwarded web port stays CategoryCamera (not Reverse Proxy).
+	cam := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.21", MAC: "00:11:22:00:00:21", IsWired: true},
+		&probe.HostProfile{OpenPorts: []int{80, 554}},
+		true,
+	)
+	if cam.Category != CategoryCamera {
+		t.Fatalf("WAN-forwarded RTSP camera classified as %q (%q), want %q", cam.Category, cam.Role, CategoryCamera)
+	}
+
+	// 3. Hue Bridge mDNS and AirPlay-only receiver classify cleanly instead of Unclassified.
+	hue := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.22", MAC: "00:11:22:00:00:22", IsWired: true},
+		&probe.HostProfile{MDNSServices: []probe.MDNSService{{Type: "_hue._tcp", Port: 443}}},
+		false,
+	)
+	if hue.Category != CategoryIoT || hue.Role != "Philips Hue Bridge" {
+		t.Fatalf("Hue mDNS classified as %+v, want Philips Hue Bridge", hue)
+	}
+	ap := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.23", MAC: "00:11:22:00:00:23", IsWired: false},
+		&probe.HostProfile{MDNSServices: []probe.MDNSService{{Type: "_airplay._tcp", Port: 7000}}},
+		false,
+	)
+	if ap.Category != CategoryMedia || ap.Role != "AirPlay Media Receiver" {
+		t.Fatalf("AirPlay-only device classified as %+v, want AirPlay Media Receiver", ap)
+	}
+
+	// 4. Recognized SIP service classifies as VoIP / SIP Endpoint (not Unclassified).
+	sip := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.24", MAC: "00:11:22:00:00:24", IsWired: true},
+		&probe.HostProfile{Services: []probe.Service{{Port: 5060, Transport: "udp", Protocol: "sip"}}},
+		false,
+	)
+	if sip.Category != CategoryNetService || sip.Role != "VoIP / SIP Endpoint" {
+		t.Fatalf("SIP device classified as %+v, want VoIP / SIP Endpoint", sip)
+	}
+
+	// 5. Hypervisor and Backup Server receive distinct roles within CategoryServer.
+	pve := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.25", MAC: "00:11:22:00:00:25", IsWired: true},
+		&probe.HostProfile{OpenPorts: []int{22, 8006}},
+		false,
+	)
+	if pve.Category != CategoryServer || pve.Role != "Hypervisor" {
+		t.Fatalf("Proxmox host classified as %+v, want Hypervisor", pve)
+	}
+	pbs := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.26", MAC: "00:11:22:00:00:26", IsWired: true},
+		&probe.HostProfile{OpenPorts: []int{22, 8007}},
+		false,
+	)
+	if pbs.Category != CategoryServer || pbs.Role != "Backup Server" {
+		t.Fatalf("Backup host classified as %+v, want Backup Server", pbs)
+	}
+}

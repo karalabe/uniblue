@@ -213,9 +213,26 @@ func (c *Classifier) ClassifyClient(cl unifi.Client, hp *probe.HostProfile, isWA
 	ouiRes := c.ouiDB.Lookup(cl.MAC)
 	vendor := resolveVendor(ouiRes, cl.OUI)
 
-	// 1. Active protocol, port, banner, and WAN-proxy signals (strongest proof).
-	if res, ok := classifyByProtocol(hp, isWANWeb, vendor); ok {
+	// 1. Active protocol, port, and banner signals (strongest hardware proof).
+	// WAN HTTP/HTTPS port-forwarding is attached as an exposure signal rather
+	// than overwriting an already-identified camera, printer, BMC, or NAS.
+	if res, ok := classifyByProtocol(hp, vendor); ok {
+		if isWANWeb {
+			res.Signals = append(res.Signals, "receives WAN HTTP/HTTPS port forward")
+		}
 		return res
+	}
+
+	// 1b. If no specific hardware identity matched yet, a host receiving a WAN
+	// HTTP/HTTPS port forward is most likely a dedicated web entrypoint or proxy.
+	if isWANWeb {
+		return Result{
+			Category:   CategoryNetService,
+			Role:       "WAN Web Entrypoint / Reverse Proxy",
+			Vendor:     vendor,
+			Confidence: ConfidenceHigh,
+			Signals:    []string{"receives WAN HTTP/HTTPS port forward"},
+		}
 	}
 
 	// 2. Virtualization MAC prefix (e.g., 52:54:00 QEMU/KVM, 00:50:56 VMware).
@@ -306,6 +323,26 @@ func (c *Classifier) ClassifyClient(cl unifi.Client, hp *probe.HostProfile, isWA
 		}
 	}
 
+	// 7. Ambient media advertisement fallback (e.g., standalone AirPlay receiver
+	// that did not match a Mac/personal OUI or hostname rule above).
+	if hp != nil {
+		for _, md := range hp.MDNSServices {
+			if md.Withdrawn {
+				continue
+			}
+			switch strings.ToLower(md.Type) {
+			case "_airplay._tcp", "_raop._tcp":
+				return Result{
+					Category:   CategoryMedia,
+					Role:       "AirPlay Media Receiver",
+					Vendor:     vendor,
+					Confidence: ConfidenceMedium,
+					Signals:    []string{"mDNS " + md.Type},
+				}
+			}
+		}
+	}
+
 	return Result{
 		Category:   CategoryUnknown,
 		Role:       "Unclassified Device",
@@ -315,17 +352,12 @@ func (c *Classifier) ClassifyClient(cl unifi.Client, hp *probe.HostProfile, isWA
 }
 
 // classifyByProtocol checks observed TCP/UDP service banners, open ports, and
-// WAN web-entrypoint routing for high-confidence functional classification.
-func classifyByProtocol(hp *probe.HostProfile, isWANWeb bool, vendor string) (Result, bool) {
-	if isWANWeb {
-		return Result{
-			Category:   CategoryNetService,
-			Role:       "WAN Web Entrypoint / Reverse Proxy",
-			Vendor:     vendor,
-			Confidence: ConfidenceHigh,
-			Signals:    []string{"receives WAN HTTP/HTTPS port forward"},
-		}, true
-	}
+// passive discovery advertisements for high-confidence hardware/functional identity.
+// Specific appliance identities (BMC, Printer, Camera, Smart-Home Hub, Discovery)
+// are evaluated before generic file-sharing/remote-access ports (SMB 445, VNC 5900)
+// so multifunction printers with Scan-to-SMB or cameras with web UIs keep their
+// true hardware identity.
+func classifyByProtocol(hp *probe.HostProfile, vendor string) (Result, bool) {
 	if hp == nil {
 		return Result{}, false
 	}
@@ -373,28 +405,9 @@ func classifyByProtocol(hp *probe.HostProfile, isWANWeb bool, vendor string) (Re
 		}, true
 	}
 
-	// Compute servers, hypervisors, and NAS boxes.
-	if hp.HasPort(8006) || hp.HasPort(445) || hp.HasPort(2049) || hp.HasPort(5900) ||
-		containsAny(titlesLower, "truenas", "unraid", "proxmox", "synology", "diskstation", "qnap") {
-		var sigs []string
-		for _, p := range []int{445, 2049, 5900, 8006} {
-			if hp.HasPort(p) {
-				sigs = append(sigs, fmt.Sprintf("port %d", p))
-			}
-		}
-		if len(sigs) == 0 {
-			sigs = append(sigs, fmt.Sprintf("HTTP title %q", titles))
-		}
-		return Result{
-			Category:   CategoryServer,
-			Role:       "Server / NAS / Hypervisor",
-			Vendor:     vendor,
-			Confidence: ConfidenceHigh,
-			Signals:    sigs,
-		}, true
-	}
-
-	// Network & 3D printers (JetDirect 9100, IPP 631, Prusa/LaserJet titles).
+	// Network & 3D printers (JetDirect 9100, IPP/IPPS 631, Prusa/LaserJet/OctoPrint/Bambu).
+	// Evaluated BEFORE generic SMB (445) so multifunction printers with Scan-to-SMB
+	// retain their printer identity instead of becoming a NAS/file server.
 	if hp.HasPort(9100) || hp.HasPort(631) || containsAny(titlesLower, "laserjet", "prusalink", "octoprint", "bambu") {
 		role := "Network Printer"
 		if containsAny(titlesLower, "prusa", "octoprint", "bambu") {
@@ -409,7 +422,7 @@ func classifyByProtocol(hp *probe.HostProfile, isWANWeb bool, vendor string) (Re
 		}, true
 	}
 
-	// IP cameras (RTSP 554).
+	// IP cameras & NVRs (RTSP 554).
 	if hp.HasPort(554) {
 		return Result{
 			Category:   CategoryCamera,
@@ -420,9 +433,56 @@ func classifyByProtocol(hp *probe.HostProfile, isWANWeb bool, vendor string) (Re
 		}, true
 	}
 
-	// Passive mDNS / SSDP / WS-Discovery signals (high-confidence protocol proof).
+	// Passive mDNS / SSDP / WS-Discovery signals (high-confidence appliance proof).
+	// Evaluated BEFORE generic SMB/VNC so advertised printers, cameras, Hue bridges,
+	// and smart-home hubs keep their exact hardware role.
 	if res, ok := classifyByDiscovery(hp, vendor); ok {
 		return res, true
+	}
+
+	// Hypervisors, backup appliances, NAS boxes, and file/compute servers.
+	if hp.HasPort(8006) || hp.HasPort(8007) || hp.HasPort(445) || hp.HasPort(2049) || hp.HasPort(5900) ||
+		containsAny(titlesLower, "proxmox backup", "veeam", "urbackup", "truenas", "unraid", "proxmox", "esxi", "synology", "diskstation", "qnap") {
+		var sigs []string
+		for _, p := range []int{445, 2049, 5900, 8006, 8007} {
+			if hp.HasPort(p) {
+				sigs = append(sigs, fmt.Sprintf("port %d", p))
+			}
+		}
+		if len(sigs) == 0 && titles != "" {
+			sigs = append(sigs, fmt.Sprintf("HTTP title %q", titles))
+		}
+		role := "Server / File Share"
+		switch {
+		case hp.HasPort(8007) || containsAny(titlesLower, "proxmox backup", "veeam", "urbackup"):
+			role = "Backup Server"
+		case hp.HasPort(8006) || containsAny(titlesLower, "proxmox", "esxi"):
+			role = "Hypervisor"
+		case hp.HasPort(2049) || containsAny(titlesLower, "truenas", "unraid", "synology", "diskstation", "qnap"):
+			role = "NAS / File Server"
+		}
+		return Result{
+			Category:   CategoryServer,
+			Role:       role,
+			Vendor:     vendor,
+			Confidence: ConfidenceHigh,
+			Signals:    sigs,
+		}, true
+	}
+
+	// VoIP / SIP endpoints and PBX appliances (port 5060/5061 or observed SIP service).
+	if hasObservedProtocol(hp, "sip") || hp.HasPort(5060) || hp.HasPort(5061) || containsAny(titlesLower, "freepbx", "asterisk", "3cx", "yealink", "polycom", "grandstream") {
+		role := "VoIP / SIP Endpoint"
+		if containsAny(titlesLower, "freepbx", "asterisk", "3cx") {
+			role = "VoIP / PBX Server"
+		}
+		return Result{
+			Category:   CategoryNetService,
+			Role:       role,
+			Vendor:     vendor,
+			Confidence: ConfidenceHigh,
+			Signals:    []string{"SIP / VoIP service observed"},
+		}, true
 	}
 
 	// Building automation / IoT control protocols.
@@ -438,6 +498,15 @@ func classifyByProtocol(hp *probe.HostProfile, isWANWeb bool, vendor string) (Re
 	}
 
 	return Result{}, false
+}
+
+func hasObservedProtocol(hp *probe.HostProfile, proto string) bool {
+	for _, svc := range hp.Services {
+		if strings.EqualFold(strings.TrimSpace(svc.Protocol), proto) {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyByDiscovery classifies devices cleanly from typed DNS-SD, SSDP/UPnP,
@@ -508,6 +577,62 @@ func classifyByDiscovery(hp *probe.HostProfile, vendor string) (Result, bool) {
 				Vendor:     firstNonEmptyVendor(vendor, "Hunter Douglas"),
 				Confidence: ConfidenceHigh,
 				Signals:    []string{"mDNS " + md.Type},
+			}, true
+		case "_hue._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Philips Hue Bridge",
+				Vendor:     firstNonEmptyVendor(vendor, "Signify / Philips Hue"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _hue._tcp"},
+			}, true
+		case "_hap._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "HomeKit Accessory",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _hap._tcp"},
+			}, true
+		case "_home-assistant._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "Smart Home Hub",
+				Vendor:     firstNonEmptyVendor(vendor, "Home Assistant"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _home-assistant._tcp"},
+			}, true
+		case "_esphomelib._tcp":
+			return Result{
+				Category:   CategoryIoT,
+				Role:       "ESPHome Smart Device",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _esphomelib._tcp"},
+			}, true
+		case "_octoprint._tcp":
+			return Result{
+				Category:   CategoryPrinter,
+				Role:       "3D Printer",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _octoprint._tcp"},
+			}, true
+		case "_googlecast._tcp":
+			return Result{
+				Category:   CategoryMedia,
+				Role:       "Google Cast / Media Device",
+				Vendor:     vendor,
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _googlecast._tcp"},
+			}, true
+		case "_sonos._tcp":
+			return Result{
+				Category:   CategoryMedia,
+				Role:       "Sonos Speaker",
+				Vendor:     firstNonEmptyVendor(vendor, "Sonos"),
+				Confidence: ConfidenceHigh,
+				Signals:    []string{"mDNS _sonos._tcp"},
 			}, true
 		case "_shelly._tcp":
 			return Result{
