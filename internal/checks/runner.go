@@ -279,7 +279,11 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 				if hp.IsRawPrintPort(port) {
 					continue
 				}
-				evidence, matched = r.executeProbe(ctx, chk, hp.Client.IP, port)
+				targetIP := hp.Client.PrimaryIP()
+				if targetIP == "" {
+					continue
+				}
+				evidence, matched = r.executeProbe(ctx, chk, targetIP, port)
 			}
 			if matched {
 				for _, supID := range chk.Supersedes {

@@ -50,7 +50,7 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 
 			for _, sf := range svc.Findings {
 				prop := nervaFindingProperty(sf.ID)
-				key := fmt.Sprintf("%s|%d|%s|%s", hp.Client.IP, svc.Port, transport, prop)
+				key := fmt.Sprintf("%s|%d|%s|%s", hp.Client.PrimaryIP(), svc.Port, transport, prop)
 				if _, ok := coveredProp[key]; ok {
 					continue
 				}

@@ -406,13 +406,20 @@ func NewFingerprinter(ports []int, concurrency int, timeout time.Duration, exclu
 // FingerprintAll profiles every eligible client concurrently using a bounded
 // channel worker pool and returns the collected HostProfiles sorted by IP.
 func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Client) []HostProfile {
-	// Filter down to clients with a valid, non-excluded IP before spawning work.
+	// Filter down to clients with a valid, non-excluded IPv4 or IPv6 address.
 	targets := make([]unifi.Client, 0, len(clients))
 	for _, cl := range clients {
-		if cl.IP == "" {
+		if cl.PrimaryIP() == "" {
 			continue
 		}
-		if _, skip := f.excludeIPs[cl.IP]; skip {
+		excluded := false
+		for _, ip := range cl.AllIPs() {
+			if _, skip := f.excludeIPs[ip]; skip {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
 			continue
 		}
 		targets = append(targets, cl)
@@ -438,7 +445,7 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 
 func hasNonLoopbackTarget(targets []unifi.Client) bool {
 	for _, cl := range targets {
-		ip := net.ParseIP(cl.IP)
+		ip := net.ParseIP(cl.PrimaryIP())
 		if ip != nil && !ip.IsLoopback() {
 			return true
 		}
@@ -490,7 +497,7 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 		f.reportProgress("probing", len(profiles), len(targets), p.Client.DisplayName())
 	}
 	sort.Slice(profiles, func(i, j int) bool {
-		return profiles[i].Client.IP < profiles[j].Client.IP
+		return profiles[i].Client.PrimaryIP() < profiles[j].Client.PrimaryIP()
 	})
 
 	// Enrich every discovered open port using Nerva's FastMode protocol
@@ -503,21 +510,30 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 // FingerprintHost probes a single client's curated ports sequentially (to stay
 // gentle on embedded stacks) and grabs lightweight HTTP banners for web ports.
 func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) HostProfile {
+	targetIP := cl.PrimaryIP()
+	allIPs := cl.AllIPs()
 	profile := HostProfile{
 		Client:    cl,
 		HTTP:      make(map[int]HTTPBanner),
 		ScannedAt: time.Now().UTC(),
 	}
 	if f.discovery != nil {
-		profile.MDNSServices = f.discovery.MDNS[cl.IP]
-		profile.UPnPDevices = f.discovery.UPnP[cl.IP]
-		profile.WSDiscovery = f.discovery.WSDiscovery[cl.IP]
-		if rawSet := f.discovery.RawPrintIPs[cl.IP]; len(rawSet) > 0 {
-			for rp := range rawSet {
-				profile.RawPrintPorts = append(profile.RawPrintPorts, rp)
+		rawSeen := make(map[int]struct{})
+		for _, ip := range allIPs {
+			profile.MDNSServices = append(profile.MDNSServices, f.discovery.MDNS[ip]...)
+			profile.UPnPDevices = append(profile.UPnPDevices, f.discovery.UPnP[ip]...)
+			profile.WSDiscovery = append(profile.WSDiscovery, f.discovery.WSDiscovery[ip]...)
+			for rp := range f.discovery.RawPrintIPs[ip] {
+				if _, dup := rawSeen[rp]; !dup {
+					rawSeen[rp] = struct{}{}
+					profile.RawPrintPorts = append(profile.RawPrintPorts, rp)
+				}
 			}
-			sort.Ints(profile.RawPrintPorts)
 		}
+		sort.Ints(profile.RawPrintPorts)
+	}
+	if targetIP == "" {
+		return profile
 	}
 
 	dialTimeout := f.timeout
@@ -526,7 +542,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	}
 	dialer := net.Dialer{Timeout: dialTimeout}
 
-	ports := f.portsForHost(cl.IP)
+	ports := f.portsForHost(allIPs...)
 	consecutiveTimeouts := 0
 	for i, port := range ports {
 		if ctx.Err() != nil {
@@ -544,7 +560,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 			}
 		}
 
-		addr := net.JoinHostPort(cl.IP, strconv.Itoa(port))
+		addr := net.JoinHostPort(targetIP, strconv.Itoa(port))
 		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -560,7 +576,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 		consecutiveTimeouts = 0
 
-		rawPrint := isRawPrintSinkPort(port, f.discovery, cl.IP)
+		rawPrint := isRawPrintSinkPortAny(port, f.discovery, allIPs)
 		if rawPrint && !profile.IsRawPrintPort(port) {
 			profile.RawPrintPorts = append(profile.RawPrintPorts, port)
 			sort.Ints(profile.RawPrintPorts)
@@ -585,7 +601,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		// HTTP checks and CVE fingerprinters can match headers, titles, and TLS
 		// certificate metadata cheaply.
 		if scheme, ok := httpSchemeForPort(port); ok {
-			if banner, ok := f.fetchHTTPBanner(ctx, scheme, cl.IP, port); ok {
+			if banner, ok := f.fetchHTTPBanner(ctx, scheme, targetIP, port); ok {
 				profile.HTTP[port] = banner
 			}
 		}
@@ -596,21 +612,40 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	// adaptively walk upward to discover additional VM displays without sending
 	// extra probes to hosts that do not speak VNC.
 	if profile.HasPort(5900) || profile.HasPort(5901) {
-		f.walkVNCDisplays(ctx, dialer, cl.IP, ports, &profile)
+		f.walkVNCDisplays(ctx, dialer, targetIP, ports, &profile)
 	}
 
 	sort.Ints(profile.OpenPorts)
 	return profile
 }
 
+func isRawPrintSinkPortAny(port int, disc *LANDiscovery, ips []string) bool {
+	if isRawPrintSinkPort(port, disc, "") {
+		return true
+	}
+	for _, ip := range ips {
+		if isRawPrintSinkPort(port, disc, ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // portsForHost returns the deduplicated, sorted list of TCP ports to probe on
-// ip, merging UniBlue's base port list with UniFi-derived port hints and
-// per-host ports dynamically discovered via mDNS/SSDP/WS-Discovery.
-func (f *Fingerprinter) portsForHost(ip string) []int {
-	hints := f.hostPortHints[ip]
+// a host, merging UniBlue's base port list with UniFi-derived port hints and
+// per-host ports dynamically discovered via mDNS/SSDP/WS-Discovery across all
+// known IPv4 and IPv6 addresses for that host.
+func (f *Fingerprinter) portsForHost(ips ...string) []int {
+	var hints []int
 	var discPorts []int
-	if f.discovery != nil {
-		discPorts = f.discovery.PortsByIP[ip]
+	for _, ip := range ips {
+		if ip == "" {
+			continue
+		}
+		hints = append(hints, f.hostPortHints[ip]...)
+		if f.discovery != nil {
+			discPorts = append(discPorts, f.discovery.PortsByIP[ip]...)
+		}
 	}
 	if len(hints) == 0 && len(discPorts) == 0 {
 		return f.ports

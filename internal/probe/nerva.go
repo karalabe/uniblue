@@ -59,25 +59,29 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 	idxByIP := make(map[string]int, len(profiles))
 	var targets []plugins.Target
 	for i, hp := range profiles {
-		if hp.Client.IP == "" || len(hp.OpenPorts) == 0 {
+		targetIP := hp.Client.PrimaryIP()
+		if targetIP == "" || len(hp.OpenPorts) == 0 {
 			continue
 		}
-		addr, err := netip.ParseAddr(hp.Client.IP)
+		addr, err := netip.ParseAddr(targetIP)
 		if err != nil {
 			continue
 		}
-		idxByIP[hp.Client.IP] = i
+		canonIP := addr.String()
+		idxByIP[targetIP] = i
+		idxByIP[canonIP] = i
+		allIPs := hp.Client.AllIPs()
 		for _, port := range hp.OpenPorts {
 			// Hard raw-printer safety guard: NEVER send application-layer probe
 			// bytes to JetDirect (9100), LPD (515), or any port advertised via
 			// mDNS _pdl-datastream._tcp, because non-PJL printers can print raw
 			// probe bytes onto physical paper.
-			if isRawPrintSinkPort(port, f.discovery, hp.Client.IP) {
+			if isRawPrintSinkPortAny(port, f.discovery, allIPs) {
 				continue
 			}
 			targets = append(targets, plugins.Target{
 				Address:    netip.AddrPortFrom(addr, uint16(port)),
-				Host:       hp.Client.IP,
+				Host:       canonIP,
 				Misconfigs: true,
 			})
 		}
@@ -200,9 +204,11 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 	// resolve accurately to "observed-protocol" or "tls-unknown-app".
 	for i := range profiles {
 		hp := &profiles[i]
-		if hp.Client.IP == "" || len(hp.OpenPorts) == 0 || ctx.Err() != nil {
+		targetIP := hp.Client.PrimaryIP()
+		if targetIP == "" || len(hp.OpenPorts) == 0 || ctx.Err() != nil {
 			continue
 		}
+		allIPs := hp.Client.AllIPs()
 		covered := make(map[int]bool, len(hp.Services))
 		for _, s := range hp.Services {
 			if s.Transport == "" || strings.EqualFold(s.Transport, "tcp") {
@@ -210,7 +216,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 			}
 		}
 		for _, port := range hp.OpenPorts {
-			if covered[port] || hp.IsRawPrintPort(port) || isRawPrintSinkPort(port, f.discovery, hp.Client.IP) {
+			if covered[port] || hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
 				continue
 			}
 			now := time.Now().UTC()
@@ -231,7 +237,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 					Transport:     "tcp",
 					Protocol:      proto,
 					State:         state,
-					AddressFamily: ipFamilyOf(hp.Client.IP),
+					AddressFamily: ipFamilyOf(targetIP),
 					ObservedAt:    &now,
 					TLS:           isTLS,
 					Title:         b.Title,
@@ -239,7 +245,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 				})
 				continue
 			}
-			if svc, ok := probeAlternatePortFallback(ctx, hp.Client.IP, port, nervaTimeout); ok {
+			if svc, ok := probeAlternatePortFallback(ctx, targetIP, port, nervaTimeout); ok {
 				hp.Services = append(hp.Services, svc)
 				if svc.Banner != "" && strings.HasPrefix(svc.Banner, "SSH-") && hp.SSHBanner == "" {
 					hp.SSHBanner = svc.Banner

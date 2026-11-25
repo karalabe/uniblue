@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/karalabe/uniblue/internal/unifi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -310,19 +311,22 @@ func parseZWaveJSInventory(raw []byte, spec BridgeInventorySpec) ([]ChildDevice,
 }
 
 // AttachBridgeChildren merges normalized child devices onto their matching
-// parent HostProfiles (by ParentMAC or ParentIP) without mutating unrelated hosts.
+// parent HostProfiles (by ParentMAC or any IPv4/IPv6 ParentIP) without mutating
+// unrelated hosts.
 func AttachBridgeChildren(profiles []HostProfile, children []ChildDevice) {
 	if len(profiles) == 0 || len(children) == 0 {
 		return
 	}
 	byMAC := make(map[string]int, len(profiles))
-	byIP := make(map[string]int, len(profiles))
+	byIP := make(map[string]int, len(profiles)*2)
 	for i, hp := range profiles {
 		if m := strings.ToLower(strings.TrimSpace(hp.Client.MAC)); m != "" {
 			byMAC[m] = i
 		}
-		if ip := strings.TrimSpace(hp.Client.IP); ip != "" {
-			byIP[ip] = i
+		for _, ip := range hp.Client.AllIPs() {
+			if k := canonicalIPKey(ip); k != "" {
+				byIP[k] = i
+			}
 		}
 	}
 	for _, ch := range children {
@@ -334,7 +338,7 @@ func AttachBridgeChildren(profiles []HostProfile, children []ChildDevice) {
 				idx = i
 			}
 		} else if ch.ParentIP != "" {
-			if i, ok := byIP[strings.TrimSpace(ch.ParentIP)]; ok {
+			if i, ok := byIP[canonicalIPKey(ch.ParentIP)]; ok {
 				idx = i
 			}
 		}
@@ -358,6 +362,59 @@ func AttachBridgeChildren(profiles []HostProfile, children []ChildDevice) {
 			return profiles[i].Children[a].ID < profiles[i].Children[b].ID
 		})
 	}
+}
+
+// MatchDeviceBridgeChildren matches bridge/NVR child devices whose parent is a
+// UniFi infrastructure device (e.g., a UDM Pro or UNVR running UniFi Protect)
+// rather than a regular client HostProfile, returning children keyed by
+// normalized lowercase UniFi device MAC.
+func MatchDeviceBridgeChildren(devices []unifi.Device, children []ChildDevice) map[string][]ChildDevice {
+	if len(devices) == 0 || len(children) == 0 {
+		return nil
+	}
+	byMAC := make(map[string]string, len(devices))
+	byIP := make(map[string]string, len(devices))
+	for _, d := range devices {
+		m := strings.ToLower(strings.TrimSpace(d.MAC))
+		if m == "" {
+			continue
+		}
+		byMAC[m] = m
+		if k := canonicalIPKey(d.IP); k != "" {
+			byIP[k] = m
+		}
+	}
+	out := make(map[string][]ChildDevice)
+	for _, ch := range children {
+		devMAC := ""
+		if m := strings.ToLower(strings.TrimSpace(ch.ParentMAC)); m != "" {
+			devMAC = byMAC[m]
+		} else if ch.ParentIP != "" {
+			devMAC = byIP[canonicalIPKey(ch.ParentIP)]
+		}
+		if devMAC == "" {
+			continue
+		}
+		dup := false
+		for _, ex := range out[devMAC] {
+			if ex.ID == ch.ID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out[devMAC] = append(out[devMAC], ch)
+		}
+	}
+	for m := range out {
+		sort.Slice(out[m], func(a, b int) bool {
+			return out[m][a].ID < out[m][b].ID
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func firstNonEmpty(vals ...string) string {

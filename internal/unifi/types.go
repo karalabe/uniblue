@@ -328,9 +328,58 @@ func (c Client) DisplayName() string {
 		return c.Hostname
 	case c.IP != "":
 		return c.IP
+	case len(c.IPv6) > 0 && strings.TrimSpace(c.IPv6[0]) != "":
+		return strings.TrimSpace(c.IPv6[0])
 	default:
 		return c.MAC
 	}
+}
+
+// PrimaryIP returns the preferred routable IP address for probing and lookup:
+// IPv4 when present, otherwise the first non-link-local IPv6 address, falling
+// back to any non-empty IPv6 address.
+func (c Client) PrimaryIP() string {
+	if ip := strings.TrimSpace(c.IP); ip != "" {
+		return ip
+	}
+	fallback := ""
+	for _, raw := range c.IPv6 {
+		ip := strings.TrimSpace(raw)
+		if ip == "" {
+			continue
+		}
+		if fallback == "" {
+			fallback = ip
+		}
+		if !strings.HasPrefix(strings.ToLower(ip), "fe80:") {
+			return ip
+		}
+	}
+	return fallback
+}
+
+// AllIPs returns every deduplicated non-empty IPv4 and IPv6 address known for
+// the client, with IPv4 first when present.
+func (c Client) AllIPs() []string {
+	var out []string
+	seen := make(map[string]struct{}, 1+len(c.IPv6))
+	add := func(raw string) {
+		ip := strings.TrimSpace(raw)
+		if ip == "" {
+			return
+		}
+		key := strings.ToLower(ip)
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, ip)
+	}
+	add(c.IP)
+	for _, ip6 := range c.IPv6 {
+		add(ip6)
+	}
+	return out
 }
 
 // Device represents a piece of Ubiquiti infrastructure managed by the site

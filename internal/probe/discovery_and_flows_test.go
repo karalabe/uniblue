@@ -408,3 +408,63 @@ func generateTestSelfSignedCert(t *testing.T) tls.Certificate {
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
 }
+
+// TestIPv6OnlyProbingDualStackFlowsAndDeviceBridgeChildren verifies that
+// IPv6-only clients produce active profiles, dual-stack IPv6 passive flows
+// match their parent host profile, and bridge children owned by a UniFi
+// infrastructure device (such as a gateway running Protect) are matched.
+func TestIPv6OnlyProbingDualStackFlowsAndDeviceBridgeChildren(t *testing.T) {
+	// 1. IPv6-only client with a listening TCP port on [::1].
+	ln6, err := net.Listen("tcp6", "[::1]:0")
+	if err == nil {
+		defer ln6.Close()
+		port6 := ln6.Addr().(*net.TCPAddr).Port
+		go func() {
+			for {
+				c, aerr := ln6.Accept()
+				if aerr != nil {
+					return
+				}
+				_ = c.Close()
+			}
+		}()
+
+		fp := NewFingerprinter([]int{port6}, 1, 500*time.Millisecond, nil)
+		fp.skipDiscovery = true
+		profiles := fp.FingerprintAll(context.Background(), []unifi.Client{
+			{MAC: "02:aa:bb:00:00:60", Name: "matter-v6-only", IPv6: []string{"::1"}},
+		})
+		if len(profiles) != 1 || !profiles[0].HasPort(port6) {
+			t.Fatalf("expected IPv6-only client to produce profile with open port %d, got %+v", port6, profiles)
+		}
+	}
+
+	// 2. Dual-stack client matches an imported passive flow using its IPv6 address.
+	dualProfiles := []HostProfile{
+		{
+			Client: unifi.Client{
+				MAC:  "02:aa:bb:00:00:61",
+				IP:   "192.0.2.61",
+				IPv6: []string{"2001:db8:0:0::61"},
+				Name: "dual-stack-host",
+			},
+		},
+	}
+	ApplyPassiveFlows(dualProfiles, []PassiveFlowRecord{
+		{Direction: "hosted", LocalIP: "2001:db8::61", Port: 5540, Transport: "udp", Protocol: "matter", Source: "zeek"},
+	})
+	if len(dualProfiles[0].Services) != 1 || dualProfiles[0].Services[0].Protocol != "matter" || dualProfiles[0].Services[0].Port != 5540 {
+		t.Fatalf("expected IPv6 passive flow to attach to dual-stack host, got %+v", dualProfiles[0].Services)
+	}
+
+	// 3. Bridge children owned by a UniFi infrastructure device (e.g. UDM Pro Protect).
+	devs := []unifi.Device{
+		{MAC: "aa:00:00:00:00:01", IP: "192.0.2.1", Name: "Home Gateway", Model: "UDM-Pro", Type: "udm"},
+	}
+	matched := MatchDeviceBridgeChildren(devs, []ChildDevice{
+		{ID: "protect-cam-1", Name: "Porch Doorbell", ParentMAC: "aa:00:00:00:00:01", Category: "camera"},
+	})
+	if len(matched["aa:00:00:00:00:01"]) != 1 || matched["aa:00:00:00:00:01"][0].Name != "Porch Doorbell" {
+		t.Fatalf("expected Protect child to match gateway device, got %+v", matched)
+	}
+}

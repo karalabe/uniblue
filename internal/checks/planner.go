@@ -83,17 +83,18 @@ func PlanHostPorts(clients []unifi.Client, list []*Check, baseHints map[string][
 			continue
 		}
 		for _, cl := range clients {
-			if cl.IP == "" {
+			targetIP := cl.PrimaryIP()
+			if targetIP == "" {
 				continue
 			}
 			if !matchesClientIdentity(chk, cl) {
 				continue
 			}
 			for _, p := range chk.Preconditions.PortsAny {
-				add(cl.IP, p)
+				add(targetIP, p)
 			}
 			for _, p := range chk.Preconditions.PortsAll {
-				add(cl.IP, p)
+				add(targetIP, p)
 			}
 		}
 	}

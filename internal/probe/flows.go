@@ -176,19 +176,32 @@ func ParsePassiveFlows(raw []byte) ([]PassiveFlowRecord, error) {
 //     only TLS, QUIC, or an opaque socket).
 //   - Outbound internet connections populate hp.OutboundDependencies and NEVER
 //     misclassify the local client as hosting that external server.
+func canonicalIPKey(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a.Unmap().String()
+	}
+	return strings.ToLower(s)
+}
+
 func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 	if len(profiles) == 0 || len(records) == 0 {
 		return
 	}
-	idxByIP := make(map[string]int, len(profiles))
+	idxByIP := make(map[string]int, len(profiles)*2)
 	for i, hp := range profiles {
-		if ip := strings.TrimSpace(hp.Client.IP); ip != "" {
-			idxByIP[ip] = i
+		for _, ip := range hp.Client.AllIPs() {
+			if k := canonicalIPKey(ip); k != "" {
+				idxByIP[k] = i
+			}
 		}
 	}
 
 	for _, rec := range records {
-		idx, ok := idxByIP[strings.TrimSpace(rec.LocalIP)]
+		idx, ok := idxByIP[canonicalIPKey(rec.LocalIP)]
 		if !ok {
 			continue
 		}
