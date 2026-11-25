@@ -615,7 +615,10 @@ func TestPolicyDecodingWideRangesBoundsNegationAndSiteRef(t *testing.T) {
 		t.Fatalf("fragment 2 unexpected: fin=%v op=%d p=%q err=%v", fin2, op2, p2, err)
 	}
 
-	// Display-name site resolution must update c.site to InternalReference and report missing switch-ports.
+	// Display-name site resolution must update c.site to InternalReference for
+	// API path routing while keeping Snapshot.Site at the configured display name
+	// and reporting missing switch-ports.
+	var routedLegacyDevice atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/proxy/network/integration/v1/sites", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":1,"totalCount":1,"data":[{"id":"s-1","name":"Office","internalReference":"office-ref"}]}`))
@@ -630,6 +633,7 @@ func TestPolicyDecodingWideRangesBoundsNegationAndSiteRef(t *testing.T) {
 		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`))
 	})
 	mux.HandleFunc("/proxy/network/api/s/office-ref/stat/device", func(w http.ResponseWriter, r *http.Request) {
+		routedLegacyDevice.Store(true)
 		w.WriteHeader(http.StatusUnauthorized)
 	})
 	srv := httptest.NewTLSServer(mux)
@@ -643,8 +647,11 @@ func TestPolicyDecodingWideRangesBoundsNegationAndSiteRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchSnapshot(Office): %v", err)
 	}
-	if snap.Site != "office-ref" {
-		t.Fatalf("expected resolved site internalReference office-ref, got %q", snap.Site)
+	if _, routedSite := ctrl.sessionPrefixAndSite(); routedSite != "office-ref" || !routedLegacyDevice.Load() {
+		t.Fatalf("expected legacy API routing via office-ref (routed=%q hit=%v)", routedSite, routedLegacyDevice.Load())
+	}
+	if snap.Site != "Office" {
+		t.Fatalf("expected Snapshot.Site to preserve configured display name Office, got %q", snap.Site)
 	}
 	if snap.Devices[0].Type != "uxg" {
 		t.Fatalf("expected model-derived uxg type, got %q", snap.Devices[0].Type)
@@ -1027,5 +1034,214 @@ func TestPortProfilesPrecedenceAndFailureVisibility(t *testing.T) {
 	}
 	if !foundPortConfMissing {
 		t.Fatalf("expected port-profiles in MissingFeeds, got %v", snap.Visibility.MissingFeeds)
+	}
+}
+
+// TestInterleavedRESTAndWSAuthRejectDoesNotPingPong verifies that alternating
+// persistent bare 401 responses on optional REST paths and persistent 403
+// responses on WebSocket upgrades do not invalidate each other's suppression
+// and cause continuous re-logins.
+func TestInterleavedRESTAndWSAuthRejectDoesNotPingPong(t *testing.T) {
+	var logins atomic.Int32
+	var allowBare atomic.Bool
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		logins.Add(1)
+		http.SetCookie(w, &http.Cookie{Name: "TOKEN", Value: "tok"})
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/proxy/network/api/s/default/stat/opt1", func(w http.ResponseWriter, r *http.Request) {
+		if allowBare.Load() {
+			_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/proxy/network/api/s/default/stat/opt2", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/proxy/network/wss/s/default/events", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	ctrl, err := New(config.UniFiConfig{
+		URL:                srv.URL,
+		Site:               "default",
+		Username:           "uniblue",
+		Password:           "secret",
+		InsecureSkipVerify: true,
+		Timeout:            5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrl.Login(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	// Interleave REST opt1, WS, REST opt2 across 5 rounds. Each distinct source
+	// may trigger at most one re-login (1 initial + 3 = 4 total), never ping-ponging.
+	for range 5 {
+		var out apiEnvelope[rawClient]
+		if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/opt1", &out); err == nil {
+			t.Fatal("expected error for opt1 bare 401")
+		}
+		if err := ctrl.SubscribeEvents(context.Background(), make(chan Event, 1)); err == nil {
+			t.Fatal("expected error for WS 403")
+		}
+		if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/opt2", &out); err == nil {
+			t.Fatal("expected error for opt2 bare 401")
+		}
+	}
+	if got := logins.Load(); got != 4 {
+		t.Fatalf("expected 4 total logins (1 initial + 1 per persistent source), got %d", got)
+	}
+
+	// Once opt1 succeeds, its suppression clears so a future genuine 401 can re-login again.
+	allowBare.Store(true)
+	var out apiEnvelope[rawClient]
+	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/opt1", &out); err != nil {
+		t.Fatalf("expected opt1 to succeed after permission granted: %v", err)
+	}
+	allowBare.Store(false)
+	_ = ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/opt1", &out)
+	if got := logins.Load(); got != 5 {
+		t.Fatalf("expected cleared opt1 to allow one re-login on later expiry (total=5), got %d", got)
+	}
+}
+
+// TestReloginCooldownIgnoresCallerTimeoutAndTransientErrors verifies that a
+// caller timing out or cancelling during re-login (or a transient 503) does not
+// activate the 30s auth-failure cooldown and block subsequent healthy callers.
+func TestReloginCooldownIgnoresCallerTimeoutAndTransientErrors(t *testing.T) {
+	var loginCalls atomic.Int32
+	var slowLogin atomic.Bool
+	var return503 atomic.Bool
+	var expired atomic.Bool
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		loginCalls.Add(1)
+		if slowLogin.Load() {
+			select {
+			case <-time.After(300 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if return503.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		expired.Store(false)
+		http.SetCookie(w, &http.Cookie{Name: "TOKEN", Value: "fresh"})
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/proxy/network/api/s/default/stat/sta", func(w http.ResponseWriter, r *http.Request) {
+		if expired.Load() {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[]}`))
+	})
+
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	ctrl, err := New(config.UniFiConfig{
+		URL:                srv.URL,
+		Site:               "default",
+		Username:           "uniblue",
+		Password:           "secret",
+		InsecureSkipVerify: true,
+		Timeout:            5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrl.Login(context.Background()); err != nil {
+		t.Fatalf("initial Login: %v", err)
+	}
+
+	// 1. Caller with a short deadline times out during relogin.
+	expired.Store(true)
+	slowLogin.Store(true)
+	shortCtx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	var out apiEnvelope[rawClient]
+	if err := ctrl.getJSON(shortCtx, "/proxy/network/api/s/default/stat/sta", &out); err == nil {
+		t.Fatal("expected timeout error for short-deadline caller")
+	}
+
+	// Immediately afterward, a healthy caller must succeed without hitting the 30s cooldown.
+	slowLogin.Store(false)
+	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/sta", &out); err != nil {
+		t.Fatalf("healthy caller blocked after prior caller timeout: %v", err)
+	}
+
+	// 2. Transient HTTP 503 during relogin must also not activate the 30s cooldown.
+	expired.Store(true)
+	return503.Store(true)
+	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/sta", &out); err == nil {
+		t.Fatal("expected 503 relogin error")
+	}
+	return503.Store(false)
+	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/sta", &out); err != nil {
+		t.Fatalf("healthy caller blocked after transient 503 login failure: %v", err)
+	}
+	if loginCalls.Load() < 5 {
+		t.Fatalf("expected relogin retries to execute after non-auth errors, loginCalls=%d", loginCalls.Load())
+	}
+}
+
+// TestSnapshotSitePreservesConfiguredDisplayName verifies that Integration v1
+// routes legacy endpoints via the site's opaque internalReference while
+// reporting the user-configured display site name in Snapshot.Site.
+func TestSnapshotSitePreservesConfiguredDisplayName(t *testing.T) {
+	var hitOpaqueRef atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/proxy/network/integration/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":1,"totalCount":1,"data":[{"id":"site-uuid-office","name":"Office","internalReference":"x8k2j3l1"}]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-uuid-office/clients", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-uuid-office/devices", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`))
+	})
+	mux.HandleFunc("/proxy/network/integration/v1/sites/site-uuid-office/networks", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`))
+	})
+	mux.HandleFunc("/proxy/network/api/s/x8k2j3l1/rest/portforward", func(w http.ResponseWriter, r *http.Request) {
+		hitOpaqueRef.Store(true)
+		_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[]}`))
+	})
+
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	ctrl, err := New(config.UniFiConfig{
+		URL:                srv.URL,
+		Site:               "Office",
+		APIKey:             "test-key",
+		InsecureSkipVerify: true,
+		Timeout:            5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ctrl.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("FetchSnapshot: %v", err)
+	}
+	if !hitOpaqueRef.Load() {
+		t.Fatal("expected legacy REST call to route via opaque internalReference x8k2j3l1")
+	}
+	if snap.Site != "Office" {
+		t.Fatalf("Snapshot.Site = %q, want Office", snap.Site)
 	}
 }

@@ -441,7 +441,7 @@ func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any,
 			return nil
 		}
 		lastErr = err
-		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorizedAtEpoch(fullPath, epoch) {
+		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorized(fullPath) {
 			relogged = true
 			if loginErr := c.relogin(ctx, epoch); loginErr != nil {
 				return fmt.Errorf("re-authentication failed: %w (after %w)", loginErr, err)
@@ -453,7 +453,7 @@ func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any,
 				return nil
 			}
 			if isSessionExpiredError(retryErr) {
-				c.markPathUnauthorized(fullPath, c.currentAuthEpoch())
+				c.markPathUnauthorized(fullPath)
 			}
 			lastErr = retryErr
 		}

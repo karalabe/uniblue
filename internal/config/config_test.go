@@ -164,65 +164,55 @@ func TestValidateDoesNotEchoWebhookURLSecret(t *testing.T) {
 	}
 }
 
-// TestStatePathPreservesLegacyCWDBaselineOnUpgrade verifies that relative state
-// paths resolve next to config.yaml on fresh installs while preserving an
-// existing working-directory baseline file across upgrades.
-func TestStatePathPreservesLegacyCWDBaselineOnUpgrade(t *testing.T) {
-	cfgDir := t.TempDir()
-	workDir := t.TempDir()
-	cfgPath := filepath.Join(cfgDir, "config.yaml")
-	cfgYAML := "unifi:\n  url: https://192.0.2.1\n  api_key: k\n"
-	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+// TestStatePathResolvesRelativeToConfigDirIgnoringCWD verifies that a relative
+// state.path in a config file always resolves relative to that config file's
+// directory, never falling back to an unrelated ./uniblue-state.json in the
+// current working directory.
+func TestStatePathResolvesRelativeToConfigDirIgnoringCWD(t *testing.T) {
+	siteA := t.TempDir()
+	siteB := t.TempDir()
+
+	siteAState := filepath.Join(siteA, "uniblue-state.json")
+	const siteAContent = `{"site":"A","findings":{"keep":true}}`
+	if err := os.WriteFile(siteAState, []byte(siteAContent), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	t.Chdir(workDir)
+	siteBConfig := filepath.Join(siteB, "config.yaml")
+	cfgYAML := "unifi:\n  url: https://192.0.2.2\n  api_key: k\n"
+	if err := os.WriteFile(siteBConfig, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	// Fresh install: no state file in cfgDir or workDir -> resolve under cfgDir.
-	cfg, err := Load(cfgPath)
+	t.Chdir(siteA)
+
+	cfg, err := Load(siteBConfig)
 	if err != nil {
-		t.Fatalf("Load (fresh): %v", err)
+		t.Fatalf("Load(siteB): %v", err)
 	}
-	wantCfgState := filepath.Join(cfgDir, "uniblue-state.json")
-	if cfg.State.Path != wantCfgState {
-		t.Fatalf("fresh install state.path = %q, want %q", cfg.State.Path, wantCfgState)
+	wantSiteBState := filepath.Join(siteB, "uniblue-state.json")
+	if cfg.State.Path != wantSiteBState {
+		t.Fatalf("siteB state.path = %q, want %q (must ignore CWD state file in siteA)", cfg.State.Path, wantSiteBState)
 	}
 
-	// Upgrade with legacy working-directory state file -> preserve workDir baseline
-	// even if config dir is read-only.
-	legacyState := filepath.Join(workDir, "uniblue-state.json")
-	if err := os.WriteFile(legacyState, []byte(`{"findings":{}}`), 0o600); err != nil {
-		t.Fatal(err)
+	// Simulate persisting siteB state and verify siteA state stays untouched.
+	const siteBContent = `{"site":"B"}`
+	if err := os.WriteFile(cfg.State.Path, []byte(siteBContent), 0o600); err != nil {
+		t.Fatalf("write siteB state: %v", err)
 	}
-	if err := os.Chmod(cfgDir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Chmod(cfgDir, 0o755) }()
-
-	cfgUpgrade, err := Load(cfgPath)
+	gotA, err := os.ReadFile(siteAState)
 	if err != nil {
-		t.Fatalf("Load (upgrade): %v", err)
+		t.Fatalf("read siteA state: %v", err)
 	}
-	gotEval, _ := filepath.EvalSymlinks(cfgUpgrade.State.Path)
-	wantEval, _ := filepath.EvalSymlinks(legacyState)
-	if gotEval != wantEval {
-		t.Fatalf("upgrade state.path = %q (eval %q), want legacy CWD %q (eval %q)",
-			cfgUpgrade.State.Path, gotEval, legacyState, wantEval)
+	if string(gotA) != siteAContent {
+		t.Fatalf("siteA state was modified: got %q, want %q", string(gotA), siteAContent)
 	}
-
-	// Once a state file exists in cfgDir, cfgDir takes precedence.
-	if err := os.Chmod(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(wantCfgState, []byte(`{"findings":{}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfgMigrated, err := Load(cfgPath)
+	gotB, err := os.ReadFile(wantSiteBState)
 	if err != nil {
-		t.Fatalf("Load (migrated): %v", err)
+		t.Fatalf("read siteB state: %v", err)
 	}
-	if cfgMigrated.State.Path != wantCfgState {
-		t.Fatalf("migrated state.path = %q, want %q", cfgMigrated.State.Path, wantCfgState)
+	if string(gotB) != siteBContent {
+		t.Fatalf("siteB state mismatch: got %q, want %q", string(gotB), siteBContent)
 	}
 }
 

@@ -951,28 +951,11 @@ func TestIdentifyIPv6OnlyHostPopulatesHostIP(t *testing.T) {
 }
 
 // TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder verifies that UniFi
-// 4-part firmware versions with a trailing numeric build number match 3-part
-// inclusive and exact NVD bounds as Exact matches, while CompareVersions keeps
-// strict transitivity and antisymmetry for general versions.
+// 4-part firmware versions remain intact on Product.Version, match 3-part NVD
+// bounds via their 3-part release prefix (including builds < 1000), compare all
+// 4 parts directly against 4-part NVD bounds, and preserve CompareVersions
+// strict total order.
 func TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder(t *testing.T) {
-	normCases := []struct {
-		in   string
-		want string
-	}{
-		{"6.6.55.15189", "6.6.55"},
-		{"6.5.53.14768", "6.5.53"},
-		{"4.4.57.5578372", "4.4.57"},
-		{"6.6.55", "6.6.55"},
-		{"6.6.55.1", "6.6.55.1"},
-		{"4.0.6", "4.0.6"},
-		{"", ""},
-	}
-	for _, tc := range normCases {
-		if got := normalizeUniFiFirmwareVersion(tc.in); got != tc.want {
-			t.Fatalf("normalizeUniFiFirmwareVersion(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-
 	// Verify CompareVersions remains a strict total order (antisymmetric and transitive)
 	// and keeps 6.6.55.15189 > 6.6.55 for general version comparison.
 	if CompareVersions("6.6.55.15189", "6.6.55") <= 0 {
@@ -981,7 +964,7 @@ func TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder(t *testing.T) {
 	corpus := []string{
 		"1.1.1-alpha1", "1.1.1-rc1", "1.1.1", "1.1.1a", "1.1.2",
 		"2.4", "2.4.0", "2.4.7", "6.0", "6.0.17",
-		"6.6.55", "6.6.55.1", "6.6.55.15189", "8.0", "8.0.3",
+		"6.6.55", "6.6.55.1", "6.6.55.999", "6.6.55.15189", "8.0", "8.0.3",
 	}
 	for _, a := range corpus {
 		if CompareVersions(a, a) != 0 {
@@ -1003,7 +986,19 @@ func TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder(t *testing.T) {
 		}
 	}
 
-	// End-to-end: Identify + MatchProducts against a local ui vendor shard.
+	// Direct MatchesRange checks for 3-part vs 4-part UniFi NVD bounds.
+	if ok, conf := MatchesRange("6.6.55.999", CPEMatch{Vendor: "ui", Product: "unifi_uap_firmware", EndIncl: "6.6.55"}); !ok || conf != ConfidenceExact {
+		t.Fatalf("6.6.55.999 against 3-part EndIncl 6.6.55 = (%v, %v), want (true, exact)", ok, conf)
+	}
+	if ok, conf := MatchesRange("6.6.55.15100", CPEMatch{Vendor: "ui", Product: "unifi_uap_firmware", EndExcl: "6.6.55.15200"}); !ok || conf != ConfidenceExact {
+		t.Fatalf("6.6.55.15100 against 4-part EndExcl 6.6.55.15200 = (%v, %v), want (true, exact)", ok, conf)
+	}
+	if ok, _ := MatchesRange("6.6.55.15300", CPEMatch{Vendor: "ui", Product: "unifi_uap_firmware", EndExcl: "6.6.55.15200"}); ok {
+		t.Fatal("6.6.55.15300 must NOT match 4-part EndExcl 6.6.55.15200")
+	}
+
+	// End-to-end: Identify + MatchProducts against a local ui vendor shard with
+	// both 3-part and 4-part bounds.
 	cacheDir := t.TempDir()
 	vendorsDir := filepath.Join(cacheDir, "vendors")
 	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
@@ -1038,6 +1033,13 @@ func TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder(t *testing.T) {
 			CVSS:      7.5,
 			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_uap_firmware", EndIncl: "6.6.54"}},
 		},
+		{
+			ID:        "CVE-2026-5005",
+			Published: "2026-01-10",
+			Severity:  checks.SeverityCritical,
+			CVSS:      9.0,
+			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_uap_firmware", EndExcl: "6.6.55.15200"}},
+		},
 	}
 	if _, err := writeGzipJSONAtomic(filepath.Join(vendorsDir, "ui.json.gz"), uiRecords); err != nil {
 		t.Fatal(err)
@@ -1050,25 +1052,47 @@ func TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Devices: []unifi.Device{
 			{Name: "Hallway AP", Model: "U6-Lite", Type: "uap", IP: "192.168.1.10", Version: "6.6.55.15189"},
+			{Name: "Office AP", Model: "U6-Lite", Type: "uap", IP: "192.168.1.11", Version: "6.6.55.15300"},
+			{Name: "Garage AP", Model: "U6-Lite", Type: "uap", IP: "192.168.1.12", Version: "6.6.55.999"},
 		},
 	}
 	prods := fp.Identify(snap, nil)
-	if len(prods) != 1 || prods[0].Version != "6.6.55" {
-		t.Fatalf("expected normalized UniFi version 6.6.55, got %+v", prods)
+	if len(prods) != 3 {
+		t.Fatalf("expected 3 UniFi products, got %+v", prods)
+	}
+	if prods[0].Version != "6.6.55.15189" || prods[1].Version != "6.6.55.15300" || prods[2].Version != "6.6.55.999" {
+		t.Fatalf("expected raw 4-part UniFi versions preserved, got %+v", prods)
 	}
 	matches, err := NewCache(cacheDir).MatchProducts(prods, MatchOptions{MinSeverity: checks.SeverityMedium})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 2 {
-		t.Fatalf("expected 2 exact matches (EndIncl 6.6.55 and exact 6.6.55), got %d: %+v", len(matches), matches)
-	}
-	gotIDs := map[string]Confidence{}
+	byHost := make(map[string]map[string]Confidence)
 	for _, m := range matches {
-		gotIDs[m.Record.ID] = m.Confidence
+		if byHost[m.Product.HostIP] == nil {
+			byHost[m.Product.HostIP] = make(map[string]Confidence)
+		}
+		byHost[m.Product.HostIP][m.Record.ID] = m.Confidence
 	}
-	if gotIDs["CVE-2026-5001"] != ConfidenceExact || gotIDs["CVE-2026-5002"] != ConfidenceExact {
-		t.Fatalf("expected exact matches for CVE-2026-5001 and CVE-2026-5002, got %+v", gotIDs)
+	// 6.6.55.15189 matches 3-part EndIncl 6.6.55, 3-part exact 6.6.55, and 4-part EndExcl 6.6.55.15200.
+	if len(byHost["192.168.1.10"]) != 3 ||
+		byHost["192.168.1.10"]["CVE-2026-5001"] != ConfidenceExact ||
+		byHost["192.168.1.10"]["CVE-2026-5002"] != ConfidenceExact ||
+		byHost["192.168.1.10"]["CVE-2026-5005"] != ConfidenceExact {
+		t.Fatalf("unexpected matches for 6.6.55.15189: %+v", byHost["192.168.1.10"])
+	}
+	// 6.6.55.15300 matches 3-part 6.6.55 bounds, but NOT 4-part EndExcl 6.6.55.15200.
+	if len(byHost["192.168.1.11"]) != 2 ||
+		byHost["192.168.1.11"]["CVE-2026-5001"] != ConfidenceExact ||
+		byHost["192.168.1.11"]["CVE-2026-5002"] != ConfidenceExact {
+		t.Fatalf("unexpected matches for 6.6.55.15300 (must not match 4-part EndExcl 6.6.55.15200): %+v", byHost["192.168.1.11"])
+	}
+	// 6.6.55.999 (build < 1000) matches 3-part 6.6.55 bounds AND 4-part EndExcl 6.6.55.15200.
+	if len(byHost["192.168.1.12"]) != 3 ||
+		byHost["192.168.1.12"]["CVE-2026-5001"] != ConfidenceExact ||
+		byHost["192.168.1.12"]["CVE-2026-5002"] != ConfidenceExact ||
+		byHost["192.168.1.12"]["CVE-2026-5005"] != ConfidenceExact {
+		t.Fatalf("unexpected matches for 6.6.55.999: %+v", byHost["192.168.1.12"])
 	}
 }
 
@@ -1314,5 +1338,185 @@ func TestJoinCPEVersionUpdatePreservesNumericUpdates(t *testing.T) {
 	}
 	if matched, conf := MatchesRange("1.1-1", m11); !matched || conf != ConfidenceExact {
 		t.Fatalf("observed version 1.1-1 should match CPE 1.1 update 1 exact, got (%v, %v)", matched, conf)
+	}
+}
+
+// TestMatchProductsPreservesSharedCVEAcrossDistinctProductsAndVersions verifies
+// that MatchProducts retains shared CVEs across distinct products and distinct
+// versions on the same host (preserving KEV flags and per-product upgrade
+// advice) while deduplicating duplicate vendor-alias hits for the same product
+// and version.
+func TestMatchProductsPreservesSharedCVEAcrossDistinctProductsAndVersions(t *testing.T) {
+	cacheDir := t.TempDir()
+	vendorsDir := filepath.Join(cacheDir, "vendors")
+	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sharedKEV := "CVE-2023-44487"
+	f5Recs := []Record{{
+		ID:        sharedKEV,
+		Published: "2023-10-10",
+		Severity:  checks.SeverityHigh,
+		CVSS:      7.5,
+		KEV:       true,
+		Matches:   []CPEMatch{{Vendor: "f5", Product: "nginx", StartIncl: "1.9.5", EndExcl: "1.25.3"}},
+	}}
+	nginxRecs := []Record{{
+		ID:        sharedKEV,
+		Published: "2023-10-10",
+		Severity:  checks.SeverityHigh,
+		CVSS:      7.5,
+		KEV:       true,
+		Matches:   []CPEMatch{{Vendor: "nginx", Product: "nginx", StartIncl: "1.9.5", EndExcl: "1.25.3"}},
+	}}
+	apacheRecs := []Record{{
+		ID:        sharedKEV,
+		Published: "2023-10-10",
+		Severity:  checks.SeverityHigh,
+		CVSS:      7.5,
+		KEV:       true,
+		Matches:   []CPEMatch{{Vendor: "apache", Product: "http_server", StartIncl: "2.4.17", EndExcl: "2.4.58"}},
+	}}
+	for name, recs := range map[string][]Record{
+		"f5":     f5Recs,
+		"nginx":  nginxRecs,
+		"apache": apacheRecs,
+	} {
+		if _, err := writeGzipJSONAtomic(filepath.Join(vendorsDir, name+".json.gz"), recs); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cache := NewCache(cacheDir)
+
+	// 1. Distinct products on one host (Nginx 1.25.2 + Apache 2.4.57) plus
+	// duplicate vendor aliases [f5, nginx] on Nginx must produce exactly 2
+	// matches (one per product) with separate MinFixedVersion rollups.
+	prods := []Product{
+		{
+			Label:    "Nginx",
+			Vendors:  []string{"f5", "nginx"},
+			Products: []string{"nginx"},
+			Version:  "1.25.2",
+			HostIP:   "192.168.1.50",
+			HostName: "edge-proxy",
+		},
+		{
+			Label:    "Apache HTTP Server",
+			Vendors:  []string{"apache"},
+			Products: []string{"http_server"},
+			Version:  "2.4.57",
+			HostIP:   "192.168.1.50",
+			HostName: "edge-proxy",
+		},
+	}
+	matches, err := cache.MatchProducts(prods, MatchOptions{MinSeverity: checks.SeverityMedium})
+	if err != nil {
+		t.Fatalf("MatchProducts: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 matches (Nginx 1.25.2 + Apache 2.4.57), got %d: %+v", len(matches), matches)
+	}
+	sums := RollupMatches(matches)
+	if len(sums) != 2 {
+		t.Fatalf("expected 2 rollup summaries, got %d: %+v", len(sums), sums)
+	}
+	fixByLabel := make(map[string]string, len(sums))
+	for _, s := range sums {
+		if s.KEVCount != 1 {
+			t.Fatalf("expected KEVCount=1 for %s, got %+v", s.Product.Label, s)
+		}
+		fixByLabel[s.Product.Label] = s.MinFixedVersion
+	}
+	if fixByLabel["Nginx"] != "1.25.3" || fixByLabel["Apache HTTP Server"] != "2.4.58" {
+		t.Fatalf("unexpected per-product MinFixedVersion: %+v", fixByLabel)
+	}
+
+	// 2. Distinct versions of the same product on one host (Nginx 1.18.0 and
+	// Nginx 1.24.0) must each retain their match.
+	multiVer := []Product{
+		{Label: "Nginx", Vendors: []string{"f5", "nginx"}, Products: []string{"nginx"}, Version: "1.18.0", HostIP: "192.168.1.51"},
+		{Label: "Nginx", Vendors: []string{"f5", "nginx"}, Products: []string{"nginx"}, Version: "1.24.0", HostIP: "192.168.1.51"},
+	}
+	mvMatches, err := cache.MatchProducts(multiVer, MatchOptions{MinSeverity: checks.SeverityMedium})
+	if err != nil {
+		t.Fatalf("MatchProducts multi-version: %v", err)
+	}
+	if len(mvMatches) != 2 {
+		t.Fatalf("expected 2 matches for distinct versions on same host, got %d: %+v", len(mvMatches), mvMatches)
+	}
+}
+
+// TestVersionlessSupersedingMergesUncoveredVendorAliases verifies that when a
+// versioned Nerva CPE covers one vendor of a multi-vendor versionless rule
+// (e.g., f5:nginx:1.18.0 vs rule vendors [f5, nginx]), uncovered vendor and
+// exact product aliases are merged into the versioned product so CVEs indexed
+// under the alternate vendor shard still match with Exact confidence.
+func TestVersionlessSupersedingMergesUncoveredVendorAliases(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	profile := probe.HostProfile{
+		Client: unifi.Client{IP: "10.0.2.20", MAC: "aa:bb:cc:00:02:20", Name: "reverse-proxy"},
+		HTTP:   map[int]probe.HTTPBanner{80: {Server: "nginx"}},
+		Services: []probe.Service{
+			{Port: 80, CPEs: []string{"cpe:2.3:a:f5:nginx:1.18.0:*:*:*:*:*:*:*"}},
+		},
+	}
+
+	prods := fp.Identify(nil, []probe.HostProfile{profile})
+	if len(prods) != 1 {
+		t.Fatalf("expected 1 consolidated versioned product, got %d: %+v", len(prods), prods)
+	}
+	if prods[0].Version != "1.18.0" {
+		t.Fatalf("expected version 1.18.0, got %+v", prods[0])
+	}
+	hasF5, hasNginx := false, false
+	for _, v := range prods[0].Vendors {
+		switch v {
+		case "f5":
+			hasF5 = true
+		case "nginx":
+			hasNginx = true
+		}
+	}
+	if !hasF5 || !hasNginx {
+		t.Fatalf("expected merged vendors [f5, nginx], got %v", prods[0].Vendors)
+	}
+
+	cacheDir := t.TempDir()
+	vendorsDir := filepath.Join(cacheDir, "vendors")
+	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nginxOnlyRecs := []Record{
+		{
+			ID:        "CVE-2021-23017",
+			Published: "2021-06-01",
+			Severity:  checks.SeverityHigh,
+			CVSS:      8.1,
+			Matches:   []CPEMatch{{Vendor: "nginx", Product: "nginx", StartIncl: "0.6.18", EndExcl: "1.20.1"}},
+		},
+		{
+			ID:        "CVE-2025-99999",
+			Published: "2025-01-01",
+			Severity:  checks.SeverityHigh,
+			CVSS:      7.5,
+			Matches:   []CPEMatch{{Vendor: "nginx", Product: "nginx", StartIncl: "1.25.0", EndExcl: "1.25.4"}},
+		},
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(vendorsDir, "nginx.json.gz"), nginxOnlyRecs); err != nil {
+		t.Fatal(err)
+	}
+
+	matches, err := NewCache(cacheDir).MatchProducts(prods, MatchOptions{MinSeverity: checks.SeverityMedium})
+	if err != nil {
+		t.Fatalf("MatchProducts: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Record.ID != "CVE-2021-23017" || matches[0].Confidence != ConfidenceExact {
+		t.Fatalf("expected exact match CVE-2021-23017 from merged nginx vendor shard, got %+v", matches)
 	}
 }

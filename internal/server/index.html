@@ -2158,6 +2158,7 @@ function renderCheckup() {
   const bmcHosts = hosts.filter(e => e.is_bmc);
   const exposedBMCs = bmcHosts.filter(e => hasPrimaryExposedReason(e));
   const exposedHosts = hosts.filter(e => !e.is_bmc && hasPrimaryExposedReason(e));
+  const secondaryExposedHosts = hosts.filter(e => e.state === "exposed" && !hasPrimaryExposedReason(e));
   const wanFlowsAll = vm.wan_flows || [];
   const wanAlerts = wanFlowsAll.filter(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown");
   const wanCoverageUnknown = wanFlowsAll.filter(f => f.kind === "coverage" || f.state === "unknown");
@@ -2224,7 +2225,7 @@ function renderCheckup() {
   const cableTone = perimItems.some(x => x.severity === "critical") ? "crit" : (perimItems.length ? "warn" : "ok");
   const devTone = exposedHosts.some(x => x.max_severity === "critical") || exposedBMCs.some(x => x.max_severity === "critical")
     ? "crit"
-    : ((exposedHosts.length + exposedBMCs.length) ? "warn" : ((checking || unassessed > 0) ? "blue" : "ok"));
+    : ((exposedHosts.length + exposedBMCs.length + secondaryExposedHosts.length) ? "warn" : ((checking || unassessed > 0) ? "blue" : "ok"));
   const wanTone = wanAlerts.some(x => x.severity === "critical")
     ? "crit"
     : ((wanAlerts.length + ctrlItems.length + wanCoverageUnknown.length) ? "warn" : "ok");
@@ -2232,6 +2233,10 @@ function renderCheckup() {
   let devPillarVal = `All ${hosts.length} look good`;
   if (exposedHosts.length + exposedBMCs.length) {
     devPillarVal = `${exposedHosts.length + exposedBMCs.length} need attention`;
+  } else if (secondaryExposedHosts.length) {
+    devPillarVal = secondaryExposedHosts.length === 1
+      ? "1 needs review (linked alert)"
+      : `${secondaryExposedHosts.length} need review (linked alerts)`;
   } else if (checking) {
     devPillarVal = `Checking ${assessedCount}/${scannableCount}…`;
   } else if (unassessed > 0) {
@@ -2271,7 +2276,7 @@ function renderCheckup() {
           <div class="pillar-val">${outdoorPerimItems.length ? `${c.open_wall_gates || outdoorPerimItems.length} need locking` : (indoorPortItems.length ? `${indoorPortItems.length} switch port alert${indoorPortItems.length === 1 ? "" : "s"}` : "All outdoor cables locked")}</div>
         </div>
       </div>
-      <div class="pillar" data-action="switch-tab" data-tab-target="devices" data-device-filter="${(exposedHosts.length + exposedBMCs.length) ? "issues" : "all"}">
+      <div class="pillar" data-action="switch-tab" data-tab-target="devices" data-device-filter="${(exposedHosts.length + exposedBMCs.length + secondaryExposedHosts.length) ? "issues" : "all"}">
         <div class="pillar-ico ${devTone}">${ICONS.laptop}</div>
         <div>
           <div class="pillar-lbl">Devices &amp; Updates</div>
@@ -2422,7 +2427,8 @@ function renderCheckup() {
         </div>
       </div>`;
     for (const f of wanCoverageUnknown) {
-      const target = f.target_id || vm.gateway_id || "";
+      const rawTarget = f.target_id || vm.gateway_id || "";
+      const target = (rawTarget && vm.entities && vm.entities[rawTarget]) ? rawTarget : "";
       html += `<div class="story-item" ${target ? `data-entity-id="${esc(target)}"` : ""}>
         <div class="story-item-l">
           <div class="story-item-name">${esc(f.rule_name)} <span class="tag unk">Unknown</span></div>
@@ -2514,7 +2520,15 @@ function renderCheckup() {
   html += `</div><div>`;
   html += `<div class="section-kicker">Router Protection</div>`;
   const rawSettings = state.report?.unifi_posture?.settings;
-  const hasSettings = rawSettings != null && typeof rawSettings === "object";
+  const vis = state.view?.visibility || state.report?.visibility || null;
+  const missingFeeds = Array.isArray(vis?.missing_feeds) ? vis.missing_feeds : [];
+  const settingsFeedMissing = Boolean(
+    (vis && vis.settings_available === false) ||
+    missingFeeds.some(f => String(f || "").toLowerCase().includes("security-settings"))
+  );
+  const hasSettings = rawSettings != null && typeof rawSettings === "object" && !settingsFeedMissing;
+  const settingsUnknownTone = settingsFeedMissing ? "warn" : "neutral";
+  const settingsUnknownVal = settingsFeedMissing ? "Unknown (feed unavailable)" : "Unknown";
   const s = hasSettings ? rawSettings : {};
   const rawHealth = state.report?.unifi_posture?.health;
   const hasHealth = rawHealth != null && typeof rawHealth === "object";
@@ -2527,14 +2541,14 @@ function renderCheckup() {
     {
       name: "Intrusion Shield",
       hint: "Blocks attacks automatically",
-      tone: !hasSettings ? "neutral" : ((s.ips_mode === "ips" || s.ips_mode === "ids") ? "ok" : "warn"),
-      val: !hasSettings ? "Unknown" : (s.ips_mode === "ips" ? "Blocking threats" : (s.ips_mode === "ids" ? "Alerting only" : "Turned off"))
+      tone: !hasSettings ? settingsUnknownTone : ((s.ips_mode === "ips" || s.ips_mode === "ids") ? "ok" : "warn"),
+      val: !hasSettings ? settingsUnknownVal : (s.ips_mode === "ips" ? "Blocking threats" : (s.ips_mode === "ids" ? "Alerting only" : "Turned off"))
     },
     {
       name: "Auto Port Opening",
       hint: "UPnP for apps & gadgets",
-      tone: !hasSettings ? "neutral" : (s.upnp_enabled ? "warn" : "ok"),
-      val: !hasSettings ? "Unknown" : (s.upnp_enabled ? "On (risky)" : "Off (safer)")
+      tone: !hasSettings ? settingsUnknownTone : (s.upnp_enabled ? "warn" : "ok"),
+      val: !hasSettings ? settingsUnknownVal : (s.upnp_enabled ? "On (risky)" : "Off (safer)")
     },
     {
       name: "Fake Wi-Fi Watch",
@@ -2545,20 +2559,20 @@ function renderCheckup() {
     {
       name: "Router Admin Login",
       hint: "SSH password protection",
-      tone: !hasSettings ? "neutral" : ((s.ssh_enabled && s.ssh_password_auth) ? "warn" : "ok"),
-      val: !hasSettings ? "Unknown" : (s.ssh_enabled ? (s.ssh_password_auth ? "Password on" : "Key-only") : "Turned off")
+      tone: !hasSettings ? settingsUnknownTone : ((s.ssh_enabled && s.ssh_password_auth) ? "warn" : "ok"),
+      val: !hasSettings ? settingsUnknownVal : (s.ssh_enabled ? (s.ssh_password_auth ? "Password on" : "Key-only") : "Turned off")
     },
     {
       name: "Encrypted DNS",
       hint: "Hides web lookups from ISP",
-      tone: !hasSettings ? "neutral" : ((s.doh_state && s.doh_state !== "off") ? "ok" : "neutral"),
-      val: !hasSettings ? "Unknown" : ((s.doh_state && s.doh_state !== "off") ? "On" : "Standard")
+      tone: !hasSettings ? settingsUnknownTone : ((s.doh_state && s.doh_state !== "off") ? "ok" : "neutral"),
+      val: !hasSettings ? settingsUnknownVal : ((s.doh_state && s.doh_state !== "off") ? "On" : "Standard")
     },
     {
       name: "Intruder Trap",
       hint: "Decoy address catches scans",
-      tone: !hasSettings ? "neutral" : (s.honeypot_enabled ? "ok" : "neutral"),
-      val: !hasSettings ? "Unknown" : (s.honeypot_enabled ? `Active (${(s.honeypot_ips || []).length})` : "Off")
+      tone: !hasSettings ? settingsUnknownTone : (s.honeypot_enabled ? "ok" : "neutral"),
+      val: !hasSettings ? settingsUnknownVal : (s.honeypot_enabled ? `Active (${(s.honeypot_ips || []).length})` : "Off")
     },
     {
       name: "Internet Line",
@@ -3004,12 +3018,15 @@ function renderDeviceRow(vm, ent) {
       seenExposedLabels.add(chip);
       pills.push(`<span class="tag ${humanStateTone(svc.severity)}">${esc(chip)}</span>`);
     } else if (svc.reachable === "wan" || svc.reachable === "wan-restricted" || svc.reachable === "wan-cgnat") {
-      const wKey = `${svc.reachable}:${svc.port}`;
+      const colonIdx = (svc.label || "").indexOf(":");
+      const labelPortPart = colonIdx >= 0 ? svc.label.slice(colonIdx + 1).trim().split(/\s+/)[0] : "";
+      const portDisp = /^\d+-\d+$/.test(labelPortPart) ? labelPortPart : String(svc.port);
+      const wKey = `${svc.reachable}:${portDisp}`;
       if (seenWanPorts.has(wKey)) continue;
       seenWanPorts.add(wKey);
-      if (svc.reachable === "wan") pills.push(`<span class="tag blue">Internet :${svc.port}</span>`);
-      else if (svc.reachable === "wan-restricted") pills.push(`<span class="tag blue">Internet (restricted) :${svc.port}</span>`);
-      else pills.push(`<span class="tag neutral">Forward (CGNAT) :${svc.port}</span>`);
+      if (svc.reachable === "wan") pills.push(`<span class="tag blue">Internet :${esc(portDisp)}</span>`);
+      else if (svc.reachable === "wan-restricted") pills.push(`<span class="tag blue">Internet (restricted) :${esc(portDisp)}</span>`);
+      else pills.push(`<span class="tag neutral">Forward (CGNAT) :${esc(portDisp)}</span>`);
     }
   }
   if (!pills.length) {
@@ -3068,7 +3085,12 @@ function renderActivity() {
 
   const entByIP = {};
   for (const e of Object.values(vm.entities || {})) {
-    if (e.ip && (e.kind === "host" || e.kind === "device")) entByIP[e.ip] = e.id;
+    if (e.kind === "host" || e.kind === "device") {
+      if (e.ip) entByIP[e.ip] = e.id;
+      for (const v6 of (e.ipv6 || [])) {
+        if (v6) entByIP[v6] = e.id;
+      }
+    }
   }
 
   const actHTML = `
@@ -3082,7 +3104,8 @@ function renderActivity() {
     </div>
     <div class="card">
       ${filtered.length ? filtered.map(ev => {
-        const target = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || (ev.dst_ip ? entByIP[ev.dst_ip] : "") || "";
+        const rawTarget = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || (ev.dst_ip ? entByIP[ev.dst_ip] : "") || "";
+        const target = (rawTarget && vm.entities && vm.entities[rawTarget]) ? rawTarget : "";
         const ht = humanEventType(ev.type);
         const clickAttr = target ? ` class="act-row clickable" data-entity-id="${esc(target)}"` : ` class="act-row"`;
         return `<div${clickAttr}>
@@ -3091,7 +3114,7 @@ function renderActivity() {
             <span class="tag ${ht.tone}">${esc(ht.label)}</span>
             <span style="font-weight:500">${esc(ev.summary)}</span>
           </div>
-          ${target ? `<span class="go-arrow">Inspect →</span>` : ""}
+          ${target ? `<span class="go-arrow">Inspect →</span>` : (rawTarget ? `<span class="small" style="color:var(--muted)">Offline</span>` : "")}
         </div>`;
       }).join("") : `<div class="empty">No matching activity yet.</div>`}
     </div>`;
@@ -3654,7 +3677,7 @@ if (authForm) {
       sseDisconnected = false;
       sseRetryMs = 1000;
       await fetchState(false);
-      connectSSE();
+      if (!sseSource) connectSSE();
     } catch (err) {
       showAuthOverlay("Sign-in request failed: " + (err?.message || "network error"));
     } finally {
@@ -3675,12 +3698,22 @@ async function fetchState(progressOnly = false) {
   try {
     const r = await fetch("/api/state", {cache: "no-store"});
     if (r.status === 401) {
-      showAuthOverlay("");
+      if (!authRequired) showAuthOverlay("");
       return;
     }
     if (!r.ok) return;
-    if (authRequired) hideAuthOverlay();
+    const needReconnectSSE = authRequired || !sseSource;
     state = await r.json();
+    if (needReconnectSSE) {
+      hideAuthOverlay();
+      if (sseRetryTimer) {
+        clearTimeout(sseRetryTimer);
+        sseRetryTimer = null;
+      }
+      sseDisconnected = false;
+      sseRetryMs = 1000;
+      connectSSE();
+    }
     if (!initialHashApplied) {
       initialHashApplied = true;
       applyHash();
@@ -3740,7 +3773,7 @@ function resolveEventSubject(ev) {
   if (ev.subject_id && ents[ev.subject_id]) return ev.subject_id;
   if (ev.ip) {
     for (const e of Object.values(ents)) {
-      if (e.ip === ev.ip && (e.kind === "host" || e.kind === "device")) return e.id;
+      if ((e.kind === "host" || e.kind === "device") && (e.ip === ev.ip || (e.ipv6 || []).includes(ev.ip))) return e.id;
     }
   }
   return "";

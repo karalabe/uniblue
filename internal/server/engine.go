@@ -11,9 +11,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -272,16 +275,28 @@ const (
 )
 
 type pendingWebhook struct {
+	seq         uint64
 	id          string
 	site        string
 	diff        risk.Diff
 	attempts    int
 	nextAttempt time.Time
+	queuedAt    time.Time
+}
+
+type persistedWebhook struct {
+	ID          string    `json:"id"`
+	Site        string    `json:"site"`
+	Diff        risk.Diff `json:"diff"`
+	Attempts    int       `json:"attempts"`
+	NextAttempt time.Time `json:"next_attempt"`
+	QueuedAt    time.Time `json:"queued_at,omitempty"`
 }
 
 const (
 	maxPendingWebhooks = 64
-	maxWebhookRetries  = 5
+	maxWebhookRetries  = 288
+	maxWebhookAge      = 24 * time.Hour
 )
 
 // Engine coordinates UniFi event ingestion, targeted single-host live checks,
@@ -319,11 +334,15 @@ type Engine struct {
 	// or failing webhook endpoints never stall recomputeMu or pollDelta.
 	webhookMu        sync.Mutex
 	pendingWebhooks  []pendingWebhook
+	webhookSeq       uint64
 	webhookRunning   bool
 	webhookRetryBase time.Duration
 
 	// authLimiter throttles repeated failed API/dashboard auth attempts per IP.
 	authLimiter authFailureLimiter
+
+	// sessions tracks active per-login random HttpOnly session cookies.
+	sessions sessionStore
 
 	// cveSyncFn optionally overrides cve.Cache.Sync in tests.
 	cveSyncFn func(ctx context.Context, cache *cve.Cache) (*cve.CacheStats, error)
@@ -495,6 +514,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	})
 	e.queueFullRescan("initial baseline")
 	go e.pollAndReconcileLoop(ctx)
+	e.resumePendingWebhooks(ctx)
 	if !e.opts.SkipCVE && e.opts.CVERefreshInterval > 0 {
 		go e.cveSyncLoop(ctx)
 	}
@@ -1166,7 +1186,11 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 				})
 			}
 			portProfilesOK := snap.Visibility == nil || snap.Visibility.PortProfilesAvailable
-			if portProfilesOK && (prev.Enabled != curr.Enabled || prev.NativeVLAN != curr.NativeVLAN || prev.TaggedPolicy != curr.TaggedPolicy || prev.PortSecurity != curr.PortSecurity) {
+			directChanged := prev.Enabled != curr.Enabled ||
+				prev.PortSecurity != curr.PortSecurity ||
+				(curr.NativeVLAN != "" && prev.NativeVLAN != curr.NativeVLAN)
+			profileChanged := portProfilesOK && (prev.TaggedPolicy != curr.TaggedPolicy || (curr.NativeVLAN == "" && prev.NativeVLAN != curr.NativeVLAN))
+			if directChanged || profileChanged {
 				changed = true
 				sev := "medium"
 				if isSensitive {
@@ -1561,32 +1585,45 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		activeByKey[clientKey(cl)] = cl
 	}
 	if adopted {
-		// Evict any departed clients (including Wi-Fi clients that were in
-		// leave-grace) that are no longer in the adopted snapshot so ghost
-		// profiles and findings never linger until rejoin.
+		// Evict absent wired clients immediately and wireless clients whose
+		// leave-grace window has elapsed, while keeping briefly dozing/roaming
+		// Wi-Fi clients intact across full-scan adoption.
+		adoptNow := time.Now().UTC()
 		for k, mc := range e.missingClients {
-			delete(e.missingClients, k)
-			if _, stillActive := activeByKey[k]; !stillActive {
-				delete(e.profilesByMAC, k)
-				delete(e.findingsByMAC, k)
-				scanExtraEvents = append(scanExtraEvents, LiveEvent{
-					Type:      "client_left",
-					Severity:  "info",
-					Host:      mc.client.DisplayName(),
-					IP:        mc.client.IP,
-					SubjectID: hostEntityID(mc.client),
-					Summary:   fmt.Sprintf("%s left %s (%s)", mc.client.DisplayName(), fallbackVLAN(mc.client.NetworkName), mc.client.IP),
-				})
+			if _, stillActive := activeByKey[k]; stillActive {
+				delete(e.missingClients, k)
+				continue
 			}
+			if !mc.client.IsWired && adoptNow.Sub(mc.since) < defaultLeaveGrace {
+				continue
+			}
+			delete(e.missingClients, k)
+			delete(e.profilesByMAC, k)
+			delete(e.findingsByMAC, k)
+			mcIP := mc.client.PrimaryIP()
+			scanExtraEvents = append(scanExtraEvents, LiveEvent{
+				Type:      "client_left",
+				Severity:  "info",
+				Host:      mc.client.DisplayName(),
+				IP:        mcIP,
+				SubjectID: hostEntityID(mc.client),
+				Summary:   fmt.Sprintf("%s left %s (%s)", mc.client.DisplayName(), fallbackVLAN(mc.client.NetworkName), mcIP),
+			})
 		}
 		for k := range e.profilesByMAC {
 			if _, stillActive := activeByKey[k]; !stillActive {
+				if _, inGrace := e.missingClients[k]; inGrace {
+					continue
+				}
 				delete(e.profilesByMAC, k)
 				delete(e.findingsByMAC, k)
 			}
 		}
 		for k := range e.findingsByMAC {
 			if _, stillActive := activeByKey[k]; !stillActive {
+				if _, inGrace := e.missingClients[k]; inGrace {
+					continue
+				}
 				delete(e.findingsByMAC, k)
 			}
 		}
@@ -1769,7 +1806,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	nextState := prevRisk
 	var webhookToSend *pendingWebhook
 	if baselineReady {
-		diff := risk.ComputeDiff(prevRisk, snap, report, e.cfg.Network)
+		diff := risk.ComputeDiffWithProbed(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
 		if prevRisk != nil {
 			for _, nf := range diff.NewFindings {
 				postEvents = append(postEvents, LiveEvent{
@@ -1837,17 +1874,168 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	}
 }
 
+func (e *Engine) pendingWebhooksPath() string {
+	if e.cfg == nil {
+		return ""
+	}
+	p := strings.TrimSpace(e.cfg.State.Path)
+	if p == "" {
+		return ""
+	}
+	return p + ".pending-webhooks.json"
+}
+
+func (e *Engine) persistPendingWebhooksLocked() {
+	path := e.pendingWebhooksPath()
+	if path == "" {
+		return
+	}
+	if len(e.pendingWebhooks) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			e.logger.Warn("failed to remove empty pending webhooks file", "path", path, "err", err)
+		}
+		return
+	}
+	out := make([]persistedWebhook, 0, len(e.pendingWebhooks))
+	for _, item := range e.pendingWebhooks {
+		out = append(out, persistedWebhook{
+			ID:          item.id,
+			Site:        item.site,
+			Diff:        item.diff,
+			Attempts:    item.attempts,
+			NextAttempt: item.nextAttempt,
+			QueuedAt:    item.queuedAt,
+		})
+	}
+	raw, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		e.logger.Error("failed to marshal pending webhooks", "err", err)
+		return
+	}
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			e.logger.Error("failed to create pending webhooks directory", "dir", dir, "err", err)
+			return
+		}
+	}
+	tmp, err := os.CreateTemp(dir, ".pending-webhooks-*.tmp")
+	if err != nil {
+		e.logger.Error("failed to create pending webhooks temp file", "path", path, "err", err)
+		return
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		e.logger.Error("failed to chmod pending webhooks temp file", "path", path, "err", err)
+		return
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		cleanup()
+		e.logger.Error("failed to write pending webhooks temp file", "path", path, "err", err)
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		e.logger.Error("failed to sync pending webhooks temp file", "path", path, "err", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		e.logger.Error("failed to close pending webhooks temp file", "path", path, "err", err)
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		e.logger.Error("failed to persist pending webhooks", "path", path, "err", err)
+	}
+}
+
+func (e *Engine) resumePendingWebhooks(ctx context.Context) {
+	path := e.pendingWebhooksPath()
+	var loaded []persistedWebhook
+	if path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				e.logger.Warn("failed to read persisted pending webhooks", "path", path, "err", err)
+			}
+		} else if len(strings.TrimSpace(string(raw))) > 0 {
+			if err := json.Unmarshal(raw, &loaded); err != nil {
+				e.logger.Warn("failed to parse persisted pending webhooks", "path", path, "err", err)
+			}
+		}
+	}
+
+	e.webhookMu.Lock()
+	defer e.webhookMu.Unlock()
+	if len(loaded) > 0 {
+		existingIDs := make(map[string]struct{}, len(e.pendingWebhooks))
+		for _, item := range e.pendingWebhooks {
+			if item.id != "" {
+				existingIDs[item.id] = struct{}{}
+			}
+		}
+		now := time.Now().UTC()
+		for _, pw := range loaded {
+			id := strings.TrimSpace(pw.ID)
+			if id == "" {
+				id = notify.NewWebhookID()
+			}
+			if _, dup := existingIDs[id]; dup {
+				continue
+			}
+			queuedAt := pw.QueuedAt
+			if queuedAt.IsZero() {
+				queuedAt = now
+			}
+			e.webhookSeq++
+			e.pendingWebhooks = append(e.pendingWebhooks, pendingWebhook{
+				seq:      e.webhookSeq,
+				id:       id,
+				site:     pw.Site,
+				diff:     pw.Diff,
+				attempts: pw.Attempts,
+				queuedAt: queuedAt,
+			})
+			existingIDs[id] = struct{}{}
+		}
+		if len(e.pendingWebhooks) > maxPendingWebhooks {
+			e.pendingWebhooks = e.pendingWebhooks[len(e.pendingWebhooks)-maxPendingWebhooks:]
+		}
+	}
+	if len(e.pendingWebhooks) > 0 && !e.webhookRunning && e.notifier != nil {
+		e.webhookRunning = true
+		go e.drainWebhooks(ctx)
+	}
+}
+
 func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
 	if item.id == "" {
 		item.id = notify.NewWebhookID()
 	}
+	if item.queuedAt.IsZero() {
+		item.queuedAt = time.Now().UTC()
+	}
 	e.webhookMu.Lock()
+	e.webhookSeq++
+	item.seq = e.webhookSeq
 	if len(e.pendingWebhooks) >= maxPendingWebhooks {
-		// Drop the oldest queued notification under sustained outage so memory stays bounded.
-		e.pendingWebhooks = e.pendingWebhooks[1:]
+		// Never drop index 0 while drainWebhooks may be actively sending it;
+		// evict the oldest non-in-flight queued batch at index 1 instead.
+		if e.webhookRunning && len(e.pendingWebhooks) > 1 {
+			e.pendingWebhooks = append(e.pendingWebhooks[:1], e.pendingWebhooks[2:]...)
+		} else {
+			e.pendingWebhooks = e.pendingWebhooks[1:]
+		}
 	}
 	e.pendingWebhooks = append(e.pendingWebhooks, item)
-	if !e.webhookRunning {
+	e.persistPendingWebhooksLocked()
+	if !e.webhookRunning && e.notifier != nil {
 		e.webhookRunning = true
 		go e.drainWebhooks(ctx)
 	}
@@ -1889,30 +2077,52 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 		}
 
 		err := e.notifier.SendWithID(ctx, item.id, item.site, item.diff)
+		if ctx.Err() != nil {
+			// Leave unsent batches persisted on disk for delivery after restart.
+			e.webhookMu.Lock()
+			e.webhookRunning = false
+			e.webhookMu.Unlock()
+			return
+		}
 		e.webhookMu.Lock()
+		idx := -1
+		for i := range e.pendingWebhooks {
+			if e.pendingWebhooks[i].seq == item.seq {
+				idx = i
+				break
+			}
+		}
 		if err == nil {
-			if len(e.pendingWebhooks) > 0 {
-				e.pendingWebhooks = e.pendingWebhooks[1:]
+			if idx >= 0 {
+				e.pendingWebhooks = append(e.pendingWebhooks[:idx], e.pendingWebhooks[idx+1:]...)
+				e.persistPendingWebhooksLocked()
 			}
 			e.webhookMu.Unlock()
 			continue
 		}
 		item.attempts++
-		if item.attempts >= maxWebhookRetries {
+		expired := item.attempts >= maxWebhookRetries || (!item.queuedAt.IsZero() && time.Since(item.queuedAt) >= maxWebhookAge)
+		if expired {
 			e.logger.Error("webhook notification failed after retries; dropping alert batch", "attempts", item.attempts, "err", err)
-			if len(e.pendingWebhooks) > 0 {
-				e.pendingWebhooks = e.pendingWebhooks[1:]
+			if idx >= 0 {
+				e.pendingWebhooks = append(e.pendingWebhooks[:idx], e.pendingWebhooks[idx+1:]...)
+				e.persistPendingWebhooksLocked()
 			}
 			e.webhookMu.Unlock()
 			continue
 		}
-		delay := baseDelay << (item.attempts - 1)
+		shift := item.attempts - 1
+		if shift > 10 {
+			shift = 10
+		}
+		delay := baseDelay << shift
 		if delay > 5*time.Minute {
 			delay = 5 * time.Minute
 		}
 		item.nextAttempt = time.Now().Add(delay)
-		if len(e.pendingWebhooks) > 0 {
-			e.pendingWebhooks[0] = item
+		if idx >= 0 {
+			e.pendingWebhooks[idx] = item
+			e.persistPendingWebhooksLocked()
 		}
 		e.logger.Error("webhook notification failed; scheduling async retry", "attempt", item.attempts, "retry_in", delay, "err", err)
 		e.webhookMu.Unlock()
@@ -1920,9 +2130,10 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 }
 
 // preserveUnavailableTelemetry carries forward last-known SecuritySettings,
-// WLANs, and switch port profile configuration across transient controller
+// WLANs, and profile-governed switch port fields across transient controller
 // telemetry fetch failures so temporary errors do not drop findings or fire
-// false drift / port_config_changed alerts.
+// false drift / port_config_changed alerts, while keeping direct per-port live
+// changes (Enabled, PortSecurity, non-empty NativeNetworkName) visible.
 func preserveUnavailableTelemetry(prevSnap, nextSnap *unifi.Snapshot) {
 	if prevSnap == nil || nextSnap == nil || nextSnap.Visibility == nil {
 		return
@@ -1947,16 +2158,15 @@ func preserveUnavailableTelemetry(prevSnap, nextSnap *unifi.Snapshot) {
 			for pi := range nextSnap.Devices[di].Ports {
 				p := &nextSnap.Devices[di].Ports[pi]
 				if old, ok := prevPorts[portKey(dmac, p.PortIdx)]; ok {
-					p.Enabled = old.Enabled
 					p.OpMode = old.OpMode
 					p.Forward = old.Forward
 					p.TaggedVLANMgmt = old.TaggedVLANMgmt
-					p.NativeNetworkID = old.NativeNetworkID
-					p.NativeNetworkName = old.NativeNetworkName
-					p.PoEMode = old.PoEMode
-					p.PortSecurityEnabled = old.PortSecurityEnabled
-					p.PortSecurityMACs = append([]string(nil), old.PortSecurityMACs...)
-					p.Isolation = old.Isolation
+					if p.NativeNetworkName == "" && old.NativeNetworkName != "" {
+						p.NativeNetworkName = old.NativeNetworkName
+						if p.NativeNetworkID == "" {
+							p.NativeNetworkID = old.NativeNetworkID
+						}
+					}
 				}
 			}
 		}
@@ -1974,6 +2184,11 @@ func lookupClientClass(classes map[string]classify.Result, cl unifi.Client) clas
 	}
 	if pip := cl.PrimaryIP(); pip != "" {
 		if r, ok := classes[pip]; ok && r.Category != "" {
+			return r
+		}
+	}
+	for _, ip := range cl.AllIPs() {
+		if r, ok := classes[ip]; ok && r.Category != "" {
 			return r
 		}
 	}
@@ -2168,14 +2383,16 @@ func clientSkipReason(cl unifi.Client, excluded map[string]struct{}, allowedSubn
 	if isClientExcluded(cl, excluded) {
 		return "Excluded via network.exclude_ips"
 	}
-	primary := strings.TrimSpace(cl.PrimaryIP())
-	if primary == "" {
+	ips := cl.AllIPs()
+	if len(ips) == 0 {
 		return "No IP address reported by UniFi"
 	}
-	if !isAllowedClientProbeIP(primary, allowedSubnets) {
-		return "Public or out-of-subnet IP address (active probing skipped)"
+	for _, rawIP := range ips {
+		if isAllowedClientProbeIP(rawIP, allowedSubnets) {
+			return ""
+		}
 	}
-	return ""
+	return "Public or out-of-subnet IP address (active probing skipped)"
 }
 
 func firewallPolicySignature(pols []unifi.FirewallPolicy) string {

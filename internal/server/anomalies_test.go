@@ -7,10 +7,13 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	classifydata "github.com/karalabe/uniblue/classify"
 	"github.com/karalabe/uniblue/internal/classify"
+	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
@@ -189,5 +192,52 @@ func TestAnomalyTrackerPortTamperAndBehavioralSignals(t *testing.T) {
 		if !siteTypes[wantType] {
 			t.Errorf("missing expected live event %q; got %+v", wantType, siteEvs)
 		}
+	}
+}
+
+// TestEvaluateIoTUploadSpikesIPv6OnlyClient verifies that an IPv6-only IoT
+// device classified via classify.ClassifyAll triggers iot_upload_spike when it
+// uploads 200 MiB within the anomaly window.
+func TestEvaluateIoTUploadSpikesIPv6OnlyClient(t *testing.T) {
+	ouiDB := oui.New("")
+	_ = ouiDB.Load()
+	classifier, err := classify.Load(classifydata.BuiltinFS, ouiDB)
+	if err != nil {
+		t.Fatalf("classify.Load: %v", err)
+	}
+
+	now := time.Now().UTC()
+	v6IoT := unifi.Client{
+		MAC:         "02:aa:bb:cc:dd:66",
+		IPv6:        []string{"fd00:20::42"},
+		Name:        "shelly-plug-kitchen",
+		Hostname:    "shellyplug-s-123456",
+		OUI:         "Espressif Inc.",
+		NetworkName: "IoT",
+		TxBytes:     1 << 20,
+	}
+	snap := &unifi.Snapshot{
+		Site:    "default",
+		Clients: []unifi.Client{v6IoT},
+	}
+	classes := classifier.ClassifyAll(snap, nil)
+	if got := lookupClientClass(classes, v6IoT); got.Category != classify.CategoryIoT {
+		t.Fatalf("expected ClassifyAll to classify IPv6-only client as iot, got %+v (map=%+v)", got, classes)
+	}
+
+	tr := newAnomalyTracker()
+	tr.Seed(snap, nil, now)
+
+	v6IoTSpiked := v6IoT
+	v6IoTSpiked.TxBytes = (1 << 20) + (200 << 20)
+	evs := tr.EvaluateIoTUploadSpikes([]unifi.Client{v6IoTSpiked}, classes, now.Add(2*time.Minute))
+	if len(evs) != 1 {
+		t.Fatalf("expected 1 iot_upload_spike event for IPv6-only IoT client, got %+v", evs)
+	}
+	if evs[0].Type != "iot_upload_spike" || evs[0].Severity != "high" || evs[0].IP != "fd00:20::42" {
+		t.Fatalf("unexpected IPv6-only iot_upload_spike event: %+v", evs[0])
+	}
+	if !strings.Contains(evs[0].Summary, "fd00:20::42") {
+		t.Fatalf("expected IPv6 address in spike summary, got %q", evs[0].Summary)
 	}
 }

@@ -576,17 +576,26 @@ func formatPolicyTarget(ep unifi.PolicyEndpoint) string {
 func protocolCovers(earlierProto string, earlierNeg bool, targetProto string, targetNeg bool) bool {
 	ep := strings.ToLower(strings.TrimSpace(earlierProto))
 	tp := strings.ToLower(strings.TrimSpace(targetProto))
+	if ep == "tcp/udp" {
+		ep = "tcp_udp"
+	}
+	if tp == "tcp/udp" {
+		tp = "tcp_udp"
+	}
 	if ep == "" || ep == "all" || ep == "any" {
 		return !earlierNeg
 	}
-	if tp == "" || tp == "all" || tp == "any" {
-		return targetNeg
-	}
 	if earlierNeg {
-		if targetNeg {
-			return ep == tp
+		// A negated protocol (e.g., NOT tcp) never covers composite selectors
+		// (all, any, tcp_udp) or another negated selector; it only covers a
+		// concrete single protocol that differs from the excluded protocol.
+		if targetNeg || tp == "" || tp == "all" || tp == "any" || tp == "tcp_udp" {
+			return false
 		}
 		return !matchesProtocol(ep, tp)
+	}
+	if tp == "" || tp == "all" || tp == "any" {
+		return targetNeg
 	}
 	if targetNeg {
 		return false

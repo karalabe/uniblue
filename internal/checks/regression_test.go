@@ -385,6 +385,26 @@ func TestEmbeddedPanelAndCUPSAuthGuards(t *testing.T) {
 		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
 			t.Fatal("UB-0040 must match unauthenticated panel without password input")
 		}
+
+		// Stock open Tasmota page includes a noscript banner alongside server-rendered
+		// control buttons and must match both preconditions and HTTP probe.
+		tasmotaHP := probe.HostProfile{
+			OpenPorts: []int{80},
+			HTTP:      map[int]probe.HTTPBanner{80: {Scheme: "http", StatusCode: 200, Title: "Tasmota - Main Menu"}},
+		}
+		if _, ok := matchPreconditions(chk, tasmotaHP); !ok {
+			t.Fatal("UB-0040 preconditions must match stock Tasmota title")
+		}
+		page = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Tasmota - Main Menu</title>` +
+			`<script>function la(p){var x=new XMLHttpRequest();x.open("GET",".?m=1"+p,true);x.send();}</script></head>` +
+			`<body><div><noscript>To use Tasmota, please enable JavaScript<br></noscript>` +
+			`<h3>Tasmota</h3><h2>Living Room Plug</h2></div>` +
+			`<table><tr><td><button onclick='la("&o=1");'>Toggle</button></td></tr></table>` +
+			`<form action='cn' method='get'><button>Configuration</button></form>` +
+			`<form action='cs' method='get'><button>Console</button></form></body></html>`
+		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
+			t.Fatal("UB-0040 must match stock open Tasmota panel with noscript banner")
+		}
 	})
 
 	t.Run("ub-0041 checks cupsd.conf auth", func(t *testing.T) {

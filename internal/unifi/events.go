@@ -146,9 +146,9 @@ func (c *Controller) SubscribeEvents(ctx context.Context, out chan<- Event) erro
 		// Only attempt a single-flight re-login when the rejection is not an
 		// explicit permission error and we have not already re-authenticated
 		// for a prior WebSocket rejection without a successful handshake.
-		if !isPermissionDeniedMsg(extractAPIErrorMsg(body)) && c.canRelogin() && c.shouldReloginWS(seenEpoch) {
+		if !isPermissionDeniedMsg(extractAPIErrorMsg(body)) && c.canRelogin() && c.shouldReloginWS() {
 			if err := c.relogin(ctx, seenEpoch); err == nil {
-				c.markWSReloginEpoch(c.currentAuthEpoch())
+				c.markWSReloginSuppressed()
 			}
 		}
 		return fmt.Errorf("websocket upgrade rejected: HTTP %d", resp.StatusCode)
@@ -157,7 +157,7 @@ func (c *Controller) SubscribeEvents(ctx context.Context, out chan<- Event) erro
 		_ = resp.Body.Close()
 		return fmt.Errorf("websocket upgrade rejected: HTTP %d", resp.StatusCode)
 	}
-	c.clearWSReloginEpoch()
+	c.clearWSReloginSuppressed()
 	_ = conn.SetDeadline(time.Time{})
 
 	var fragBuf []byte

@@ -272,11 +272,7 @@ func (a *anomalyTracker) EvaluateIoTUploadSpikes(clients []unifi.Client, classes
 
 		// Only evaluate upload spikes on embedded / IoT appliance categories
 		// (skip servers, NAS, workstations, phones that legitimately upload bulk data).
-		clsKey := cl.IP
-		if clsKey == "" {
-			clsKey = cl.MAC
-		}
-		cat := strings.ToLower(string(classes[clsKey].Category))
+		cat := strings.ToLower(string(lookupClientClass(classes, cl).Category))
 		if !isApplianceCategory(cat) {
 			if now.Sub(sample.At) >= iotUploadSpikeWindow {
 				sample.Bytes = cl.TxBytes
@@ -291,12 +287,17 @@ func (a *anomalyTracker) EvaluateIoTUploadSpikes(clients []unifi.Client, classes
 		if delta >= iotUploadSpikeBytes && elapsed <= iotUploadSpikeWindow {
 			if sample.LastAlert.IsZero() || now.Sub(sample.LastAlert) >= iotUploadAlertCooldown {
 				mb := float64(delta) / (1024 * 1024)
+				clIP := cl.PrimaryIP()
+				addrLabel := clIP
+				if addrLabel == "" {
+					addrLabel = cl.MAC
+				}
 				events = append(events, LiveEvent{
 					Type:     "iot_upload_spike",
 					Severity: "high",
 					Host:     cl.DisplayName(),
-					IP:       cl.IP,
-					Summary:  fmt.Sprintf("IoT upload spike on %s (%s, %s): uploaded %.1f MB in %s", cl.DisplayName(), cl.IP, cat, mb, elapsed.Round(time.Second)),
+					IP:       clIP,
+					Summary:  fmt.Sprintf("IoT upload spike on %s (%s, %s): uploaded %.1f MB in %s", cl.DisplayName(), addrLabel, cat, mb, elapsed.Round(time.Second)),
 				})
 				sample.LastAlert = now
 			}

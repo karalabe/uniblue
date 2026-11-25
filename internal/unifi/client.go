@@ -67,8 +67,12 @@ type Controller struct {
 	// baseURL is the trimmed controller URL without a trailing slash.
 	baseURL string
 
-	// site is the UniFi site name or reference configured by the user (typically "default").
+	// site is the UniFi site reference used for legacy/v2 API path routing (typically "default").
 	site string
+
+	// displaySite is the human-readable site name reported in Snapshot.Site,
+	// preserving the user-configured site name over an opaque internalReference.
+	displaySite string
 
 	// siteID stores the resolved site UUID when speaking the Integration v1 API.
 	siteID string
@@ -86,8 +90,8 @@ type Controller struct {
 	// httpClient carries TLS configuration, timeouts, and the session cookie jar.
 	httpClient *http.Client
 
-	// authMu guards apiPrefix, controllerType, site, siteID, csrfToken, authEpoch,
-	// wsReloginEpoch, and unauthPaths.
+	// authMu guards apiPrefix, controllerType, site, displaySite, siteID, csrfToken,
+	// authEpoch, wsReloginSuppressed, and unauthPaths.
 	authMu sync.RWMutex
 
 	// loginMu serializes Login/relogin calls so concurrent 401s re-authenticate once
@@ -101,15 +105,16 @@ type Controller struct {
 	// know whether another goroutine already refreshed the session.
 	authEpoch uint64
 
-	// wsReloginEpoch records the authEpoch produced after a WebSocket upgrade
-	// rejection triggered re-login so persistent 401/403 rejections do not create
-	// a new console session on every redial.
-	wsReloginEpoch uint64
+	// wsReloginSuppressed records that a WebSocket upgrade rejection already
+	// triggered a re-login and has not yet completed a successful handshake,
+	// preventing repeated re-logins on persistent 401/403 rejections independently
+	// of any REST-triggered re-logins.
+	wsReloginSuppressed bool
 
-	// unauthPaths maps REST paths that still returned 401 immediately after a
-	// fresh re-login to the authEpoch at which they failed, suppressing repeated
-	// re-logins on every poll for role-restricted endpoints.
-	unauthPaths map[string]uint64
+	// unauthPaths records REST paths that still returned 401 immediately after a
+	// fresh re-login, suppressing repeated re-logins on every poll until the path
+	// succeeds or Login is called explicitly.
+	unauthPaths map[string]struct{}
 
 	// apiPrefix is "/proxy/network" for UniFi OS consoles or "" for classic
 	// controllers, discovered automatically during Login.
@@ -147,6 +152,7 @@ func New(cfg config.UniFiConfig) (*Controller, error) {
 	return &Controller{
 		baseURL:            baseURL,
 		site:               cfg.Site,
+		displaySite:        strings.TrimSpace(cfg.Site),
 		username:           cfg.Username,
 		password:           cfg.Password,
 		apiKey:             cfg.APIKey,
@@ -179,6 +185,15 @@ func (c *Controller) sessionPrefixAndSite() (string, string) {
 	c.authMu.RLock()
 	defer c.authMu.RUnlock()
 	return c.apiPrefix, c.site
+}
+
+func (c *Controller) snapshotSiteName() string {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	if c.displaySite != "" {
+		return c.displaySite
+	}
+	return c.site
 }
 
 func (c *Controller) currentSiteID() string {
@@ -216,43 +231,40 @@ func (c *Controller) authFailCooldownDuration() time.Duration {
 	return defaultAuthFailCooldown
 }
 
-func (c *Controller) shouldReloginWS(seenEpoch uint64) bool {
+func (c *Controller) shouldReloginWS() bool {
 	c.authMu.RLock()
 	defer c.authMu.RUnlock()
-	if c.wsReloginEpoch != 0 && c.wsReloginEpoch == seenEpoch {
-		return false
-	}
-	return true
+	return !c.wsReloginSuppressed
 }
 
-func (c *Controller) markWSReloginEpoch(epoch uint64) {
+func (c *Controller) markWSReloginSuppressed() {
 	c.authMu.Lock()
-	c.wsReloginEpoch = epoch
+	c.wsReloginSuppressed = true
 	c.authMu.Unlock()
 }
 
-func (c *Controller) clearWSReloginEpoch() {
+func (c *Controller) clearWSReloginSuppressed() {
 	c.authMu.Lock()
-	c.wsReloginEpoch = 0
+	c.wsReloginSuppressed = false
 	c.authMu.Unlock()
 }
 
-func (c *Controller) isPathUnauthorizedAtEpoch(path string, epoch uint64) bool {
+func (c *Controller) isPathUnauthorized(path string) bool {
 	c.authMu.RLock()
 	defer c.authMu.RUnlock()
 	if len(c.unauthPaths) == 0 {
 		return false
 	}
-	failedEpoch, ok := c.unauthPaths[path]
-	return ok && failedEpoch == epoch
+	_, ok := c.unauthPaths[path]
+	return ok
 }
 
-func (c *Controller) markPathUnauthorized(path string, epoch uint64) {
+func (c *Controller) markPathUnauthorized(path string) {
 	c.authMu.Lock()
 	if c.unauthPaths == nil {
-		c.unauthPaths = make(map[string]uint64)
+		c.unauthPaths = make(map[string]struct{})
 	}
-	c.unauthPaths[path] = epoch
+	c.unauthPaths[path] = struct{}{}
 	c.authMu.Unlock()
 }
 
@@ -260,6 +272,67 @@ func (c *Controller) clearPathUnauthorized(path string) {
 	c.authMu.Lock()
 	delete(c.unauthPaths, path)
 	c.authMu.Unlock()
+}
+
+func (c *Controller) resetReloginSuppressions() {
+	c.authMu.Lock()
+	c.wsReloginSuppressed = false
+	c.unauthPaths = nil
+	c.authMu.Unlock()
+}
+
+// shouldActivateAuthCooldown reports whether a failed login error represents an
+// actual controller authentication or rate-limit rejection (HTTP 401/403/429 or
+// invalid credentials) rather than a caller timeout, cancellation, or transient
+// transport/server failure.
+func shouldActivateAuthCooldown(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return hasAuthRejectionError(err)
+}
+
+func hasAuthRejectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if httpErr, ok := err.(*httpStatusError); ok {
+		switch httpErr.status {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+			return true
+		case http.StatusBadRequest:
+			msg := strings.ToLower(strings.TrimSpace(httpErr.apiMsg))
+			if strings.Contains(msg, "invalid") || strings.Contains(msg, "credential") ||
+				strings.Contains(msg, "password") || strings.Contains(msg, "unauth") {
+				return true
+			}
+		}
+	}
+	if apiErr, ok := err.(*apiEnvelopeError); ok {
+		msg := strings.ToLower(strings.TrimSpace(apiErr.msg))
+		if strings.Contains(msg, "invalid") || strings.Contains(msg, "credential") ||
+			strings.Contains(msg, "password") || strings.Contains(msg, "unauth") ||
+			strings.Contains(msg, "nopermission") {
+			return true
+		}
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, sub := range multi.Unwrap() {
+			if hasAuthRejectionError(sub) {
+				return true
+			}
+		}
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		return hasAuthRejectionError(single.Unwrap())
+	}
+	return false
 }
 
 func (c *Controller) relogin(ctx context.Context, seenEpoch uint64) error {
@@ -273,8 +346,10 @@ func (c *Controller) relogin(ctx context.Context, seenEpoch uint64) error {
 		return c.lastLoginErr
 	}
 	if err := c.loginLocked(ctx); err != nil {
-		c.lastLoginErr = err
-		c.authFailCooldownUntil = time.Now().Add(c.authFailCooldownDuration())
+		if shouldActivateAuthCooldown(ctx, err) {
+			c.lastLoginErr = err
+			c.authFailCooldownUntil = time.Now().Add(c.authFailCooldownDuration())
+		}
 		return err
 	}
 	c.lastLoginErr = nil
@@ -296,6 +371,7 @@ func (c *Controller) Login(ctx context.Context) error {
 	}
 	c.lastLoginErr = nil
 	c.authFailCooldownUntil = time.Time{}
+	c.resetReloginSuppressions()
 	return nil
 }
 
@@ -342,7 +418,7 @@ func (c *Controller) loginLocked(ctx context.Context) error {
 		if status == http.StatusNotFound {
 			return fmt.Errorf("classic unifi login failed: %w", classicErr)
 		}
-		return fmt.Errorf("unifi-os login failed: %w (classic fallback: %v)", uosErr, classicErr)
+		return fmt.Errorf("unifi-os login failed: %w (classic fallback: %w)", uosErr, classicErr)
 	}
 	c.authMu.Lock()
 	c.apiPrefix = ""
@@ -368,6 +444,11 @@ func (c *Controller) loginWithAPIKey(ctx context.Context) error {
 		c.siteID = site.ID
 		if ref := strings.TrimSpace(site.InternalReference); ref != "" {
 			c.site = ref
+		}
+		if c.displaySite == "" {
+			c.displaySite = firstNonEmpty(site.Name, site.InternalReference, site.ID)
+		} else if strings.EqualFold(c.displaySite, site.ID) && strings.TrimSpace(site.Name) != "" {
+			c.displaySite = strings.TrimSpace(site.Name)
 		}
 		c.controllerType = controllerIntegrationV1
 		c.apiPrefix = "/proxy/network"
@@ -460,10 +541,15 @@ func (c *Controller) postLogin(ctx context.Context, path string) (int, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, fmt.Errorf("HTTP %d from %s", resp.StatusCode, path)
+		return resp.StatusCode, &httpStatusError{
+			method: http.MethodPost,
+			path:   path,
+			status: resp.StatusCode,
+			apiMsg: extractAPIErrorMsg(body),
+		}
 	}
 	if token := resp.Header.Get("X-CSRF-Token"); token != "" {
 		c.setCSRFToken(token)
@@ -895,7 +981,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
-		Site:             site,
+		Site:             c.snapshotSiteName(),
 		ControllerType:   c.currentControllerType(),
 		Clients:          clients,
 		Devices:          devices,
@@ -1129,7 +1215,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	}
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
-		Site:             site,
+		Site:             c.snapshotSiteName(),
 		ControllerType:   c.currentControllerType(),
 		Clients:          clients,
 		Devices:          devices,
@@ -2067,6 +2153,7 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 // message on failed requests so callers can distinguish missing endpoints (404),
 // session expiry (401), and explicit permission errors (NoPermission).
 type httpStatusError struct {
+	method string
 	path   string
 	status int
 	apiMsg string
@@ -2074,10 +2161,14 @@ type httpStatusError struct {
 
 // Error formats a concise description of the non-2xx HTTP status.
 func (e *httpStatusError) Error() string {
-	if e.apiMsg != "" {
-		return fmt.Sprintf("GET %s returned HTTP %d (%s)", e.path, e.status, e.apiMsg)
+	method := e.method
+	if method == "" {
+		method = http.MethodGet
 	}
-	return fmt.Sprintf("GET %s returned HTTP %d", e.path, e.status)
+	if e.apiMsg != "" {
+		return fmt.Sprintf("%s %s returned HTTP %d (%s)", method, e.path, e.status, e.apiMsg)
+	}
+	return fmt.Sprintf("%s %s returned HTTP %d", method, e.path, e.status)
 }
 
 // apiEnvelopeError reports a UniFi REST envelope carrying meta.rc == "error"
@@ -2183,7 +2274,7 @@ func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) erro
 			return nil
 		}
 		lastErr = err
-		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorizedAtEpoch(fullPath, epoch) {
+		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorized(fullPath) {
 			relogged = true
 			if loginErr := c.relogin(ctx, epoch); loginErr != nil {
 				return fmt.Errorf("re-authentication failed: %w (after %w)", loginErr, err)
@@ -2195,7 +2286,7 @@ func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) erro
 				return nil
 			}
 			if isSessionExpiredError(retryErr) {
-				c.markPathUnauthorized(fullPath, c.currentAuthEpoch())
+				c.markPathUnauthorized(fullPath)
 			}
 			lastErr = retryErr
 		}

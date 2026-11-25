@@ -217,14 +217,17 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		"state_path", cfg.State.Path,
 	)
 
-	session := &watchSession{
-		cfg:     cfg,
-		minSev:  minSev,
-		logger:  logger,
-		scanFn:  func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) { return executeCycle(ctx, cfg, checkList) },
-		sendFn:  notifier.Send,
-		loadFn:  risk.LoadState,
-		saveFn:  risk.SaveState,
+	var session *watchSession
+	session = &watchSession{
+		cfg:    cfg,
+		minSev: minSev,
+		logger: logger,
+		scanFn: func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
+			return executeCycleWithPrev(ctx, cfg, checkList, session.lastSnap)
+		},
+		sendFn: notifier.Send,
+		loadFn: risk.LoadState,
+		saveFn: risk.SaveState,
 	}
 
 	// Run one pass immediately, then repeat on a ticker until cancelled.
@@ -246,12 +249,15 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 
 // watchSession holds in-memory baseline state across `uniblue watch` cycles so
 // a runtime SaveState failure (such as a read-only remount or full disk) never
-// reloads stale on-disk state and re-sends identical alerts on every interval.
+// reloads stale on-disk state and re-sends identical alerts on every interval,
+// and transient controller telemetry outages preserve last-known settings,
+// WLANs, and switch port profiles without dropping posture findings.
 type watchSession struct {
 	cfg         *config.Config
 	minSev      checks.Severity
 	logger      *slog.Logger
 	prevState   *risk.State
+	lastSnap    *unifi.Snapshot
 	stateLoaded bool
 
 	scanFn func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
@@ -280,7 +286,13 @@ func (w *watchSession) runCycle(ctx context.Context) {
 		return
 	}
 
-	diff := risk.ComputeDiff(w.prevState, snap, report, w.cfg.Network)
+	if preserveUnavailableWatchTelemetry(w.lastSnap, snap) {
+		report = mergePreservedWatchPosture(snap, report, w.cfg.Network)
+	}
+	w.lastSnap = cloneWatchTelemetrySnapshot(snap)
+
+	probedKeys := probedHostKeys(profiles)
+	diff := risk.ComputeDiffWithProbed(w.prevState, snap, report, w.cfg.Network, probedKeys)
 	w.logger.Info("scan cycle complete",
 		"clients", report.ClientCount,
 		"findings", len(report.Findings),
@@ -298,13 +310,123 @@ func (w *watchSession) runCycle(ctx context.Context) {
 		}
 	}
 
-	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedHostKeys(profiles))
+	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedKeys)
 	// Always advance the in-memory baseline after notifications succeed so a
 	// runtime persistence error does not trigger duplicate alerts every cycle.
 	w.prevState = nextState
 	if err := w.saveFn(w.cfg.State.Path, nextState); err != nil {
 		w.logger.Error("failed to persist state; retaining updated baseline in memory", "path", w.cfg.State.Path, "err", err)
 	}
+}
+
+// preserveUnavailableWatchTelemetry carries forward last-known SecuritySettings,
+// WLANs, and profile-governed switch port fields when a watch cycle encounters
+// a transient controller telemetry fetch error, returning true if snap was updated.
+func preserveUnavailableWatchTelemetry(prevSnap, nextSnap *unifi.Snapshot) bool {
+	if prevSnap == nil || nextSnap == nil || nextSnap.Visibility == nil {
+		return false
+	}
+	changed := false
+	if !nextSnap.Visibility.SettingsAvailable && nextSnap.SecuritySettings == nil && prevSnap.SecuritySettings != nil {
+		cp := *prevSnap.SecuritySettings
+		nextSnap.SecuritySettings = &cp
+		changed = true
+	}
+	if !nextSnap.Visibility.WLANsAvailable && len(nextSnap.WLANs) == 0 && len(prevSnap.WLANs) > 0 {
+		nextSnap.WLANs = append([]unifi.WLANConfig(nil), prevSnap.WLANs...)
+		changed = true
+	}
+	if !nextSnap.Visibility.PortProfilesAvailable && len(prevSnap.Devices) > 0 && len(nextSnap.Devices) > 0 {
+		prevPorts := make(map[string]unifi.SwitchPort)
+		for _, d := range prevSnap.Devices {
+			dmac := strings.ToLower(strings.TrimSpace(d.MAC))
+			for _, p := range d.Ports {
+				prevPorts[fmt.Sprintf("%s|%d", dmac, p.PortIdx)] = p
+			}
+		}
+		for di := range nextSnap.Devices {
+			dmac := strings.ToLower(strings.TrimSpace(nextSnap.Devices[di].MAC))
+			for pi := range nextSnap.Devices[di].Ports {
+				p := &nextSnap.Devices[di].Ports[pi]
+				if old, ok := prevPorts[fmt.Sprintf("%s|%d", dmac, p.PortIdx)]; ok {
+					if p.OpMode != old.OpMode {
+						p.OpMode = old.OpMode
+						changed = true
+					}
+					if p.Forward != old.Forward {
+						p.Forward = old.Forward
+						changed = true
+					}
+					if p.TaggedVLANMgmt != old.TaggedVLANMgmt {
+						p.TaggedVLANMgmt = old.TaggedVLANMgmt
+						changed = true
+					}
+					if p.NativeNetworkName == "" && old.NativeNetworkName != "" {
+						p.NativeNetworkName = old.NativeNetworkName
+						if p.NativeNetworkID == "" {
+							p.NativeNetworkID = old.NativeNetworkID
+						}
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return changed
+}
+
+func cloneWatchTelemetrySnapshot(snap *unifi.Snapshot) *unifi.Snapshot {
+	if snap == nil {
+		return nil
+	}
+	cp := &unifi.Snapshot{
+		Site: snap.Site,
+	}
+	if snap.SecuritySettings != nil {
+		sec := *snap.SecuritySettings
+		sec.HoneypotIPs = append([]string(nil), snap.SecuritySettings.HoneypotIPs...)
+		cp.SecuritySettings = &sec
+	}
+	if len(snap.WLANs) > 0 {
+		cp.WLANs = append([]unifi.WLANConfig(nil), snap.WLANs...)
+	}
+	if len(snap.Devices) > 0 {
+		cp.Devices = make([]unifi.Device, len(snap.Devices))
+		for i, d := range snap.Devices {
+			cp.Devices[i] = d
+			if len(d.Ports) > 0 {
+				cp.Devices[i].Ports = make([]unifi.SwitchPort, len(d.Ports))
+				copy(cp.Devices[i].Ports, d.Ports)
+			}
+		}
+	}
+	return cp
+}
+
+func watchFindingKey(f checks.Finding) string {
+	host := strings.ToLower(strings.TrimSpace(f.Client.MAC))
+	if host == "" {
+		host = strings.ToLower(strings.TrimSpace(f.Client.PrimaryIP()))
+	}
+	return fmt.Sprintf("%s|%s|%d|%s", f.CheckID, host, f.Port, f.Property)
+}
+
+func mergePreservedWatchPosture(snap *unifi.Snapshot, report risk.Report, netCfg config.NetworkConfig) risk.Report {
+	eval := risk.Evaluate(snap, nil, netCfg)
+	seen := make(map[string]struct{}, len(report.Findings))
+	for _, f := range report.Findings {
+		seen[watchFindingKey(f)] = struct{}{}
+	}
+	for _, f := range eval.Findings {
+		if _, ok := seen[watchFindingKey(f)]; !ok {
+			report.Findings = append(report.Findings, f)
+			seen[watchFindingKey(f)] = struct{}{}
+		}
+	}
+	report.UniFiPosture = eval.UniFiPosture
+	report.SwitchPorts = eval.SwitchPorts
+	report.PostureNotes = eval.PostureNotes
+	return report
 }
 
 // runInventory connects to UniFi and prints the discovered networks, zones,
@@ -594,6 +716,10 @@ func reportUnevaluableCheckHints(stderr io.Writer, list []*checks.Check, target 
 // executeCycle runs one end-to-end UniFi snapshot, host fingerprinting pass,
 // declarative check sweep, and blast-radius risk evaluation.
 func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.Check) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
+	return executeCycleWithPrev(ctx, cfg, checkList, nil)
+}
+
+func executeCycleWithPrev(ctx context.Context, cfg *config.Config, checkList []*checks.Check, prevSnap *unifi.Snapshot) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
 	ctrl, err := unifi.New(cfg.UniFi)
 	if err != nil {
 		return nil, nil, risk.Report{}, err
@@ -605,6 +731,7 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	if err != nil {
 		return nil, nil, risk.Report{}, err
 	}
+	preserveUnavailableWatchTelemetry(prevSnap, snap)
 
 	// Union configured default ports with any specialty ports required by loaded
 	// community checks so dropping a YAML check into checks/ works automatically.

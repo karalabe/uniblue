@@ -9,7 +9,7 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -34,6 +34,8 @@ import (
 
 const (
 	sessionCookieName = "uniblue_session"
+	sessionTTL        = 30 * 24 * time.Hour
+	maxActiveSessions = 256
 
 	authMaxFailedAttempts  = 5
 	authFailureWindow      = 15 * time.Minute
@@ -41,6 +43,103 @@ const (
 	authMaxLockoutDuration = 1 * time.Hour
 	authMaxTrackedClients  = 1024
 )
+
+type sessionEntry struct {
+	tokenHash [32]byte
+	createdAt time.Time
+	expiresAt time.Time
+}
+
+// sessionStore holds per-login random HttpOnly session tokens in memory with
+// bounded capacity, expiry, and explicit revocation on logout.
+type sessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]sessionEntry
+	nowFn    func() time.Time
+}
+
+func (s *sessionStore) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
+}
+
+func (s *sessionStore) create(apiToken string) (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate session token: %w", err)
+	}
+	id := hex.EncodeToString(raw[:])
+	now := s.now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessions == nil {
+		s.sessions = make(map[string]sessionEntry)
+	}
+	for k, entry := range s.sessions {
+		if !now.Before(entry.expiresAt) {
+			delete(s.sessions, k)
+		}
+	}
+	for len(s.sessions) >= maxActiveSessions {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, entry := range s.sessions {
+			if oldestKey == "" || entry.createdAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = entry.createdAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(s.sessions, oldestKey)
+	}
+	s.sessions[id] = sessionEntry{
+		tokenHash: sha256.Sum256([]byte(apiToken)),
+		createdAt: now,
+		expiresAt: now.Add(sessionTTL),
+	}
+	return id, nil
+}
+
+func (s *sessionStore) validate(sessionID, apiToken string) bool {
+	if sessionID == "" || apiToken == "" {
+		return false
+	}
+	now := s.now()
+	wantHash := sha256.Sum256([]byte(apiToken))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.sessions) == 0 {
+		return false
+	}
+	entry, ok := s.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	if !now.Before(entry.expiresAt) {
+		delete(s.sessions, sessionID)
+		return false
+	}
+	if subtle.ConstantTimeCompare(entry.tokenHash[:], wantHash[:]) != 1 {
+		delete(s.sessions, sessionID)
+		return false
+	}
+	return true
+}
+
+func (s *sessionStore) revoke(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.sessions, sessionID)
+	s.mu.Unlock()
+}
 
 type authAttemptState struct {
 	failures    int
@@ -237,6 +336,7 @@ func (e *Engine) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", e.handleIndex)
 	mux.HandleFunc("POST /api/auth", e.handleAuth)
+	mux.HandleFunc("POST /api/logout", e.handleLogout)
 	mux.HandleFunc("GET /api/state", e.handleState)
 	mux.HandleFunc("GET /api/events", e.handleEventsSSE)
 	mux.HandleFunc("POST /api/rescan", e.handleRescan)
@@ -269,12 +369,6 @@ func (e *Engine) effectiveAllowedHosts() []string {
 		}
 	}
 	return out
-}
-
-func sessionCookieValue(apiToken string) string {
-	mac := hmac.New(sha256.New, []byte(apiToken))
-	_, _ = mac.Write([]byte("uniblue-web-session-v1"))
-	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func isLoopbackListenAddr(addr string) bool {
@@ -378,7 +472,7 @@ func requestHostName(hostHeader string) string {
 	return strings.Trim(h, "[]")
 }
 
-func hasValidAPIAuth(r *http.Request, tok string) bool {
+func (e *Engine) hasValidAPIAuth(r *http.Request, tok string) bool {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	const prefix = "Bearer "
 	if strings.HasPrefix(auth, prefix) {
@@ -388,8 +482,7 @@ func hasValidAPIAuth(r *http.Request, tok string) bool {
 		}
 	}
 	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
-		want := sessionCookieValue(tok)
-		if subtle.ConstantTimeCompare([]byte(ck.Value), []byte(want)) == 1 {
+		if e.sessions.validate(ck.Value, tok) {
 			return true
 		}
 	}
@@ -434,14 +527,15 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 			}
 		}
 
-		if isAPI && !(r.Method == http.MethodPost && r.URL.Path == "/api/auth") {
+		isAuthEndpoint := r.Method == http.MethodPost && (r.URL.Path == "/api/auth" || r.URL.Path == "/api/logout")
+		if isAPI && !isAuthEndpoint {
 			if tok := e.effectiveAPIToken(); tok != "" {
 				ip := clientRemoteIP(r)
 				if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
 					writeAuthLockedResponse(w, retryAfter)
 					return
 				}
-				if !hasValidAPIAuth(r, tok) {
+				if !e.hasValidAPIAuth(r, tok) {
 					// Count failed attempts only when the client actually sent
 					// an invalid credential (Bearer token or session cookie), so
 					// unauthenticated initial page loads prompting for login
@@ -521,16 +615,41 @@ func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	e.authLimiter.reset(ip)
 
+	sessionID, err := e.sessions.create(tok)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to create session"})
+		return
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
-		Value:    sessionCookieValue(tok),
+		Value:    sessionID,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
-		MaxAge:   30 * 24 * 3600,
+		MaxAge:   int(sessionTTL.Seconds()),
 	})
 	_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": true, "required": true})
+}
+
+func (e *Engine) handleLogout(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
+		e.sessions.revoke(ck.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
+		MaxAge:   -1,
+	})
+	_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": false})
 }
 
 // RenderStaticHTML renders a self-contained, offline interactive HTML snapshot

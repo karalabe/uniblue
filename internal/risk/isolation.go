@@ -1954,10 +1954,11 @@ func isTransitProbeApproved(
 		if ap.IPVersion != "" && !matchesIPFamily(ap.IPVersion, fam) {
 			continue
 		}
-		// When an approval scopes by destination role (e.g., dest_role: "ups"),
-		// never suppress a zone-wide ALLOW rule or a host that does not actually
-		// hold the approved role.
-		if strings.TrimSpace(ap.DestRole) != "" {
+		// When an approval scopes by destination role or function without a fixed
+		// DestIP (e.g., dest_role: "ups" or function: "ipps-printing"), never
+		// suppress a zone-wide ALLOW rule or a host that does not actually hold
+		// the approved role or function.
+		if strings.TrimSpace(ap.DestRole) != "" || (strings.TrimSpace(ap.DestIP) == "" && strings.TrimSpace(ap.Function) != "") {
 			if !hasDstClient || !clientMatchesApprovedRole(dstClient, rawFindings, ap.DestRole, ap.Function) {
 				continue
 			}
@@ -2338,7 +2339,7 @@ func approvedHostIPsFor(
 			addIP(ap.DestIP)
 			continue
 		}
-		if strings.TrimSpace(ap.DestRole) != "" {
+		if strings.TrimSpace(ap.DestRole) != "" || strings.TrimSpace(ap.Function) != "" {
 			if snap != nil {
 				for _, cl := range snap.Clients {
 					if !clientMatchesApprovedRole(cl, rawFindings, ap.DestRole, ap.Function) {
@@ -2370,10 +2371,56 @@ func endpointMatchesNetworkSelector(ep unifi.PolicyEndpoint, net unifi.Network) 
 	return hit
 }
 
-// collectBoundaryPorts returns representative ports for [start, end] that are
-// guaranteed to hit at least one uncovered port if any port in [start, end] is
-// not blocked by earlier denyPorts / denyRanges.
-func collectBoundaryPorts(start, end int, denyPorts []int, denyRanges []unifi.PortRange) []int {
+// portInBlockedSet reports whether port falls in portSet, extraPorts, ranges,
+// or extraRanges.
+func portInBlockedSet(
+	port int,
+	portSet map[int]struct{},
+	ranges []unifi.PortRange,
+	extraPorts []int,
+	extraRanges []unifi.PortRange,
+) bool {
+	if _, hit := portSet[port]; hit {
+		return true
+	}
+	for _, ep := range extraPorts {
+		if ep == port {
+			return true
+		}
+	}
+	for _, r := range ranges {
+		rs, re := r.Start, r.End
+		if re < rs {
+			re = rs
+		}
+		if port >= rs && port <= re {
+			return true
+		}
+	}
+	for _, r := range extraRanges {
+		rs, re := r.Start, r.End
+		if re < rs {
+			re = rs
+		}
+		if port >= rs && port <= re {
+			return true
+		}
+	}
+	return false
+}
+
+// findUncoveredPort finds at most one port in [start, end] that is not covered
+// by denyPorts/denyPortSet/denyRanges or extraPorts/extraRanges. Checking
+// common ports, range endpoints, and boundary neighbors is both O(1) in common
+// cases and mathematically complete for finding any gap in [start, end].
+func findUncoveredPort(
+	start, end int,
+	denyPorts []int,
+	denyPortSet map[int]struct{},
+	denyRanges []unifi.PortRange,
+	extraPorts []int,
+	extraRanges []unifi.PortRange,
+) (int, bool) {
 	if start < 1 {
 		start = 1
 	}
@@ -2383,33 +2430,207 @@ func collectBoundaryPorts(start, end int, denyPorts []int, denyRanges []unifi.Po
 	if end > 65535 {
 		end = 65535
 	}
-	seen := make(map[int]struct{})
-	var out []int
-	add := func(p int) {
+	check := func(p int) bool {
 		if p < start || p > end {
-			return
+			return false
 		}
-		if _, dup := seen[p]; dup {
-			return
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
+		return !portInBlockedSet(p, denyPortSet, denyRanges, extraPorts, extraRanges)
 	}
-	add(start)
-	add(end)
+	for _, p := range []int{443, 80, 22, 53, start, end} {
+		if check(p) {
+			return p, true
+		}
+	}
 	for _, dp := range denyPorts {
-		add(dp - 1)
-		add(dp + 1)
+		if check(dp - 1) {
+			return dp - 1, true
+		}
+		if check(dp + 1) {
+			return dp + 1, true
+		}
 	}
 	for _, dr := range denyRanges {
 		rs, re := dr.Start, dr.End
 		if re < rs {
 			re = rs
 		}
-		add(rs - 1)
-		add(re + 1)
+		if check(rs - 1) {
+			return rs - 1, true
+		}
+		if check(re + 1) {
+			return re + 1, true
+		}
+	}
+	for _, ep := range extraPorts {
+		if check(ep - 1) {
+			return ep - 1, true
+		}
+		if check(ep + 1) {
+			return ep + 1, true
+		}
+	}
+	for _, er := range extraRanges {
+		rs, re := er.Start, er.End
+		if re < rs {
+			re = rs
+		}
+		if check(rs - 1) {
+			return rs - 1, true
+		}
+		if check(re + 1) {
+			return re + 1, true
+		}
+	}
+	return 0, false
+}
+
+// hasUnparseableSelector reports whether selectors contains any entry that
+// cannot be parsed as a valid IPv4/IPv6 address, CIDR prefix, or IP range.
+func hasUnparseableSelector(selectors []string) bool {
+	for _, sel := range selectors {
+		if selectorFamilyTri(sel) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// isSingleHostSelector reports whether sel parses strictly as a single IPv4
+// (/32) or IPv6 (/128) host address, returning its canonical address string.
+func isSingleHostSelector(sel string) (string, bool) {
+	s := strings.TrimSpace(sel)
+	if s == "" {
+		return "", false
+	}
+	if addr, err := netip.ParseAddr(s); err == nil {
+		return addr.Unmap().String(), true
+	}
+	if pfx, err := netip.ParsePrefix(s); err == nil {
+		addr := pfx.Addr().Unmap()
+		if (addr.Is4() && pfx.Bits() == 32) || (addr.Is6() && pfx.Bits() == 128) {
+			return addr.String(), true
+		}
+		return "", false
+	}
+	if startStr, endStr, ok := strings.Cut(s, "-"); ok {
+		a1, e1 := netip.ParseAddr(strings.TrimSpace(startStr))
+		a2, e2 := netip.ParseAddr(strings.TrimSpace(endStr))
+		if e1 == nil && e2 == nil && a1.Unmap() == a2.Unmap() {
+			return a1.Unmap().String(), true
+		}
+	}
+	return "", false
+}
+
+// narrowPinholePathsForZone extracts synthetic ApprovedPaths strictly for
+// single-host (/32 or /128) narrow-port ALLOW pinholes (such as DNS 53 or
+// NTP 123) on srcZone -> Internal. Wider CIDRs (like /25), multi-host ranges,
+// AnyPort, negated selectors, or broad port ranges are never tolerated.
+func narrowPinholePathsForZone(sorted []unifi.FirewallPolicy, srcZone string) []config.ApprovedPath {
+	var out []config.ApprovedPath
+	for _, pol := range sorted {
+		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
+			continue
+		}
+		if !strings.EqualFold(pol.Source.ZoneName, srcZone) || !strings.EqualFold(pol.Destination.ZoneName, "internal") {
+			continue
+		}
+		if pol.ProtocolNegated || pol.Destination.AnyTarget || pol.Destination.NegateTarget ||
+			pol.Destination.AnyPort || pol.Destination.NegatePort || pol.Destination.CoversAllPorts() ||
+			!pol.Destination.HasPortConstraint() || len(pol.Destination.NetworkIDs) > 0 || len(pol.Destination.MACs) > 0 ||
+			len(pol.Destination.IPs) == 0 || len(pol.Destination.IPs) > 4 {
+			continue
+		}
+		var hostIPs []string
+		allSingle := true
+		for _, sel := range pol.Destination.IPs {
+			ip, ok := isSingleHostSelector(sel)
+			if !ok {
+				allSingle = false
+				break
+			}
+			hostIPs = append(hostIPs, ip)
+		}
+		if !allSingle {
+			continue
+		}
+		var ports []int
+		narrowPorts := true
+		for _, p := range pol.Destination.Ports {
+			if p > 0 && p <= 65535 {
+				ports = append(ports, p)
+			}
+		}
+		for _, r := range pol.Destination.PortRanges {
+			if r.Start > 0 && r.Start == r.End && r.Start <= 65535 {
+				ports = append(ports, r.Start)
+			} else {
+				narrowPorts = false
+				break
+			}
+		}
+		if !narrowPorts || len(ports) == 0 || len(ports) > 4 {
+			continue
+		}
+		proto := strings.ToLower(strings.TrimSpace(pol.Protocol))
+		if proto == "all" || proto == "any" {
+			proto = ""
+		}
+		for _, ip := range hostIPs {
+			for _, p := range ports {
+				out = append(out, config.ApprovedPath{
+					SourceZone: srcZone,
+					DestZone:   "Internal",
+					DestIP:     ip,
+					Transport:  proto,
+					Port:       p,
+					IPVersion:  pol.IPVersion,
+				})
+			}
+		}
 	}
 	return out
+}
+
+type transitDenyState struct {
+	ports     []int
+	portSet   map[int]struct{}
+	ranges    []unifi.PortRange
+	negPorts  []int
+	negRanges []unifi.PortRange
+	ips       []string
+	negIPs    []string
+}
+
+func (d *transitDenyState) record(dst unifi.PolicyEndpoint) {
+	if !dst.AnyPort {
+		if dst.NegatePort {
+			d.negPorts = append(d.negPorts, dst.Ports...)
+			d.negRanges = append(d.negRanges, dst.PortRanges...)
+		} else {
+			if len(dst.Ports) > 0 && d.portSet == nil {
+				d.portSet = make(map[int]struct{}, len(dst.Ports))
+			}
+			for _, p := range dst.Ports {
+				if _, dup := d.portSet[p]; !dup {
+					d.portSet[p] = struct{}{}
+					d.ports = append(d.ports, p)
+				}
+			}
+			d.ranges = append(d.ranges, dst.PortRanges...)
+		}
+	}
+	if !dst.AnyTarget && len(dst.IPs) > 0 {
+		if dst.NegateTarget {
+			d.negIPs = append(d.negIPs, dst.IPs...)
+		} else {
+			d.ips = append(d.ips, dst.IPs...)
+		}
+	}
+}
+
+func (d *transitDenyState) hasAny() bool {
+	return len(d.ports) > 0 || len(d.ranges) > 0 || len(d.negPorts) > 0 || len(d.negRanges) > 0 || len(d.ips) > 0 || len(d.negIPs) > 0
 }
 
 // evaluateTransitBoundary evaluates an untrusted-to-trusted network pair across
@@ -2461,9 +2682,18 @@ func evaluateTransitBoundary(
 	srcIPSample := sampleNetworkIPForFamily(srcNet, snap, fam)
 	dstIPSample := sampleNetworkIPForFamily(dstNet, snap, fam)
 
+	baseDstIP := func(proto string, port int) string {
+		if approvedIPs, _ := approvedHostIPsFor(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, proto, port, fam); len(approvedIPs) > 0 {
+			if outside := sampleIPOutsideSelectors(dstNet, snap, fam, approvedIPs); outside != "" {
+				return outside
+			}
+		}
+		return dstIPSample
+	}
+
 	// Default baseline probes across TCP and UDP scoped to srcNet -> dstNet.
-	addProbe("tcp", 443, srcIPSample, dstIPSample)
-	addProbe("udp", 53, srcIPSample, dstIPSample)
+	addProbe("tcp", 443, srcIPSample, baseDstIP("tcp", 443))
+	addProbe("udp", 53, srcIPSample, baseDstIP("udp", 53))
 
 	sampleSourceIPs := func(ep unifi.PolicyEndpoint) ([]string, bool) {
 		if !endpointMatchesNetworkSelector(ep, srcNet) {
@@ -2473,6 +2703,18 @@ func evaluateTransitBoundary(
 			return []string{srcIPSample}, true
 		}
 		if ep.NegateTarget {
+			if hasUnparseableSelector(ep.IPs) {
+				var parseable []string
+				for _, sel := range ep.IPs {
+					if selectorFamilyTri(sel) != "" {
+						parseable = append(parseable, sel)
+					}
+				}
+				if outside := sampleIPOutsideSelectors(srcNet, snap, fam, parseable); outside != "" {
+					return []string{outside}, true
+				}
+				return []string{srcIPSample}, true
+			}
 			if outside := sampleIPOutsideSelectors(srcNet, snap, fam, ep.IPs); outside != "" {
 				return []string{outside}, true
 			}
@@ -2488,6 +2730,9 @@ func evaluateTransitBoundary(
 			}
 		}
 		if len(ips) == 0 {
+			if hasUnparseableSelector(ep.IPs) {
+				return []string{srcIPSample}, true
+			}
 			return nil, false
 		}
 		return ips, true
@@ -2520,6 +2765,23 @@ func evaluateTransitBoundary(
 			return ips
 		}
 		if ep.NegateTarget {
+			// When any negated IP selector is unparseable (e.g., malformed CIDR
+			// or unresolved group name), emit a probe target outside parseable
+			// exclusions so evaluateRoutedPath hits matchesEndpoint and returns
+			// IsolationUnknown instead of false blocked-ok.
+			if hasUnparseableSelector(ep.IPs) {
+				parseable := make([]string, 0, len(avoidIPs)+len(ep.IPs))
+				parseable = append(parseable, avoidIPs...)
+				for _, sel := range ep.IPs {
+					if selectorFamilyTri(sel) != "" {
+						parseable = append(parseable, sel)
+					}
+				}
+				if outside := sampleIPOutsideSelectors(dstNet, snap, fam, parseable); outside != "" {
+					return []string{outside}
+				}
+				return []string{dstIPSample}
+			}
 			// Negated target ALLOW (e.g., all hosts except 192.168.1.0/28):
 			// probe a destination address in dstNet outside the rule's excluded
 			// selectors, earlier deny selectors, and any approved exceptions.
@@ -2544,16 +2806,13 @@ func evaluateTransitBoundary(
 				ips = append(ips, sample)
 			}
 		}
+		if len(ips) == 0 && hasUnparseableSelector(ep.IPs) {
+			return []string{dstIPSample}
+		}
 		return ips
 	}
 
-	collectRulePorts := func(
-		ep unifi.PolicyEndpoint,
-		denyPorts []int,
-		denyRanges []unifi.PortRange,
-		negDenyPorts []int,
-		negDenyRanges []unifi.PortRange,
-	) []int {
+	collectRulePorts := func(ep unifi.PolicyEndpoint, deny *transitDenyState) []int {
 		seenPort := make(map[int]struct{})
 		var ports []int
 		addPort := func(p int) {
@@ -2566,7 +2825,20 @@ func evaluateTransitBoundary(
 			seenPort[p] = struct{}{}
 			ports = append(ports, p)
 		}
-		// Always probe ports that escape any earlier negated BLOCK rule
+		var denyPorts []int
+		var denyPortSet map[int]struct{}
+		var denyRanges []unifi.PortRange
+		var negDenyPorts []int
+		var negDenyRanges []unifi.PortRange
+		if deny != nil {
+			denyPorts = deny.ports
+			denyPortSet = deny.portSet
+			denyRanges = deny.ranges
+			negDenyPorts = deny.negPorts
+			negDenyRanges = deny.negRanges
+		}
+
+		// Probe ports that escape any earlier negated BLOCK rule
 		// (e.g., BLOCK all-except-8080 followed by ALLOW all) when allowed by ep.
 		for _, p := range negDenyPorts {
 			if endpointMatchesPort(ep, p) {
@@ -2574,31 +2846,27 @@ func evaluateTransitBoundary(
 			}
 		}
 		for _, r := range negDenyRanges {
-			for _, p := range collectBoundaryPorts(r.Start, r.End, denyPorts, denyRanges) {
-				if endpointMatchesPort(ep, p) {
-					addPort(p)
-				}
+			if p, ok := findUncoveredPort(r.Start, r.End, denyPorts, denyPortSet, denyRanges, nil, nil); ok && endpointMatchesPort(ep, p) {
+				addPort(p)
+			} else if endpointMatchesPort(ep, r.Start) {
+				addPort(r.Start)
 			}
 		}
 
 		if ep.AnyPort || (!ep.HasPortConstraint() && !ep.NegatePort) {
 			addPort(443)
 			if len(denyPorts) > 0 || len(denyRanges) > 0 {
-				for _, cand := range collectBoundaryPorts(1, 65535, denyPorts, denyRanges) {
-					addPort(cand)
+				if p, ok := findUncoveredPort(1, 65535, denyPorts, denyPortSet, denyRanges, nil, nil); ok {
+					addPort(p)
 				}
 			}
 			return ports
 		}
 		if ep.NegatePort {
-			mergedPorts := make([]int, 0, len(denyPorts)+len(ep.Ports))
-			mergedPorts = append(mergedPorts, denyPorts...)
-			mergedPorts = append(mergedPorts, ep.Ports...)
-			mergedRanges := make([]unifi.PortRange, 0, len(denyRanges)+len(ep.PortRanges))
-			mergedRanges = append(mergedRanges, denyRanges...)
-			mergedRanges = append(mergedRanges, ep.PortRanges...)
-			for _, cand := range collectBoundaryPorts(1, 65535, mergedPorts, mergedRanges) {
-				addPort(cand)
+			if p, ok := findUncoveredPort(1, 65535, denyPorts, denyPortSet, denyRanges, ep.Ports, ep.PortRanges); ok {
+				addPort(p)
+			} else if p, ok := findUncoveredPort(1, 65535, nil, nil, nil, ep.Ports, ep.PortRanges); ok {
+				addPort(p)
 			}
 			return ports
 		}
@@ -2606,8 +2874,10 @@ func evaluateTransitBoundary(
 			addPort(p)
 		}
 		for _, r := range ep.PortRanges {
-			for _, p := range collectBoundaryPorts(r.Start, r.End, denyPorts, denyRanges) {
+			if p, ok := findUncoveredPort(r.Start, r.End, denyPorts, denyPortSet, denyRanges, nil, nil); ok {
 				addPort(p)
+			} else {
+				addPort(r.Start)
 			}
 		}
 		return ports
@@ -2628,19 +2898,26 @@ func evaluateTransitBoundary(
 		rawProto string,
 		protoNegated bool,
 		srcEP, dstEP unifi.PolicyEndpoint,
-		denyPorts []int,
-		denyRanges []unifi.PortRange,
-		negDenyPorts []int,
-		negDenyRanges []unifi.PortRange,
-		denyIPs []string,
-		negDenyIPs []string,
+		tcpDeny, udpDeny *transitDenyState,
 	) {
 		srcIPs, ok := sampleSourceIPs(srcEP)
 		if !ok {
 			return
 		}
-		ports := collectRulePorts(dstEP, denyPorts, denyRanges, negDenyPorts, negDenyRanges)
 		for _, pr := range expandProtos(rawProto, protoNegated) {
+			var deny *transitDenyState
+			switch pr {
+			case "tcp":
+				deny = tcpDeny
+			case "udp":
+				deny = udpDeny
+			}
+			var denyIPs, negDenyIPs []string
+			if deny != nil {
+				denyIPs = deny.ips
+				negDenyIPs = deny.negIPs
+			}
+			ports := collectRulePorts(dstEP, deny)
 			for _, port := range ports {
 				dstIPs := sampleTargetIPsForEndpoint(dstEP, pr, port, denyIPs, negDenyIPs)
 				for _, sip := range srcIPs {
@@ -2670,12 +2947,7 @@ func evaluateTransitBoundary(
 			return i < j
 		})
 		swLower := strings.ToLower(strings.TrimSpace(l3SwitchMAC))
-		var priorDenyPorts []int
-		var priorDenyRanges []unifi.PortRange
-		var priorNegDenyPorts []int
-		var priorNegDenyRanges []unifi.PortRange
-		var priorDenyIPs []string
-		var priorNegDenyIPs []string
+		var tcpDeny, udpDeny transitDenyState
 		for _, acl := range sortedACLs {
 			if !acl.Enabled || !matchesIPFamily(acl.IPVersion, fam) {
 				continue
@@ -2700,41 +2972,26 @@ func evaluateTransitBoundary(
 			}
 			if !strings.EqualFold(acl.Action, "ALLOW") {
 				if denyAppliesToSource(acl.Source) && endpointMatchesNetworkSelector(acl.Destination, dstNet) {
-					if !acl.Destination.AnyPort {
-						if acl.Destination.NegatePort {
-							priorNegDenyPorts = append(priorNegDenyPorts, acl.Destination.Ports...)
-							priorNegDenyRanges = append(priorNegDenyRanges, acl.Destination.PortRanges...)
-						} else {
-							priorDenyPorts = append(priorDenyPorts, acl.Destination.Ports...)
-							priorDenyRanges = append(priorDenyRanges, acl.Destination.PortRanges...)
-						}
+					if matchesProtocol(acl.Protocol, "tcp") {
+						tcpDeny.record(acl.Destination)
 					}
-					if !acl.Destination.AnyTarget && len(acl.Destination.IPs) > 0 {
-						if acl.Destination.NegateTarget {
-							priorNegDenyIPs = append(priorNegDenyIPs, acl.Destination.IPs...)
-						} else {
-							priorDenyIPs = append(priorDenyIPs, acl.Destination.IPs...)
-						}
+					if matchesProtocol(acl.Protocol, "udp") {
+						udpDeny.record(acl.Destination)
 					}
 				}
 				continue
 			}
-			addRuleProbes(acl.Protocol, false, acl.Source, acl.Destination, priorDenyPorts, priorDenyRanges, priorNegDenyPorts, priorNegDenyRanges, priorDenyIPs, priorNegDenyIPs)
+			addRuleProbes(acl.Protocol, false, acl.Source, acl.Destination, &tcpDeny, &udpDeny)
 		}
 		// Because L3 switch forwarding defaults to ALLOW when no ACL matches,
 		// also probe ports/targets escaping narrow or negated deny ACLs against
 		// the implicit switch default.
-		if len(priorDenyPorts) > 0 || len(priorDenyRanges) > 0 || len(priorNegDenyPorts) > 0 || len(priorNegDenyRanges) > 0 || len(priorDenyIPs) > 0 || len(priorNegDenyIPs) > 0 {
+		if tcpDeny.hasAny() || udpDeny.hasAny() {
 			anyEP := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
-			addRuleProbes("all", false, anyEP, anyEP, priorDenyPorts, priorDenyRanges, priorNegDenyPorts, priorNegDenyRanges, priorDenyIPs, priorNegDenyIPs)
+			addRuleProbes("all", false, anyEP, anyEP, &tcpDeny, &udpDeny)
 		}
 	} else {
-		var priorDenyPorts []int
-		var priorDenyRanges []unifi.PortRange
-		var priorNegDenyPorts []int
-		var priorNegDenyRanges []unifi.PortRange
-		var priorDenyIPs []string
-		var priorNegDenyIPs []string
+		var tcpDeny, udpDeny transitDenyState
 		for _, pol := range sortedPolicies {
 			if !pol.Enabled || !matchesIPFamily(pol.IPVersion, fam) {
 				continue
@@ -2747,26 +3004,16 @@ func evaluateTransitBoundary(
 			}
 			if !strings.EqualFold(pol.Action, "ALLOW") {
 				if denyAppliesToSource(pol.Source) && endpointMatchesNetworkSelector(pol.Destination, dstNet) {
-					if !pol.Destination.AnyPort {
-						if pol.Destination.NegatePort {
-							priorNegDenyPorts = append(priorNegDenyPorts, pol.Destination.Ports...)
-							priorNegDenyRanges = append(priorNegDenyRanges, pol.Destination.PortRanges...)
-						} else {
-							priorDenyPorts = append(priorDenyPorts, pol.Destination.Ports...)
-							priorDenyRanges = append(priorDenyRanges, pol.Destination.PortRanges...)
-						}
+					if matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "tcp") {
+						tcpDeny.record(pol.Destination)
 					}
-					if !pol.Destination.AnyTarget && len(pol.Destination.IPs) > 0 {
-						if pol.Destination.NegateTarget {
-							priorNegDenyIPs = append(priorNegDenyIPs, pol.Destination.IPs...)
-						} else {
-							priorDenyIPs = append(priorDenyIPs, pol.Destination.IPs...)
-						}
+					if matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "udp") {
+						udpDeny.record(pol.Destination)
 					}
 				}
 				continue
 			}
-			addRuleProbes(pol.Protocol, pol.ProtocolNegated, pol.Source, pol.Destination, priorDenyPorts, priorDenyRanges, priorNegDenyPorts, priorNegDenyRanges, priorDenyIPs, priorNegDenyIPs)
+			addRuleProbes(pol.Protocol, pol.ProtocolNegated, pol.Source, pol.Destination, &tcpDeny, &udpDeny)
 		}
 	}
 
@@ -2795,15 +3042,15 @@ func evaluateTransitBoundary(
 				state:      "new",
 			}, dstNet.Name, "trusted-lan-transit", "deny",
 		)
-		if !hasFirst {
-			firstCell = cell
-			hasFirst = true
-		}
 		if cell.Verdict == IsolationViolation {
 			if isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, pt.dstIP, pt.proto, pt.port, fam) {
 				continue
 			}
 			return cell
+		}
+		if !hasFirst {
+			firstCell = cell
+			hasFirst = true
 		}
 		if cell.Verdict == IsolationUnknown && unknownCell == nil {
 			cp := cell
@@ -3192,6 +3439,7 @@ func sampleIPOutsideSelectors(net unifi.Network, snap *unifi.Snapshot, fam strin
 	}
 
 	// 1. Prefer an actual active client IP on net that is outside excluded.
+	hasNetClient := false
 	if snap != nil && (net.ID != "" || net.Name != "") {
 		for _, cl := range snap.Clients {
 			if (net.ID == "" || cl.NetworkID != net.ID) &&
@@ -3200,14 +3448,33 @@ func sampleIPOutsideSelectors(net unifi.Network, snap *unifi.Snapshot, fam strin
 			}
 			if wantV6 {
 				for _, raw := range cl.IPv6 {
-					if a, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil && usable(a) {
+					if a, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil && a.Unmap().Is6() {
+						hasNetClient = true
+						if usable(a) {
+							return a.Unmap().String()
+						}
+					}
+				}
+				if a, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && a.Unmap().Is6() {
+					hasNetClient = true
+					if usable(a) {
 						return a.Unmap().String()
 					}
 				}
-			} else if a, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && usable(a) {
-				return a.Unmap().String()
+			} else if a, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && a.Unmap().Is4() {
+				hasNetClient = true
+				if usable(a) {
+					return a.Unmap().String()
+				}
 			}
 		}
+	}
+
+	// When net has no configured subnet for fam but does have active clients of
+	// family fam, every active client was checked above and covered by excluded;
+	// do not invent synthetic out-of-network addresses.
+	if !hasPfx && hasNetClient {
+		return ""
 	}
 
 	// 2. Try boundary neighbors just outside each excluded selector.

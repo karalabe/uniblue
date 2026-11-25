@@ -25,6 +25,10 @@ import (
 //
 // When version is empty, it returns (true, ConfidencePotential).
 func MatchesRange(version string, m CPEMatch) (bool, Confidence) {
+	return matchesRange(version, m, isUniFiFirmwareCPE(m))
+}
+
+func matchesRange(version string, m CPEMatch, unifiFirmware bool) (bool, Confidence) {
 	version = strings.TrimSpace(version)
 	if version == "" {
 		return true, ConfidencePotential
@@ -36,18 +40,28 @@ func MatchesRange(version string, m CPEMatch) (bool, Confidence) {
 	if !hasExact && !hasRange {
 		return true, ConfidencePotential
 	}
+
+	eff := func(bound string) string {
+		if unifiFirmware {
+			return unifiEffectiveVersionForBound(version, bound)
+		}
+		return version
+	}
+
 	if hasExact {
-		if isCoarsePrefix(version, m.Version) {
+		v := eff(m.Version)
+		if isCoarsePrefix(v, m.Version) {
 			return true, ConfidencePotential
 		}
-		return CompareVersions(version, m.Version) == 0, ConfidenceExact
+		return CompareVersions(v, m.Version) == 0, ConfidenceExact
 	}
 
 	ambiguous := false
 
 	if m.StartIncl != "" {
-		cmp := CompareVersions(version, m.StartIncl)
-		if isCoarsePrefix(version, m.StartIncl) {
+		v := eff(m.StartIncl)
+		cmp := CompareVersions(v, m.StartIncl)
+		if isCoarsePrefix(v, m.StartIncl) {
 			// If StartIncl has non-zero trailing components (e.g., "2.4.2"),
 			// an observed "2.4" could be either below or at/above the bound.
 			// If cmp == 0 (e.g., "2.4.0"), every 2.4.x is >= 2.4.0.
@@ -59,26 +73,29 @@ func MatchesRange(version string, m CPEMatch) (bool, Confidence) {
 		}
 	}
 	if m.StartExcl != "" {
-		if isCoarsePrefix(version, m.StartExcl) {
+		v := eff(m.StartExcl)
+		if isCoarsePrefix(v, m.StartExcl) {
 			// Any more-specific StartExcl under the same prefix (e.g., "2.4.0"
 			// or "2.4.2") leaves some 2.4.x versions inside and some outside.
 			ambiguous = true
-		} else if CompareVersions(version, m.StartExcl) <= 0 {
+		} else if CompareVersions(v, m.StartExcl) <= 0 {
 			return false, ConfidenceExact
 		}
 	}
 	if m.EndIncl != "" {
-		if isCoarsePrefix(version, m.EndIncl) {
+		v := eff(m.EndIncl)
+		if isCoarsePrefix(v, m.EndIncl) {
 			// Any more-specific EndIncl under the same prefix (e.g., "2.4.0"
 			// or "2.4.7") leaves some 2.4.x versions inside and some outside.
 			ambiguous = true
-		} else if CompareVersions(version, m.EndIncl) > 0 {
+		} else if CompareVersions(v, m.EndIncl) > 0 {
 			return false, ConfidenceExact
 		}
 	}
 	if m.EndExcl != "" {
-		cmp := CompareVersions(version, m.EndExcl)
-		if isCoarsePrefix(version, m.EndExcl) {
+		v := eff(m.EndExcl)
+		cmp := CompareVersions(v, m.EndExcl)
+		if isCoarsePrefix(v, m.EndExcl) {
 			// If cmp == 0 (e.g., EndExcl "2.4.0"), no 2.4.x release is < 2.4.0.
 			if cmp >= 0 {
 				return false, ConfidenceExact
@@ -92,6 +109,48 @@ func MatchesRange(version string, m CPEMatch) (bool, Confidence) {
 		return true, ConfidencePotential
 	}
 	return true, ConfidenceExact
+}
+
+func isUniFiFirmwareCPE(m CPEMatch) bool {
+	v := strings.ToLower(strings.TrimSpace(m.Vendor))
+	p := strings.ToLower(strings.TrimSpace(m.Product))
+	return (v == "ui" || v == "ubiquiti") && strings.HasPrefix(p, "unifi_")
+}
+
+// unifiEffectiveVersionForBound maps a 4-part UniFi firmware string
+// (major.minor.patch.build, such as "6.6.55.15189" or "6.6.55.999") to its
+// 3-part release prefix ("6.6.55") only when compared against a 3-part NVD
+// bound. Against 4-part NVD bounds (such as "6.6.55.15200"), all 4 numeric
+// parts are compared directly.
+func unifiEffectiveVersionForBound(observed, bound string) string {
+	obsParts, ok := numericDotParts(observed, 4)
+	if !ok {
+		return observed
+	}
+	if _, boundIs3 := numericDotParts(bound, 3); !boundIs3 {
+		return observed
+	}
+	return obsParts[0] + "." + obsParts[1] + "." + obsParts[2]
+}
+
+func numericDotParts(raw string, want int) ([]string, bool) {
+	v := strings.TrimSpace(raw)
+	v = strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V")
+	parts := strings.Split(v, ".")
+	if len(parts) != want {
+		return nil, false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return nil, false
+		}
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return nil, false
+			}
+		}
+	}
+	return parts, true
 }
 
 // isCoarsePrefix reports whether observed has strictly fewer tokens than bound,

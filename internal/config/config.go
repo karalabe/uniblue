@@ -363,21 +363,7 @@ func Load(path string) (*Config, error) {
 	if !filepath.IsAbs(cfg.State.Path) {
 		if loadedFromFile {
 			if cfgDir := filepath.Dir(path); cfgDir != "" && cfgDir != "." {
-				candidate := filepath.Join(cfgDir, cfg.State.Path)
-				if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
-					if info, cwdErr := os.Stat(cfg.State.Path); cwdErr == nil && !info.IsDir() {
-						// Preserve an existing working-directory state file across upgrades
-						// instead of silently abandoning the baseline when config lives in
-						// a separate directory.
-						if abs, absErr := filepath.Abs(cfg.State.Path); absErr == nil {
-							cfg.State.Path = abs
-						}
-					} else {
-						cfg.State.Path = candidate
-					}
-				} else {
-					cfg.State.Path = candidate
-				}
+				cfg.State.Path = filepath.Join(cfgDir, cfg.State.Path)
 			}
 		} else if cwd, err := os.Getwd(); err == nil && cwd == string(filepath.Separator) {
 			cfg.State.Path = defaultFallbackStatePath(cfg.State.Path)

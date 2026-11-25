@@ -521,11 +521,11 @@ func TestIsolatedZonePinholesAndLeakingCustomZones(t *testing.T) {
 			pols []unifi.FirewallPolicy
 		}{
 			{
-				name: "icmp_block_then_allow_all",
+				name: "tcp_only_broad_block_then_allow_all",
 				pols: []unifi.FirewallPolicy{
 					{
-						ID: "p-icmp", Index: 1, Name: "Block ICMP", Enabled: true, Action: "BLOCK", Origin: "USER_DEFINED",
-						IPVersion: "both", Protocol: "icmp",
+						ID: "p-tcp-block", Index: 1, Name: "Block IoT TCP to Internal", Enabled: true, Action: "BLOCK", Origin: "USER_DEFINED",
+						IPVersion: "both", Protocol: "tcp",
 						Source:      unifi.PolicyEndpoint{ZoneName: "IoTZone", AnyTarget: true, AnyPort: true},
 						Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
 					},

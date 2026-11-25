@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/karalabe/uniblue/internal/probe"
@@ -215,7 +214,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 				Label:    fmt.Sprintf("UniFi %s (%s)", dev.Name, dev.Model),
 				Vendors:  []string{"ui"},
 				Products: cpeProducts,
-				Version:  normalizeUniFiFirmwareVersion(dev.Version),
+				Version:  strings.TrimSpace(dev.Version),
 				Source:   "unifi-firmware",
 				HostName: dev.Name,
 				HostIP:   dev.IP,
@@ -339,103 +338,108 @@ func productHostKey(p Product) string {
 }
 
 // dropSupersededVersionlessProducts removes versionless Products whose
-// (host, vendor, product) is already covered by a versioned Product on the
-// same host so one service never emits both Exact and Potential rollups.
+// (host, vendor, product) is already covered by one or more versioned Products
+// on the same host, merging any uncovered vendor and exact product aliases from
+// the versionless rule into each matching versioned Product so multi-vendor
+// NVD shards (such as nginx alongside f5) still match with the exact version.
 func dropSupersededVersionlessProducts(products []Product) []Product {
-	type vendorProductPair struct {
-		vendor  string
-		product string
-	}
-	versionedByHost := make(map[string][]vendorProductPair)
-	for _, p := range products {
+	work := make([]Product, len(products))
+	copy(work, products)
+
+	versionedIdxByHost := make(map[string][]int)
+	for i, p := range work {
 		if strings.TrimSpace(p.Version) == "" {
 			continue
 		}
 		hk := productHostKey(p)
-		for _, v := range p.Vendors {
-			v = strings.ToLower(strings.TrimSpace(v))
-			if v == "" {
-				continue
-			}
-			for _, prod := range p.Products {
-				prod = strings.ToLower(strings.TrimSpace(prod))
-				if prod == "" {
-					continue
-				}
-				versionedByHost[hk] = append(versionedByHost[hk], vendorProductPair{vendor: v, product: prod})
-			}
-		}
+		versionedIdxByHost[hk] = append(versionedIdxByHost[hk], i)
 	}
-	if len(versionedByHost) == 0 {
-		return products
+	if len(versionedIdxByHost) == 0 {
+		return work
 	}
-	out := make([]Product, 0, len(products))
-	for _, p := range products {
+
+	drop := make([]bool, len(work))
+	for i, p := range work {
 		if strings.TrimSpace(p.Version) != "" {
-			out = append(out, p)
 			continue
 		}
-		covered := versionedByHost[productHostKey(p)]
-		if len(covered) == 0 {
-			out = append(out, p)
+		vIdxs := versionedIdxByHost[productHostKey(p)]
+		if len(vIdxs) == 0 {
 			continue
 		}
-		superseded := false
-		for _, v := range p.Vendors {
-			v = strings.ToLower(strings.TrimSpace(v))
-			if v == "" {
+		matchedAny := false
+		for _, vi := range vIdxs {
+			if !productsOverlapVendorProduct(p, work[vi]) {
 				continue
 			}
-			for _, c := range covered {
-				if c.vendor == v && matchesAnyPattern(p.Products, c.product) {
-					superseded = true
-					break
+			matchedAny = true
+			work[vi].Vendors = mergeUniqueStringsCI(work[vi].Vendors, p.Vendors)
+			var exactAliases []string
+			for _, pat := range p.Products {
+				if !strings.Contains(pat, "*") {
+					exactAliases = append(exactAliases, pat)
 				}
 			}
-			if superseded {
-				break
+			if len(exactAliases) > 0 {
+				work[vi].Products = mergeUniqueStringsCI(work[vi].Products, exactAliases)
 			}
 		}
-		if !superseded {
+		if matchedAny {
+			drop[i] = true
+		}
+	}
+
+	out := make([]Product, 0, len(work))
+	for i, p := range work {
+		if !drop[i] {
 			out = append(out, p)
 		}
 	}
 	return out
 }
 
-// normalizeUniFiFirmwareVersion strips UniFi's trailing 4th numeric build
-// suffix (such as "6.6.55.15189" -> "6.6.55" or "4.4.57.5578372" -> "4.4.57")
-// when the version consists of a 3-part major.minor.patch release plus a build
-// number >= 1000. This allows UniFi stat/device strings to match 3-part NVD
-// inclusive bounds and exact versions without weakening CompareVersions.
-func normalizeUniFiFirmwareVersion(raw string) string {
-	v := strings.TrimSpace(raw)
-	parts := strings.Split(v, ".")
-	if len(parts) != 4 {
-		return v
-	}
-	for _, part := range parts {
-		if !isASCIIUnsignedInt(part) {
-			return v
+func productsOverlapVendorProduct(ruleProd, versionedProd Product) bool {
+	for _, rv := range ruleProd.Vendors {
+		rv = strings.ToLower(strings.TrimSpace(rv))
+		if rv == "" {
+			continue
+		}
+		for _, vv := range versionedProd.Vendors {
+			if strings.ToLower(strings.TrimSpace(vv)) != rv {
+				continue
+			}
+			for _, vp := range versionedProd.Products {
+				if matchesAnyPattern(ruleProd.Products, vp) {
+					return true
+				}
+			}
+			for _, rp := range ruleProd.Products {
+				if !strings.Contains(rp, "*") && matchesAnyPattern(versionedProd.Products, rp) {
+					return true
+				}
+			}
 		}
 	}
-	build, err := strconv.Atoi(parts[3])
-	if err != nil || build < 1000 {
-		return v
-	}
-	return parts[0] + "." + parts[1] + "." + parts[2]
+	return false
 }
 
-func isASCIIUnsignedInt(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
+func mergeUniqueStringsCI(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	out := make([]string, 0, len(base)+len(extra))
+	for _, list := range [][]string{base, extra} {
+		for _, raw := range list {
+			norm := strings.ToLower(strings.TrimSpace(raw))
+			if norm == "" {
+				continue
+			}
+			if _, dup := seen[norm]; dup {
+				continue
+			}
+			seen[norm] = struct{}{}
+			out = append(out, raw)
 		}
 	}
-	return true
+	return out
 }
 
 // ruleHit records one deterministic match emitted by FingerprintRule.matchAll.

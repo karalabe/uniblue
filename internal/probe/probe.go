@@ -224,9 +224,8 @@ var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 // IsRawPrintPort reports whether port on this host is protected by the raw
 // print or raw serial sink zero-byte guard. Self-announced sinks are always
-// honored; reflected sinks from a local reflector are honored for known
-// serial-bridge types on non-privileged ports and for standard raw print ports
-// (515, 9100-9107).
+// honored; reflected sinks from a local reflector are honored only for known
+// serial coordinator ports (6638, 6639, 20108) and raw print port 9100.
 func (h HostProfile) IsRawPrintPort(port int) bool {
 	if port == 9100 || port == 515 {
 		return true
@@ -437,6 +436,54 @@ func (f *Fingerprinter) isAllowedProbeIP(rawIP string) bool {
 	return isAllowedProbeIPWithSubnets(rawIP, f.allowedSubnets)
 }
 
+// SelectProbeIP picks the preferred probe-eligible IP address for cl given
+// allowedSubnets: first an allowed non-link-local IPv4, then an allowed
+// non-link-local IPv6, then an allowed link-local IPv4, then an allowed
+// link-local IPv6. Returns "" when cl has no probe-eligible address.
+func SelectProbeIP(cl unifi.Client, allowedSubnets []netip.Prefix) string {
+	var v4LL, v6Global, v6LL string
+	for _, raw := range cl.AllIPs() {
+		ip := strings.TrimSpace(raw)
+		if !isAllowedProbeIPWithSubnets(ip, allowedSubnets) {
+			continue
+		}
+		addr, err := netip.ParseAddr(ip)
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		if addr.Is4() {
+			if !addr.IsLinkLocalUnicast() {
+				return ip
+			}
+			if v4LL == "" {
+				v4LL = ip
+			}
+			continue
+		}
+		if !addr.IsLinkLocalUnicast() {
+			if v6Global == "" {
+				v6Global = ip
+			}
+			continue
+		}
+		if v6LL == "" {
+			v6LL = ip
+		}
+	}
+	if v6Global != "" {
+		return v6Global
+	}
+	if v4LL != "" {
+		return v4LL
+	}
+	return v6LL
+}
+
+func (f *Fingerprinter) selectAllowedProbeIP(cl unifi.Client) string {
+	return SelectProbeIP(cl, f.allowedSubnets)
+}
+
 // SetProgressFunc registers an optional callback invoked on the collector
 // goroutine as discovery, per-host port probing, and protocol fingerprinting advance.
 func (f *Fingerprinter) SetProgressFunc(fn func(phase string, done, total int, host string)) {
@@ -494,8 +541,7 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	// Filter down to clients with a valid, non-excluded, probe-eligible LAN IP.
 	targets := make([]unifi.Client, 0, len(clients))
 	for _, cl := range clients {
-		primaryIP := cl.PrimaryIP()
-		if primaryIP == "" || !f.isAllowedProbeIP(primaryIP) {
+		if f.selectAllowedProbeIP(cl) == "" {
 			continue
 		}
 		excluded := false
@@ -522,16 +568,16 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	// Run one bounded LAN multicast discovery sweep (mDNS, SSDP/UPnP, WS-Discovery)
 	// when profiling non-loopback LAN hosts so per-host port hints and passive
 	// service metadata enrich every matching HostProfile with zero blind dials.
-	if f.discovery == nil && !f.skipDiscovery && hasNonLoopbackTarget(targets) {
+	if f.discovery == nil && !f.skipDiscovery && f.hasNonLoopbackTarget(targets) {
 		f.reportProgress("discovery", 0, len(targets), "")
 		f.discovery = discoverLANWithOptions(ctx, f.httpClient, f.excludeIPs, f.allowedSubnets)
 	}
 	return f.collectProfiles(ctx, targets, workers)
 }
 
-func hasNonLoopbackTarget(targets []unifi.Client) bool {
+func (f *Fingerprinter) hasNonLoopbackTarget(targets []unifi.Client) bool {
 	for _, cl := range targets {
-		ip := net.ParseIP(cl.PrimaryIP())
+		ip := net.ParseIP(f.selectAllowedProbeIP(cl))
 		if ip != nil && !ip.IsLoopback() {
 			return true
 		}
@@ -596,7 +642,7 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 // FingerprintHost probes a single client's curated ports sequentially (to stay
 // gentle on embedded stacks) and grabs lightweight HTTP banners for web ports.
 func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) HostProfile {
-	targetIP := cl.PrimaryIP()
+	targetIP := f.selectAllowedProbeIP(cl)
 	allIPs := cl.AllIPs()
 	profile := HostProfile{
 		Client:    cl,

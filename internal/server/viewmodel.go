@@ -252,6 +252,7 @@ type PresentationModel struct {
 	WANFlows        []WANFlow                    `json:"wan_flows,omitempty"`
 	Isolation       *risk.IsolationMatrix        `json:"isolation,omitempty"`
 	ServiceCoverage *probe.ServiceCoverageReport `json:"service_coverage,omitempty"`
+	Visibility      *unifi.SiteVisibility        `json:"visibility,omitempty"`
 	Copyright       string                       `json:"copyright"`
 	AuthorURL       string                       `json:"author_url,omitempty"`
 	License         string                       `json:"license"`
@@ -1429,11 +1430,17 @@ func BuildPresentationModel(
 		finalizeEntityVerdict(ent)
 	}
 
-	// Attach effective isolation matrix and measurable service coverage metrics.
+	// Attach effective isolation matrix, measurable service coverage metrics,
+	// and site telemetry visibility so the UI never treats stale cached feeds as current.
 	pm.Isolation = report.Isolation
 	if len(profiles) > 0 {
 		sc := probe.ComputeServiceCoverage(profiles)
 		pm.ServiceCoverage = &sc
+	}
+	if snap.Visibility != nil {
+		visCopy := *snap.Visibility
+		visCopy.MissingFeeds = append([]string(nil), snap.Visibility.MissingFeeds...)
+		pm.Visibility = &visCopy
 	}
 
 	// Propagate WallGate states from their backing Port entities.
@@ -2097,30 +2104,57 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		}
 	}
 	type wideUDPForward struct {
-		fwd        unifi.PortForward
 		spec       string
 		startPort  int
+		endPort    int
 		restricted bool
 	}
-	var wideUDPForwards []wideUDPForward
+	wideUDPBySpec := make(map[string]wideUDPForward)
+	recordWideUDP := func(start, end int, restricted bool) {
+		spec := fmt.Sprintf("%d-%d", start, end)
+		if cur, exists := wideUDPBySpec[spec]; exists {
+			cur.restricted = cur.restricted && restricted
+			wideUDPBySpec[spec] = cur
+		} else {
+			wideUDPBySpec[spec] = wideUDPForward{
+				spec:       spec,
+				startPort:  start,
+				endPort:    end,
+				restricted: restricted,
+			}
+		}
+	}
+	const maxExpandedUDPPorts = 64
 	for _, a := range wan {
 		if !a.Forward.Enabled {
 			continue
 		}
 		if a.Forward.MatchesTransport("udp") {
-			ports := a.Forward.ExpandFwdPorts(64)
+			spec := strings.TrimSpace(firstStr(a.Forward.FwdPort, a.Forward.DstPort))
 			restricted := a.Forward.IsSourceRestricted()
-			if len(ports) > 0 {
-				for _, p := range ports {
-					recordWAN(wanUDPPorts, p, restricted)
+			for _, seg := range strings.Split(spec, ",") {
+				seg = strings.TrimSpace(seg)
+				if seg == "" {
+					continue
 				}
-			} else if spec := strings.TrimSpace(firstStr(a.Forward.FwdPort, a.Forward.DstPort)); spec != "" {
-				wideUDPForwards = append(wideUDPForwards, wideUDPForward{
-					fwd:        a.Forward,
-					spec:       spec,
-					startPort:  firstPortInSpec(spec),
-					restricted: restricted,
-				})
+				if startStr, endStr, ok := strings.Cut(seg, "-"); ok {
+					start, err1 := strconv.Atoi(strings.TrimSpace(startStr))
+					end, err2 := strconv.Atoi(strings.TrimSpace(endStr))
+					if err1 != nil || err2 != nil || start < 1 || end > 65535 || end < start {
+						continue
+					}
+					if end-start+1 <= maxExpandedUDPPorts {
+						for p := start; p <= end; p++ {
+							recordWAN(wanUDPPorts, p, restricted)
+						}
+					} else {
+						recordWideUDP(start, end, restricted)
+					}
+					continue
+				}
+				if single, err := strconv.Atoi(seg); err == nil && single >= 1 && single <= 65535 {
+					recordWAN(wanUDPPorts, single, restricted)
+				}
 			}
 		}
 	}
@@ -2297,23 +2331,26 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		})
 	}
 	// Surface wide UDP port-forward ranges (>64 ports) as a concise range chip
-	// whenever no concrete UDP service inside that forward was observed on the host.
-	if len(wideUDPForwards) > 0 {
+	// whenever no concrete UDP service inside that range was observed on the host.
+	if len(wideUDPBySpec) > 0 {
+		wideUDPForwards := make([]wideUDPForward, 0, len(wideUDPBySpec))
+		for _, wf := range wideUDPBySpec {
+			wideUDPForwards = append(wideUDPForwards, wf)
+		}
 		sort.Slice(wideUDPForwards, func(i, j int) bool {
 			if wideUDPForwards[i].startPort != wideUDPForwards[j].startPort {
 				return wideUDPForwards[i].startPort < wideUDPForwards[j].startPort
 			}
 			return wideUDPForwards[i].spec < wideUDPForwards[j].spec
 		})
-		seenWide := make(map[string]bool)
 		for _, wf := range wideUDPForwards {
-			if seenWide[wf.spec] {
-				continue
-			}
-			seenWide[wf.spec] = true
 			coveredByObserved := false
 			for _, svc := range hp.Services {
-				if svc.Port > 0 && wf.fwd.ExposesEndpoint(svc.Port, firstStr(strings.ToLower(strings.TrimSpace(svc.Transport)), "tcp")) {
+				t := strings.ToLower(strings.TrimSpace(svc.Transport))
+				if t == "" {
+					t = "tcp"
+				}
+				if t == "udp" && svc.Port >= wf.startPort && svc.Port <= wf.endPort {
 					coveredByObserved = true
 					break
 				}
@@ -2333,25 +2370,6 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		}
 	}
 	return out
-}
-
-func firstPortInSpec(spec string) int {
-	for _, token := range strings.Split(spec, ",") {
-		token = strings.TrimSpace(token)
-		if token == "" {
-			continue
-		}
-		if startStr, _, ok := strings.Cut(token, "-"); ok {
-			if p, err := strconv.Atoi(strings.TrimSpace(startStr)); err == nil && p > 0 {
-				return p
-			}
-			continue
-		}
-		if p, err := strconv.Atoi(token); err == nil && p > 0 {
-			return p
-		}
-	}
-	return 0
 }
 
 func isSnapshotWANBehindCGNAT(snap *unifi.Snapshot) bool {

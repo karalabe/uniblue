@@ -60,7 +60,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 	idxByIP := make(map[string]int, len(profiles))
 	var targets []plugins.Target
 	for i, hp := range profiles {
-		targetIP := hp.Client.PrimaryIP()
+		targetIP := f.selectAllowedProbeIP(hp.Client)
 		if targetIP == "" || len(hp.OpenPorts) == 0 {
 			continue
 		}
@@ -150,7 +150,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 	// resolve accurately to "observed-protocol" or "tls-unknown-app".
 	for i := range profiles {
 		hp := &profiles[i]
-		targetIP := hp.Client.PrimaryIP()
+		targetIP := f.selectAllowedProbeIP(hp.Client)
 		if targetIP == "" || len(hp.OpenPorts) == 0 || ctx.Err() != nil {
 			continue
 		}

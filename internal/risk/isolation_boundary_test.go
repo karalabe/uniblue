@@ -7,7 +7,9 @@
 package risk
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
@@ -468,5 +470,420 @@ func TestHostSpecificRuleAlertsOnlyOwningVLANInSharedZone(t *testing.T) {
 	}
 	if transitFindings != 1 {
 		t.Fatalf("expected exactly 1 transit finding (GuestA->TrustedA only), got %d (%+v)", transitFindings, findings)
+	}
+}
+
+// TestProtocolCoversNegatedCompositeDoesNotShadowWANAllow verifies that an
+// earlier negated BLOCK (NOT tcp) never shadows a later composite ALLOW
+// (tcp_udp), raising CRITICAL UB-UNIFI-FW-WAN-LAN, and validates protocolCovers
+// across concrete, composite, and negated selectors.
+func TestProtocolCoversNegatedCompositeDoesNotShadowWANAllow(t *testing.T) {
+	cases := []struct {
+		ep   string
+		eNeg bool
+		tp   string
+		tNeg bool
+		want bool
+	}{
+		{"tcp", true, "tcp_udp", false, false},
+		{"tcp", true, "tcp/udp", false, false},
+		{"tcp", true, "all", false, false},
+		{"tcp", true, "any", false, false},
+		{"tcp", true, "", false, false},
+		{"tcp", true, "tcp", true, false},
+		{"tcp", true, "udp", true, false},
+		{"tcp", true, "tcp", false, false},
+		{"tcp", true, "udp", false, true},
+		{"tcp", true, "icmp", false, true},
+		{"tcp_udp", true, "tcp", false, false},
+		{"tcp_udp", true, "udp", false, false},
+		{"tcp_udp", true, "icmp", false, true},
+	}
+	for _, tc := range cases {
+		if got := protocolCovers(tc.ep, tc.eNeg, tc.tp, tc.tNeg); got != tc.want {
+			t.Fatalf("protocolCovers(%q, %v, %q, %v) = %v, want %v", tc.ep, tc.eNeg, tc.tp, tc.tNeg, got, tc.want)
+		}
+	}
+
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Devices: []unifi.Device{
+			{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.168.1.1", Model: "UDM-Pro", Type: "udm"},
+		},
+		FirewallPolicies: []unifi.FirewallPolicy{
+			{
+				ID: "p-block-not-tcp", Index: 1, Name: "Block Non-TCP from WAN", Enabled: true, Action: "BLOCK", Origin: "USER_DEFINED",
+				Protocol: "tcp", ProtocolNegated: true,
+				Source:      unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+			{
+				ID: "p-allow-tcp-udp", Index: 2, Name: "Allow WAN TCP/UDP", Enabled: true, Action: "ALLOW", Origin: "USER_DEFINED",
+				Protocol:    "tcp_udp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+		},
+	}
+
+	fwFindings := auditFirewallPolicies(snap)
+	if len(fwFindings) != 1 || fwFindings[0].CheckID != "UB-UNIFI-FW-WAN-LAN" || fwFindings[0].EffectiveSeverity != checks.SeverityCritical {
+		t.Fatalf("expected CRITICAL UB-UNIFI-FW-WAN-LAN when BLOCK NOT tcp precedes ALLOW tcp_udp, got %+v", fwFindings)
+	}
+}
+
+// TestNegatedTargetAllowWithUnparseableSelectorReturnsUnknown verifies that a
+// negated-target ALLOW with an unparseable IP selector (such as a malformed CIDR
+// or unresolved group name) produces IsolationUnknown rather than false
+// blocked-ok on both Gateway firewall policies and L3 switch ACLs.
+func TestNegatedTargetAllowWithUnparseableSelectorReturnsUnknown(t *testing.T) {
+	t.Run("gateway_malformed_cidr", func(t *testing.T) {
+		snap := &unifi.Snapshot{
+			Site: "default",
+			Devices: []unifi.Device{
+				{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.168.1.1", Model: "UDM-Pro", Type: "udm"},
+			},
+			Networks: []unifi.Network{
+				{ID: "net-lan", Name: "LAN", VLAN: "1", Subnet: "192.168.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
+				{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "192.168.50.1/24", Purpose: "guest", ZoneName: "Hotspot", IsolationEnabled: true},
+			},
+			FirewallPolicies: []unifi.FirewallPolicy{
+				{
+					ID: "p-allow-bad-neg", Index: 10, Name: "Allow SSH Except Bad CIDR", Enabled: true, Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"192.168.1.0/33"}, NegateTarget: true, Ports: []int{22}},
+				},
+				{
+					ID: "p-block-all", Index: 20, Name: "Block Guest to Internal", Enabled: true, Action: "BLOCK", IPVersion: "ipv4", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			},
+			Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+		}
+		mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{TrustedVLANs: []string{"LAN"}, IsolatedVLANs: []string{"Guest"}})
+		var cell *IsolationCell
+		for i := range mat.Cells {
+			if mat.Cells[i].DestFunction == "trusted-lan-transit" && mat.Cells[i].IPFamily == "ipv4" {
+				cell = &mat.Cells[i]
+			}
+		}
+		if cell == nil || cell.Verdict != IsolationUnknown {
+			t.Fatalf("expected IsolationUnknown for negated-target ALLOW with malformed CIDR, got %+v", cell)
+		}
+	})
+
+	t.Run("gateway_mixed_parseable_and_unparseable", func(t *testing.T) {
+		snap := &unifi.Snapshot{
+			Site: "default",
+			Devices: []unifi.Device{
+				{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.168.1.1", Model: "UDM-Pro", Type: "udm"},
+			},
+			Networks: []unifi.Network{
+				{ID: "net-lan", Name: "LAN", VLAN: "1", Subnet: "192.168.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
+				{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "192.168.50.1/24", Purpose: "guest", ZoneName: "Hotspot", IsolationEnabled: true},
+			},
+			FirewallPolicies: []unifi.FirewallPolicy{
+				{
+					ID: "p-allow-mixed-neg", Index: 10, Name: "Allow SSH Except Gateway and Group", Enabled: true, Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"192.168.1.1", "UnresolvedGroup"}, NegateTarget: true, Ports: []int{22}},
+				},
+				{
+					ID: "p-block-all", Index: 20, Name: "Block Guest to Internal", Enabled: true, Action: "BLOCK", IPVersion: "ipv4", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			},
+			Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+		}
+		mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{TrustedVLANs: []string{"LAN"}, IsolatedVLANs: []string{"Guest"}})
+		var cell *IsolationCell
+		for i := range mat.Cells {
+			if mat.Cells[i].DestFunction == "trusted-lan-transit" && mat.Cells[i].IPFamily == "ipv4" {
+				cell = &mat.Cells[i]
+			}
+		}
+		if cell == nil || cell.Verdict != IsolationUnknown {
+			t.Fatalf("expected IsolationUnknown for mixed parseable/unparseable negated target, got %+v", cell)
+		}
+	})
+
+	t.Run("l3_switch_acl_malformed_cidr", func(t *testing.T) {
+		const swMAC = "bb:00:00:00:00:33"
+		snap := &unifi.Snapshot{
+			Site: "default",
+			Devices: []unifi.Device{
+				{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.168.1.1", Model: "UDM-Pro", Type: "udm"},
+				{Name: "Core L3 Switch", MAC: swMAC, IP: "192.168.1.2", Model: "USW-Pro-24", Type: "usw"},
+			},
+			Networks: []unifi.Network{
+				{ID: "net-lan", Name: "LAN", VLAN: "1", Subnet: "192.168.1.1/24", Purpose: "corporate", ZoneName: "Internal", RouterDeviceMAC: swMAC},
+				{ID: "net-iot", Name: "IoT", VLAN: "30", Subnet: "192.168.30.1/24", Purpose: "corporate", ZoneName: "IoT", IsolationEnabled: true, RouterDeviceMAC: swMAC},
+			},
+			SwitchACLs: []unifi.SwitchACL{
+				{
+					ID: "acl-allow-bad-neg", Index: 10, Name: "Allow SSH Except Bad CIDR", Enabled: true, Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					DeviceMACs:  []string{swMAC},
+					Source:      unifi.PolicyEndpoint{ZoneName: "IoT", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"192.168.1.0/33"}, NegateTarget: true, Ports: []int{22}},
+				},
+				{
+					ID: "acl-block-all", Index: 20, Name: "Block IoT to Internal", Enabled: true, Action: "BLOCK", IPVersion: "ipv4", Protocol: "all",
+					DeviceMACs:  []string{swMAC},
+					Source:      unifi.PolicyEndpoint{ZoneName: "IoT", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			},
+			SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
+			Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+		}
+		mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{TrustedVLANs: []string{"LAN"}, IsolatedVLANs: []string{"IoT"}})
+		var cell *IsolationCell
+		for i := range mat.Cells {
+			if mat.Cells[i].DestFunction == "trusted-lan-transit" && mat.Cells[i].IPFamily == "ipv4" {
+				cell = &mat.Cells[i]
+			}
+		}
+		if cell == nil || cell.Verdict != IsolationUnknown {
+			t.Fatalf("expected IsolationUnknown for L3 switch ACL negated-target ALLOW with malformed CIDR, got %+v", cell)
+		}
+	})
+}
+
+// TestFunctionOnlyApprovedPathDoesNotHideZoneWideAllow verifies that an
+// ApprovedPath specifying only Function (with empty DestIP and DestRole)
+// requires a matching destination client role and never suppresses a zone-wide
+// ALLOW as blocked-ok.
+func TestFunctionOnlyApprovedPathDoesNotHideZoneWideAllow(t *testing.T) {
+	printer := unifi.Client{MAC: "02:11:22:33:44:50", IP: "192.168.1.50", Name: "Office Printer", Hostname: "office-printer", NetworkID: "net-lan", NetworkName: "LAN"}
+	workstation := unifi.Client{MAC: "02:11:22:33:44:20", IP: "192.168.1.20", Name: "Dev Laptop", Hostname: "dev-laptop", NetworkID: "net-lan", NetworkName: "LAN"}
+
+	makeSnap := func(allowDst unifi.PolicyEndpoint) *unifi.Snapshot {
+		return &unifi.Snapshot{
+			Site: "default",
+			Devices: []unifi.Device{
+				{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.168.1.1", Model: "UDM-Pro", Type: "udm"},
+			},
+			Networks: []unifi.Network{
+				{ID: "net-lan", Name: "LAN", VLAN: "1", Subnet: "192.168.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
+				{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "192.168.50.1/24", Purpose: "guest", ZoneName: "Hotspot", IsolationEnabled: true},
+			},
+			Clients: []unifi.Client{printer, workstation},
+			FirewallPolicies: []unifi.FirewallPolicy{
+				{
+					ID: "p-allow-631", Index: 10, Name: "Allow Guest Printing", Enabled: true, Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: allowDst,
+				},
+				{
+					ID: "p-block-all", Index: 20, Name: "Block Guest to Internal", Enabled: true, Action: "BLOCK", IPVersion: "ipv4", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			},
+			Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+		}
+	}
+
+	netCfg := config.NetworkConfig{
+		TrustedVLANs: []string{"LAN"},
+		IsolationPolicy: config.IsolationIntent{
+			GuestVLANs: []string{"Guest"},
+			ApprovedPaths: []config.ApprovedPath{
+				{
+					Name:       "Guest Printing",
+					SourceZone: "Hotspot",
+					DestZone:   "Internal",
+					Function:   "ipps-printing",
+					Transport:  "tcp",
+					Port:       631,
+				},
+			},
+		},
+	}
+
+	// Zone-wide ALLOW Hotspot->Internal tcp/631 MUST report a transit violation.
+	matWide, _, _ := EvaluateIsolation(makeSnap(unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, Ports: []int{631}}), nil, netCfg)
+	var wideCell *IsolationCell
+	for i := range matWide.Cells {
+		if matWide.Cells[i].DestFunction == "trusted-lan-transit" && matWide.Cells[i].IPFamily == "ipv4" {
+			wideCell = &matWide.Cells[i]
+		}
+	}
+	if wideCell == nil || wideCell.Verdict != IsolationViolation {
+		t.Fatalf("expected zone-wide ALLOW tcp/631 not to be hidden by function-only ApprovedPath, got %+v", wideCell)
+	}
+	if wideCell.DestIP == printer.IP {
+		t.Fatalf("expected violation to cite a non-printer host, not printer %s: %+v", printer.IP, wideCell)
+	}
+
+	// Printer-scoped ALLOW Hotspot->192.168.1.50 tcp/631 IS approved (blocked-ok).
+	matScoped, _, _ := EvaluateIsolation(makeSnap(unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{printer.IP}, Ports: []int{631}}), nil, netCfg)
+	var scopedCell *IsolationCell
+	for i := range matScoped.Cells {
+		if matScoped.Cells[i].DestFunction == "trusted-lan-transit" && matScoped.Cells[i].IPFamily == "ipv4" {
+			scopedCell = &matScoped.Cells[i]
+		}
+	}
+	if scopedCell == nil || scopedCell.Verdict != IsolationBlockedOK {
+		t.Fatalf("expected printer-only ALLOW tcp/631 to be approved as blocked-ok, got %+v", scopedCell)
+	}
+}
+
+// TestSubnetlessNetworkExcludedRealClientsNoSyntheticViolation verifies that
+// when a destination network has no configured subnet but has active clients
+// all covered by a negated-target ALLOW exclusion, EvaluateIsolation returns
+// blocked-ok instead of synthesizing an out-of-network boundary IP violation.
+func TestSubnetlessNetworkExcludedRealClientsNoSyntheticViolation(t *testing.T) {
+	makeSnap := func(clients []unifi.Client) *unifi.Snapshot {
+		return &unifi.Snapshot{
+			Site: "default",
+			Devices: []unifi.Device{
+				{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.168.1.1", Model: "UDM-Pro", Type: "udm"},
+			},
+			Networks: []unifi.Network{
+				{ID: "net-lan", Name: "LAN", VLAN: "1", Subnet: "", Purpose: "corporate", ZoneName: "Internal"},
+				{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "192.168.50.1/24", Purpose: "guest", ZoneName: "Hotspot", IsolationEnabled: true},
+			},
+			Clients: clients,
+			FirewallPolicies: []unifi.FirewallPolicy{
+				{
+					ID: "p-allow-except", Index: 10, Name: "Allow SSH Except 192.168.1.0/24", Enabled: true, Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"192.168.1.0/24"}, NegateTarget: true, Ports: []int{22}},
+				},
+				{
+					ID: "p-block-all", Index: 20, Name: "Block Guest to Internal", Enabled: true, Action: "BLOCK", IPVersion: "ipv4", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			},
+			Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+		}
+	}
+
+	netCfg := config.NetworkConfig{TrustedVLANs: []string{"LAN"}, IsolatedVLANs: []string{"Guest"}}
+
+	// All real clients on subnet-less LAN fall inside 192.168.1.0/24 -> blocked-ok.
+	snapCovered := makeSnap([]unifi.Client{
+		{MAC: "02:aa:00:00:00:05", IP: "192.168.1.5", Name: "host-a", NetworkID: "net-lan", NetworkName: "LAN"},
+		{MAC: "02:aa:00:00:00:06", IP: "192.168.1.6", Name: "host-b", NetworkID: "net-lan", NetworkName: "LAN"},
+	})
+	matCovered, _, _ := EvaluateIsolation(snapCovered, nil, netCfg)
+	var cellCovered *IsolationCell
+	for i := range matCovered.Cells {
+		if matCovered.Cells[i].DestFunction == "trusted-lan-transit" && matCovered.Cells[i].IPFamily == "ipv4" {
+			cellCovered = &matCovered.Cells[i]
+		}
+	}
+	if cellCovered == nil || cellCovered.Verdict != IsolationBlockedOK {
+		t.Fatalf("expected blocked-ok when all real clients on subnet-less LAN are excluded, got %+v", cellCovered)
+	}
+
+	// Adding a real client outside 192.168.1.0/24 on LAN must still detect the violation.
+	snapOutside := makeSnap([]unifi.Client{
+		{MAC: "02:aa:00:00:00:05", IP: "192.168.1.5", Name: "host-a", NetworkID: "net-lan", NetworkName: "LAN"},
+		{MAC: "02:aa:00:00:00:10", IP: "192.168.2.10", Name: "host-c", NetworkID: "net-lan", NetworkName: "LAN"},
+	})
+	matOutside, _, _ := EvaluateIsolation(snapOutside, nil, netCfg)
+	var cellOutside *IsolationCell
+	for i := range matOutside.Cells {
+		if matOutside.Cells[i].DestFunction == "trusted-lan-transit" && matOutside.Cells[i].IPFamily == "ipv4" {
+			cellOutside = &matOutside.Cells[i]
+		}
+	}
+	if cellOutside == nil || cellOutside.Verdict != IsolationViolation || cellOutside.DestIP != "192.168.2.10" {
+		t.Fatalf("expected real violation to 192.168.2.10 on subnet-less LAN, got %+v", cellOutside)
+	}
+}
+
+// TestTransitBoundaryProbePerformanceManyDenyPorts verifies that evaluating
+// 25 multi-port BLOCK policies (16 ports each) plus 25 source-scoped any-port
+// ALLOW policies across 3x3 dual-stack networks completes well under 100ms
+// without sacrificing violation accuracy.
+func TestTransitBoundaryProbePerformanceManyDenyPorts(t *testing.T) {
+	networks := []unifi.Network{
+		{ID: "net-t1", Name: "Trusted1", VLAN: "10", Subnet: "10.10.0.1/24", IPv6Subnet: "2001:db8:10::1/64", Purpose: "corporate", ZoneName: "Internal"},
+		{ID: "net-t2", Name: "Trusted2", VLAN: "11", Subnet: "10.11.0.1/24", IPv6Subnet: "2001:db8:11::1/64", Purpose: "corporate", ZoneName: "Internal"},
+		{ID: "net-t3", Name: "Trusted3", VLAN: "12", Subnet: "10.12.0.1/24", IPv6Subnet: "2001:db8:12::1/64", Purpose: "corporate", ZoneName: "Internal"},
+		{ID: "net-u1", Name: "Untrusted1", VLAN: "20", Subnet: "10.20.0.1/24", IPv6Subnet: "2001:db8:20::1/64", Purpose: "corporate", ZoneName: "IoT", IsolationEnabled: true},
+		{ID: "net-u2", Name: "Untrusted2", VLAN: "21", Subnet: "10.21.0.1/24", IPv6Subnet: "2001:db8:21::1/64", Purpose: "corporate", ZoneName: "IoT", IsolationEnabled: true},
+		{ID: "net-u3", Name: "Untrusted3", VLAN: "22", Subnet: "10.22.0.1/24", IPv6Subnet: "2001:db8:22::1/64", Purpose: "corporate", ZoneName: "IoT", IsolationEnabled: true},
+	}
+
+	var policies []unifi.FirewallPolicy
+	idx := 1
+	// 25 BLOCK policies of 16 ports each (400 blocked ports total).
+	for b := 0; b < 25; b++ {
+		ports := make([]int, 0, 16)
+		base := 1000 + b*20
+		for p := 0; p < 16; p++ {
+			ports = append(ports, base+p)
+		}
+		policies = append(policies, unifi.FirewallPolicy{
+			ID: fmt.Sprintf("p-block-%d", b), Index: idx, Name: fmt.Sprintf("Block Batch %d", b),
+			Enabled: true, Action: "BLOCK", IPVersion: "both", Protocol: "tcp_udp",
+			Source:      unifi.PolicyEndpoint{ZoneName: "IoT", AnyTarget: true, AnyPort: true},
+			Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, Ports: ports},
+		})
+		idx++
+	}
+	// Shadowing broad BLOCK so all probes across all 25 ALLOW rules execute to completion.
+	policies = append(policies, unifi.FirewallPolicy{
+		ID: "p-block-all", Index: idx, Name: "Block All IoT to Internal",
+		Enabled: true, Action: "BLOCK", IPVersion: "both", Protocol: "all",
+		Source:      unifi.PolicyEndpoint{ZoneName: "IoT", AnyTarget: true, AnyPort: true},
+		Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+	})
+	idx++
+	// 25 source-scoped any-port ALLOW policies across the 3 untrusted networks.
+	for a := 0; a < 25; a++ {
+		vlan := 20 + (a % 3)
+		host := 10 + a
+		policies = append(policies, unifi.FirewallPolicy{
+			ID: fmt.Sprintf("p-allow-%d", a), Index: idx, Name: fmt.Sprintf("Allow Host %d", a),
+			Enabled: true, Action: "ALLOW", IPVersion: "both", Protocol: "all",
+			Source: unifi.PolicyEndpoint{
+				ZoneName: "IoT",
+				IPs:      []string{fmt.Sprintf("10.%d.0.%d", vlan, host), fmt.Sprintf("2001:db8:%d::%x", vlan, host)},
+				AnyPort:  true,
+			},
+			Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+		})
+		idx++
+	}
+
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Devices: []unifi.Device{
+			{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "10.10.0.1", Model: "UDM-Pro", Type: "udm"},
+		},
+		Networks:         networks,
+		FirewallPolicies: policies,
+		Visibility:       &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+	}
+	netCfg := config.NetworkConfig{
+		TrustedVLANs:  []string{"Trusted1", "Trusted2", "Trusted3"},
+		IsolatedVLANs: []string{"Untrusted1", "Untrusted2", "Untrusted3"},
+	}
+
+	start := time.Now()
+	mat, _, _ := EvaluateIsolation(snap, nil, netCfg)
+	elapsed := time.Since(start)
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("EvaluateIsolation took %v on 25x16 BLOCK + 25 ALLOW across 3x3 dual-stack networks, want < 100ms", elapsed)
+	}
+	transitCount := 0
+	for _, c := range mat.Cells {
+		if c.DestFunction == "trusted-lan-transit" {
+			transitCount++
+			if c.Verdict != IsolationBlockedOK {
+				t.Fatalf("expected shadowed transit cell blocked-ok, got %+v", c)
+			}
+		}
+	}
+	if transitCount != 18 {
+		t.Fatalf("expected 18 transit cells (3x3 dual-stack), got %d", transitCount)
 	}
 }

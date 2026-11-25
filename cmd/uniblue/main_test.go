@@ -491,3 +491,111 @@ devices:
 		t.Fatalf("expected offline CLI enrichment to match recorder child camera, got %+v", devChildren)
 	}
 }
+
+// TestWatchSessionPreservesUnavailableSettingsAcrossTransientOutage verifies
+// that a transient rest/setting failure in `uniblue watch` carries forward the
+// last-known SecuritySettings so UB-UNIFI-SSH-PASSWORD and UB-UNIFI-UPNP-ENABLED
+// are neither dropped from persisted state nor re-alerted upon recovery.
+func TestWatchSessionPreservesUnavailableSettingsAcrossTransientOutage(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	cfg := config.Default()
+	cfg.State.Path = statePath
+
+	makeHealthySnap := func() *unifi.Snapshot {
+		return &unifi.Snapshot{
+			Site: "default",
+			SecuritySettings: &unifi.SiteSecuritySettings{
+				SSHEnabled:      true,
+				SSHPasswordAuth: true,
+				UPnPEnabled:     true,
+			},
+			Visibility: &unifi.SiteVisibility{
+				SettingsAvailable: true,
+				WLANsAvailable:    true,
+			},
+		}
+	}
+	makeOutageSnap := func() *unifi.Snapshot {
+		return &unifi.Snapshot{
+			Site:             "default",
+			SecuritySettings: nil,
+			Visibility: &unifi.SiteVisibility{
+				SettingsAvailable: false,
+				WLANsAvailable:    true,
+			},
+		}
+	}
+
+	var cycle int
+	var sentDiffs []risk.Diff
+	var logBuf bytes.Buffer
+	sess := &watchSession{
+		cfg:    cfg,
+		minSev: checks.SeverityMedium,
+		logger: slog.New(slog.NewTextHandler(&logBuf, nil)),
+		scanFn: func(context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
+			cycle++
+			var snap *unifi.Snapshot
+			if cycle == 2 {
+				snap = makeOutageSnap()
+			} else {
+				snap = makeHealthySnap()
+			}
+			rep := risk.Evaluate(snap, nil, cfg.Network)
+			return snap, nil, rep, nil
+		},
+		sendFn: func(_ context.Context, _ string, diff risk.Diff) error {
+			sentDiffs = append(sentDiffs, diff)
+			return nil
+		},
+		loadFn: risk.LoadState,
+		saveFn: risk.SaveState,
+	}
+
+	// Cycle 1: baseline establishes UB-UNIFI-SSH-PASSWORD and UB-UNIFI-UPNP-ENABLED.
+	sess.runCycle(context.Background())
+	if len(sentDiffs) != 1 {
+		t.Fatalf("cycle 1: expected 1 initial alert batch, got %d", len(sentDiffs))
+	}
+	hasSSH, hasUPnP := false, false
+	for _, f := range sentDiffs[0].NewFindings {
+		if f.CheckID == "UB-UNIFI-SSH-PASSWORD" {
+			hasSSH = true
+		}
+		if f.CheckID == "UB-UNIFI-UPNP-ENABLED" {
+			hasUPnP = true
+		}
+	}
+	if !hasSSH || !hasUPnP {
+		t.Fatalf("cycle 1: expected both UB-UNIFI-SSH-PASSWORD and UB-UNIFI-UPNP-ENABLED, got %+v", sentDiffs[0].NewFindings)
+	}
+
+	// Cycle 2: transient rest/setting failure must preserve both findings in state.
+	sess.runCycle(context.Background())
+	if len(sentDiffs) != 1 {
+		t.Fatalf("cycle 2: expected no alert during transient settings outage, got %d", len(sentDiffs))
+	}
+	persisted, err := risk.LoadState(statePath)
+	if err != nil {
+		t.Fatalf("LoadState after cycle 2: %v", err)
+	}
+	keptSSH, keptUPnP := false, false
+	for k := range persisted.Findings {
+		if strings.HasPrefix(k, "UB-UNIFI-SSH-PASSWORD|") {
+			keptSSH = true
+		}
+		if strings.HasPrefix(k, "UB-UNIFI-UPNP-ENABLED|") {
+			keptUPnP = true
+		}
+	}
+	if !keptSSH || !keptUPnP {
+		t.Fatalf("cycle 2 dropped settings findings from persisted state during transient outage: %+v", persisted.Findings)
+	}
+
+	// Cycle 3: rest/setting recovers; must NOT re-alert on already-known findings.
+	sess.runCycle(context.Background())
+	if len(sentDiffs) != 1 {
+		t.Fatalf("cycle 3 re-alerted after transient settings outage recovery: sentDiffs=%+v", sentDiffs)
+	}
+}

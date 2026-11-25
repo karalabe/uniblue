@@ -549,14 +549,15 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 		Visibility: &unifi.SiteVisibility{SettingsAvailable: true, WLANsAvailable: true, PortProfilesAvailable: true},
 	}
 
-	// Simulate transient failure of settings, WLANs, and rest/portconf.
+	// Simulate transient failure of settings, WLANs, and rest/portconf where
+	// profile-derived port fields fall back while direct per-port fields stay unchanged.
 	failSnap := &unifi.Snapshot{
 		Site: "default",
 		Devices: []unifi.Device{
 			{
 				MAC: "aa:00:00:00:00:02", Name: "Switch", Type: "usw",
 				Ports: []unifi.SwitchPort{
-					{PortIdx: 1, Enabled: true, Up: true, NativeNetworkName: "Default", TaggedVLANMgmt: "auto", PortSecurityEnabled: false},
+					{PortIdx: 1, Enabled: true, Up: true, NativeNetworkName: "", TaggedVLANMgmt: "auto", PortSecurityEnabled: true},
 				},
 			},
 		},
@@ -595,7 +596,38 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 		}
 	}
 
-	// Verify runFullScan adoption evicts a Wi-Fi client that was in leave-grace.
+	// Direct live per-port changes during a portconf outage (e.g., disabling MAC
+	// lock or changing Enabled / explicit non-empty NativeNetworkName) MUST NOT
+	// be masked and MUST emit port_config_changed.
+	directChangeSnap := &unifi.Snapshot{
+		Site: "default",
+		Devices: []unifi.Device{
+			{
+				MAC: "aa:00:00:00:00:02", Name: "Switch", Type: "usw",
+				Ports: []unifi.SwitchPort{
+					{PortIdx: 1, Enabled: false, Up: true, NativeNetworkName: "Management", TaggedVLANMgmt: "auto", PortSecurityEnabled: false},
+				},
+			},
+		},
+		Visibility: &unifi.SiteVisibility{SettingsAvailable: false, WLANsAvailable: false, PortProfilesAvailable: false},
+	}
+	eng.applySnapshotDelta(context.Background(), directChangeSnap, time.Now().UTC().Add(5*time.Second))
+	foundPortChanged := false
+	for _, ev := range eng.Snapshot().Events {
+		if ev.Type == "port_config_changed" {
+			foundPortChanged = true
+		}
+	}
+	if !foundPortChanged {
+		t.Fatalf("expected port_config_changed for direct per-port change during portconf outage, got %+v", eng.Snapshot().Events)
+	}
+	changedPort := eng.snap.Devices[0].Ports[0]
+	if changedPort.Enabled || changedPort.PortSecurityEnabled || changedPort.NativeNetworkName != "Management" || changedPort.TaggedVLANMgmt != "block_all" {
+		t.Fatalf("expected direct fields preserved live and profile field carried forward, got %+v", changedPort)
+	}
+
+	// Verify runFullScan adoption keeps briefly dozing Wi-Fi clients (<60s)
+	// intact while evicting Wi-Fi clients whose leave-grace has elapsed.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "TOKEN", Value: "tok"})
@@ -629,17 +661,24 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	phone := unifi.Client{MAC: "02:cc:dd:ee:ff:01", IP: "192.0.2.77", Name: "sleepy-phone", NetworkName: "Main", IsWired: false}
+	dozingPhone := unifi.Client{MAC: "02:cc:dd:ee:ff:01", IP: "192.0.2.77", Name: "dozing-phone", NetworkName: "Main", IsWired: false}
+	gonePhone := unifi.Client{MAC: "02:cc:dd:ee:ff:02", IP: "192.0.2.78", Name: "departed-phone", NetworkName: "Main", IsWired: false}
+	nowUTC := time.Now().UTC()
 	eng2.mu.Lock()
 	eng2.snap = &unifi.Snapshot{
 		Site:             "default",
 		SecuritySettings: &unifi.SiteSecuritySettings{UPnPEnabled: true},
 		Visibility:       &unifi.SiteVisibility{SettingsAvailable: true},
 	}
-	eng2.missingClients[clientKey(phone)] = missingClient{client: phone, since: time.Now().UTC()}
-	eng2.profilesByMAC[clientKey(phone)] = probe.HostProfile{Client: phone, ScannedAt: time.Now().UTC()}
-	eng2.findingsByMAC[clientKey(phone)] = []checks.Finding{
-		{CheckID: "UB-0001", Title: "Ghost finding", EffectiveSeverity: checks.SeverityHigh, Client: phone, Port: 23},
+	eng2.missingClients[clientKey(dozingPhone)] = missingClient{client: dozingPhone, since: nowUTC.Add(-20 * time.Second)}
+	eng2.profilesByMAC[clientKey(dozingPhone)] = probe.HostProfile{Client: dozingPhone, ScannedAt: nowUTC}
+	eng2.findingsByMAC[clientKey(dozingPhone)] = []checks.Finding{
+		{CheckID: "UB-0002", Title: "Dozing host finding", EffectiveSeverity: checks.SeverityMedium, Client: dozingPhone, Port: 80},
+	}
+	eng2.missingClients[clientKey(gonePhone)] = missingClient{client: gonePhone, since: nowUTC.Add(-defaultLeaveGrace - 5*time.Second)}
+	eng2.profilesByMAC[clientKey(gonePhone)] = probe.HostProfile{Client: gonePhone, ScannedAt: nowUTC}
+	eng2.findingsByMAC[clientKey(gonePhone)] = []checks.Finding{
+		{CheckID: "UB-0001", Title: "Ghost finding", EffectiveSeverity: checks.SeverityHigh, Client: gonePhone, Port: 23},
 	}
 	eng2.mu.Unlock()
 
@@ -649,8 +688,17 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 	snapOut := eng2.Snapshot()
 	for _, f := range snapOut.Report.Findings {
 		if f.CheckID == "UB-0001" {
-			t.Fatalf("ghost finding lingered after full-scan snapshot adoption: %+v", f)
+			t.Fatalf("expired leave-grace ghost finding lingered after full-scan snapshot adoption: %+v", f)
 		}
+	}
+	eng2.mu.RLock()
+	_, dozingStillTracked := eng2.missingClients[clientKey(dozingPhone)]
+	_, dozingHasProfile := eng2.profilesByMAC[clientKey(dozingPhone)]
+	_, dozingHasFindings := eng2.findingsByMAC[clientKey(dozingPhone)]
+	eng2.mu.RUnlock()
+	if !dozingStillTracked || !dozingHasProfile || !dozingHasFindings {
+		t.Fatalf("20s dozing Wi-Fi client should survive full-scan adoption: tracked=%v profile=%v findings=%v",
+			dozingStillTracked, dozingHasProfile, dozingHasFindings)
 	}
 	foundUPnP := false
 	for _, f := range snapOut.Report.Findings {
@@ -661,14 +709,20 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 	if !foundUPnP {
 		t.Fatalf("expected preserved UPnP finding during full-scan settings 500, got %+v", snapOut.Report.Findings)
 	}
-	foundLeft := false
+	var sawGoneLeft, sawDozingLeft bool
 	for _, ev := range snapOut.Events {
-		if ev.Type == "client_left" && ev.Host == "sleepy-phone" {
-			foundLeft = true
+		if ev.Type == "client_left" && ev.Host == "departed-phone" {
+			sawGoneLeft = true
+		}
+		if ev.Type == "client_left" && ev.Host == "dozing-phone" {
+			sawDozingLeft = true
 		}
 	}
-	if !foundLeft {
-		t.Fatalf("expected client_left event for evicted leave-grace client, got %+v", snapOut.Events)
+	if !sawGoneLeft {
+		t.Fatalf("expected client_left event for expired leave-grace client, got %+v", snapOut.Events)
+	}
+	if sawDozingLeft {
+		t.Fatalf("did not expect premature client_left for 20s dozing Wi-Fi client, got %+v", snapOut.Events)
 	}
 }
 
@@ -696,6 +750,9 @@ func TestClientSkipReasonAndIPv6ClassLookup(t *testing.T) {
 	}
 	if r := clientSkipReason(unifi.Client{IPv6: []string{"2001:db8:1::50"}}, nil, siteSubnets); r != "" {
 		t.Fatalf("expected GUA IPv6 inside site ipv6_subnet to be probeable, got skip=%q", r)
+	}
+	if r := clientSkipReason(unifi.Client{IPv6: []string{"2001:db8:99::50", "fd12:3456::25"}}, nil, siteSubnets); r != "" {
+		t.Fatalf("expected IPv6-only host with out-of-subnet GUA and allowed ULA to be probeable, got skip=%q", r)
 	}
 	if r := clientSkipReason(unifi.Client{IP: "192.168.1.25"}, nil, siteSubnets); r != "" {
 		t.Fatalf("expected RFC1918 host to be probeable, got skip=%q", r)
@@ -1141,4 +1198,333 @@ func TestIPv6OnlyClientJoinTriggersImmediateScan(t *testing.T) {
 	if len(toScanMove) != 1 || toScanMove[0].client.PrimaryIP() != "fd00:20::99" {
 		t.Fatalf("expected IPv6 address change to re-queue scan, got %+v", toScanMove)
 	}
+}
+
+// TestWebhookQueueOverflowPreservesInFlightAndQueuedBatches verifies that
+// overflowing the async webhook queue while batch 0 is in flight never drops
+// the in-flight batch or silently pops/overwrites the next queued batch on
+// completion or retry.
+func TestWebhookQueueOverflowPreservesInFlightAndQueuedBatches(t *testing.T) {
+	batch0Started := make(chan struct{})
+	releaseBatch0 := make(chan struct{})
+	var batch0Once sync.Once
+
+	var mu sync.Mutex
+	var delivered []string
+	allDone := make(chan struct{})
+	var allDoneOnce sync.Once
+
+	whSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Site string `json:"site"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if payload.Site == "batch-0" {
+			batch0Once.Do(func() { close(batch0Started) })
+			<-releaseBatch0
+		}
+		mu.Lock()
+		delivered = append(delivered, payload.Site)
+		if len(delivered) >= maxPendingWebhooks {
+			allDoneOnce.Do(func() { close(allDone) })
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer whSrv.Close()
+
+	cfg := config.Default()
+	cfg.UniFi.URL = "https://192.0.2.1"
+	cfg.UniFi.APIKey = "test"
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	cfg.Notify.WebhookURL = whSrv.URL
+	cfg.Notify.Format = "json"
+
+	eng, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	eng.webhookRetryBase = 10 * time.Millisecond
+
+	makeDiff := func(name string) risk.Diff {
+		return risk.Diff{
+			NewFindings: []checks.Finding{{
+				CheckID:           "UB-0001",
+				Title:             name,
+				EffectiveSeverity: checks.SeverityHigh,
+				Client:            unifi.Client{IP: "192.0.2.50", Name: name},
+			}},
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start batch 0 in flight and wait until the server has received it.
+	eng.enqueueWebhook(ctx, pendingWebhook{site: "batch-0", diff: makeDiff("batch-0")})
+	select {
+	case <-batch0Started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for batch-0 to start sending")
+	}
+
+	// Overflow past maxPendingWebhooks (total 66 batches: 0..65). Index 1 is
+	// evicted on overflow so batch-0 stays intact at index 0 and batches 3..65
+	// occupy indices 1..63.
+	for i := 1; i <= maxPendingWebhooks+1; i++ {
+		name := "batch-" + strconv.Itoa(i)
+		eng.enqueueWebhook(ctx, pendingWebhook{site: name, diff: makeDiff(name)})
+	}
+	close(releaseBatch0)
+
+	select {
+	case <-allDone:
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		n := len(delivered)
+		mu.Unlock()
+		t.Fatalf("timed out waiting for %d webhook deliveries, got %d", maxPendingWebhooks, n)
+	}
+
+	// Wait briefly to confirm no stray extra/duplicate deliveries occur.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		eng.webhookMu.Lock()
+		empty := len(eng.pendingWebhooks) == 0 && !eng.webhookRunning
+		eng.webhookMu.Unlock()
+		if empty {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != maxPendingWebhooks {
+		t.Fatalf("expected exactly %d delivered batches (batch-0 + newest 63), got %d: %v", maxPendingWebhooks, len(delivered), delivered)
+	}
+	if delivered[0] != "batch-0" {
+		t.Fatalf("first delivered batch = %q, want batch-0", delivered[0])
+	}
+	if delivered[1] != "batch-3" || delivered[len(delivered)-1] != "batch-65" {
+		t.Fatalf("expected continuous tail batch-3..batch-65 with no extra silent pop, got [1]=%q last=%q", delivered[1], delivered[len(delivered)-1])
+	}
+}
+
+// TestPendingWebhooksSurviveRestartWithSameID verifies that unsent webhook
+// alerts persist to `<statePath>.pending-webhooks.json`, remain on disk across
+// context cancellation, and are automatically delivered on Start by a restarted
+// Engine with the exact same Standard Webhooks webhook-id.
+func TestPendingWebhooksSurviveRestartWithSameID(t *testing.T) {
+	rawKey := []byte("restart-durable-webhook-key-32b!")
+	secret := "whsec_" + base64.StdEncoding.EncodeToString(rawKey)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	var failWebhook atomic.Bool
+	failWebhook.Store(true)
+	firstHit := make(chan string, 4)
+	deliveredCh := make(chan string, 4)
+
+	whSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("webhook-id")
+		if failWebhook.Load() {
+			firstHit <- id
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		deliveredCh <- id
+	}))
+	defer whSrv.Close()
+
+	// Minimal mock UniFi server so restartedEngine.Start runs its real startup path.
+	unifiMux := http.NewServeMux()
+	unifiMux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "TOKEN", Value: "tok"})
+		w.WriteHeader(http.StatusOK)
+	})
+	unifiMux.HandleFunc("/proxy/network/api/s/default/stat/sta", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[]}`))
+	})
+	unifiMux.HandleFunc("/proxy/network/api/s/default/stat/device", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[]}`))
+	})
+	unifiMux.HandleFunc("/proxy/network/api/s/default/rest/networkconf", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[{"_id":"n1","name":"Main","purpose":"corporate","ip_subnet":"192.0.2.1/24"}]}`))
+	})
+	unifiMux.HandleFunc("/proxy/network/api/s/default/rest/portforward", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"meta":{"rc":"ok"},"data":[]}`))
+	})
+	unifiSrv := httptest.NewTLSServer(unifiMux)
+	defer unifiSrv.Close()
+
+	makeCfg := func() *config.Config {
+		cfg := config.Default()
+		cfg.UniFi.URL = unifiSrv.URL
+		cfg.UniFi.Username = "uniblue"
+		cfg.UniFi.Password = "secret"
+		cfg.UniFi.InsecureSkipVerify = true
+		cfg.State.Path = statePath
+		cfg.Notify.WebhookURL = whSrv.URL
+		cfg.Notify.WebhookSecret = secret
+		cfg.Notify.Format = "json"
+		return cfg
+	}
+
+	eng1, err := NewEngine(makeCfg(), nil, nil, Options{SkipCVE: true})
+	if err != nil {
+		t.Fatalf("NewEngine 1: %v", err)
+	}
+	eng1.webhookRetryBase = 5 * time.Second
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	eng1.enqueueWebhook(ctx1, pendingWebhook{
+		site: "default",
+		diff: risk.Diff{
+			NewFindings: []checks.Finding{{
+				CheckID:           "UB-0001",
+				Title:             "Telnet open",
+				EffectiveSeverity: checks.SeverityHigh,
+				Client:            unifi.Client{IP: "192.0.2.50", Name: "nas"},
+			}},
+		},
+	})
+
+	var firstID string
+	select {
+	case firstID = <-firstHit:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for initial failed webhook attempt")
+	}
+	if !strings.HasPrefix(firstID, "msg_") {
+		t.Fatalf("expected msg_* webhook-id, got %q", firstID)
+	}
+
+	// Cancel engine 1 while retry is pending; persisted file must remain intact.
+	cancel1()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		eng1.webhookMu.Lock()
+		stopped := !eng1.webhookRunning
+		eng1.webhookMu.Unlock()
+		if stopped {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	persistPath := statePath + ".pending-webhooks.json"
+	if _, err := os.Stat(persistPath); err != nil {
+		t.Fatalf("expected persisted pending webhooks file %q to survive shutdown: %v", persistPath, err)
+	}
+
+	// Webhook endpoint recovers and a brand-new Engine starts against the same state path.
+	failWebhook.Store(false)
+	eng2, err := NewEngine(makeCfg(), nil, nil, Options{SkipCVE: true, PollInterval: time.Hour, ReconcileInterval: time.Hour})
+	if err != nil {
+		t.Fatalf("NewEngine 2: %v", err)
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	if err := eng2.Start(ctx2); err != nil {
+		t.Fatalf("eng2.Start: %v", err)
+	}
+
+	select {
+	case deliveredID := <-deliveredCh:
+		if deliveredID != firstID {
+			t.Fatalf("restarted engine delivered webhook-id %q, want %q", deliveredID, firstID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for restarted engine to deliver persisted webhook")
+	}
+
+	// Persisted file should be removed once the queue drains cleanly.
+	cleanDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(cleanDeadline) {
+		if _, err := os.Stat(persistPath); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected %q to be removed after queue drained", persistPath)
+}
+
+// TestRandomPerLoginSessionCookiesAndLogout verifies that each POST /api/auth
+// mints a distinct 32-byte random hex session cookie, validates against the
+// engine's bounded session store, expires old sessions, and revokes only the
+// caller's session on POST /api/logout.
+func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
+	eng := NewDemoEngineForTest(t)
+	eng.opts.ListenAddr = "127.0.0.1:8080"
+	eng.opts.APIToken = "session-secret-token"
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	eng.sessions.nowFn = func() time.Time { return now }
+	h := eng.Handler()
+
+	login := func() *http.Cookie {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/auth", strings.NewReader(`{"token":"session-secret-token"}`))
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /api/auth status = %d, want 200", rec.Code)
+		}
+		for _, ck := range rec.Result().Cookies() {
+			if ck.Name == sessionCookieName {
+				return ck
+			}
+		}
+		t.Fatal("POST /api/auth did not set session cookie")
+		return nil
+	}
+
+	ck1 := login()
+	ck2 := login()
+	if len(ck1.Value) != 64 || len(ck2.Value) != 64 {
+		t.Fatalf("expected 64-char hex random session tokens, got lengths %d and %d", len(ck1.Value), len(ck2.Value))
+	}
+	if ck1.Value == ck2.Value {
+		t.Fatalf("expected distinct random session cookies per login, both were %q", ck1.Value)
+	}
+
+	checkState := func(ck *http.Cookie, want int) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/state", nil)
+		req.Host = "127.0.0.1:8080"
+		req.AddCookie(ck)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("GET /api/state status = %d, want %d", rec.Code, want)
+		}
+	}
+
+	checkState(ck1, http.StatusOK)
+	checkState(ck2, http.StatusOK)
+
+	// POST /api/logout revokes ck1 and clears the cookie without affecting ck2.
+	reqLogout := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/logout", nil)
+	reqLogout.Host = "127.0.0.1:8080"
+	reqLogout.AddCookie(ck1)
+	recLogout := httptest.NewRecorder()
+	h.ServeHTTP(recLogout, reqLogout)
+	if recLogout.Code != http.StatusOK {
+		t.Fatalf("POST /api/logout status = %d, want 200", recLogout.Code)
+	}
+	cleared := false
+	for _, ck := range recLogout.Result().Cookies() {
+		if ck.Name == sessionCookieName && ck.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatalf("expected POST /api/logout to expire session cookie, got %+v", recLogout.Result().Cookies())
+	}
+
+	checkState(ck1, http.StatusUnauthorized)
+	checkState(ck2, http.StatusOK)
+
+	// Expired session cookie is rejected after sessionTTL.
+	now = now.Add(sessionTTL + time.Minute)
+	checkState(ck2, http.StatusUnauthorized)
 }

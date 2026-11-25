@@ -7,6 +7,7 @@
 package server
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -788,9 +789,18 @@ func TestDashboardHTMLInvariants(t *testing.T) {
 		t.Fatal("isInitialScanActive must gate strictly on scan_progress.initial")
 	}
 
-	// Safety Features must handle absent/null settings as Unknown rather than green Off.
-	if !strings.Contains(html, "const hasSettings = rawSettings != null") || !strings.Contains(html, `!hasSettings ? "Unknown"`) {
-		t.Fatal("index.html must render Unknown when unifi_posture.settings is absent/null")
+	// Safety Features must handle absent/null settings and unavailable settings feeds
+	// as Unknown rather than green Off.
+	for _, needle := range []string{
+		"const hasSettings = rawSettings != null",
+		"vis.settings_available === false",
+		`includes("security-settings")`,
+		`"Unknown (feed unavailable)"`,
+		`!hasSettings ? settingsUnknownVal`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("index.html missing stale/absent settings guard %q", needle)
+		}
 	}
 
 	// DOM patching must preserve focus/details state, skip scan_progress tab rebuilds
@@ -799,10 +809,22 @@ func TestDashboardHTMLInvariants(t *testing.T) {
 		t.Fatal("index.html must preserve focus/details state and render full view when transitioning out of splash")
 	}
 
-	// Token sign-in overlay must post to /api/auth on HTTP 401.
-	for _, needle := range []string{`id="auth-overlay"`, `id="auth-form"`, `fetch("/api/auth"`, `r.status === 401`} {
+	// Token sign-in overlay must post to /api/auth on HTTP 401, preserve existing
+	// error text on subsequent 401 polls, and reconnect SSE once /api/state succeeds.
+	for _, needle := range []string{
+		`id="auth-overlay"`,
+		`id="auth-form"`,
+		`fetch("/api/auth"`,
+		`r.status === 401`,
+		`if (!authRequired) showAuthOverlay("")`,
+		`const needReconnectSSE = authRequired || !sseSource;`,
+		`hideAuthOverlay();`,
+		`sseDisconnected = false;`,
+		`sseRetryMs = 1000;`,
+		`connectSSE();`,
+	} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("index.html missing API token auth flow marker %q", needle)
+			t.Fatalf("index.html missing API token auth/SSE recovery marker %q", needle)
 		}
 	}
 
@@ -884,6 +906,32 @@ func TestDashboardHTMLInvariants(t *testing.T) {
 	for _, needle := range []string{"EventSource.CLOSED", "scheduleSSEReconnect()", "sseDisconnected"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("SSE reconnect handler missing %q", needle)
+		}
+	}
+
+	// Devices & Updates pillar must account for hosts exposed only via secondary
+	// linked reasons so Checkup never claims "All N look good" while Devices flags them.
+	for _, needle := range []string{
+		`const secondaryExposedHosts = hosts.filter(e => e.state === "exposed" && !hasPrimaryExposedReason(e));`,
+		`"1 needs review (linked alert)"`,
+		`need review (linked alerts)`,
+		`exposedHosts.length + exposedBMCs.length + secondaryExposedHosts.length`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("index.html missing secondary-exposed Devices pillar marker %q", needle)
+		}
+	}
+
+	// Device-row WAN chips must render full port ranges (e.g. :10000-20000) instead
+	// of truncating to the starting port.
+	for _, needle := range []string{
+		`const portDisp = /^\d+-\d+$/.test(labelPortPart) ? labelPortPart : String(svc.port);`,
+		`Internet :${esc(portDisp)}`,
+		`Internet (restricted) :${esc(portDisp)}`,
+		`Forward (CGNAT) :${esc(portDisp)}`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("index.html missing device-row WAN range chip marker %q", needle)
 		}
 	}
 
@@ -1011,5 +1059,189 @@ func TestHostServicesPreservesDistinctProtocolsAcrossAddressFamiliesOnSamePort(t
 	}
 	if sshCount != 1 {
 		t.Fatalf("expected identical dual-stack SSH on port 22 to stay collapsed into 1 row, got %d (%+v)", sshCount, ent.Services)
+	}
+}
+
+// TestPresentationModelVisibilityForStaleSettings verifies that when
+// security settings were carried forward from a prior snapshot while the
+// settings feed is currently unavailable (SettingsAvailable == false), the
+// serialized StateSnapshot exposes view.visibility.settings_available=false
+// and missing_feeds so the dashboard renders "Unknown (feed unavailable)"
+// instead of stale green settings.
+func TestPresentationModelVisibilityForStaleSettings(t *testing.T) {
+	cachedSettings := &unifi.SiteSecuritySettings{
+		SSHEnabled:  false,
+		UPnPEnabled: false,
+		IPSMode:     "ips",
+	}
+	snap := &unifi.Snapshot{
+		Site:             "default",
+		SecuritySettings: cachedSettings,
+		Devices: []unifi.Device{
+			{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.168.1.1", Model: "UDM-Pro", Type: "udm"},
+		},
+		Visibility: &unifi.SiteVisibility{
+			SettingsAvailable:        false,
+			GatewayPoliciesAvailable: true,
+			PortForwardsAvailable:    true,
+			MissingFeeds:             []string{"security-settings (unavailable)"},
+		},
+	}
+	report := risk.Report{
+		UniFiPosture: &risk.UniFiPostureSummary{
+			Settings: cachedSettings,
+		},
+	}
+
+	pm := BuildPresentationModel(snap, report, nil, nil, nil, nil, nil)
+	if pm.Visibility == nil {
+		t.Fatal("expected PresentationModel.Visibility to be populated when snap.Visibility is non-nil")
+	}
+	if pm.Visibility.SettingsAvailable {
+		t.Fatalf("expected SettingsAvailable=false, got %+v", pm.Visibility)
+	}
+
+	// Mutating the source slice must not affect the copied PresentationModel visibility.
+	snap.Visibility.MissingFeeds[0] = "mutated"
+	if len(pm.Visibility.MissingFeeds) != 1 || pm.Visibility.MissingFeeds[0] != "security-settings (unavailable)" {
+		t.Fatalf("expected deep-copied MissingFeeds, got %+v", pm.Visibility.MissingFeeds)
+	}
+
+	// Verify the wire JSON shape read by index.html.
+	raw, err := json.Marshal(StateSnapshot{
+		Site:   "default",
+		Report: report,
+		View:   pm,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(StateSnapshot): %v", err)
+	}
+	var decoded struct {
+		Report struct {
+			UniFiPosture struct {
+				Settings map[string]any `json:"settings"`
+			} `json:"unifi_posture"`
+		} `json:"report"`
+		View struct {
+			Visibility struct {
+				SettingsAvailable *bool    `json:"settings_available"`
+				MissingFeeds      []string `json:"missing_feeds"`
+			} `json:"visibility"`
+		} `json:"view"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(StateSnapshot): %v", err)
+	}
+	if decoded.Report.UniFiPosture.Settings == nil {
+		t.Fatal("expected cached report.unifi_posture.settings to remain present")
+	}
+	if decoded.View.Visibility.SettingsAvailable == nil || *decoded.View.Visibility.SettingsAvailable {
+		t.Fatalf("expected view.visibility.settings_available=false in JSON, got %+v", decoded.View.Visibility)
+	}
+	if len(decoded.View.Visibility.MissingFeeds) != 1 || !strings.Contains(decoded.View.Visibility.MissingFeeds[0], "security-settings") {
+		t.Fatalf("expected security-settings in view.visibility.missing_feeds, got %+v", decoded.View.Visibility.MissingFeeds)
+	}
+}
+
+// TestMixedWideUDPForwardSpecEmitsBothSingleAndRangeChips verifies that a UDP
+// port forward mixing a wide range with single ports (e.g. "10000-20000,5060")
+// emits both the individual UDP :5060 service and the wide UDP :10000-20000
+// range chip, keeps the wide range when only port 5060 is observed, suppresses
+// the wide range only when a UDP service inside 10000-20000 is observed, and
+// lets an unrestricted forward win over a restricted forward on the same range.
+func TestMixedWideUDPForwardSpecEmitsBothSingleAndRangeChips(t *testing.T) {
+	now := time.Now().UTC()
+	cl := unifi.Client{
+		MAC:         "55:55:55:55:55:60",
+		IP:          "192.168.1.60",
+		Name:        "pbx-box",
+		NetworkName: "LAN",
+	}
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Networks: []unifi.Network{
+			{ID: "n1", Name: "LAN", VLAN: "1", Subnet: "192.168.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
+		},
+		Clients: []unifi.Client{cl},
+	}
+	clientViews := []ClientView{
+		{Client: cl, LastScannedAt: &now},
+	}
+	report := risk.Report{
+		WANSurface: []risk.ExposureAssessment{
+			{
+				Forward: unifi.PortForward{
+					ID: "pf-sip-rtp-restricted", Name: "SIP + RTP Restricted", Enabled: true, Proto: "udp",
+					DstPort: "10000-20000,5060", FwdIP: "192.168.1.60", FwdPort: "10000-20000,5060", Src: "203.0.113.10",
+				},
+				Client:   cl,
+				Severity: checks.SeverityMedium,
+			},
+			{
+				Forward: unifi.PortForward{
+					ID: "pf-rtp-open", Name: "RTP Open", Enabled: true, Proto: "udp",
+					DstPort: "10000-20000", FwdIP: "192.168.1.60", FwdPort: "10000-20000", Src: "any",
+				},
+				Client:   cl,
+				Severity: checks.SeverityHigh,
+			},
+		},
+	}
+
+	// Case 1: no observed UDP services -> both UDP :5060 (restricted) and UDP :10000-20000 (unrestricted).
+	pm := BuildPresentationModel(snap, report, nil, clientViews, nil, nil, nil)
+	ent := pm.Entities["host:55:55:55:55:55:60"]
+	if ent == nil {
+		t.Fatal("missing pbx-box entity")
+	}
+	var saw5060, sawRange bool
+	for _, svc := range ent.Services {
+		if svc.Proto == "udp" && svc.Port == 5060 && svc.Label == "UDP :5060" && svc.Reachable == "wan-restricted" {
+			saw5060 = true
+		}
+		if svc.Proto == "udp" && svc.Port == 10000 && svc.Label == "UDP :10000-20000" && svc.Reachable == "wan" {
+			sawRange = true
+		}
+	}
+	if !saw5060 || !sawRange {
+		t.Fatalf("expected both UDP :5060 (wan-restricted) and UDP :10000-20000 (wan), got %+v", ent.Services)
+	}
+
+	// Case 2: observed UDP service on 5060 must NOT suppress the 10000-20000 wide range chip.
+	profilesOutside := []probe.HostProfile{
+		{
+			Client: cl,
+			Services: []probe.Service{
+				{Port: 5060, Transport: "udp", Protocol: "sip", State: probe.ServiceStateObservedProtocol},
+			},
+		},
+	}
+	pmOutside := BuildPresentationModel(snap, report, nil, clientViews, nil, nil, profilesOutside)
+	entOutside := pmOutside.Entities["host:55:55:55:55:55:60"]
+	sawRange = false
+	for _, svc := range entOutside.Services {
+		if svc.Proto == "udp" && svc.Label == "UDP :10000-20000" {
+			sawRange = true
+		}
+	}
+	if !sawRange {
+		t.Fatalf("expected UDP :10000-20000 chip to remain when only UDP 5060 is observed, got %+v", entOutside.Services)
+	}
+
+	// Case 3: observed UDP service inside 10000-20000 covers the wide range chip.
+	profilesInside := []probe.HostProfile{
+		{
+			Client: cl,
+			Services: []probe.Service{
+				{Port: 12000, Transport: "udp", Protocol: "rtp", State: probe.ServiceStateObservedProtocol},
+			},
+		},
+	}
+	pmInside := BuildPresentationModel(snap, report, nil, clientViews, nil, nil, profilesInside)
+	entInside := pmInside.Entities["host:55:55:55:55:55:60"]
+	for _, svc := range entInside.Services {
+		if svc.Label == "UDP :10000-20000" {
+			t.Fatalf("expected wide range chip to be suppressed when UDP 12000 is observed, got %+v", entInside.Services)
+		}
 	}
 }

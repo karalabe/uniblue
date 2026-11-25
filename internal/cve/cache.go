@@ -756,9 +756,12 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 
 	var matches []Match
 	seenIdx := make(map[string]int)
+	exactByHostLabelCVE := make(map[string]struct{})
 
 	for _, prod := range products {
 		hostKey := productHostKey(prod)
+		labelKey := strings.ToLower(strings.TrimSpace(prod.Label))
+		verKey := strings.ToLower(strings.TrimSpace(prod.Version))
 		for _, vendor := range prod.Vendors {
 			recs := loaded[sanitizeVendor(vendor)]
 			for _, rec := range recs {
@@ -772,7 +775,7 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					if !matchesAnyPattern(prod.Products, cpe.Product) {
 						continue
 					}
-					ok, conf := MatchesRange(prod.Version, cpe)
+					ok, conf := matchesRange(prod.Version, cpe, prod.Source == "unifi-firmware" || isUniFiFirmwareCPE(cpe))
 					if !ok {
 						continue
 					}
@@ -793,9 +796,15 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					continue
 				}
 
-				// Deduplicate by (host, CVE ID) and keep Exact over Potential so one
-				// CVE on one host is never reported in both Exact and Potential buckets.
-				dedupKey := fmt.Sprintf("%s|%s", hostKey, strings.ToUpper(strings.TrimSpace(rec.ID)))
+				// Deduplicate by (host, product label, product version, CVE ID)
+				// so shared CVEs across distinct products or versions on one host
+				// each retain their KEV flag and upgrade advice, while duplicate
+				// vendor-alias hits for the same product and version collapse.
+				cveID := strings.ToUpper(strings.TrimSpace(rec.ID))
+				dedupKey := fmt.Sprintf("%s|%s|%s|%s", hostKey, labelKey, verKey, cveID)
+				if bestConf == ConfidenceExact && verKey != "" {
+					exactByHostLabelCVE[fmt.Sprintf("%s|%s|%s", hostKey, labelKey, cveID)] = struct{}{}
+				}
 				candidate := Match{
 					Record:     rec,
 					Product:    prod,
@@ -812,6 +821,26 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 				matches = append(matches, candidate)
 			}
 		}
+	}
+
+	// Suppress versionless Potential hits when a concrete versioned product with
+	// the same host and label already matched the same CVE with Exact confidence.
+	if len(exactByHostLabelCVE) > 0 {
+		filtered := matches[:0]
+		for _, m := range matches {
+			if m.Confidence == ConfidencePotential && strings.TrimSpace(m.Product.Version) == "" {
+				k := fmt.Sprintf("%s|%s|%s",
+					productHostKey(m.Product),
+					strings.ToLower(strings.TrimSpace(m.Product.Label)),
+					strings.ToUpper(strings.TrimSpace(m.Record.ID)),
+				)
+				if _, covered := exactByHostLabelCVE[k]; covered {
+					continue
+				}
+			}
+			filtered = append(filtered, m)
+		}
+		matches = filtered
 	}
 
 	// Sort matches so actionable items surface first: Exact before Potential,
