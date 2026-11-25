@@ -2038,19 +2038,20 @@ function renderInitialSplash() {
   const C = 226.2;
   const offset = C * (1 - pct / 100);
 
-  const phaseRank = { topology: 0, discovery: 1, probing: 1, fingerprinting: 1, "fingerprinting-fallback": 1, checks: 2, evaluating: 3 };
+  const phaseRank = { topology: 0, discovery: 1, probing: 1, fingerprinting: 2, "fingerprinting-fallback": 2, checks: 3, evaluating: 4 };
   const rank = phaseRank[sp.phase] ?? 0;
   const stepState = (idx) => (idx < rank ? "done" : (idx === rank ? "active" : ""));
   const stepMark = (idx) => (idx < rank ? "✓" : (idx === rank ? "·" : ""));
 
   const probeCount = (sp.phase === "probing" && sp.total > 0)
     ? ` (${sp.completed} / ${sp.total} devices)`
-    : ((sp.phase === "fingerprinting" || sp.phase === "fingerprinting-fallback") && sp.total > 0)
-      ? ` (${sp.completed} / ${sp.total} ports)`
-      : (rank > 1 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts})` : "");
+    : (rank > 1 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts} devices)` : "");
+  const fpCount = ((sp.phase === "fingerprinting" || sp.phase === "fingerprinting-fallback") && sp.total > 0)
+    ? ` (${sp.completed} / ${sp.total} ports)`
+    : "";
   const checkCount = (sp.phase === "checks" && sp.total > 0)
-    ? ` (${sp.completed} / ${sp.total})`
-    : (rank > 2 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts})` : "");
+    ? ` (${sp.completed} / ${sp.total} devices)`
+    : (rank > 3 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts} devices)` : "");
 
   document.getElementById("view-initial").innerHTML = `
     <div class="init-splash">
@@ -2078,9 +2079,10 @@ function renderInitialSplash() {
 
       <div class="init-steps">
         <div class="init-step ${stepState(0)}"><span class="step-dot">${stepMark(0)}</span>Read UniFi router, switches, cables &amp; firewall rules</div>
-        <div class="init-step ${stepState(1)}"><span class="step-dot">${stepMark(1)}</span>Probe devices for open ports &amp; services${esc(probeCount)}</div>
-        <div class="init-step ${stepState(2)}"><span class="step-dot">${stepMark(2)}</span>Run read-only security checks${esc(checkCount)}</div>
-        <div class="init-step ${stepState(3)}"><span class="step-dot">${stepMark(3)}</span>Evaluate firewall isolation &amp; known security bugs (CVEs)</div>
+        <div class="init-step ${stepState(1)}"><span class="step-dot">${stepMark(1)}</span>Discover devices &amp; scan open ports${esc(probeCount)}</div>
+        <div class="init-step ${stepState(2)}"><span class="step-dot">${stepMark(2)}</span>Identify services across open ports${esc(fpCount)}</div>
+        <div class="init-step ${stepState(3)}"><span class="step-dot">${stepMark(3)}</span>Run read-only security checks${esc(checkCount)}</div>
+        <div class="init-step ${stepState(4)}"><span class="step-dot">${stepMark(4)}</span>Evaluate firewall isolation &amp; known security bugs (CVEs)</div>
       </div>
 
       <div class="init-foot">
