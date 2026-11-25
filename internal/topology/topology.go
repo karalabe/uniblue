@@ -314,7 +314,7 @@ func Build(snap *unifi.Snapshot, classes map[string]classify.Result, netCfg conf
 			}
 		}
 
-		key := cl.IP
+		key := cl.PrimaryIP()
 		if key == "" {
 			key = cl.MAC
 		}

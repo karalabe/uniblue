@@ -915,3 +915,37 @@ func TestFingerprintRejectsPortOnlyAndCoyoteFalsePositives(t *testing.T) {
 		t.Fatalf("expected port-only rule not to match, got %+v", hits)
 	}
 }
+
+// TestIdentifyIPv6OnlyHostPopulatesHostIP verifies that versioned products
+// discovered on an IPv6-only client carry the host's IPv6 address in HostIP
+// rather than an empty string so downstream advisory attachment works.
+func TestIdentifyIPv6OnlyHostPopulatesHostIP(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatalf("LoadFingerprinter: %v", err)
+	}
+	v6Client := unifi.Client{
+		MAC:         "00:17:88:aa:bb:cc",
+		IPv6:        []string{"fd00:20::42"},
+		Name:        "hue-bridge-v6",
+		NetworkName: "IoT",
+	}
+	profiles := []probe.HostProfile{
+		{
+			Client: v6Client,
+			HTTP:   map[int]probe.HTTPBanner{443: {Server: "nginx/1.24.0"}},
+			Services: []probe.Service{
+				{Port: 443, Transport: "tcp", Protocol: "https", AddressFamily: "ipv6", CPEs: []string{"cpe:2.3:a:openbsd:openssh:8.9p1:*:*:*:*:*:*:*"}},
+			},
+		},
+	}
+	prods := fp.Identify(&unifi.Snapshot{Clients: []unifi.Client{v6Client}}, profiles)
+	if len(prods) < 2 {
+		t.Fatalf("expected at least 2 products for IPv6-only host, got %+v", prods)
+	}
+	for _, p := range prods {
+		if p.HostIP != "fd00:20::42" {
+			t.Fatalf("expected IPv6-only product %q to carry HostIP=fd00:20::42, got %q", p.Label, p.HostIP)
+		}
+	}
+}

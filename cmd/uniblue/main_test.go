@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/cve"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
@@ -84,5 +85,38 @@ func TestCLIHelpNegativeLimitCacheDirStateCheckAndReportCounts(t *testing.T) {
 	cancel()
 	if err := run([]string{"check", "test", "-target", "127.0.0.1"}, &out, &errBuf); err != nil {
 		_ = ctx // ensure context import used
+	}
+}
+
+// TestEnrichSiteAndProfilesMatchesDeviceChildrenForOfflineExport verifies that
+// CLI enrichment attaches child devices owned by a UniFi infrastructure device
+// (such as a UDM Pro / UNVR recorder) so offline topology exports match the
+// live dashboard.
+func TestEnrichSiteAndProfilesMatchesDeviceChildrenForOfflineExport(t *testing.T) {
+	dir := t.TempDir()
+	invPath := filepath.Join(dir, "nvr.yaml")
+	invYAML := `parent_mac: "aa:00:00:00:00:01"
+devices:
+  - id: "cam-front"
+    name: "Front Porch Camera"
+    category: "camera"
+    role: "PoE Security Camera"
+`
+	if err := os.WriteFile(invPath, []byte(invYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Devices: []unifi.Device{
+			{MAC: "aa:00:00:00:00:01", IP: "10.0.1.1", Name: "UDM-Pro Protect", Model: "UDM-Pro", Type: "udm"},
+		},
+	}
+	devChildren := enrichSiteAndProfiles(snap, nil, config.NetworkConfig{
+		BridgeInventories: []config.BridgeInventoryConfig{
+			{Format: "nvr", Path: invPath},
+		},
+	})
+	if len(devChildren["aa:00:00:00:00:01"]) != 1 || devChildren["aa:00:00:00:00:01"][0].Name != "Front Porch Camera" {
+		t.Fatalf("expected offline CLI enrichment to match recorder child camera, got %+v", devChildren)
 	}
 }

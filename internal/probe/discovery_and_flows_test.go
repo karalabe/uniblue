@@ -439,7 +439,8 @@ func TestIPv6OnlyProbingDualStackFlowsAndDeviceBridgeChildren(t *testing.T) {
 		}
 	}
 
-	// 2. Dual-stack client matches an imported passive flow using its IPv6 address.
+	// 2. Dual-stack client matches an imported passive flow using its IPv6 address
+	// AND preserves both IPv4 and IPv6 services on the same (transport, port).
 	dualProfiles := []HostProfile{
 		{
 			Client: unifi.Client{
@@ -451,10 +452,14 @@ func TestIPv6OnlyProbingDualStackFlowsAndDeviceBridgeChildren(t *testing.T) {
 		},
 	}
 	ApplyPassiveFlows(dualProfiles, []PassiveFlowRecord{
+		{Direction: "hosted", LocalIP: "192.0.2.61", Port: 5540, Transport: "udp", Protocol: "matter", Source: "zeek"},
 		{Direction: "hosted", LocalIP: "2001:db8::61", Port: 5540, Transport: "udp", Protocol: "matter", Source: "zeek"},
 	})
-	if len(dualProfiles[0].Services) != 1 || dualProfiles[0].Services[0].Protocol != "matter" || dualProfiles[0].Services[0].Port != 5540 {
-		t.Fatalf("expected IPv6 passive flow to attach to dual-stack host, got %+v", dualProfiles[0].Services)
+	if len(dualProfiles[0].Services) != 2 {
+		t.Fatalf("expected dual-stack host to retain BOTH ipv4 and ipv6 services on udp/5540, got %+v", dualProfiles[0].Services)
+	}
+	if dualProfiles[0].Services[0].AddressFamily != "ipv4" || dualProfiles[0].Services[1].AddressFamily != "ipv6" {
+		t.Fatalf("expected [ipv4, ipv6] address families, got %+v", dualProfiles[0].Services)
 	}
 
 	// 3. Bridge children owned by a UniFi infrastructure device (e.g. UDM Pro Protect).

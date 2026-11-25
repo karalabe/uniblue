@@ -568,11 +568,15 @@ func probedHostKeys(profiles []probe.HostProfile) map[string]struct{} {
 // enrichSiteAndProfiles merges owner-supplied site supplements (switch ACLs,
 // proxy routes, tunnels, dynamic NAT mappings, backups), bridge/NVR child
 // inventories, and passive service/flow observations onto snap and profiles.
+// It returns child devices matched to UniFi infrastructure devices (e.g., UDM
+// Pro or UNVR running UniFi Protect) keyed by lowercase device MAC so offline
+// exports render identical enrolled children to the live dashboard.
 // Load errors are surfaced in snap.Visibility.MissingFeeds rather than ignored.
-func enrichSiteAndProfiles(snap *unifi.Snapshot, profiles []probe.HostProfile, netCfg config.NetworkConfig) {
+func enrichSiteAndProfiles(snap *unifi.Snapshot, profiles []probe.HostProfile, netCfg config.NetworkConfig) map[string][]probe.ChildDevice {
 	if snap != nil && strings.TrimSpace(netCfg.SiteSupplementPath) != "" {
 		_ = unifi.ApplySiteSupplement(snap, netCfg.SiteSupplementPath)
 	}
+	var devChildren map[string][]probe.ChildDevice
 	for _, bi := range netCfg.BridgeInventories {
 		if strings.TrimSpace(bi.Path) == "" {
 			continue
@@ -591,6 +595,25 @@ func enrichSiteAndProfiles(snap *unifi.Snapshot, profiles []probe.HostProfile, n
 		}
 		if len(children) > 0 {
 			probe.AttachBridgeChildren(profiles, children)
+			if snap != nil && len(snap.Devices) > 0 {
+				for mac, list := range probe.MatchDeviceBridgeChildren(snap.Devices, children) {
+					if devChildren == nil {
+						devChildren = make(map[string][]probe.ChildDevice)
+					}
+					for _, ch := range list {
+						dup := false
+						for _, ex := range devChildren[mac] {
+							if ex.ID == ch.ID {
+								dup = true
+								break
+							}
+						}
+						if !dup {
+							devChildren[mac] = append(devChildren[mac], ch)
+						}
+					}
+				}
+			}
 		}
 	}
 	if strings.TrimSpace(netCfg.PassiveFlowsPath) != "" {
@@ -601,6 +624,7 @@ func enrichSiteAndProfiles(snap *unifi.Snapshot, profiles []probe.HostProfile, n
 			probe.ApplyPassiveFlows(profiles, flows)
 		}
 	}
+	return devChildren
 }
 
 // correlateLocalCVEs checks whether the local NVD+KEV cache exists and, if so,
@@ -855,7 +879,7 @@ func printInventory(w io.Writer, snap *unifi.Snapshot, classes map[string]classi
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "CLIENT\tIP\tVLAN\tCATEGORY\tROLE\tVENDOR\tLINK")
 	for _, cl := range snap.Clients {
-		key := cl.IP
+		key := cl.PrimaryIP()
 		if key == "" {
 			key = cl.MAC
 		}
@@ -1338,6 +1362,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 
 	var profiles []probe.HostProfile
 	var rawFindings []checks.Finding
+	var devChildren map[string][]probe.ChildDevice
 	if !*noProbe {
 		checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
 		if err != nil {
@@ -1350,7 +1375,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		enrichSiteAndProfiles(snap, profiles, cfg.Network)
+		devChildren = enrichSiteAndProfiles(snap, profiles, cfg.Network)
 		runner := checks.NewRunner(checkList, cfg.Scan.Concurrency)
 		rawFindings = runner.RunAll(ctx, profiles)
 		if err := ctx.Err(); err != nil {
@@ -1362,7 +1387,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		for i, cl := range snap.Clients {
 			profiles[i] = probe.HostProfile{Client: cl}
 		}
-		enrichSiteAndProfiles(snap, profiles, cfg.Network)
+		devChildren = enrichSiteAndProfiles(snap, profiles, cfg.Network)
 	}
 
 	ouiDB := oui.New("")
@@ -1385,7 +1410,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		for _, hp := range profiles {
 			k := strings.ToLower(hp.Client.MAC)
 			if k == "" {
-				k = hp.Client.IP
+				k = hp.Client.PrimaryIP()
 			}
 			profileByMAC[k] = hp
 		}
@@ -1393,9 +1418,9 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		for _, cl := range snap.Clients {
 			k := strings.ToLower(cl.MAC)
 			if k == "" {
-				k = cl.IP
+				k = cl.PrimaryIP()
 			}
-			clsKey := cl.IP
+			clsKey := cl.PrimaryIP()
 			if clsKey == "" {
 				clsKey = cl.MAC
 			}
@@ -1414,6 +1439,8 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			clientViews = append(clientViews, cv)
 		}
 		now := time.Now().UTC()
+		viewModel := server.BuildPresentationModel(snap, report, model, clientViews, exactCVEs, potentialCVEs, profiles)
+		server.AttachDeviceChildren(viewModel, devChildren)
 		stateSnap := server.StateSnapshot{
 			StartedAt:      now,
 			UpdatedAt:      now,
@@ -1427,7 +1454,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			PotentialCVEs:  potentialCVEs,
 			Topology:       model,
 			Clients:        clientViews,
-			View:           server.BuildPresentationModel(snap, report, model, clientViews, exactCVEs, potentialCVEs, profiles),
+			View:           viewModel,
 		}
 		if *outPath == "-" {
 			return server.RenderStaticHTML(stdout, stateSnap)

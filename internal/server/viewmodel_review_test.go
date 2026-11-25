@@ -15,6 +15,7 @@ import (
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/cve"
+	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
 	"github.com/karalabe/uniblue/internal/topology"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -806,5 +807,59 @@ func TestDashboardHTMLReviewFixes(t *testing.T) {
 	// Typography constraint: no en-dash or em-dash characters anywhere in index.html.
 	if strings.ContainsAny(html, "\u2013\u2014") {
 		t.Fatal("index.html must not contain en-dash or em-dash characters")
+	}
+}
+
+// TestIPv6OnlyHostReceivesAdvisoriesAndClassification verifies that an
+// IPv6-only client (Client.IP == "", Client.IPv6 populated) gets its exact and
+// potential CVE advisories and profile services attached in BuildPresentationModel.
+func TestIPv6OnlyHostReceivesAdvisoriesAndClassification(t *testing.T) {
+	now := time.Now().UTC()
+	v6Client := unifi.Client{
+		MAC:         "00:17:88:aa:bb:99",
+		IPv6:        []string{"fd00:30::99"},
+		Name:        "hue-bridge",
+		NetworkName: "IoT",
+	}
+	snap := &unifi.Snapshot{
+		Site:    "default",
+		Clients: []unifi.Client{v6Client},
+	}
+	clientViews := []ClientView{
+		{
+			Client:        v6Client,
+			Class:         classify.Result{Category: classify.CategoryIoT, Role: "Philips Hue Bridge", Confidence: classify.ConfidenceHigh},
+			LastScannedAt: &now,
+		},
+	}
+	exact := []cve.ProductSummary{
+		{
+			Product:     cve.Product{HostIP: "fd00:30::99", Label: "Nginx", Version: "1.24.0"},
+			Confidence:  cve.ConfidenceExact,
+			TotalCVEs:   2,
+			MaxSeverity: checks.SeverityHigh,
+			MaxCVSS:     8.1,
+			TopCVEs:     []string{"CVE-2026-9999"},
+		},
+	}
+	profiles := []probe.HostProfile{
+		{
+			Client: v6Client,
+			Services: []probe.Service{
+				{Port: 443, Transport: "tcp", Protocol: "https", AddressFamily: "ipv6"},
+			},
+		},
+	}
+
+	pm := BuildPresentationModel(snap, risk.Report{}, nil, clientViews, exact, nil, profiles)
+	ent := pm.Entities["host:00:17:88:aa:bb:99"]
+	if ent == nil {
+		t.Fatalf("missing IPv6-only host entity in presentation model")
+	}
+	if ent.Subtitle != "Philips Hue Bridge" {
+		t.Fatalf("expected role Philips Hue Bridge, got %q", ent.Subtitle)
+	}
+	if ent.ExactCVECount != 2 || len(ent.ExactCVEs) != 1 {
+		t.Fatalf("expected IPv6-only host to receive 2 exact CVEs, got count=%d list=%+v", ent.ExactCVECount, ent.ExactCVEs)
 	}
 }

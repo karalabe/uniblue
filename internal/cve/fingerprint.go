@@ -227,7 +227,14 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 	// extract exact software versions directly from Nerva's Service discoveries
 	// (e.g., "<product>:<version>-<finding>").
 	for _, hp := range profiles {
-		wan := wanExposedIPs[hp.Client.IP]
+		hostIP := hp.Client.PrimaryIP()
+		wan := false
+		for _, ip := range hp.Client.AllIPs() {
+			if wanExposedIPs[ip] {
+				wan = true
+				break
+			}
+		}
 		for _, rule := range f.rules {
 			for _, hit := range rule.matchAll(hp) {
 				label := rule.Name
@@ -241,7 +248,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 					Version:    hit.version,
 					Source:     hit.source,
 					HostName:   hp.Client.DisplayName(),
-					HostIP:     hp.Client.IP,
+					HostIP:     hostIP,
 					VLAN:       hp.Client.NetworkName,
 					WANExposed: wan,
 				})
@@ -263,7 +270,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 					Version:    ver,
 					Source:     "nerva-cpe",
 					HostName:   hp.Client.DisplayName(),
-					HostIP:     hp.Client.IP,
+					HostIP:     hostIP,
 					VLAN:       hp.Client.NetworkName,
 					WANExposed: wan,
 				})
@@ -296,7 +303,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 						Version:  hit.version,
 						Source:   hit.source,
 						HostName: cl.DisplayName(),
-						HostIP:   cl.IP,
+						HostIP:   cl.PrimaryIP(),
 						VLAN:     cl.NetworkName,
 					})
 				}

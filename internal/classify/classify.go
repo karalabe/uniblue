@@ -13,6 +13,7 @@ package classify
 import (
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -165,16 +166,33 @@ func Load(fsys fs.FS, ouiDB *oui.DB) (*Classifier, error) {
 	return c, nil
 }
 
-// ClassifyAll classifies every client in snap (keyed by client IP, falling back
-// to MAC), incorporating optional host probe profiles when available.
+func canonicalClassifyIP(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a.Unmap().String()
+	}
+	return strings.ToLower(s)
+}
+
+// ClassifyAll classifies every client in snap (keyed by PrimaryIP, falling back
+// to MAC), incorporating optional host probe profiles across both IPv4 and IPv6.
 func (c *Classifier) ClassifyAll(snap *unifi.Snapshot, profiles []probe.HostProfile) map[string]Result {
 	if snap == nil {
 		return nil
 	}
-	profileByIP := make(map[string]*probe.HostProfile, len(profiles))
+	profileByMAC := make(map[string]*probe.HostProfile, len(profiles))
+	profileByIP := make(map[string]*probe.HostProfile, len(profiles)*2)
 	for i := range profiles {
-		if profiles[i].Client.IP != "" {
-			profileByIP[profiles[i].Client.IP] = &profiles[i]
+		if m := strings.ToLower(strings.TrimSpace(profiles[i].Client.MAC)); m != "" {
+			profileByMAC[m] = &profiles[i]
+		}
+		for _, ip := range profiles[i].Client.AllIPs() {
+			if k := canonicalClassifyIP(ip); k != "" {
+				profileByIP[k] = &profiles[i]
+			}
 		}
 	}
 
@@ -185,27 +203,62 @@ func (c *Classifier) ClassifyAll(snap *unifi.Snapshot, profiles []probe.HostProf
 			continue
 		}
 		if pf.ExposesEndpoint(80, "tcp") || pf.ExposesEndpoint(443, "tcp") {
-			wanWebIPs[pf.FwdIP] = true
+			if k := canonicalClassifyIP(pf.FwdIP); k != "" {
+				wanWebIPs[k] = true
+			}
 		}
 	}
 
 	out := make(map[string]Result, len(snap.Clients))
 	for _, cl := range snap.Clients {
-		key := cl.IP
+		var hp *probe.HostProfile
+		if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
+			hp = profileByMAC[m]
+		}
+		if hp == nil {
+			for _, ip := range cl.AllIPs() {
+				if p := profileByIP[canonicalClassifyIP(ip)]; p != nil {
+					hp = p
+					break
+				}
+			}
+		}
+		isWANWeb := false
+		for _, ip := range cl.AllIPs() {
+			if wanWebIPs[canonicalClassifyIP(ip)] {
+				isWANWeb = true
+				break
+			}
+		}
+		key := cl.PrimaryIP()
 		if key == "" {
 			key = cl.MAC
 		}
-		out[key] = c.ClassifyClient(cl, profileByIP[cl.IP], wanWebIPs[cl.IP])
+		out[key] = c.ClassifyClient(cl, hp, isWANWeb)
 	}
 	return out
+}
+
+// isDedicatedApplianceCategory reports whether a vendor-OUI category represents
+// a dedicated hardware appliance (camera, printer, BMC, IoT, media) whose
+// identity must not be overwritten by a WAN HTTP/HTTPS port forward.
+func isDedicatedApplianceCategory(cat Category) bool {
+	switch cat {
+	case CategoryCamera, CategoryPrinter, CategoryBMC, CategoryIoT, CategoryMedia:
+		return true
+	default:
+		return false
+	}
 }
 
 // ClassifyClient determines the Category, Role, Vendor, Confidence, and
 // supporting Signals for a single UniFi client using an ordered, deterministic
 // signal stack:
-//  1. Active protocol/port/HTTP banner proof (and WAN HTTP entrypoint role)
+//  1. Active protocol/port/HTTP banner proof (preserving hardware identity over WAN forward)
+//  1b. Dedicated appliance hardware OUI (camera, printer, BMC, IoT, media)
+//  1c. WAN HTTP/HTTPS port-forward entrypoint role (when not a dedicated appliance)
 //  2. Known virtualization MAC prefixes (QEMU, VMware, Proxmox, Docker, etc.)
-//  3. Unambiguous hardware manufacturer OUI (IEEE MA-S -> MA-M -> MA-L)
+//  3. Remaining hardware manufacturer OUI (IEEE MA-S -> MA-M -> MA-L)
 //  4. DHCP hostname / controller display name patterns
 //  5. Generic embedded Wi-Fi/MCU silicon OUIs (e.g., Espressif)
 //  6. IEEE locally-administered MAC bit (wired -> virtual NIC, Wi-Fi -> private mobile/laptop)
@@ -223,7 +276,37 @@ func (c *Classifier) ClassifyClient(cl unifi.Client, hp *probe.HostProfile, isWA
 		return res
 	}
 
-	// 1b. If no specific hardware identity matched yet, a host receiving a WAN
+	// 1b. Unambiguous dedicated hardware appliance OUI (e.g., Axis/Hikvision
+	// camera with only HTTPS visible) takes precedence over WAN web forwarding
+	// so forwarding a camera's web UI never turns it into a reverse proxy.
+	var vendorMatch *Result
+	if vendor != "" {
+		for _, r := range c.vendorRules {
+			if r.re.MatchString(vendor) {
+				sig := fmt.Sprintf("vendor %q", vendor)
+				if ouiRes.Registry != "" && ouiRes.Prefix != "" {
+					sig = fmt.Sprintf("IEEE %s %s (%s)", ouiRes.Registry, ouiRes.Prefix, vendor)
+				}
+				res := Result{
+					Category:   r.Category,
+					Role:       r.Role,
+					Vendor:     vendor,
+					Confidence: ConfidenceHigh,
+					Signals:    []string{sig},
+				}
+				if isDedicatedApplianceCategory(r.Category) {
+					if isWANWeb {
+						res.Signals = append(res.Signals, "receives WAN HTTP/HTTPS port forward")
+					}
+					return res
+				}
+				vendorMatch = &res
+				break
+			}
+		}
+	}
+
+	// 1c. If no specific appliance identity matched yet, a host receiving a WAN
 	// HTTP/HTTPS port forward is most likely a dedicated web entrypoint or proxy.
 	if isWANWeb {
 		return Result{
@@ -246,23 +329,9 @@ func (c *Classifier) ClassifyClient(cl unifi.Client, hp *probe.HostProfile, isWA
 		}
 	}
 
-	// 3. Unambiguous hardware manufacturer OUI (MA-S / MA-M / MA-L).
-	if vendor != "" {
-		for _, r := range c.vendorRules {
-			if r.re.MatchString(vendor) {
-				sig := fmt.Sprintf("vendor %q", vendor)
-				if ouiRes.Registry != "" && ouiRes.Prefix != "" {
-					sig = fmt.Sprintf("IEEE %s %s (%s)", ouiRes.Registry, ouiRes.Prefix, vendor)
-				}
-				return Result{
-					Category:   r.Category,
-					Role:       r.Role,
-					Vendor:     vendor,
-					Confidence: ConfidenceHigh,
-					Signals:    []string{sig},
-				}
-			}
-		}
+	// 3. Remaining unambiguous hardware manufacturer OUI (MA-S / MA-M / MA-L).
+	if vendorMatch != nil {
+		return *vendorMatch
 	}
 
 	// 4. DHCP hostname and UniFi display-name taxonomy rules.

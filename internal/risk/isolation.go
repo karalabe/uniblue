@@ -469,33 +469,58 @@ func EvaluateIsolation(
 		if len(srcNets) == 0 {
 			continue
 		}
-		var dstClient unifi.Client
-		var dstNet unifi.Network
+		type approvedTarget struct {
+			client unifi.Client
+			net    unifi.Network
+		}
+		var targets []approvedTarget
 		if ap.DestIP != "" {
-			dstClient.IP = ap.DestIP
+			dstClient := unifi.Client{IP: ap.DestIP}
 			for _, cl := range snap.Clients {
 				for _, ip := range cl.AllIPs() {
-					if strings.EqualFold(ip, strings.TrimSpace(ap.DestIP)) {
+					if canonicalIsolationIP(ip) != "" && canonicalIsolationIP(ip) == canonicalIsolationIP(ap.DestIP) {
 						dstClient = cl
 						break
 					}
 				}
 			}
-			dstNet = lookupClientNetwork(dstClient, netByID, netByName)
+			dstNet := lookupClientNetwork(dstClient, netByID, netByName)
+			if dstNet.Name == "" && ap.DestZone != "" {
+				for _, n := range snap.Networks {
+					if strings.EqualFold(n.ZoneName, ap.DestZone) || strings.EqualFold(n.Name, ap.DestZone) {
+						dstNet = n
+						break
+					}
+				}
+			}
+			if dstNet.Name != "" {
+				targets = append(targets, approvedTarget{client: dstClient, net: dstNet})
+			}
+		} else if strings.TrimSpace(ap.DestRole) != "" {
+			for _, cl := range snap.Clients {
+				clNet := lookupClientNetwork(cl, netByID, netByName)
+				if ap.DestZone != "" && !strings.EqualFold(clNet.ZoneName, ap.DestZone) && !strings.EqualFold(clNet.Name, ap.DestZone) {
+					continue
+				}
+				if clNet.Name == "" {
+					continue
+				}
+				if clientMatchesApprovedRole(cl, rawFindings, ap.DestRole, ap.Function) {
+					targets = append(targets, approvedTarget{client: cl, net: clNet})
+				}
+			}
 		}
-		if dstNet.Name == "" && ap.DestZone != "" {
+		if len(targets) == 0 && ap.DestZone != "" {
 			for _, n := range snap.Networks {
 				if strings.EqualFold(n.ZoneName, ap.DestZone) || strings.EqualFold(n.Name, ap.DestZone) {
-					dstNet = n
+					targets = append(targets, approvedTarget{net: n})
 					break
 				}
 			}
 		}
-		if dstNet.Name == "" {
+		if len(targets) == 0 {
 			continue
 		}
-		dstZone := firstNonEmptyStr(dstNet.ZoneName, ap.DestZone)
-		dstName := firstNonEmptyStr(dstClient.DisplayName(), ap.DestIP, dstNet.Name)
 		fams := []string{"ipv4"}
 		switch strings.ToLower(strings.TrimSpace(ap.IPVersion)) {
 		case "ipv6":
@@ -503,43 +528,49 @@ func EvaluateIsolation(
 		case "both", "ipv4_and_ipv6":
 			fams = []string{"ipv4", "ipv6"}
 		}
-		for _, srcNet := range srcNets {
-			srcZone := strings.TrimSpace(srcNet.ZoneName)
-			for _, fam := range fams {
-				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, dstClient) {
-					continue
-				}
-				dstAddr := firstNonEmptyStr(clientAddressForFamily(dstClient, fam), ap.DestIP)
-				cell := evaluateRoutedPath(
-					snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-					switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
-					pathQuery{
-						srcZone:    srcZone,
-						srcNetID:   srcNet.ID,
-						srcNetName: srcNet.Name,
-						dstZone:    dstZone,
-						dstNetID:   dstNet.ID,
-						dstNetName: dstNet.Name,
-						dstIP:      dstAddr,
-						dstMAC:     dstClient.MAC,
-						proto:      proto,
-						port:       ap.Port,
-						ipFamily:   fam,
-						state:      "new",
-					}, dstName, funcLabel, "allow",
-				)
-				if cell.Verdict == IsolationBrokenDependency {
-					cell.RecommendedFix = fmt.Sprintf(
-						"Allow %s -> %s (%s, %s) on %s %d to restore approved workflow %q.",
-						srcNet.Name, dstName, dstAddr, fam, strings.ToUpper(proto), ap.Port, firstNonEmptyStr(ap.Name, funcLabel),
+		for _, tgt := range targets {
+			dstClient := tgt.client
+			dstNet := tgt.net
+			dstZone := firstNonEmptyStr(dstNet.ZoneName, ap.DestZone)
+			dstName := firstNonEmptyStr(dstClient.DisplayName(), ap.DestIP, dstNet.Name)
+			for _, srcNet := range srcNets {
+				srcZone := strings.TrimSpace(srcNet.ZoneName)
+				for _, fam := range fams {
+					if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, dstClient) {
+						continue
+					}
+					dstAddr := firstNonEmptyStr(clientAddressForFamily(dstClient, fam), ap.DestIP)
+					cell := evaluateRoutedPath(
+						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
+						switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
+						pathQuery{
+							srcZone:    srcZone,
+							srcNetID:   srcNet.ID,
+							srcNetName: srcNet.Name,
+							dstZone:    dstZone,
+							dstNetID:   dstNet.ID,
+							dstNetName: dstNet.Name,
+							dstIP:      dstAddr,
+							dstMAC:     dstClient.MAC,
+							proto:      proto,
+							port:       ap.Port,
+							ipFamily:   fam,
+							state:      "new",
+						}, dstName, funcLabel, "allow",
 					)
-					notes = append(notes, PostureNote{
-						Severity: checks.SeverityMedium,
-						Title:    fmt.Sprintf("Approved workflow blocked (%s -> %s %s:%d, %s)", srcNet.Name, dstName, strings.ToUpper(proto), ap.Port, fam),
-						Detail:   cell.RecommendedFix,
-					})
+					if cell.Verdict == IsolationBrokenDependency {
+						cell.RecommendedFix = fmt.Sprintf(
+							"Allow %s -> %s (%s, %s) on %s %d to restore approved workflow %q.",
+							srcNet.Name, dstName, dstAddr, fam, strings.ToUpper(proto), ap.Port, firstNonEmptyStr(ap.Name, funcLabel),
+						)
+						notes = append(notes, PostureNote{
+							Severity: checks.SeverityMedium,
+							Title:    fmt.Sprintf("Approved workflow blocked (%s -> %s %s:%d, %s)", srcNet.Name, dstName, strings.ToUpper(proto), ap.Port, fam),
+							Detail:   cell.RecommendedFix,
+						})
+					}
+					addCell(cell)
 				}
-				addCell(cell)
 			}
 		}
 	}
@@ -556,7 +587,7 @@ func EvaluateIsolation(
 					continue
 				}
 				cell := evaluateTransitBoundary(
-					snap, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason,
+					snap, rawFindings, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason,
 					switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
 					srcZone, dstZone, fam,
 				)
@@ -1697,7 +1728,111 @@ func matchesApprovedRoleOrFunc(field, hint string) bool {
 	return false
 }
 
-func isTransitProbeApproved(paths []config.ApprovedPath, srcZone, srcNet string, dstNet unifi.Network, dstIP, proto string, port int, fam string) bool {
+func canonicalIsolationIP(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a.Unmap().String()
+	}
+	return strings.ToLower(s)
+}
+
+func clientMatchesApprovedRole(cl unifi.Client, rawFindings []checks.Finding, roleHint, fnHint string) bool {
+	hint := strings.ToLower(strings.TrimSpace(firstNonEmptyStr(roleHint, fnHint)))
+	if hint == "" {
+		return false
+	}
+	nameText := strings.ToLower(strings.TrimSpace(cl.Name + " " + cl.Hostname + " " + cl.OUI))
+	hasFindingText := func(tokens ...string) bool {
+		for _, f := range rawFindings {
+			if !sameClient(f.Client, cl) {
+				continue
+			}
+			ft := strings.ToLower(f.Title + " " + f.Category + " " + f.CheckID + " " + f.Property)
+			for _, tok := range tokens {
+				if strings.Contains(ft, tok) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	hasFindingPort := func(ports ...int) bool {
+		for _, f := range rawFindings {
+			if !sameClient(f.Client, cl) {
+				continue
+			}
+			for _, p := range ports {
+				if f.Port == p {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	containsAnyToken := func(text string, tokens ...string) bool {
+		for _, tok := range tokens {
+			if strings.Contains(text, tok) {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch {
+	case strings.Contains(hint, "print") || strings.Contains(hint, "ipp"):
+		return containsAnyToken(nameText, "print", "cups", "laserjet", "brother", "epson", "canon") ||
+			hasFindingPort(631, 9100) || hasFindingText("ipp", "printer", "cups")
+	case strings.Contains(hint, "bmc") || strings.Contains(hint, "ipmi") || strings.Contains(hint, "idrac") || strings.Contains(hint, "ilo"):
+		return bmcIdentityPattern.MatchString(cl.Name) || bmcIdentityPattern.MatchString(cl.Hostname) ||
+			hasFindingText("oob-bmc", "ub-0019", "ub-0020", "ipmi", "redfish")
+	case strings.Contains(hint, "ups") || strings.Contains(hint, "nut") || strings.Contains(hint, "pdu") || strings.Contains(hint, "power"):
+		return containsAnyToken(nameText, "ups", "nut", "apc", "eaton", "cyberpower", "pdu") ||
+			hasFindingPort(3493) || hasFindingText("ups", "nut", "pdu", "power")
+	case strings.Contains(hint, "nvr") || strings.Contains(hint, "recorder") || strings.Contains(hint, "camera") || strings.Contains(hint, "cam"):
+		return containsAnyToken(nameText, "nvr", "recorder", "cam", "protect", "frigate", "reolink", "hikvision", "dahua", "axis") ||
+			hasFindingPort(554) || hasFindingText("camera", "nvr", "rtsp", "onvif")
+	case strings.Contains(hint, "backup") || strings.Contains(hint, "nas") || strings.Contains(hint, "storage"):
+		return containsAnyToken(nameText, "backup", "pbs", "veeam", "urbackup", "nas", "truenas", "synology", "qnap") ||
+			hasFindingPort(8007) || hasFindingText("backup", "proxmox backup", "veeam", "nas")
+	case strings.Contains(hint, "pbx") || strings.Contains(hint, "sip") || strings.Contains(hint, "voip") || strings.Contains(hint, "voice"):
+		return containsAnyToken(nameText, "pbx", "sip", "voip", "asterisk", "freepbx", "grandstream", "yealink", "polycom") ||
+			hasFindingPort(5060, 5061) || hasFindingText("sip", "pbx", "voip")
+	default:
+		return strings.Contains(nameText, hint) || hasFindingText(hint)
+	}
+}
+
+func isTransitProbeApproved(
+	snap *unifi.Snapshot,
+	rawFindings []checks.Finding,
+	paths []config.ApprovedPath,
+	srcZone, srcNet string,
+	dstNet unifi.Network,
+	dstIP, proto string,
+	port int,
+	fam string,
+) bool {
+	canonDstIP := canonicalIsolationIP(dstIP)
+	var dstClient unifi.Client
+	hasDstClient := false
+	if canonDstIP != "" && snap != nil {
+		for _, cl := range snap.Clients {
+			for _, ip := range cl.AllIPs() {
+				if canonicalIsolationIP(ip) == canonDstIP {
+					dstClient = cl
+					hasDstClient = true
+					break
+				}
+			}
+			if hasDstClient {
+				break
+			}
+		}
+	}
+
 	for _, ap := range paths {
 		if ap.SourceZone != "" && !strings.EqualFold(ap.SourceZone, srcZone) && !strings.EqualFold(ap.SourceZone, srcNet) {
 			continue
@@ -1705,10 +1840,16 @@ func isTransitProbeApproved(paths []config.ApprovedPath, srcZone, srcNet string,
 		if ap.DestZone != "" && !strings.EqualFold(ap.DestZone, dstNet.ZoneName) && !strings.EqualFold(ap.DestZone, dstNet.Name) {
 			continue
 		}
-		if ap.DestIP != "" && !strings.EqualFold(strings.TrimSpace(ap.DestIP), strings.TrimSpace(dstIP)) {
+		if ap.DestIP != "" {
+			if canonDstIP == "" || canonicalIsolationIP(ap.DestIP) != canonDstIP {
+				continue
+			}
+		}
+		if ap.Port <= 0 {
+			// A port-less approval cannot suppress arbitrary ports in transit evaluation.
 			continue
 		}
-		if ap.Port > 0 && ap.Port != port {
+		if ap.Port != port {
 			continue
 		}
 		if ap.Transport != "" && !matchesProtocol(ap.Transport, proto) {
@@ -1716,6 +1857,14 @@ func isTransitProbeApproved(paths []config.ApprovedPath, srcZone, srcNet string,
 		}
 		if ap.IPVersion != "" && !matchesIPFamily(ap.IPVersion, fam) {
 			continue
+		}
+		// When an approval scopes by destination role (e.g., dest_role: "ups"),
+		// never suppress a zone-wide ALLOW rule or a host that does not actually
+		// hold the approved role.
+		if strings.TrimSpace(ap.DestRole) != "" {
+			if !hasDstClient || !clientMatchesApprovedRole(dstClient, rawFindings, ap.DestRole, ap.Function) {
+				continue
+			}
 		}
 		return true
 	}
@@ -1757,12 +1906,56 @@ func allGatewayIPs(snap *unifi.Snapshot, gwIP string) []string {
 	return out
 }
 
+// collectBoundaryPorts returns representative ports for [start, end] that are
+// guaranteed to hit at least one uncovered port if any port in [start, end] is
+// not blocked by earlier denyPorts / denyRanges.
+func collectBoundaryPorts(start, end int, denyPorts []int, denyRanges []unifi.PortRange) []int {
+	if start < 1 {
+		start = 1
+	}
+	if end < start {
+		end = start
+	}
+	if end > 65535 {
+		end = 65535
+	}
+	seen := make(map[int]struct{})
+	var out []int
+	add := func(p int) {
+		if p < start || p > end {
+			return
+		}
+		if _, dup := seen[p]; dup {
+			return
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	add(start)
+	add(end)
+	for _, dp := range denyPorts {
+		add(dp - 1)
+		add(dp + 1)
+	}
+	for _, dr := range denyRanges {
+		rs, re := dr.Start, dr.End
+		if re < rs {
+			re = rs
+		}
+		add(rs - 1)
+		add(re + 1)
+	}
+	return out
+}
+
 // evaluateTransitBoundary evaluates an untrusted-to-trusted network pair across
 // TCP 443, UDP 53, AND every concrete (protocol, port, target IP) referenced by
-// enabled ALLOW policies between the pair so non-443 leaks (SSH, SMB, RDP, UDP)
-// are never misreported as "blocked-ok".
+// enabled ALLOW policies (or L3 switch ACLs when switch-routed) between the pair,
+// using exact deny-boundary port sampling so partially-blocked ranges and L3
+// switch exceptions are never misreported as "blocked-ok".
 func evaluateTransitBoundary(
 	snap *unifi.Snapshot,
+	rawFindings []checks.Finding,
 	sortedPolicies []unifi.FirewallPolicy,
 	intent config.IsolationIntent,
 	gwPoliciesAvailable bool,
@@ -1798,56 +1991,133 @@ func evaluateTransitBoundary(
 	addProbe("udp", 53, "")
 
 	// Also probe every protocol/port/target explicitly opened by enabled ALLOW
-	// policies targeting srcZone -> dstZone in this address family.
+	// rules on the actual enforcer (L3 switch ACLs when switch-routed, otherwise
+	// gateway firewall policies) targeting srcNet/srcZone -> dstNet/dstZone.
 	dstIPSample := ""
 	if hostStr, _, ok := strings.Cut(strings.TrimSpace(dstNet.Subnet), "/"); ok {
 		if _, err := netip.ParseAddr(hostStr); err == nil && fam == "ipv4" {
 			dstIPSample = hostStr
 		}
 	}
-	for _, pol := range sortedPolicies {
-		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
-			continue
+	sampleTargetIPs := func(ep unifi.PolicyEndpoint) []string {
+		if len(ep.IPs) == 0 {
+			return []string{""}
 		}
-		if !matchesIPFamily(pol.IPVersion, fam) {
-			continue
+		var ips []string
+		for _, cand := range ep.IPs {
+			if sample := sampleIPFromSelector(cand, fam); sample != "" {
+				ips = append(ips, sample)
+			}
 		}
-		if pol.Source.ZoneName != "" && !strings.EqualFold(pol.Source.ZoneName, srcZone) {
-			continue
+		if len(ips) == 0 && dstIPSample != "" {
+			return []string{dstIPSample}
 		}
-		if pol.Destination.ZoneName != "" && !strings.EqualFold(pol.Destination.ZoneName, dstZone) {
-			continue
+		if len(ips) == 0 {
+			return []string{""}
 		}
-		targetIPs := []string{""}
-		if len(pol.Destination.IPs) > 0 {
-			targetIPs = nil
-			for _, cand := range pol.Destination.IPs {
-				if sample := sampleIPFromSelector(cand, fam); sample != "" {
-					targetIPs = append(targetIPs, sample)
+		return ips
+	}
+	addEndpointProbes := func(pr string, ep unifi.PolicyEndpoint, tip string, denyPorts []int, denyRanges []unifi.PortRange) {
+		if ep.AnyPort || (!ep.HasPortConstraint() && len(ep.Ports) == 0 && len(ep.PortRanges) == 0) {
+			addProbe(pr, 443, tip)
+			for _, cand := range collectBoundaryPorts(1, 65535, denyPorts, denyRanges) {
+				if cand != 1 && cand != 65535 {
+					addProbe(pr, cand, tip)
 				}
 			}
-			if len(targetIPs) == 0 && dstIPSample != "" {
-				targetIPs = []string{dstIPSample}
+			return
+		}
+		if ep.NegatePort {
+			for _, cand := range collectBoundaryPorts(1, 65535, append(denyPorts, ep.Ports...), append(denyRanges, ep.PortRanges...)) {
+				addProbe(pr, cand, tip)
 			}
-			if len(targetIPs) == 0 {
-				targetIPs = []string{""}
+			return
+		}
+		for _, p := range ep.Ports {
+			addProbe(pr, p, tip)
+		}
+		for _, r := range ep.PortRanges {
+			for _, p := range collectBoundaryPorts(r.Start, r.End, denyPorts, denyRanges) {
+				addProbe(pr, p, tip)
 			}
 		}
-		protos := []string{pol.Protocol}
-		if pol.ProtocolNegated {
-			protos = []string{"tcp", "udp"}
-		}
-		for _, pr := range protos {
-			for _, tip := range targetIPs {
-				if len(pol.Destination.Ports) == 0 && len(pol.Destination.PortRanges) == 0 {
-					addProbe(pr, 443, tip)
+	}
+
+	l3SwitchMAC := firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC)
+	if l3SwitchMAC != "" {
+		sortedACLs := make([]unifi.SwitchACL, len(snap.SwitchACLs))
+		copy(sortedACLs, snap.SwitchACLs)
+		sort.SliceStable(sortedACLs, func(i, j int) bool {
+			if sortedACLs[i].Index != sortedACLs[j].Index {
+				return sortedACLs[i].Index < sortedACLs[j].Index
+			}
+			return i < j
+		})
+		swLower := strings.ToLower(strings.TrimSpace(l3SwitchMAC))
+		var priorDenyPorts []int
+		var priorDenyRanges []unifi.PortRange
+		for _, acl := range sortedACLs {
+			if !acl.Enabled || !matchesIPFamily(acl.IPVersion, fam) {
+				continue
+			}
+			if len(acl.DeviceMACs) > 0 && !containsFold(acl.DeviceMACs, swLower) {
+				continue
+			}
+			if len(acl.NetworkIDs) > 0 {
+				netHit := (srcNet.ID != "" && containsFold(acl.NetworkIDs, srcNet.ID)) ||
+					(srcNet.Name != "" && containsFold(acl.NetworkIDs, srcNet.Name)) ||
+					(dstNet.ID != "" && containsFold(acl.NetworkIDs, dstNet.ID)) ||
+					(dstNet.Name != "" && containsFold(acl.NetworkIDs, dstNet.Name))
+				if !netHit {
 					continue
 				}
-				for _, p := range pol.Destination.Ports {
-					addProbe(pr, p, tip)
+			}
+			if acl.Source.ZoneName != "" && !strings.EqualFold(acl.Source.ZoneName, srcZone) {
+				continue
+			}
+			if acl.Destination.ZoneName != "" && !strings.EqualFold(acl.Destination.ZoneName, dstZone) {
+				continue
+			}
+			if !strings.EqualFold(acl.Action, "ALLOW") {
+				if !acl.Destination.AnyPort && !acl.Destination.NegatePort {
+					priorDenyPorts = append(priorDenyPorts, acl.Destination.Ports...)
+					priorDenyRanges = append(priorDenyRanges, acl.Destination.PortRanges...)
 				}
-				for _, r := range pol.Destination.PortRanges {
-					addProbe(pr, r.Start, tip)
+				continue
+			}
+			targetIPs := sampleTargetIPs(acl.Destination)
+			for _, tip := range targetIPs {
+				addEndpointProbes(acl.Protocol, acl.Destination, tip, priorDenyPorts, priorDenyRanges)
+			}
+		}
+	} else {
+		var priorDenyPorts []int
+		var priorDenyRanges []unifi.PortRange
+		for _, pol := range sortedPolicies {
+			if !pol.Enabled || !matchesIPFamily(pol.IPVersion, fam) {
+				continue
+			}
+			if pol.Source.ZoneName != "" && !strings.EqualFold(pol.Source.ZoneName, srcZone) {
+				continue
+			}
+			if pol.Destination.ZoneName != "" && !strings.EqualFold(pol.Destination.ZoneName, dstZone) {
+				continue
+			}
+			if !strings.EqualFold(pol.Action, "ALLOW") {
+				if !pol.Destination.AnyPort && !pol.Destination.NegatePort {
+					priorDenyPorts = append(priorDenyPorts, pol.Destination.Ports...)
+					priorDenyRanges = append(priorDenyRanges, pol.Destination.PortRanges...)
+				}
+				continue
+			}
+			targetIPs := sampleTargetIPs(pol.Destination)
+			protos := []string{pol.Protocol}
+			if pol.ProtocolNegated {
+				protos = []string{"tcp", "udp"}
+			}
+			for _, pr := range protos {
+				for _, tip := range targetIPs {
+					addEndpointProbes(pr, pol.Destination, tip, priorDenyPorts, priorDenyRanges)
 				}
 			}
 		}
@@ -1856,7 +2126,7 @@ func evaluateTransitBoundary(
 	var firstCell IsolationCell
 	var unknownCell *IsolationCell
 	for i, pt := range probes {
-		if i > 0 && isTransitProbeApproved(intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, pt.dstIP, pt.proto, pt.port, fam) {
+		if i > 0 && isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, pt.dstIP, pt.proto, pt.port, fam) {
 			continue
 		}
 		cell := evaluateRoutedPath(

@@ -180,6 +180,31 @@ func TestClassifyPreservesHardwareIdentityOverServicesAndWAN(t *testing.T) {
 	if pbs.Category != CategoryServer || pbs.Role != "Backup Server" {
 		t.Fatalf("Backup host classified as %+v, want Backup Server", pbs)
 	}
+
+	// 6. Axis camera identified by vendor with only HTTPS visible stays CategoryCamera
+	// even when forwarded from WAN (does not become WAN Web Entrypoint / Reverse Proxy).
+	axis := c.ClassifyClient(
+		unifi.Client{IP: "192.0.2.27", MAC: "ac:cc:8e:00:00:27", OUI: "Axis Communications AB", IsWired: true},
+		&probe.HostProfile{OpenPorts: []int{443}},
+		true,
+	)
+	if axis.Category != CategoryCamera {
+		t.Fatalf("WAN-forwarded HTTPS-only Axis camera classified as %q (%q), want %q", axis.Category, axis.Role, CategoryCamera)
+	}
+
+	// 7. IPv6-only Hue Bridge classifies cleanly via batch ClassifyAll under its PrimaryIP key.
+	v6Hue := unifi.Client{MAC: "00:17:88:00:00:28", IPv6: []string{"fd00:10::28"}, IsWired: true}
+	batch := c.ClassifyAll(
+		&unifi.Snapshot{Clients: []unifi.Client{v6Hue}},
+		[]probe.HostProfile{{
+			Client:       v6Hue,
+			MDNSServices: []probe.MDNSService{{Type: "_hue._tcp", Port: 443, AddressFamily: "ipv6"}},
+		}},
+	)
+	gotHue, ok := batch["fd00:10::28"]
+	if !ok || gotHue.Category != CategoryIoT || gotHue.Role != "Philips Hue Bridge" {
+		t.Fatalf("IPv6-only Hue batch ClassifyAll got %+v (map=%+v), want Philips Hue Bridge under fd00:10::28", gotHue, batch)
+	}
 }
 
 // TestClassifyHostnameBoundariesAndPersonalPrecedence verifies that whole-token

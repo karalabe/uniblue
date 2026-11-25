@@ -372,9 +372,15 @@ func BuildPresentationModel(
 		swByMAC[strings.ToLower(sw.MAC)] = sw
 	}
 	profileByIP := make(map[string]probe.HostProfile, len(profiles))
+	profileByMAC := make(map[string]probe.HostProfile, len(profiles))
 	for _, hp := range profiles {
+		if m := strings.ToLower(strings.TrimSpace(hp.Client.MAC)); m != "" {
+			profileByMAC[m] = hp
+		}
 		for _, ip := range hp.Client.AllIPs() {
-			profileByIP[ip] = hp
+			if k := strings.ToLower(strings.TrimSpace(ip)); k != "" {
+				profileByIP[k] = hp
+			}
 		}
 	}
 
@@ -427,30 +433,53 @@ func BuildPresentationModel(
 		}
 	}
 
-	// Index exact & potential CVEs per host IP (deduplicated per host+product).
+	// Index exact & potential CVEs per host IP (supporting both IPv4 and IPv6).
 	exactByIP := make(map[string][]cve.ProductSummary)
 	for _, s := range exactCVEs {
-		if s.Product.HostIP != "" {
-			exactByIP[s.Product.HostIP] = append(exactByIP[s.Product.HostIP], s)
+		if k := strings.ToLower(strings.TrimSpace(s.Product.HostIP)); k != "" {
+			exactByIP[k] = append(exactByIP[k], s)
 		}
 	}
 	potByIP := make(map[string][]cve.ProductSummary)
 	for _, s := range potentialCVEs {
-		if s.Product.HostIP != "" {
-			potByIP[s.Product.HostIP] = append(potByIP[s.Product.HostIP], s)
+		if k := strings.ToLower(strings.TrimSpace(s.Product.HostIP)); k != "" {
+			potByIP[k] = append(potByIP[k], s)
 		}
 	}
 
-	// Index WAN forwards by target IP.
+	// Index WAN forwards by target IP (supporting both IPv4 and IPv6).
 	wanByIP := make(map[string][]risk.ExposureAssessment)
 	for _, a := range report.WANSurface {
 		ip := a.Forward.FwdIP
 		if ip == "" {
-			ip = a.Client.IP
+			ip = a.Client.PrimaryIP()
 		}
-		if ip != "" {
-			wanByIP[ip] = append(wanByIP[ip], a)
+		if k := strings.ToLower(strings.TrimSpace(ip)); k != "" {
+			wanByIP[k] = append(wanByIP[k], a)
 		}
+	}
+	lookupCVEsForIPs := func(idx map[string][]cve.ProductSummary, ips []string) []cve.ProductSummary {
+		var out []cve.ProductSummary
+		seen := make(map[string]struct{})
+		for _, ip := range ips {
+			k := strings.ToLower(strings.TrimSpace(ip))
+			for _, s := range idx[k] {
+				dedup := s.Product.Label + "|" + s.Product.Version + "|" + s.Product.HostIP
+				if _, dup := seen[dedup]; dup {
+					continue
+				}
+				seen[dedup] = struct{}{}
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	lookupWANForIPs := func(ips []string) []risk.ExposureAssessment {
+		var out []risk.ExposureAssessment
+		for _, ip := range ips {
+			out = append(out, wanByIP[strings.ToLower(strings.TrimSpace(ip))]...)
+		}
+		return out
 	}
 
 	// 1. Register UniFi Infrastructure Devices + Gateway ID.
@@ -528,7 +557,7 @@ func BuildPresentationModel(
 		}
 		// Attach Exact and Potential CVEs matched against UniFi gateway/switch/AP firmware.
 		if d.IP != "" {
-			if exList := exactByIP[d.IP]; len(exList) > 0 {
+			if exList := exactByIP[strings.ToLower(strings.TrimSpace(d.IP))]; len(exList) > 0 {
 				ent.ExactCVEs = exList
 				for i, s := range exList {
 					ent.ExactCVECount += s.TotalCVEs
@@ -553,7 +582,7 @@ func BuildPresentationModel(
 					})
 				}
 			}
-			if potList := potByIP[d.IP]; len(potList) > 0 {
+			if potList := potByIP[strings.ToLower(strings.TrimSpace(d.IP))]; len(potList) > 0 {
 				ent.PotentialCVEs = potList
 				for _, s := range potList {
 					ent.PotCVECount += s.TotalCVEs
@@ -607,7 +636,7 @@ func BuildPresentationModel(
 		if isBMC {
 			weight = 3
 		}
-		if len(wanByIP[cl.IP]) > 0 {
+		if len(lookupWANForIPs(cl.AllIPs())) > 0 {
 			weight += 2
 		}
 
@@ -692,8 +721,8 @@ func BuildPresentationModel(
 			}
 		}
 
-		// Attach Exact CVEs (independent Exposed verdict).
-		if exList := exactByIP[cl.IP]; len(exList) > 0 {
+		// Attach Exact CVEs (independent Exposed verdict) across IPv4 and IPv6 addresses.
+		if exList := lookupCVEsForIPs(exactByIP, cl.AllIPs()); len(exList) > 0 {
 			ent.ExactCVEs = exList
 			for i, s := range exList {
 				ent.ExactCVECount += s.TotalCVEs
@@ -718,7 +747,7 @@ func BuildPresentationModel(
 				})
 			}
 		}
-		if potList := potByIP[cl.IP]; len(potList) > 0 {
+		if potList := lookupCVEsForIPs(potByIP, cl.AllIPs()); len(potList) > 0 {
 			ent.PotentialCVEs = potList
 			for _, s := range potList {
 				ent.PotCVECount += s.TotalCVEs
@@ -726,9 +755,12 @@ func BuildPresentationModel(
 		}
 
 		// Build structured Services[] with computed reachability.
-		hp := profileByIP[cl.PrimaryIP()]
+		hp := profileByIP[strings.ToLower(strings.TrimSpace(cl.PrimaryIP()))]
+		if hp.Client.MAC == "" && hp.Client.PrimaryIP() == "" && mac != "" {
+			hp = profileByMAC[mac]
+		}
 		behindCGNAT := isSnapshotWANBehindCGNAT(snap)
-		ent.Services = buildHostServices(cv, hp, wanByIP[cl.IP], netIsolated[strings.ToLower(cl.NetworkName)], behindCGNAT)
+		ent.Services = buildHostServices(cv, hp, lookupWANForIPs(cl.AllIPs()), netIsolated[strings.ToLower(cl.NetworkName)], behindCGNAT)
 		if len(hp.OutboundDependencies) > 0 {
 			ent.OutboundDependencies = hp.OutboundDependencies
 		}

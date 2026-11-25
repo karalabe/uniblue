@@ -249,15 +249,25 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 			labelProto = "unknown"
 		}
 
-		// Do not duplicate an already-observed (transport, port) entry unless
-		// enriching an unknown protocol with a typed protocol observation.
+		// Keep distinct address families (ipv4 vs ipv6) separate so dual-stack
+		// service evidence is preserved rather than merged away; only merge when
+		// (transport, port, address_family) match.
+		recFam := ipFamilyOf(rec.LocalIP)
+		defaultHostFam := ipFamilyOf(hp.Client.PrimaryIP())
 		updated := false
 		for i := range hp.Services {
 			curT := strings.ToLower(strings.TrimSpace(hp.Services[i].Transport))
 			if curT == "" {
 				curT = "tcp"
 			}
-			if hp.Services[i].Port == rec.Port && curT == transport {
+			curFam := strings.ToLower(strings.TrimSpace(hp.Services[i].AddressFamily))
+			if curFam == "" {
+				curFam = defaultHostFam
+			}
+			if hp.Services[i].Port == rec.Port && curT == transport && curFam == recFam {
+				if hp.Services[i].AddressFamily == "" && recFam != "" {
+					hp.Services[i].AddressFamily = recFam
+				}
 				if hp.Services[i].Protocol == "" || hp.Services[i].Protocol == "unknown" {
 					hp.Services[i].Protocol = labelProto
 					hp.Services[i].State = state
@@ -272,7 +282,7 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 				Transport:     transport,
 				Protocol:      labelProto,
 				State:         state,
-				AddressFamily: ipFamilyOf(rec.LocalIP),
+				AddressFamily: recFam,
 				Observer:      rec.Observer,
 				ObservedAt:    rec.ObservedAt,
 				TLS:           proto == "tls" || proto == "https" || proto == "quic" || proto == "dot",
@@ -285,7 +295,10 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 			if profiles[i].Services[a].Port != profiles[i].Services[b].Port {
 				return profiles[i].Services[a].Port < profiles[i].Services[b].Port
 			}
-			return profiles[i].Services[a].Transport < profiles[i].Services[b].Transport
+			if profiles[i].Services[a].Transport != profiles[i].Services[b].Transport {
+				return profiles[i].Services[a].Transport < profiles[i].Services[b].Transport
+			}
+			return profiles[i].Services[a].AddressFamily < profiles[i].Services[b].AddressFamily
 		})
 	}
 }
@@ -384,7 +397,7 @@ func buildOutboundDependency(rec PassiveFlowRecord, transport string) OutboundDe
 
 func appendOutboundUnique(existing []OutboundDependency, dep OutboundDependency) []OutboundDependency {
 	for _, e := range existing {
-		if e.DestinationIP == dep.DestinationIP && e.DestinationHost == dep.DestinationHost && e.Port == dep.Port && e.Transport == dep.Transport {
+		if e.DestinationIP == dep.DestinationIP && e.DestinationHost == dep.DestinationHost && e.Port == dep.Port && e.Transport == dep.Transport && e.AddressFamily == dep.AddressFamily {
 			return existing
 		}
 	}

@@ -1471,10 +1471,10 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	for _, hp := range profiles {
 		profileByKey[clientKey(hp.Client)] = hp
 	}
-	findingsByIP := make(map[string][]checks.Finding)
+	findingsByKey := make(map[string][]checks.Finding)
 	for _, f := range report.Findings {
-		if f.Client.IP != "" && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" && !f.IsInventoryOnly() {
-			findingsByIP[f.Client.IP] = append(findingsByIP[f.Client.IP], f)
+		if k := clientKey(f.Client); k != "" && f.CheckID != "UB-UNIFI-PORTFWD" && f.CheckID != "UB-UNIFI-FIRMWARE" && !f.IsInventoryOnly() {
+			findingsByKey[k] = append(findingsByKey[k], f)
 		}
 	}
 
@@ -1501,7 +1501,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 			cv.Skipped = true
 			cv.SkipReason = reason
 		}
-		if fl := findingsByIP[cl.IP]; len(fl) > 0 {
+		if fl := findingsByKey[k]; len(fl) > 0 {
 			cv.FindingCount = len(fl)
 			maxSev := checks.SeverityInfo
 			for _, f := range fl {
