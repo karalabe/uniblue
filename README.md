@@ -142,6 +142,30 @@ Everything works out of the box with just your UniFi console. When you want deep
 - **`network.passive_flows_path`:** Ingest Zeek `known_services`, IPFIX summaries, or JSON/YAML flow exports to enrich UDP/TLS service visibility and track outbound internet dependencies separately from local listeners.
 - **`network.site_supplement_path`:** Supply controller-omitted telemetry such as switch ACL tables, reverse proxy routes, outbound publishing tunnels (Cloudflare Tunnel / Tailscale Funnel), active dynamic NAT leases, and backup freshness.
 
+## Where to run UniBlue
+
+UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_RAW` required), so you can run it almost anywhere depending on whether you want ad-hoc checkups or 24/7 monitoring:
+
+| Setup | Best for | Pros | Trade-offs |
+| :--- | :--- | :--- | :--- |
+| **On your laptop** | First try & ad-hoc audits (`./uniblue serve`) | Zero extra hardware; instant local web UI at `127.0.0.1:8080`. | Stops watching when your laptop sleeps or leaves home; cross-VLAN probes from a personal laptop can trigger your own UniFi IPS alerts. |
+| **In a Docker container** | Existing home server or NAS | Tiny footprint, easy restarts and volume mounts for `state.json` and the CVE/OUI cache. Use **`macvlan`** so UniBlue gets its own static LAN IP and native mDNS/UPnP discovery. | Default `bridge` networking blocks link-local multicast discovery (mDNS/UPnP) and NATs probes behind the Docker host IP; `network_mode: host` shares the host's IP in UniFi IPS logs. |
+| **In a VM or Proxmox LXC** | Hypervisor homelabs (recommended) | Dedicated static LAN IP, clean OS isolation, native mDNS/UPnP (plus optional extra VLAN NICs), and simple single-IP UniFi firewall/IPS rules. | Slightly more setup than running a local binary; LXC gives VM-like networking with container-level RAM overhead. |
+| **On a dedicated machine** (e.g. Raspberry Pi) | Always-on standalone security appliance | Plugs straight into your switch on a fixed IP; keeps detecting cable swaps, new devices, and firewall drift even while your main server or hypervisor is down for maintenance. | One extra physical device to power and keep patched. |
+
+### Integrating with AI agents (e.g., Hermes)
+
+Running UniBlue 24/7 pairs well with an AI agent like **Hermes** so you get proactive notifications, can discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
+
+- **Push alerts (webhooks):** Set `notify.webhook_url` (`format: "json"`) in `config.yaml` to point at your agent's webhook endpoint (for example, `hermes webhook subscribe`). Whenever UniBlue detects a new exposure, severity escalation, new port forward, or unexpected device on a trusted VLAN, it wakes your agent to summarize what happened and ping you.
+- **Inspect & verify (local API + CLI):** Let your agent query `GET /api/state` (or `GET /api/events`) on your UniBlue instance to pull device findings, CVEs, and plain-English fix steps. Once you review and approve a fix (applied manually in UniFi or by your agent on a managed host), the agent can call `POST /api/rescan?ip=<ip>` to confirm the vulnerability is actually gone.
+
+> **Why not run UniBlue *inside* your agent framework?**
+> Resist the temptation to run UniBlue inside the same container or process as your AI agent:
+> 1. **Privilege and blast-radius separation:** UniBlue needs a UniFi API credential and L3 reachability across your VLANs (IoT, Servers, Cameras, BMCs). An LLM agent has shell, web, and chat access and is a much larger prompt-injection target. Co-locating them gives the agent direct network access to your router/BMCs and your UniFi credentials on disk.
+> 2. **Independent uptime:** If you restart your agent, break a skill, or hit an LLM outage, a separate UniBlue container/VM/Pi keeps watching your network and firing fallback alerts uninterrupted.
+> 3. **Clean read/write split:** Keep UniBlue strictly read-only on its own IP, expose only its narrow HTTP/webhook boundary to your agent, and keep any remediation writes explicitly human-approved on the agent side.
+
 ## Controller compatibility
 
 UniBlue automatically detects how to talk to your UniFi console:
