@@ -868,12 +868,12 @@ func TestReflectedSerialBridgeProtectedZeroBytesAndSpoofedAdminPortNotHidden(t *
 	reflectedSerial := buildMDNSTestPacket("_slzb-06._tcp", "slzb-coord", "slzb.local", 6638, 120, []byte{192, 168, 20, 40}, nil, nil)
 	cache.IngestMDNSPacket(reflectedSerial, "192.168.1.1", "eth0", "IoT", now)
 
-	// Gateway reflector relays a raw printer on port 9100 (allowed) and 9101-9107 (must NOT hide).
+	// Gateway reflector relays a raw printer on JetDirect ports 9100-9107 (all protected).
 	reflectedPrint9100 := buildMDNSTestPacket("_pdl-datastream._tcp", "office-prn-9100", "prn9100.local", 9100, 120, []byte{192, 168, 20, 50}, nil, nil)
 	cache.IngestMDNSPacket(reflectedPrint9100, "192.168.1.1", "eth0", "IoT", now)
 	for p := uint16(9101); p <= 9107; p++ {
-		pkt := buildMDNSTestPacket("_pdl-datastream._tcp", fmt.Sprintf("forged-prn-%d", p), fmt.Sprintf("prn-%d.local", p), p, 120, []byte{192, 168, 20, 51}, nil, nil)
-		cache.IngestMDNSPacket(pkt, "192.168.1.66", "eth0", "LAN", now)
+		pkt := buildMDNSTestPacket("_pdl-datastream._tcp", fmt.Sprintf("office-prn-%d", p), fmt.Sprintf("prn-%d.local", p), p, 120, []byte{192, 168, 20, 51}, nil, nil)
+		cache.IngestMDNSPacket(pkt, "192.168.1.1", "eth0", "IoT", now)
 	}
 
 	// Attacker tries to hide Redis (6379), RDP (3389), VNC (5900), Docker (2375),
@@ -899,8 +899,8 @@ func TestReflectedSerialBridgeProtectedZeroBytesAndSpoofedAdminPortNotHidden(t *
 		t.Fatalf("reflected raw print port 9100 must be protected: %+v", snap.RawPrintIPs)
 	}
 	for p := 9101; p <= 9107; p++ {
-		if _, poisoned := snap.RawPrintIPs["192.168.20.51"][p]; poisoned {
-			t.Fatalf("relayed _pdl-datastream must NOT protect port %d", p)
+		if _, protected := snap.RawPrintIPs["192.168.20.51"][p]; !protected {
+			t.Fatalf("relayed _pdl-datastream must protect JetDirect port %d", p)
 		}
 	}
 	victimHP := HostProfile{

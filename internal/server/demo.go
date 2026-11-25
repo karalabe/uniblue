@@ -506,6 +506,7 @@ func buildDemoDataset(now time.Time) (
 			GatewayPoliciesAvailable: true,
 			SwitchACLsAvailable:      true,
 			WLANsAvailable:           true,
+			SettingsAvailable:        true,
 			DHCPAvailable:            true,
 			MDNSReflectorKnown:       true,
 		},

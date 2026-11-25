@@ -178,6 +178,12 @@ type HostProfile struct {
 	// Client is the UniFi inventory record for this host.
 	Client unifi.Client `json:"client"`
 
+	// ProbeIP is the concrete probe-eligible IPv4 or IPv6 address chosen by
+	// SelectProbeIP for active probing and checks. When empty (e.g. profiles
+	// constructed directly without Fingerprinter), EffectiveProbeIP falls back
+	// to SelectProbeIP(Client, nil) so public internet addresses are never dialed.
+	ProbeIP string `json:"probe_ip,omitempty"`
+
 	// OpenPorts lists the TCP ports from the scan list that accepted a connection.
 	OpenPorts []int `json:"open_ports,omitempty"`
 
@@ -221,6 +227,17 @@ type HostProfile struct {
 // cgnatPrefix matches RFC 6598 Carrier-Grade NAT space (100.64.0.0/10),
 // commonly used for Tailscale and private lab VLANs.
 var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// EffectiveProbeIP returns the validated probe target address for active checks
+// on this host: the explicitly authorized ProbeIP selected during fingerprinting,
+// or SelectProbeIP(Client, nil) when ProbeIP was not populated. Public internet
+// addresses are never returned unless explicitly authorized via SetAllowedSubnets.
+func (h HostProfile) EffectiveProbeIP() string {
+	if ip := strings.TrimSpace(h.ProbeIP); ip != "" {
+		return ip
+	}
+	return SelectProbeIP(h.Client, nil)
+}
 
 // IsRawPrintPort reports whether port on this host is protected by the raw
 // print or raw serial sink zero-byte guard. Self-announced sinks are always
@@ -359,6 +376,10 @@ type Fingerprinter struct {
 	// RFC1918/ULA, CGNAT, link-local, and loopback) that are allowed to be probed.
 	allowedSubnets []netip.Prefix
 
+	// trustedReflectors lists local gateway/router IP addresses authorized to
+	// reflect cross-VLAN mDNS advertisements.
+	trustedReflectors []string
+
 	// hostPortHints maps specific client IPs to extra TCP ports discovered from
 	// UniFi port forwards, firewall policies, or per-host LAN discovery.
 	hostPortHints map[string][]int
@@ -392,6 +413,12 @@ func (f *Fingerprinter) SetHostPortHints(hints map[string][]int) {
 // link-local unicast, and loopback addresses.
 func (f *Fingerprinter) SetAllowedSubnets(prefixes []netip.Prefix) {
 	f.allowedSubnets = append([]netip.Prefix(nil), prefixes...)
+}
+
+// SetTrustedReflectors registers local gateway/router IP addresses authorized
+// to reflect cross-VLAN mDNS advertisements during passive discovery.
+func (f *Fingerprinter) SetTrustedReflectors(ips []string) {
+	f.trustedReflectors = append([]string(nil), ips...)
 }
 
 // SetCachedDiscovery injects a previously collected LANDiscovery snapshot so
@@ -570,7 +597,7 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	// service metadata enrich every matching HostProfile with zero blind dials.
 	if f.discovery == nil && !f.skipDiscovery && f.hasNonLoopbackTarget(targets) {
 		f.reportProgress("discovery", 0, len(targets), "")
-		f.discovery = discoverLANWithOptions(ctx, f.httpClient, f.excludeIPs, f.allowedSubnets)
+		f.discovery = discoverLANWithOptions(ctx, f.httpClient, f.excludeIPs, f.allowedSubnets, f.trustedReflectors)
 	}
 	return f.collectProfiles(ctx, targets, workers)
 }
@@ -646,6 +673,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	allIPs := cl.AllIPs()
 	profile := HostProfile{
 		Client:    cl,
+		ProbeIP:   targetIP,
 		HTTP:      make(map[int]HTTPBanner),
 		ScannedAt: time.Now().UTC(),
 	}

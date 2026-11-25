@@ -725,43 +725,62 @@ func extractLogParams(raw map[string]json.RawMessage) map[string]string {
 	return out
 }
 
+const maxLogParamDecodeDepth = 8
+
+var logPlaceholderPattern = regexp.MustCompile(`\{([A-Za-z0-9_]+)\}`)
+
 func decodeLogParamValue(v json.RawMessage) string {
+	return decodeLogParamValueDepth(v, 0)
+}
+
+func decodeLogParamValueDepth(v json.RawMessage, depth int) string {
+	if depth > maxLogParamDecodeDepth {
+		return ""
+	}
 	trimmed := bytes.TrimSpace(v)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return ""
 	}
-	var s string
-	if err := json.Unmarshal(trimmed, &s); err == nil {
-		return strings.TrimSpace(s)
-	}
-	var num json.Number
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
-	dec.UseNumber()
-	if err := dec.Decode(&num); err == nil && num.String() != "" {
-		return num.String()
-	}
-	var b bool
-	if err := json.Unmarshal(trimmed, &b); err == nil {
-		return strconv.FormatBool(b)
-	}
-	var obj struct {
-		Name     string          `json:"name"`
-		Value    json.RawMessage `json:"value"`
-		Label    string          `json:"label"`
-		Title    string          `json:"title"`
-		IP       string          `json:"ip"`
-		Hostname string          `json:"hostname"`
-		MAC      string          `json:"mac"`
-		Section  string          `json:"section"`
-		Object   string          `json:"object"`
-		ID       string          `json:"id"`
-	}
-	if err := json.Unmarshal(trimmed, &obj); err == nil {
-		valStr := ""
-		if len(obj.Value) > 0 {
-			valStr = decodeLogParamValue(obj.Value)
+	// Dispatch on the leading JSON token byte so each nesting level runs at
+	// most one unmarshal pass (O(n) total work instead of O(n^2) on nested JSON).
+	switch trimmed[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err == nil {
+			return strings.TrimSpace(s)
 		}
-		return firstNonEmpty(obj.Name, valStr, obj.Label, obj.Title, obj.IP, obj.Hostname, obj.MAC, obj.Section, obj.Object, obj.ID)
+	case 't', 'f':
+		var b bool
+		if err := json.Unmarshal(trimmed, &b); err == nil {
+			return strconv.FormatBool(b)
+		}
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		var num json.Number
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		dec.UseNumber()
+		if err := dec.Decode(&num); err == nil && num.String() != "" {
+			return num.String()
+		}
+	case '{':
+		var obj struct {
+			Name     string          `json:"name"`
+			Value    json.RawMessage `json:"value"`
+			Label    string          `json:"label"`
+			Title    string          `json:"title"`
+			IP       string          `json:"ip"`
+			Hostname string          `json:"hostname"`
+			MAC      string          `json:"mac"`
+			Section  string          `json:"section"`
+			Object   string          `json:"object"`
+			ID       string          `json:"id"`
+		}
+		if err := json.Unmarshal(trimmed, &obj); err == nil {
+			valStr := ""
+			if len(obj.Value) > 0 && depth < maxLogParamDecodeDepth {
+				valStr = decodeLogParamValueDepth(obj.Value, depth+1)
+			}
+			return firstNonEmpty(obj.Name, valStr, obj.Label, obj.Title, obj.IP, obj.Hostname, obj.MAC, obj.Section, obj.Object, obj.ID)
+		}
 	}
 	return ""
 }
@@ -770,20 +789,35 @@ func interpolateLogTemplate(tmpl string, params map[string]string) string {
 	if tmpl == "" {
 		return ""
 	}
-	out := tmpl
+	upper := make(map[string]string, len(params))
 	for k, v := range params {
-		if v != "" {
-			out = strings.ReplaceAll(out, "{"+k+"}", v)
-			if up := strings.ToUpper(k); up != k {
-				out = strings.ReplaceAll(out, "{"+up+"}", v)
-			}
+		if v == "" {
+			continue
+		}
+		uk := strings.ToUpper(k)
+		if upper[uk] == "" {
+			upper[uk] = v
 		}
 	}
-	// Strip any remaining unpopulated UniFi template placeholders (such as
-	// {COUNT}, {OBJECT}, {SECTION}) and normalize spacing so raw braces never
-	// appear in dashboard activity entries.
-	if unresolvedLogPlaceholderPattern.MatchString(out) {
-		out = unresolvedLogPlaceholderPattern.ReplaceAllString(out, "")
+	// Perform a single-pass template replacement so map iteration order has no
+	// effect and literal braces inside parameter values (such as hostnames or
+	// usernames) are never re-interpolated or stripped.
+	stripped := false
+	out := logPlaceholderPattern.ReplaceAllStringFunc(tmpl, func(tok string) string {
+		key := tok[1 : len(tok)-1]
+		if v := params[key]; v != "" {
+			return v
+		}
+		if v := upper[strings.ToUpper(key)]; v != "" {
+			return v
+		}
+		if unresolvedLogPlaceholderPattern.MatchString(tok) {
+			stripped = true
+			return ""
+		}
+		return tok
+	})
+	if stripped {
 		out = strings.Join(strings.Fields(out), " ")
 	}
 	return strings.TrimSpace(out)

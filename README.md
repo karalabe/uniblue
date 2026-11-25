@@ -114,9 +114,10 @@ Built-in checks live in `checks/generic/` and `checks/community/` and are compil
 
 ### 4. Offline security bug (CVE) & hardware vendor databases
 
-UniBlue matches your UniFi firmware and LAN services offline against the official NVD + CISA KEV vulnerability catalog (~38 MB) and IEEE MAC vendor tables (~550 KB).
+UniBlue matches your UniFi firmware and LAN services offline against the official NVD + CISA KEV vulnerability catalog and IEEE MAC vendor tables (~550 KB).
 
-In `uniblue serve` mode (including Docker/Unraid), the local CVE cache downloads automatically on first startup and checks hourly in the background (`-cve-refresh 1h`, or `0` to disable). Unchanged feeds do zero work, and new CVEs are re-correlated in memory without rescanning your LAN.
+- **Storage & bandwidth:** The first CVE sync downloads ~250 MB of compressed yearly NVD feeds and builds a vendor-sharded local cache (~400 MB on disk total, including the cached yearly feeds so future syncs only re-download changed years).
+- **Automatic background refresh:** In `uniblue serve` mode (including Docker/Unraid), the local CVE cache syncs automatically on first startup and checks hourly in the background (`-cve-refresh 1h`, or `0` to disable) by fetching lightweight `.meta` files plus the CISA KEV catalog. Unchanged years are skipped without re-downloading, and new CVEs are re-correlated in memory without rescanning your LAN.
 
 You can also sync or query the databases manually from the CLI:
 
@@ -199,7 +200,9 @@ All `/api/v1/*` endpoints return JSON (except the SSE stream) and share one erro
 | `GET /api/v1/findings` | Active findings (`?severity=high&host=<ip\|mac>&category=...`) |
 | `GET /api/v1/cves` | Exact and potential CVE rollups (`?host=<ip\|mac>&kev=true&severity=...`) |
 | `GET /api/v1/hosts` | Host inventory (`?vlan=<name>&state=exposed\|review\|ok\|unknown&role=...`) |
-| `GET /api/v1/hosts/{id}` | Single host detail by entity ID (`host:<mac>`), MAC, or IPv4/IPv6 |
+| `GET /api/v1/hosts/{id}` | Single host or UniFi device detail by entity ID (`host:<mac>` / `infra:<mac>`), MAC, or IPv4/IPv6 (including gateway WAN IP) |
+| `GET /api/v1/devices` | UniFi infrastructure device inventory (gateways, switches, APs) |
+| `GET /api/v1/devices/{id}` | Single UniFi device detail by entity ID (`infra:<mac>`), MAC, or LAN/WAN IP |
 | `GET /api/v1/isolation` | Effective VLAN/zone isolation matrix (`?verdict=violation&source=...&dest=...`) |
 | `GET /api/v1/events` | Recent live events as JSON (`?since_id=42&type=...&severity=...&limit=50`) |
 | `GET /api/v1/events/stream` | Live Server-Sent Events stream (`Last-Event-ID` replay supported) |
@@ -223,7 +226,7 @@ In `json` format, each POST sends `{"version": 1, "id", "timestamp", "site", "su
 | `policy_changed` | Firewall policy or WAN port-forward rule set changed |
 | `config_drift` | Controller security controls (SSH, UPnP, IPS, Honeypot, DoH, Teleport) or Wi-Fi security changed |
 | `honeypot_hit` | Internal LAN host probed UniFi's internal Honeypot |
-| `port_link_up`<br>`port_link_down`<br>`port_config_changed` | Link or port-config changes on ports zoned `external`, `external_uplink`, or `unused` |
+| `port_link_up`<br>`port_link_down`<br>`port_config_changed` | Link or port-config changes on ports zoned `external`, `external_uplink`, or `unused` (`port_link_down` on unused ports is `info`, so it only pushes if `min_severity` is `info`) |
 | `port_poe_tamper` | PoE device replaced by a non-PoE host on an `external` or `unused` port |
 | `port_mac_surge` | Single-MAC access port jumped to 2+ MACs (possible inline hub or tap) |
 | `wifi_evil_twin` | Unknown AP broadcasting one of your site's Wi-Fi SSIDs |

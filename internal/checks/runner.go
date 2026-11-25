@@ -285,7 +285,7 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 				if hp.IsRawPrintPort(port) {
 					continue
 				}
-				targetIP := hp.Client.PrimaryIP()
+				targetIP := hp.EffectiveProbeIP()
 				if targetIP == "" {
 					continue
 				}
@@ -536,7 +536,12 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 
 // matchesMDNSService reports whether a single passive mDNS service record
 // satisfies chk's mDNS type and positive/negative TXT regex preconditions.
+// Untrusted third-party reflected advertisements are ignored so a forged mDNS
+// packet from another LAN host cannot attach mDNS-gated findings to a victim.
 func matchesMDNSService(chk *Check, svc probe.MDNSService) bool {
+	if svc.Withdrawn || (svc.Reflected && !svc.TrustedReflector) {
+		return false
+	}
 	typeOK := false
 	for _, want := range chk.Preconditions.MDNSTypeAny {
 		if strings.EqualFold(svc.Type, want) {

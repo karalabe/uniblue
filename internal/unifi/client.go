@@ -60,6 +60,16 @@ const (
 	// hammering the controller login endpoint when credentials were revoked or
 	// changed while running.
 	defaultAuthFailCooldown = 30 * time.Second
+
+	// defaultTransientReloginCooldown coalesces bursts of concurrent 401s inside
+	// a single poll cycle when the controller returns transient 5xx or transport
+	// errors during a restart, without engaging the full credential lockout.
+	defaultTransientReloginCooldown = 3 * time.Second
+
+	// defaultReloginSuppressTTL bounds how long a path-level or WebSocket
+	// re-login suppression lasts so a transient console restart window never
+	// permanently prevents re-authentication.
+	defaultReloginSuppressTTL = 5 * time.Minute
 )
 
 // Controller is a read-only client for a single UniFi controller or gateway.
@@ -96,25 +106,26 @@ type Controller struct {
 
 	// loginMu serializes Login/relogin calls so concurrent 401s re-authenticate once
 	// and failed re-logins share a cooldown window.
-	loginMu               sync.Mutex
-	authFailCooldown      time.Duration
-	authFailCooldownUntil time.Time
-	lastLoginErr          error
+	loginMu                  sync.Mutex
+	authFailCooldown         time.Duration
+	transientReloginCooldown time.Duration
+	reloginSuppressTTL       time.Duration
+	authFailCooldownUntil    time.Time
+	lastLoginErr             error
 
 	// authEpoch increments on every completed Login so single-flight relogin callers
 	// know whether another goroutine already refreshed the session.
 	authEpoch uint64
 
-	// wsReloginSuppressed records that a WebSocket upgrade rejection already
-	// triggered a re-login and has not yet completed a successful handshake,
-	// preventing repeated re-logins on persistent 401/403 rejections independently
-	// of any REST-triggered re-logins.
-	wsReloginSuppressed bool
+	// wsReloginSuppressedUntil bounds how long WebSocket upgrade rejections skip
+	// re-login after a fresh re-authentication did not yet yield a successful
+	// handshake, preventing login loops without permanently freezing recovery.
+	wsReloginSuppressedUntil time.Time
 
 	// unauthPaths records REST paths that still returned 401 immediately after a
-	// fresh re-login, suppressing repeated re-logins on every poll until the path
-	// succeeds or Login is called explicitly.
-	unauthPaths map[string]struct{}
+	// fresh re-login along with their suppression expiry time, avoiding repeated
+	// re-logins on every poll while automatically recovering after a restart.
+	unauthPaths map[string]time.Time
 
 	// apiPrefix is "/proxy/network" for UniFi OS consoles or "" for classic
 	// controllers, discovered automatically during Login.
@@ -231,21 +242,36 @@ func (c *Controller) authFailCooldownDuration() time.Duration {
 	return defaultAuthFailCooldown
 }
 
+func (c *Controller) transientReloginCooldownDuration() time.Duration {
+	if c.transientReloginCooldown > 0 {
+		return c.transientReloginCooldown
+	}
+	return defaultTransientReloginCooldown
+}
+
+func (c *Controller) reloginSuppressTTLDuration() time.Duration {
+	if c.reloginSuppressTTL > 0 {
+		return c.reloginSuppressTTL
+	}
+	return defaultReloginSuppressTTL
+}
+
 func (c *Controller) shouldReloginWS() bool {
 	c.authMu.RLock()
 	defer c.authMu.RUnlock()
-	return !c.wsReloginSuppressed
+	return c.wsReloginSuppressedUntil.IsZero() || !time.Now().Before(c.wsReloginSuppressedUntil)
 }
 
 func (c *Controller) markWSReloginSuppressed() {
+	ttl := c.reloginSuppressTTLDuration()
 	c.authMu.Lock()
-	c.wsReloginSuppressed = true
+	c.wsReloginSuppressedUntil = time.Now().Add(ttl)
 	c.authMu.Unlock()
 }
 
 func (c *Controller) clearWSReloginSuppressed() {
 	c.authMu.Lock()
-	c.wsReloginSuppressed = false
+	c.wsReloginSuppressedUntil = time.Time{}
 	c.authMu.Unlock()
 }
 
@@ -255,16 +281,17 @@ func (c *Controller) isPathUnauthorized(path string) bool {
 	if len(c.unauthPaths) == 0 {
 		return false
 	}
-	_, ok := c.unauthPaths[path]
-	return ok
+	until, ok := c.unauthPaths[path]
+	return ok && time.Now().Before(until)
 }
 
 func (c *Controller) markPathUnauthorized(path string) {
+	ttl := c.reloginSuppressTTLDuration()
 	c.authMu.Lock()
 	if c.unauthPaths == nil {
-		c.unauthPaths = make(map[string]struct{})
+		c.unauthPaths = make(map[string]time.Time)
 	}
-	c.unauthPaths[path] = struct{}{}
+	c.unauthPaths[path] = time.Now().Add(ttl)
 	c.authMu.Unlock()
 }
 
@@ -276,7 +303,7 @@ func (c *Controller) clearPathUnauthorized(path string) {
 
 func (c *Controller) resetReloginSuppressions() {
 	c.authMu.Lock()
-	c.wsReloginSuppressed = false
+	c.wsReloginSuppressedUntil = time.Time{}
 	c.unauthPaths = nil
 	c.authMu.Unlock()
 }
@@ -349,6 +376,14 @@ func (c *Controller) relogin(ctx context.Context, seenEpoch uint64) error {
 		if shouldActivateAuthCooldown(ctx, err) {
 			c.lastLoginErr = err
 			c.authFailCooldownUntil = time.Now().Add(c.authFailCooldownDuration())
+		} else if (ctx == nil || ctx.Err() == nil) &&
+			!errors.Is(err, context.Canceled) &&
+			!errors.Is(err, context.DeadlineExceeded) {
+			// Apply a brief burst cooldown for transient controller/server 5xx
+			// failures so concurrent 401s in one poll cycle coalesce to a single
+			// login attempt while keeping caller-canceled contexts unpenalized.
+			c.lastLoginErr = err
+			c.authFailCooldownUntil = time.Now().Add(c.transientReloginCooldownDuration())
 		}
 		return err
 	}
@@ -1469,7 +1504,8 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 		// not "manual". When setting_preference is explicitly "auto", the assigned
 		// profile takes precedence over any stale per-port fields.
 		pref := strings.ToLower(strings.TrimSpace(rp.SettingPreference))
-		if rp.PortConfID != "" && pref != "manual" {
+		profileManaged := rp.PortConfID != "" && pref != "manual"
+		if profileManaged {
 			if pc, ok := portConfByID[rp.PortConfID]; ok {
 				profileWins := pref == "auto"
 				if (profileWins || rp.OpMode == "") && pc.OpMode != "" {
@@ -1571,6 +1607,8 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			TaggedVLANMgmt:      tagged,
 			NativeNetworkID:     rp.NativeNetworkConfID,
 			NativeNetworkName:   nativeName,
+			PortConfID:          rp.PortConfID,
+			ProfileManaged:      profileManaged,
 			PoEEnabled:          rp.PoEEnable,
 			PoEMode:             strings.ToLower(strings.TrimSpace(rp.PoEMode)),
 			PoEPower:            poeStr,

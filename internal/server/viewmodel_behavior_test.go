@@ -1245,3 +1245,83 @@ func TestMixedWideUDPForwardSpecEmitsBothSingleAndRangeChips(t *testing.T) {
 		}
 	}
 }
+
+// TestDualStackIPv4PortForwardDoesNotMarkIPv6ServiceWAN verifies that an IPv4
+// port forward on TCP 443 labels only the IPv4 service row as WAN-reachable,
+// keeping the IPv6 service row on the same port as LAN/VLAN-only (both when
+// IPv4/IPv6 run different protocols and when they share the same protocol).
+func TestDualStackIPv4PortForwardDoesNotMarkIPv6ServiceWAN(t *testing.T) {
+	cl := unifi.Client{
+		MAC:         "aa:bb:cc:dd:ee:44",
+		Name:        "dualstack-app",
+		IP:          "192.168.10.25",
+		IPv6:        []string{"2001:db8:10::25"},
+		NetworkName: "Servers",
+	}
+	cv := ClientView{
+		Client:    cl,
+		OpenPorts: []int{443},
+	}
+	wanV4Only := []risk.ExposureAssessment{{
+		Forward: unifi.PortForward{
+			ID:        "pf-v4-443",
+			Name:      "HTTPS IPv4",
+			Enabled:   true,
+			Proto:     "tcp",
+			DstPort:   "443",
+			FwdIP:     "192.168.10.25",
+			FwdPort:   "443",
+			Src:       "any",
+			IPVersion: "ipv4",
+		},
+		Client: cl,
+	}}
+
+	t.Run("distinct_protocols_ipv4_https_ipv6_mqtt", func(t *testing.T) {
+		hp := probe.HostProfile{
+			Client: cl,
+			Services: []probe.Service{
+				{Port: 443, Transport: "tcp", Protocol: "https", AddressFamily: "ipv4", State: probe.ServiceStateObservedProtocol},
+				{Port: 443, Transport: "tcp", Protocol: "mqtt", AddressFamily: "ipv6", State: probe.ServiceStateObservedProtocol},
+			},
+		}
+		svcs := buildHostServices(cv, hp, wanV4Only, false, false)
+		if len(svcs) != 2 {
+			t.Fatalf("expected 2 services, got %+v", svcs)
+		}
+		byFam := map[string]ServiceView{}
+		for _, s := range svcs {
+			byFam[s.AddressFamily] = s
+		}
+		if byFam["ipv4"].Reachable != "wan" || byFam["ipv4"].Name != "https" {
+			t.Fatalf("expected IPv4 HTTPS to be wan, got %+v", byFam["ipv4"])
+		}
+		if byFam["ipv6"].Reachable != "lan" || byFam["ipv6"].Name != "mqtt" {
+			t.Fatalf("expected IPv6 MQTT to remain lan (not wan), got %+v", byFam["ipv6"])
+		}
+	})
+
+	t.Run("same_protocol_split_when_only_ipv4_forwarded", func(t *testing.T) {
+		hp := probe.HostProfile{
+			Client: cl,
+			Services: []probe.Service{
+				{Port: 443, Transport: "tcp", Protocol: "https", AddressFamily: "ipv4", State: probe.ServiceStateObservedProtocol},
+				{Port: 443, Transport: "tcp", Protocol: "https", AddressFamily: "ipv6", State: probe.ServiceStateObservedProtocol},
+			},
+		}
+		svcs := buildHostServices(cv, hp, wanV4Only, true, false)
+		if len(svcs) != 2 {
+			t.Fatalf("expected 2 separate rows when only IPv4 is forwarded, got %+v", svcs)
+		}
+		byFam := map[string]ServiceView{}
+		for _, s := range svcs {
+			byFam[s.AddressFamily] = s
+		}
+		if byFam["ipv4"].Reachable != "wan" {
+			t.Fatalf("expected IPv4 HTTPS to be wan, got %+v", byFam["ipv4"])
+		}
+		if byFam["ipv6"].Reachable != "vlan-only" {
+			t.Fatalf("expected IPv6 HTTPS to remain vlan-only (not wan), got %+v", byFam["ipv6"])
+		}
+	})
+}

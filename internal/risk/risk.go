@@ -109,6 +109,11 @@ type State struct {
 	// newly matched or newly KEV-promoted exact CVEs trigger outbound webhooks.
 	// A nil map indicates the CVE baseline has not been seeded yet.
 	ExactCVEs map[string]string `json:"exact_cves,omitempty"`
+
+	// ExactCVELastSeen records when each exact-version CVE key was last actively
+	// observed (UTC) so transient banner misses or offline hosts do not cause
+	// flapping alerts while genuinely patched CVEs age out cleanly.
+	ExactCVELastSeen map[string]time.Time `json:"exact_cve_last_seen,omitempty"`
 }
 
 // AlertEvent represents a high-signal live security event (admin activity,
@@ -501,7 +506,7 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 			continue
 		}
 		k := stateFindingKey(f)
-		if legacyKey, ok := legacyBaseFindingKey(k); ok {
+		for _, legacyKey := range legacyBaseFindingKeys(k) {
 			migratedLegacyKeys[legacyKey] = struct{}{}
 		}
 		sev := f.EffectiveSeverity
@@ -581,6 +586,12 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 		st.ExactCVEs = make(map[string]string, len(prev.ExactCVEs))
 		for k, v := range prev.ExactCVEs {
 			st.ExactCVEs[k] = v
+		}
+	}
+	if prev != nil && prev.ExactCVELastSeen != nil {
+		st.ExactCVELastSeen = make(map[string]time.Time, len(prev.ExactCVELastSeen))
+		for k, v := range prev.ExactCVELastSeen {
+			st.ExactCVELastSeen[k] = v
 		}
 	}
 	return st
@@ -682,15 +693,19 @@ func shouldCarryForward(prev *State, oldKey string, activeHosts, probedHostKeys 
 	return prev != nil && prev.CarriedFindings[oldKey]
 }
 
-// legacyBaseFindingKey strips trailing "|property" / "|transport" segments from
-// a finding key that has more than 3 pipe-delimited parts, returning the legacy
-// 3-part "<CheckID>|<host>|<port>" key used by older state files.
-func legacyBaseFindingKey(key string) (string, bool) {
+// legacyBaseFindingKeys returns legacy finding key formats from older state
+// files (the 3-part "<CheckID>|<host>|<port>" key and, for non-TCP transports,
+// the 4-part "<CheckID>|<host>|<port>|<transport>" key without property).
+func legacyBaseFindingKeys(key string) []string {
 	parts := strings.Split(key, "|")
 	if len(parts) <= 3 {
-		return "", false
+		return nil
 	}
-	return parts[0] + "|" + parts[1] + "|" + parts[2], true
+	base3 := parts[0] + "|" + parts[1] + "|" + parts[2]
+	if len(parts) == 5 && parts[4] != "" && parts[4] != "tcp" {
+		return []string{base3 + "|" + parts[4], base3}
+	}
+	return []string{base3}
 }
 
 // splitFindingKey extracts the CheckID and host identifier from a Finding.Key()
@@ -742,11 +757,14 @@ func ComputeDiffWithProbed(prev *State, snap *unifi.Snapshot, report Report, net
 		oldSev, existed := prev.Findings[key]
 		if existed {
 			matchedPrevKeys[key] = struct{}{}
-		} else if legacyKey, ok := legacyBaseFindingKey(key); ok {
-			if legacySev, legacyExisted := prev.Findings[legacyKey]; legacyExisted {
-				oldSev = legacySev
-				existed = true
-				matchedPrevKeys[legacyKey] = struct{}{}
+		} else {
+			for _, legacyKey := range legacyBaseFindingKeys(key) {
+				if legacySev, legacyExisted := prev.Findings[legacyKey]; legacyExisted {
+					oldSev = legacySev
+					existed = true
+					matchedPrevKeys[legacyKey] = struct{}{}
+					break
+				}
 			}
 		}
 		if !existed {
@@ -930,6 +948,37 @@ func IsolatedZones(snap *unifi.Snapshot) map[string]bool {
 	return isolatedZoneSet(snap)
 }
 
+// endpointCoversZoneNetworks reports whether ep broadly covers every LAN
+// network belonging to zone (either via AnyTarget or via positive NetworkIDs
+// naming all LAN networks in that zone, with no IP/MAC/negation narrowing).
+func endpointCoversZoneNetworks(ep unifi.PolicyEndpoint, zone string, snap *unifi.Snapshot) bool {
+	if ep.NegateTarget || ep.UnsupportedSelector != "" {
+		return false
+	}
+	if ep.AnyTarget {
+		return true
+	}
+	if len(ep.IPs) > 0 || len(ep.MACs) > 0 || len(ep.NetworkIDs) == 0 || snap == nil {
+		return false
+	}
+	zoneLow := strings.ToLower(strings.TrimSpace(zone))
+	matched := 0
+	for _, n := range snap.Networks {
+		p := strings.ToLower(strings.TrimSpace(n.Purpose))
+		if p == "wan" || p == "wan2" || p == "remote-user-vpn" {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(n.ZoneName)) != zoneLow {
+			continue
+		}
+		if !((n.ID != "" && containsFold(ep.NetworkIDs, n.ID)) || (n.Name != "" && containsFold(ep.NetworkIDs, n.Name))) {
+			return false
+		}
+		matched++
+	}
+	return matched > 0
+}
+
 // intendedIsolatedZoneSet returns the lowercase set of UniFi firewall zones
 // that express isolation intent from Internal: Hotspot, DMZ, and any custom
 // zone that has at least one enabled broad BLOCK/REJECT/DROP policy targeting
@@ -956,8 +1005,9 @@ func intendedIsolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 		if src == "" || src == "internal" || src == "external" || src == "gateway" || src == "vpn" || dst != "internal" {
 			continue
 		}
-		if !pol.Source.AnyTarget || !pol.Destination.AnyTarget || !pol.Destination.CoversAllPorts() ||
-			pol.Source.NegateTarget || pol.Destination.NegateTarget || pol.Destination.NegatePort {
+		if !endpointCoversZoneNetworks(pol.Source, src, snap) ||
+			!endpointCoversZoneNetworks(pol.Destination, "internal", snap) ||
+			!pol.Destination.CoversAllPorts() || pol.Destination.NegatePort {
 			continue
 		}
 		if pol.ProtocolNegated || !matchesProtocol(pol.Protocol, "tcp") {
@@ -1010,8 +1060,9 @@ func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 		if src == "" || src == "internal" || src == "external" || src == "gateway" || src == "vpn" || dst != "internal" {
 			continue
 		}
-		if pol.Schedule != "" || !pol.Source.AnyTarget || pol.Source.NegateTarget ||
-			!pol.Destination.AnyTarget || pol.Destination.NegateTarget ||
+		if pol.Schedule != "" ||
+			!endpointCoversZoneNetworks(pol.Source, src, snap) ||
+			!endpointCoversZoneNetworks(pol.Destination, "internal", snap) ||
 			!pol.Destination.CoversAllPorts() || pol.Destination.NegatePort {
 			continue
 		}

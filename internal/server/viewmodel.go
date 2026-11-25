@@ -2090,6 +2090,38 @@ func buildLogicalLanes(
 	return lanes
 }
 
+// portForwardAddressFamily returns the effective address family ("ipv4",
+// "ipv6", or "both") targeted by pf, preferring the literal FwdIP family when
+// present and falling back to pf.IPVersion (defaulting to "ipv4").
+func portForwardAddressFamily(pf unifi.PortForward) string {
+	if addr, err := netip.ParseAddr(strings.TrimSpace(pf.FwdIP)); err == nil {
+		if addr.Unmap().Is6() {
+			return "ipv6"
+		}
+		return "ipv4"
+	}
+	switch strings.ToLower(strings.TrimSpace(pf.IPVersion)) {
+	case "ipv6":
+		return "ipv6"
+	case "both", "ipv4_and_ipv6":
+		return "both"
+	default:
+		return "ipv4"
+	}
+}
+
+func forwardMatchesAddressFamily(pf unifi.PortForward, svcFam string) bool {
+	sf := strings.ToLower(strings.TrimSpace(svcFam))
+	if sf == "" {
+		return true
+	}
+	ff := portForwardAddressFamily(pf)
+	if ff == "both" {
+		return true
+	}
+	return ff == sf
+}
+
 func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureAssessment, vlanIsolated, behindCGNAT bool) []ServiceView {
 	type wanPortInfo struct {
 		restricted bool
@@ -2167,13 +2199,17 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		}
 		return "wan"
 	}
-	// Decide WAN reachability for any observed port+transport directly via
-	// Forward.ExposesEndpoint so port ranges wider than 64 ports still match.
-	wanReachForEndpoint := func(port int, transport string) (string, bool, bool) {
+	// Decide WAN reachability for any observed (port, transport, addressFamily)
+	// directly via Forward.ExposesEndpoint and address-family matching so an
+	// IPv4-only port forward never marks an IPv6 service row as WAN-reachable.
+	wanReachForEndpoint := func(port int, transport, addrFamily string) (string, bool, bool) {
 		matched := false
 		allRestricted := true
 		for _, a := range wan {
 			if !a.Forward.ExposesEndpoint(port, transport) {
+				continue
+			}
+			if !forwardMatchesAddressFamily(a.Forward, addrFamily) {
 				continue
 			}
 			matched = true
@@ -2188,8 +2224,9 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 	}
 
 	// Group observed services by (transport, port), preserving distinct protocols
-	// across IPv4/IPv6 (e.g., IPv4 HTTPS and IPv6 MQTT on the same TCP port)
-	// while collapsing duplicate rows when both families run the same protocol.
+	// or distinct WAN reachability across IPv4/IPv6 (e.g., IPv4 HTTPS forwarded
+	// to WAN vs. IPv6 MQTT or IPv6 HTTPS on LAN only) while collapsing duplicate
+	// rows when both families share the same protocol and reachability.
 	servicesByEndpoint := make(map[string][]probe.Service)
 	for _, svc := range hp.Services {
 		if svc.Port <= 0 {
@@ -2209,6 +2246,11 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			exFam := strings.ToLower(strings.TrimSpace(existing[i].AddressFamily))
 			if exProto == normProto {
 				if exFam != "" && normFam != "" && exFam != normFam {
+					exReach, exRestr, exWAN := wanReachForEndpoint(svc.Port, t, exFam)
+					normReach, normRestr, normWAN := wanReachForEndpoint(svc.Port, t, normFam)
+					if exWAN != normWAN || exReach != normReach || exRestr != normRestr {
+						continue
+					}
 					existing[i].AddressFamily = ""
 				} else if exFam == "" && normFam != "" {
 					existing[i].AddressFamily = normFam
@@ -2248,6 +2290,13 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		return base
 	}
 
+	hostDefaultFamily := ""
+	if strings.TrimSpace(cv.Client.IP) == "" && len(cv.Client.IPv6) > 0 {
+		hostDefaultFamily = "ipv6"
+	} else if strings.TrimSpace(cv.Client.IP) != "" && len(cv.Client.IPv6) == 0 {
+		hostDefaultFamily = "ipv4"
+	}
+
 	var out []ServiceView
 	seen := make(map[string]bool)
 	emitObservedEndpoint := func(epKey string, port int, transport string) {
@@ -2255,14 +2304,14 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			return
 		}
 		seen[epKey] = true
-		reach := defaultReach
-		srcRestricted := false
-		if lbl, restr, ok := wanReachForEndpoint(port, transport); ok {
-			reach = lbl
-			srcRestricted = restr
-		}
 		svcs := servicesByEndpoint[epKey]
 		if len(svcs) == 0 {
+			reach := defaultReach
+			srcRestricted := false
+			if lbl, restr, ok := wanReachForEndpoint(port, transport, hostDefaultFamily); ok {
+				reach = lbl
+				srcRestricted = restr
+			}
 			name := commonPortLabel(port)
 			out = append(out, ServiceView{
 				Port:             port,
@@ -2277,6 +2326,12 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		}
 		multi := len(svcs) > 1
 		for _, svc := range svcs {
+			reach := defaultReach
+			srcRestricted := false
+			if lbl, restr, ok := wanReachForEndpoint(port, transport, svc.AddressFamily); ok {
+				reach = lbl
+				srcRestricted = restr
+			}
 			name := firstStr(svc.Protocol, commonPortLabel(port))
 			out = append(out, ServiceView{
 				Port:             port,

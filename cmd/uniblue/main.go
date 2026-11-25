@@ -210,6 +210,7 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
+	warnLegacyCWDState(logger, cfg.State.Path)
 	logger.Info("starting uniblue watch",
 		"site", cfg.UniFi.Site,
 		"interval", cfg.Scan.Interval,
@@ -225,9 +226,10 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		scanFn: func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
 			return executeCycleWithPrev(ctx, cfg, checkList, session.lastSnap)
 		},
-		sendFn: notifier.Send,
-		loadFn: risk.LoadState,
-		saveFn: risk.SaveState,
+		sendFn:       notifier.Send,
+		sendWithIDFn: notifier.SendWithID,
+		loadFn:       risk.LoadState,
+		saveFn:       risk.SaveState,
 	}
 
 	// Run one pass immediately, then repeat on a ticker until cancelled.
@@ -253,17 +255,19 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 // and transient controller telemetry outages preserve last-known settings,
 // WLANs, and switch port profiles without dropping posture findings.
 type watchSession struct {
-	cfg         *config.Config
-	minSev      checks.Severity
-	logger      *slog.Logger
-	prevState   *risk.State
-	lastSnap    *unifi.Snapshot
-	stateLoaded bool
+	cfg              *config.Config
+	minSev           checks.Severity
+	logger           *slog.Logger
+	prevState        *risk.State
+	lastSnap         *unifi.Snapshot
+	stateLoaded      bool
+	pendingWebhookID string
 
-	scanFn func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
-	sendFn func(ctx context.Context, site string, diff risk.Diff) error
-	loadFn func(path string) (*risk.State, error)
-	saveFn func(path string, st *risk.State) error
+	scanFn       func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
+	sendFn       func(ctx context.Context, site string, diff risk.Diff) error
+	sendWithIDFn func(ctx context.Context, id, site string, diff risk.Diff) error
+	loadFn       func(path string) (*risk.State, error)
+	saveFn       func(path string, st *risk.State) error
 }
 
 func (w *watchSession) runCycle(ctx context.Context) {
@@ -304,10 +308,22 @@ func (w *watchSession) runCycle(ctx context.Context) {
 	)
 
 	if diff.HasAlerts(w.minSev) {
-		if err := w.sendFn(ctx, snap.Site, diff); err != nil {
-			w.logger.Error("failed to send notification; preserving previous baseline for retry", "err", err)
+		var sendErr error
+		if w.sendWithIDFn != nil {
+			if w.pendingWebhookID == "" {
+				w.pendingWebhookID = notify.NewWebhookID()
+			}
+			sendErr = w.sendWithIDFn(ctx, w.pendingWebhookID, snap.Site, diff)
+		} else {
+			sendErr = w.sendFn(ctx, snap.Site, diff)
+		}
+		if sendErr != nil {
+			w.logger.Error("failed to send notification; preserving previous baseline for retry", "err", sendErr)
 			return
 		}
+		w.pendingWebhookID = ""
+	} else {
+		w.pendingWebhookID = ""
 	}
 
 	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedKeys)
@@ -349,15 +365,58 @@ func preserveUnavailableWatchTelemetry(prevSnap, nextSnap *unifi.Snapshot) bool 
 			for pi := range nextSnap.Devices[di].Ports {
 				p := &nextSnap.Devices[di].Ports[pi]
 				if old, ok := prevPorts[fmt.Sprintf("%s|%d", dmac, p.PortIdx)]; ok {
-					if p.OpMode != old.OpMode {
+					if p.ProfileManaged {
+						if p.Enabled != old.Enabled {
+							p.Enabled = old.Enabled
+							changed = true
+						}
+						if p.OpMode != old.OpMode {
+							p.OpMode = old.OpMode
+							changed = true
+						}
+						if p.Forward != old.Forward {
+							p.Forward = old.Forward
+							changed = true
+						}
+						if p.TaggedVLANMgmt != old.TaggedVLANMgmt {
+							p.TaggedVLANMgmt = old.TaggedVLANMgmt
+							changed = true
+						}
+						if p.NativeNetworkName != old.NativeNetworkName || p.NativeNetworkID != old.NativeNetworkID {
+							p.NativeNetworkName = old.NativeNetworkName
+							p.NativeNetworkID = old.NativeNetworkID
+							changed = true
+						}
+						if p.PoEMode != old.PoEMode {
+							p.PoEMode = old.PoEMode
+							changed = true
+						}
+						if p.PortSecurityEnabled != old.PortSecurityEnabled {
+							p.PortSecurityEnabled = old.PortSecurityEnabled
+							changed = true
+						}
+						if len(p.PortSecurityMACs) == 0 && len(old.PortSecurityMACs) > 0 {
+							p.PortSecurityMACs = append([]string(nil), old.PortSecurityMACs...)
+							changed = true
+						}
+						if p.Isolation != old.Isolation {
+							p.Isolation = old.Isolation
+							changed = true
+						}
+						if p.PortConfID == "" && old.PortConfID != "" {
+							p.PortConfID = old.PortConfID
+						}
+						continue
+					}
+					if p.OpMode == "" && old.OpMode != "" {
 						p.OpMode = old.OpMode
 						changed = true
 					}
-					if p.Forward != old.Forward {
+					if p.Forward == "" && old.Forward != "" {
 						p.Forward = old.Forward
 						changed = true
 					}
-					if p.TaggedVLANMgmt != old.TaggedVLANMgmt {
+					if p.TaggedVLANMgmt == "" && old.TaggedVLANMgmt != "" {
 						p.TaggedVLANMgmt = old.TaggedVLANMgmt
 						changed = true
 					}
@@ -784,12 +843,80 @@ func siteSubnets(snap *unifi.Snapshot) []netip.Prefix {
 	return out
 }
 
+// siteGatewayReflectorIPs collects UniFi gateway LAN interface IPs so passive
+// mDNS discovery distinguishes legitimate gateway-reflected cross-VLAN services
+// from third-party LAN spoofing.
+func siteGatewayReflectorIPs(snap *unifi.Snapshot) []string {
+	if snap == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(raw string) {
+		addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil {
+			return
+		}
+		norm := addr.Unmap().String()
+		if _, dup := seen[norm]; dup {
+			return
+		}
+		seen[norm] = struct{}{}
+		out = append(out, norm)
+	}
+	for _, d := range snap.Devices {
+		t := strings.ToLower(strings.TrimSpace(d.Type))
+		if t == "ugw" || t == "udm" || t == "uxg" || t == "ucg" {
+			add(d.IP)
+		}
+	}
+	for _, n := range snap.Networks {
+		p := strings.ToLower(strings.TrimSpace(n.Purpose))
+		if p == "wan" || p == "wan2" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil {
+			if pfx.Addr().IsValid() && pfx.Addr() != pfx.Masked().Addr() {
+				add(pfx.Addr().String())
+			}
+		}
+	}
+	return out
+}
+
 // newSiteFingerprinter constructs a Fingerprinter pre-populated with all site
-// IPv4/IPv6 subnets from snap.
+// IPv4/IPv6 subnets and gateway mDNS reflector IPs from snap.
 func newSiteFingerprinter(ports []int, concurrency int, timeout time.Duration, excluded map[string]struct{}, snap *unifi.Snapshot) *probe.Fingerprinter {
 	fp := probe.NewFingerprinter(ports, concurrency, timeout, excluded)
 	fp.SetAllowedSubnets(siteSubnets(snap))
+	fp.SetTrustedReflectors(siteGatewayReflectorIPs(snap))
 	return fp
+}
+
+// warnLegacyCWDState emits a startup warning when the resolved state.path does
+// not exist yet while a legacy ./uniblue-state.json exists in the current
+// working directory at a different location, helping operators notice after
+// upgrading without silently adopting an untrusted working-directory file.
+func warnLegacyCWDState(logger *slog.Logger, resolvedPath string) {
+	if logger == nil || strings.TrimSpace(resolvedPath) == "" {
+		return
+	}
+	if _, err := os.Stat(resolvedPath); err == nil {
+		return
+	}
+	legacy := "uniblue-state.json"
+	if _, err := os.Stat(legacy); err != nil {
+		return
+	}
+	absResolved, err1 := filepath.Abs(resolvedPath)
+	absLegacy, err2 := filepath.Abs(legacy)
+	if err1 == nil && err2 == nil && absResolved == absLegacy {
+		return
+	}
+	logger.Warn("configured state file does not exist yet while a legacy state file exists in the current working directory; set state.path explicitly or move it to preserve baseline history",
+		"state_path", resolvedPath,
+		"legacy_cwd_state", absLegacy,
+	)
 }
 
 // verifyStatePathWritable creates parent directories if needed and writes+removes
@@ -1875,6 +2002,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
+	warnLegacyCWDState(logger, cfg.State.Path)
 	eng, err := server.NewEngine(cfg, checkList, scanPorts, server.Options{
 		ListenAddr:         *listen,
 		PollInterval:       *poll,

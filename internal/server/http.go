@@ -9,6 +9,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -37,9 +38,9 @@ import (
 )
 
 const (
-	sessionCookieName = "uniblue_session"
-	sessionTTL        = 30 * 24 * time.Hour
-	maxActiveSessions = 256
+	sessionCookieName  = "uniblue_session"
+	sessionTTL         = 30 * 24 * time.Hour
+	maxRevokedSessions = 1024
 
 	authMaxFailedAttempts  = 5
 	authFailureWindow      = 15 * time.Minute
@@ -48,18 +49,15 @@ const (
 	authMaxTrackedClients  = 1024
 )
 
-type sessionEntry struct {
-	tokenHash [32]byte
-	createdAt time.Time
-	expiresAt time.Time
-}
-
-// sessionStore holds per-login random HttpOnly session tokens in memory with
-// bounded capacity, expiry, and explicit revocation on logout.
+// sessionStore mints and validates per-login random-nonce HMAC-SHA256 session
+// cookies bound to the active UNIBLUE_API_TOKEN, plus a bounded in-memory
+// revocation set for explicit DELETE /api/v1/session logouts. Sessions survive
+// restarts with the same API token while token rotation invalidates all prior
+// cookies immediately.
 type sessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]sessionEntry
-	nowFn    func() time.Time
+	mu      sync.Mutex
+	revoked map[string]time.Time
+	nowFn   func() time.Time
 }
 
 func (s *sessionStore) now() time.Time {
@@ -69,80 +67,110 @@ func (s *sessionStore) now() time.Time {
 	return time.Now()
 }
 
+func deriveSessionMACKey(apiToken string) [32]byte {
+	return sha256.Sum256([]byte("uniblue-session-v1:" + apiToken))
+}
+
+func signSessionToken(apiToken, nonce string, expUnix int64) string {
+	key := deriveSessionMACKey(apiToken)
+	mac := hmac.New(sha256.New, key[:])
+	_, _ = mac.Write([]byte(nonce))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write([]byte(strconv.FormatInt(expUnix, 10)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func parseSessionToken(cookieVal string) (nonce string, expUnix int64, sigHex string, ok bool) {
+	parts := strings.Split(cookieVal, ".")
+	if len(parts) != 3 || len(parts[0]) != 64 || len(parts[2]) != 64 {
+		return "", 0, "", false
+	}
+	if _, err := hex.DecodeString(parts[0]); err != nil {
+		return "", 0, "", false
+	}
+	if _, err := hex.DecodeString(parts[2]); err != nil {
+		return "", 0, "", false
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || exp <= 0 {
+		return "", 0, "", false
+	}
+	return parts[0], exp, parts[2], true
+}
+
 func (s *sessionStore) create(apiToken string) (string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", fmt.Errorf("generate session token: %w", err)
 	}
-	id := hex.EncodeToString(raw[:])
-	now := s.now()
+	nonce := hex.EncodeToString(raw[:])
+	expUnix := s.now().Add(sessionTTL).Unix()
+	sigHex := signSessionToken(apiToken, nonce, expUnix)
+	return nonce + "." + strconv.FormatInt(expUnix, 10) + "." + sigHex, nil
+}
 
+func (s *sessionStore) validate(cookieVal, apiToken string) bool {
+	if cookieVal == "" || apiToken == "" {
+		return false
+	}
+	nonce, expUnix, sigHex, ok := parseSessionToken(cookieVal)
+	if !ok {
+		return false
+	}
+	now := s.now()
+	if now.Unix() >= expUnix {
+		return false
+	}
+	wantSig := signSessionToken(apiToken, nonce, expUnix)
+	if subtle.ConstantTimeCompare([]byte(sigHex), []byte(wantSig)) != 1 {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sessions == nil {
-		s.sessions = make(map[string]sessionEntry)
+	if exp, isRevoked := s.revoked[nonce]; isRevoked {
+		if now.Before(exp) {
+			return false
+		}
+		delete(s.revoked, nonce)
 	}
-	for k, entry := range s.sessions {
-		if !now.Before(entry.expiresAt) {
-			delete(s.sessions, k)
+	return true
+}
+
+func (s *sessionStore) revoke(cookieVal string) {
+	nonce, expUnix, _, ok := parseSessionToken(cookieVal)
+	if !ok {
+		return
+	}
+	now := s.now()
+	exp := time.Unix(expUnix, 0)
+	if !now.Before(exp) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revoked == nil {
+		s.revoked = make(map[string]time.Time)
+	}
+	for k, v := range s.revoked {
+		if !now.Before(v) {
+			delete(s.revoked, k)
 		}
 	}
-	for len(s.sessions) >= maxActiveSessions {
+	for len(s.revoked) >= maxRevokedSessions {
 		var oldestKey string
-		var oldestTime time.Time
-		for k, entry := range s.sessions {
-			if oldestKey == "" || entry.createdAt.Before(oldestTime) {
+		var oldestExp time.Time
+		for k, v := range s.revoked {
+			if oldestKey == "" || v.Before(oldestExp) {
 				oldestKey = k
-				oldestTime = entry.createdAt
+				oldestExp = v
 			}
 		}
 		if oldestKey == "" {
 			break
 		}
-		delete(s.sessions, oldestKey)
+		delete(s.revoked, oldestKey)
 	}
-	s.sessions[id] = sessionEntry{
-		tokenHash: sha256.Sum256([]byte(apiToken)),
-		createdAt: now,
-		expiresAt: now.Add(sessionTTL),
-	}
-	return id, nil
-}
-
-func (s *sessionStore) validate(sessionID, apiToken string) bool {
-	if sessionID == "" || apiToken == "" {
-		return false
-	}
-	now := s.now()
-	wantHash := sha256.Sum256([]byte(apiToken))
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.sessions) == 0 {
-		return false
-	}
-	entry, ok := s.sessions[sessionID]
-	if !ok {
-		return false
-	}
-	if !now.Before(entry.expiresAt) {
-		delete(s.sessions, sessionID)
-		return false
-	}
-	if subtle.ConstantTimeCompare(entry.tokenHash[:], wantHash[:]) != 1 {
-		delete(s.sessions, sessionID)
-		return false
-	}
-	return true
-}
-
-func (s *sessionStore) revoke(sessionID string) {
-	if sessionID == "" {
-		return
-	}
-	s.mu.Lock()
-	delete(s.sessions, sessionID)
-	s.mu.Unlock()
+	s.revoked[nonce] = exp
 }
 
 type authAttemptState struct {
@@ -241,16 +269,29 @@ func (l *authFailureLimiter) evictStaleLocked(now time.Time) {
 	if len(l.clients) < authMaxTrackedClients {
 		return
 	}
-	var oldestKey string
-	var oldestTime time.Time
+	// Prefer evicting the oldest UNLOCKED entry so flooding fresh addresses
+	// cannot evict an actively locked-out client.
+	var oldestUnlockedKey string
+	var oldestUnlockedTime time.Time
+	var oldestLockedKey string
+	var oldestLockedTime time.Time
 	for k, st := range l.clients {
-		if oldestKey == "" || st.lastSeen.Before(oldestTime) {
-			oldestKey = k
-			oldestTime = st.lastSeen
+		if now.Before(st.lockedUntil) {
+			if oldestLockedKey == "" || st.lastSeen.Before(oldestLockedTime) {
+				oldestLockedKey = k
+				oldestLockedTime = st.lastSeen
+			}
+		} else {
+			if oldestUnlockedKey == "" || st.lastSeen.Before(oldestUnlockedTime) {
+				oldestUnlockedKey = k
+				oldestUnlockedTime = st.lastSeen
+			}
 		}
 	}
-	if oldestKey != "" {
-		delete(l.clients, oldestKey)
+	if oldestUnlockedKey != "" {
+		delete(l.clients, oldestUnlockedKey)
+	} else if oldestLockedKey != "" {
+		delete(l.clients, oldestLockedKey)
 	}
 }
 
@@ -265,7 +306,13 @@ func clientRemoteIP(r *http.Request) string {
 	}
 	host = strings.Trim(host, "[]")
 	if addr, err := netip.ParseAddr(host); err == nil {
-		return addr.Unmap().String()
+		addr = addr.Unmap()
+		if addr.Is6() && !addr.IsLoopback() {
+			// Bucket non-loopback IPv6 clients by /64 prefix so a single host
+			// rotating temporary IIDs cannot bypass per-client lockout.
+			return netip.PrefixFrom(addr, 64).Masked().String()
+		}
+		return addr.String()
 	}
 	return host
 }
@@ -376,6 +423,8 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/cves", e.handleCVEs)
 	mux.HandleFunc("GET /api/v1/hosts", e.handleHosts)
 	mux.HandleFunc("GET /api/v1/hosts/{id}", e.handleHostByID)
+	mux.HandleFunc("GET /api/v1/devices", e.handleDevices)
+	mux.HandleFunc("GET /api/v1/devices/{id}", e.handleDeviceByID)
 	mux.HandleFunc("GET /api/v1/isolation", e.handleIsolation)
 	mux.HandleFunc("GET /api/v1/events", e.handleEventsList)
 	mux.HandleFunc("GET /api/v1/events/stream", e.handleEventsStream)
@@ -601,34 +650,39 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 			(r.Method == http.MethodGet || r.Method == http.MethodPost || r.Method == http.MethodDelete)
 		if isAPI && !isSessionEndpoint {
 			if tok := e.effectiveAPIToken(); tok != "" {
+				// Validate legitimate credentials BEFORE checking per-IP lockout
+				// so a valid owner/agent behind a shared reverse proxy or NAT is
+				// never locked out by another client's failed attempts. Do not
+				// reset the failure counter on routine valid requests either, so
+				// polling cannot clear an attacker's lockout progress.
+				if e.hasValidAPIAuth(r, tok) {
+					next.ServeHTTP(w, r)
+					return
+				}
+
 				ip := clientRemoteIP(r)
-				if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
-					writeAuthLockedResponse(w, retryAfter)
-					return
+				hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
+				ck, ckErr := r.Cookie(sessionCookieName)
+				hasBadCookie := ckErr == nil && ck.Value != ""
+				if hasBadCookie {
+					// Clear stale or rotated session cookies silently without
+					// penalizing the lockout limiter (multiple open dashboard
+					// tabs after token rotation must not trigger a lockout).
+					clearSessionCookie(w, r)
 				}
-				if !e.hasValidAPIAuth(r, tok) {
-					// Count failed attempts only when the client actually sent
-					// an invalid credential (Bearer token or session cookie), so
-					// unauthenticated initial page loads prompting for login
-					// never trigger a lockout. Clear stale/invalid cookies so
-					// browsers with a rotated token do not keep resending them.
-					hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
-					ck, ckErr := r.Cookie(sessionCookieName)
-					hasBadCookie := ckErr == nil && ck.Value != ""
-					if hasBadCookie {
-						clearSessionCookie(w, r)
+				if hasBearer {
+					if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
+						writeAuthLockedResponse(w, retryAfter)
+						return
 					}
-					if hasBearer || hasBadCookie {
-						if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
-							writeAuthLockedResponse(w, retryAfter)
-							return
-						}
+					if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
+						writeAuthLockedResponse(w, retryAfter)
+						return
 					}
-					w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
-					writeAPIError(w, http.StatusUnauthorized, "unauthorized", "valid bearer token or session cookie required")
-					return
 				}
-				e.authLimiter.reset(ip)
+				w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
+				writeAPIError(w, http.StatusUnauthorized, "unauthorized", "valid bearer token or session cookie required")
+				return
 			}
 		}
 
@@ -659,23 +713,21 @@ func (e *Engine) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if e.hasValidAPIAuth(r, tok) {
+		writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": true})
+		return
+	}
+
 	hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
 	ck, ckErr := r.Cookie(sessionCookieName)
-	hasCookie := ckErr == nil && ck.Value != ""
-
-	ip := clientRemoteIP(r)
-	if hasBearer || hasCookie {
+	if ckErr == nil && ck.Value != "" {
+		clearSessionCookie(w, r)
+	}
+	if hasBearer {
+		ip := clientRemoteIP(r)
 		if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
 			writeAuthLockedResponse(w, retryAfter)
 			return
-		}
-		if e.hasValidAPIAuth(r, tok) {
-			e.authLimiter.reset(ip)
-			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": true})
-			return
-		}
-		if hasCookie {
-			clearSessionCookie(w, r)
 		}
 		if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
 			writeAuthLockedResponse(w, retryAfter)
@@ -689,12 +741,6 @@ func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	tok := e.effectiveAPIToken()
 	if tok == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "required": false})
-		return
-	}
-
-	ip := clientRemoteIP(r)
-	if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
-		writeAuthLockedResponse(w, retryAfter)
 		return
 	}
 
@@ -712,6 +758,12 @@ func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 			cand = strings.TrimSpace(body.Token)
 		}
 	}
+
+	ip := clientRemoteIP(r)
+	if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
+		writeAuthLockedResponse(w, retryAfter)
+		return
+	}
 	if cand == "" || subtle.ConstantTimeCompare([]byte(cand), []byte(tok)) != 1 {
 		if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
 			writeAuthLockedResponse(w, retryAfter)
@@ -721,8 +773,6 @@ func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnauthorized, "invalid_token", "invalid API token")
 		return
 	}
-
-	e.authLimiter.reset(ip)
 
 	sessionID, err := e.sessions.create(tok)
 	if err != nil {
@@ -1065,19 +1115,107 @@ func (e *Engine) handleHosts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"hosts": out})
 }
 
+func collectDeviceEntities(snap StateSnapshot) []Entity {
+	var devices []Entity
+	if snap.View != nil && len(snap.View.Entities) > 0 {
+		for _, ent := range snap.View.Entities {
+			if ent != nil && ent.Kind == "device" {
+				devices = append(devices, *ent)
+			}
+		}
+	}
+	sort.Slice(devices, func(i, j int) bool {
+		ri, rj := verdictRank(devices[i].State), verdictRank(devices[j].State)
+		if ri != rj {
+			return ri > rj
+		}
+		if devices[i].Label != devices[j].Label {
+			return strings.ToLower(devices[i].Label) < strings.ToLower(devices[j].Label)
+		}
+		return devices[i].ID < devices[j].ID
+	})
+	return devices
+}
+
+func deviceMatchesIdentifier(ent Entity, snap StateSnapshot, query string) bool {
+	if entityMatchesIdentifier(ent, query) {
+		return true
+	}
+	// Gateway findings (such as WAN firewall or SSH checks) may reference the
+	// gateway's external WAN IP in addition to its LAN management IP.
+	if strings.EqualFold(ent.Role, "gateway") && snap.Report.UniFiPosture != nil && snap.Report.UniFiPosture.Health != nil {
+		if wanIP := strings.TrimSpace(snap.Report.UniFiPosture.Health.WANIP); wanIP != "" && strings.EqualFold(wanIP, strings.TrimSpace(query)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Engine) handleHostByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
 	if id == "" {
 		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "host identifier is required")
 		return
 	}
-	for _, h := range collectHostEntities(e.Snapshot()) {
+	snap := e.Snapshot()
+	for _, h := range collectHostEntities(snap) {
 		if entityMatchesIdentifier(h, id) {
 			writeJSON(w, http.StatusOK, h)
 			return
 		}
 	}
+	// Fall back to UniFi infrastructure devices (gateway, switches, APs) so any
+	// IP or MAC referenced in /api/v1/findings resolves cleanly.
+	for _, d := range collectDeviceEntities(snap) {
+		if deviceMatchesIdentifier(d, snap, id) {
+			writeJSON(w, http.StatusOK, d)
+			return
+		}
+	}
 	writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("host %q not found", id))
+}
+
+func (e *Engine) handleDevices(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	roleFilter := strings.TrimSpace(q.Get("role"))
+	stateFilter := strings.ToLower(strings.TrimSpace(q.Get("state")))
+	if stateFilter != "" {
+		switch VerdictState(stateFilter) {
+		case VerdictOK, VerdictUnknown, VerdictReview, VerdictExposed:
+		default:
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", fmt.Sprintf("unknown state %q (expected ok, unknown, review, or exposed)", stateFilter))
+			return
+		}
+	}
+
+	devices := collectDeviceEntities(e.Snapshot())
+	out := make([]Entity, 0, len(devices))
+	for _, d := range devices {
+		if stateFilter != "" && string(d.State) != stateFilter {
+			continue
+		}
+		if roleFilter != "" && !strings.EqualFold(d.Role, roleFilter) {
+			continue
+		}
+		out = append(out, d)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"devices": out})
+}
+
+func (e *Engine) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "device identifier is required")
+		return
+	}
+	snap := e.Snapshot()
+	for _, d := range collectDeviceEntities(snap) {
+		if deviceMatchesIdentifier(d, snap, id) {
+			writeJSON(w, http.StatusOK, d)
+			return
+		}
+	}
+	writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("device %q not found", id))
 }
 
 func (e *Engine) handleIsolation(w http.ResponseWriter, r *http.Request) {

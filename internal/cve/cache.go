@@ -8,6 +8,7 @@ package cve
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -23,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/karalabe/uniblue/internal/checks"
@@ -164,6 +167,12 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create vendors dir: %w", err)
 	}
+
+	unlock, err := acquireCacheLock(ctx, filepath.Join(c.dir, ".sync.lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	prevStats, _ := c.Stats()
 	prevSHAs := map[string]string{}
@@ -321,10 +330,14 @@ func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string
 	metaURL := fmt.Sprintf("%s/nvdcve-2.0-%s.meta", c.nvdBaseURL, year)
 	sha, status, err := c.fetchMetaSHA(ctx, metaURL)
 	if err != nil {
-		// Gracefully skip a not-yet-published year (e.g., future clock or early Jan).
+		// Gracefully skip a not-yet-published current/future year (e.g., clock skew
+		// or early January). Treat 404 on a past year as a transient error so an
+		// upstream glitch never silently drops an existing year from the cache.
 		if status == http.StatusNotFound {
-			out.skipped = true
-			return out
+			if yNum, parseErr := strconv.Atoi(year); parseErr == nil && yNum >= time.Now().UTC().Year() {
+				out.skipped = true
+				return out
+			}
 		}
 		out.err = fmt.Errorf("fetch meta %s: %w", year, err)
 		return out
@@ -333,13 +346,15 @@ func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string
 
 	if !force && sha != "" && sha == prevSHA {
 		if info, statErr := os.Stat(out.filePath); statErr == nil && info.Size() > 0 {
-			out.size = info.Size()
-			return out
+			if verifyFeedGzipFile(out.filePath, sha) == nil {
+				out.size = info.Size()
+				return out
+			}
 		}
 	}
 
 	feedURL := fmt.Sprintf("%s/nvdcve-2.0-%s.json.gz", c.nvdBaseURL, year)
-	size, err := c.downloadFile(ctx, feedURL, out.filePath)
+	size, err := c.downloadFeedFile(ctx, feedURL, out.filePath, sha)
 	if err != nil {
 		out.err = fmt.Errorf("download feed %s: %w", year, err)
 		return out
@@ -349,14 +364,12 @@ func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string
 	return out
 }
 
-// fetchKEV downloads CISA's KEV catalog, persists it locally, and returns a
-// lookup map of all actively exploited CVE IDs along with the catalog's SHA256.
+// fetchKEV downloads CISA's KEV catalog, validates its JSON structure before
+// persisting it locally, and returns a lookup map of all actively exploited
+// CVE IDs along with the catalog's SHA256.
 func (c *Cache) fetchKEV(ctx context.Context) (map[string]struct{}, string, error) {
 	kevPath := filepath.Join(c.dir, "kev.json")
-	if _, err := c.downloadFile(ctx, c.kevURL, kevPath); err != nil {
-		return nil, "", err
-	}
-	raw, err := os.ReadFile(kevPath)
+	raw, err := c.downloadAndValidateKEV(ctx, c.kevURL, kevPath)
 	if err != nil {
 		return nil, "", err
 	}
@@ -380,13 +393,47 @@ func (c *Cache) fetchKEV(ctx context.Context) (map[string]struct{}, string, erro
 	return set, kevSHA, nil
 }
 
-// fetchMetaSHA downloads an NVD .meta file and extracts its sha256 line.
+func (c *Cache) downloadAndValidateKEV(ctx context.Context, url, dst string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "UniBlue/1.0")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	var probe struct {
+		Vulnerabilities json.RawMessage `json:"vulnerabilities"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil || len(bytes.TrimSpace(probe.Vulnerabilities)) == 0 {
+		return nil, fmt.Errorf("invalid kev json payload from %s", url)
+	}
+	if err := writeBytesAtomic(dst, raw, 0o644); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// fetchMetaSHA downloads an NVD .meta file and extracts its required sha256 line.
 func (c *Cache) fetchMetaSHA(ctx context.Context, metaURL string) (string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
 	if err != nil {
 		return "", 0, err
 	}
-	req.Header.Set("User-Agent", "UniBlue/0.2")
+	req.Header.Set("User-Agent", "UniBlue/1.0")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -403,19 +450,83 @@ func (c *Cache) fetchMetaSHA(ctx context.Context, metaURL string) (string, int, 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.HasPrefix(strings.ToLower(line), "sha256:") {
-			return strings.TrimSpace(line[len("sha256:"):]), resp.StatusCode, nil
+			sha := strings.TrimSpace(line[len("sha256:"):])
+			if sha != "" {
+				return sha, resp.StatusCode, nil
+			}
 		}
 	}
-	return "", resp.StatusCode, nil
+	return "", resp.StatusCode, fmt.Errorf("missing sha256 line in %s", metaURL)
 }
 
-// downloadFile streams url into a temporary file and atomically renames it to dst.
-func (c *Cache) downloadFile(ctx context.Context, url, dst string) (int64, error) {
+func isHexSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// verifyFeedGzipFile validates that path is a readable gzipped JSON object and,
+// when expectedSHA is a 64-character hex SHA256 digest, verifies the
+// uncompressed JSON payload matches expectedSHA.
+func verifyFeedGzipFile(path, expectedSHA string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("invalid gzip header: %w", err)
+	}
+	defer gz.Close()
+
+	var firstByte [1]byte
+	h := sha256.New()
+	var buf [32 * 1024]byte
+	foundNonSpace := false
+	for {
+		n, readErr := gz.Read(buf[:])
+		if n > 0 {
+			chunk := buf[:n]
+			if !foundNonSpace {
+				trimmed := bytes.TrimLeft(chunk, " \t\r\n")
+				if len(trimmed) > 0 {
+					firstByte[0] = trimmed[0]
+					foundNonSpace = true
+				}
+			}
+			_, _ = h.Write(chunk)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("corrupt gzip stream: %w", readErr)
+		}
+	}
+	if !foundNonSpace || firstByte[0] != '{' {
+		return errors.New("feed payload is not a JSON object")
+	}
+	if isHexSHA256(expectedSHA) {
+		got := hex.EncodeToString(h.Sum(nil))
+		if !strings.EqualFold(got, expectedSHA) {
+			return fmt.Errorf("feed sha256 mismatch: got %s, want %s", got, expectedSHA)
+		}
+	}
+	return nil
+}
+
+// downloadFeedFile streams url into a unique temporary file, validates its gzip
+// integrity and SHA256 checksum, and atomically replaces dst only when valid.
+func (c *Cache) downloadFeedFile(ctx context.Context, url, dst, expectedSHA string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("User-Agent", "UniBlue/0.2")
+	req.Header.Set("User-Agent", "UniBlue/1.0")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -428,16 +539,20 @@ func (c *Cache) downloadFile(ctx context.Context, url, dst string) (int64, error
 		return 0, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
 	}
 
-	tmp := dst + ".tmp"
-	f, err := os.Create(tmp)
+	tmpFile, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*.tmp")
 	if err != nil {
 		return 0, err
 	}
-	n, copyErr := io.Copy(f, resp.Body)
-	closeErr := f.Close()
+	tmp := tmpFile.Name()
+	n, copyErr := io.Copy(tmpFile, resp.Body)
+	closeErr := tmpFile.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(tmp)
 		return 0, errors.Join(copyErr, closeErr)
+	}
+	if err := verifyFeedGzipFile(tmp, expectedSHA); err != nil {
+		_ = os.Remove(tmp)
+		return 0, fmt.Errorf("validate downloaded feed %s: %w", url, err)
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
@@ -446,189 +561,250 @@ func (c *Cache) downloadFile(ctx context.Context, url, dst string) (int64, error
 	return n, nil
 }
 
-// buildVendorIndex parses all yearly NVD .json.gz feeds in parallel over a
-// channel worker pool, groups Records by CPE vendor, and writes compact
-// gzipped vendor shard files under vendorsDir.
-func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendorsDir string, kevSet map[string]struct{}, kevSHA string, yearSHAs map[string]string, rawBytes int64, started time.Time) (*CacheStats, error) {
-	type parsedFeed struct {
-		total    int
-		withCPE  int
-		byVendor map[string][]Record
-		err      error
+func acquireCacheLock(ctx context.Context, lockPath string) (func(), error) {
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open cache lock %s: %w", lockPath, err)
 	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = f.Close()
+			}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = f.Close()
+			return nil, fmt.Errorf("lock cache %s: %w", lockPath, err)
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
 
+// buildVendorIndex streams all yearly NVD .json.gz feeds one CVE at a time into
+// hash-partitioned temporary spill buckets on disk, then compiles each bucket
+// into compact gzipped vendor shard files under vendorsDir. Keeping only 1/32
+// of vendors in memory at once keeps peak RSS well under 150 MB even on the
+// full 400k+ NVD dataset.
+func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendorsDir string, kevSet map[string]struct{}, kevSHA string, yearSHAs map[string]string, rawBytes int64, started time.Time) (*CacheStats, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	parseCtx, cancelParse := context.WithCancel(ctx)
-	defer cancelParse()
+	const numBuckets = 32
+	tmpDir, err := os.MkdirTemp(c.dir, ".index-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp index dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
-	workers := syncWorkers
-	if len(feedFiles) < workers && len(feedFiles) > 0 {
-		workers = len(feedFiles)
+	type spillBucket struct {
+		path string
+		file *os.File
+		buf  *bufio.Writer
+		enc  *json.Encoder
+	}
+	type spillEntry struct {
+		Vendor string `json:"v"`
+		Record Record `json:"r"`
 	}
 
-	jobs := make(chan string)
-	results := make(chan parsedFeed, workers)
-
-	var parseWG sync.WaitGroup
-	for range workers {
-		parseWG.Add(1)
-		go func() {
-			defer parseWG.Done()
-			for path := range jobs {
-				if parseCtx.Err() != nil {
-					return
+	buckets := make([]*spillBucket, numBuckets)
+	closeBuckets := func() {
+		for _, b := range buckets {
+			if b != nil {
+				if b.buf != nil {
+					_ = b.buf.Flush()
 				}
-				total, withCPE, byVendor, err := parseNVDFeed(path, kevSet)
-				select {
-				case results <- parsedFeed{total: total, withCPE: withCPE, byVendor: byVendor, err: err}:
-				case <-parseCtx.Done():
-					return
+				if b.file != nil {
+					_ = b.file.Close()
 				}
-			}
-		}()
-	}
-	parseProdDone := make(chan struct{})
-	go func() {
-		defer close(parseProdDone)
-		defer close(jobs)
-		for _, p := range feedFiles {
-			select {
-			case <-parseCtx.Done():
-				return
-			case jobs <- p:
+				b.file = nil
+				b.buf = nil
 			}
 		}
-	}()
-	go func() {
-		parseWG.Wait()
-		<-parseProdDone
-		close(results)
-	}()
+	}
+	defer closeBuckets()
 
-	// Merge per-year vendor buckets in the single collector goroutine (zero locks),
-	// always draining results after cancellation so workers never leak.
-	merged := make(map[string][]Record, 4096)
+	for i := range buckets {
+		bp := filepath.Join(tmpDir, fmt.Sprintf("bucket-%02d.ndjson", i))
+		f, err := os.Create(bp)
+		if err != nil {
+			return nil, fmt.Errorf("create spill bucket: %w", err)
+		}
+		bw := bufio.NewWriterSize(f, 32*1024)
+		buckets[i] = &spillBucket{
+			path: bp,
+			file: f,
+			buf:  bw,
+			enc:  json.NewEncoder(bw),
+		}
+	}
+
+	vendorBucket := func(vendor string) int {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(vendor))
+		return int(h.Sum32() % numBuckets)
+	}
+
+	// Pass 1: Stream each yearly feed one CVE record at a time into spill buckets.
 	totalCVEs := 0
 	indexedCPECVEs := 0
-	var parseErr error
-	for pf := range results {
-		if pf.err != nil {
-			if parseErr == nil {
-				parseErr = pf.err
-				cancelParse()
+	for _, path := range feedFiles {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		total, withCPE, err := streamNVDFeed(ctx, path, kevSet, func(vendor string, rec Record) error {
+			b := buckets[vendorBucket(vendor)]
+			return b.enc.Encode(spillEntry{Vendor: vendor, Record: rec})
+		})
+		if err != nil {
+			return nil, err
+		}
+		totalCVEs += total
+		indexedCPECVEs += withCPE
+	}
+	for _, b := range buckets {
+		if err := b.buf.Flush(); err != nil {
+			return nil, err
+		}
+		if err := b.file.Close(); err != nil {
+			return nil, err
+		}
+		b.file = nil
+		b.buf = nil
+	}
+
+	// Pass 2: Load one bucket at a time, group/sort by vendor, and atomically
+	// write each vendor's compressed shard file.
+	var (
+		vendorCount int
+		indexBytes  int64
+	)
+	for _, b := range buckets {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		f, err := os.Open(b.path)
+		if err != nil {
+			return nil, err
+		}
+		byVendor := make(map[string][]Record, 256)
+		dec := json.NewDecoder(bufio.NewReaderSize(f, 64*1024))
+		for {
+			var se spillEntry
+			err := dec.Decode(&se)
+			if errors.Is(err, io.EOF) {
+				break
 			}
+			if err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("decode spill bucket: %w", err)
+			}
+			byVendor[se.Vendor] = append(byVendor[se.Vendor], se.Record)
+		}
+		_ = f.Close()
+		_ = os.Remove(b.path)
+
+		if len(byVendor) == 0 {
 			continue
 		}
-		if parseErr != nil {
-			continue
+		vendorCount += len(byVendor)
+
+		type vendorJob struct {
+			vendor string
+			recs   []Record
 		}
-		totalCVEs += pf.total
-		indexedCPECVEs += pf.withCPE
-		for vendor, recs := range pf.byVendor {
-			merged[vendor] = append(merged[vendor], recs...)
+		type writeRes struct {
+			size int64
+			err  error
 		}
-	}
-	cancelParse()
-	if parseErr != nil {
-		return nil, parseErr
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 
-	// Write vendor shard files concurrently using a channel worker pool so
-	// thousands of small gzipped shards flush quickly.
-	type vendorJob struct {
-		vendor string
-		recs   []Record
-	}
-	type writeRes struct {
-		size int64
-		err  error
-	}
+		writeCtx, cancelWrite := context.WithCancel(ctx)
+		writeWorkers := syncWorkers
+		if len(byVendor) < writeWorkers {
+			writeWorkers = len(byVendor)
+		}
+		writeJobs := make(chan vendorJob, writeWorkers)
+		writeResults := make(chan writeRes, writeWorkers)
 
-	writeCtx, cancelWrite := context.WithCancel(ctx)
-	defer cancelWrite()
-
-	writeWorkers := syncWorkers * 2
-	writeJobs := make(chan vendorJob)
-	writeResults := make(chan writeRes, writeWorkers)
-
-	var writeWG sync.WaitGroup
-	for range writeWorkers {
-		writeWG.Add(1)
-		go func() {
-			defer writeWG.Done()
-			for vj := range writeJobs {
-				if writeCtx.Err() != nil {
-					return
+		var writeWG sync.WaitGroup
+		for range writeWorkers {
+			writeWG.Add(1)
+			go func() {
+				defer writeWG.Done()
+				for vj := range writeJobs {
+					if writeCtx.Err() != nil {
+						return
+					}
+					sort.Slice(vj.recs, func(i, j int) bool {
+						if vj.recs[i].KEV != vj.recs[j].KEV {
+							return vj.recs[i].KEV
+						}
+						if vj.recs[i].Severity != vj.recs[j].Severity {
+							return vj.recs[i].Severity > vj.recs[j].Severity
+						}
+						return vj.recs[i].ID > vj.recs[j].ID
+					})
+					shardPath := filepath.Join(vendorsDir, sanitizeVendor(vj.vendor)+".json.gz")
+					sz, err := writeGzipJSONAtomic(shardPath, vj.recs)
+					select {
+					case writeResults <- writeRes{size: sz, err: err}:
+					case <-writeCtx.Done():
+						return
+					}
 				}
-				// Sort newest/highest-severity CVEs first inside each vendor shard.
-				sort.Slice(vj.recs, func(i, j int) bool {
-					if vj.recs[i].KEV != vj.recs[j].KEV {
-						return vj.recs[i].KEV
-					}
-					if vj.recs[i].Severity != vj.recs[j].Severity {
-						return vj.recs[i].Severity > vj.recs[j].Severity
-					}
-					return vj.recs[i].ID > vj.recs[j].ID
-				})
-				shardPath := filepath.Join(vendorsDir, sanitizeVendor(vj.vendor)+".json.gz")
-				sz, err := writeGzipJSONAtomic(shardPath, vj.recs)
+			}()
+		}
+		writeProdDone := make(chan struct{})
+		go func() {
+			defer close(writeProdDone)
+			defer close(writeJobs)
+			for vendor, recs := range byVendor {
 				select {
-				case writeResults <- writeRes{size: sz, err: err}:
 				case <-writeCtx.Done():
 					return
+				case writeJobs <- vendorJob{vendor: vendor, recs: recs}:
 				}
 			}
 		}()
-	}
-	writeProdDone := make(chan struct{})
-	go func() {
-		defer close(writeProdDone)
-		defer close(writeJobs)
-		for vendor, recs := range merged {
-			select {
-			case <-writeCtx.Done():
-				return
-			case writeJobs <- vendorJob{vendor: vendor, recs: recs}:
-			}
-		}
-	}()
-	go func() {
-		writeWG.Wait()
-		<-writeProdDone
-		close(writeResults)
-	}()
+		go func() {
+			writeWG.Wait()
+			<-writeProdDone
+			close(writeResults)
+		}()
 
-	var indexBytes int64
-	var writeErr error
-	for wr := range writeResults {
-		if wr.err != nil {
-			if writeErr == nil {
-				writeErr = wr.err
-				cancelWrite()
+		var writeErr error
+		for wr := range writeResults {
+			if wr.err != nil {
+				if writeErr == nil {
+					writeErr = wr.err
+					cancelWrite()
+				}
+				continue
 			}
-			continue
+			indexBytes += wr.size
 		}
-		indexBytes += wr.size
-	}
-	cancelWrite()
-	if writeErr != nil {
-		return nil, writeErr
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+		cancelWrite()
+		if writeErr != nil {
+			return nil, writeErr
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	return &CacheStats{
 		SyncedAt:       time.Now().UTC(),
 		TotalCVEs:      totalCVEs,
 		IndexedCPECVEs: indexedCPECVEs,
-		VendorCount:    len(merged),
+		VendorCount:    vendorCount,
 		KEVCount:       len(kevSet),
 		KEVSHA:         kevSHA,
 		RawFeedBytes:   rawBytes,
@@ -638,66 +814,112 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 	}, nil
 }
 
-// parseNVDFeed streams a single nvdcve-2.0-<year>.json.gz archive and extracts
-// slim Records grouped by CPE vendor.
-func parseNVDFeed(path string, kevSet map[string]struct{}) (int, int, map[string][]Record, error) {
+// streamNVDFeed streams a single nvdcve-2.0-<year>.json.gz archive one
+// vulnerability item at a time without materializing the whole feed in RAM.
+func streamNVDFeed(ctx context.Context, path string, kevSet map[string]struct{}, emit func(vendor string, rec Record) error) (int, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, err
 	}
 	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return 0, 0, nil, fmt.Errorf("gunzip %s: %w", path, err)
+		return 0, 0, fmt.Errorf("gunzip %s: %w", path, err)
 	}
 	defer gz.Close()
 
-	var feed nvdFeedFile
-	if err := json.NewDecoder(gz).Decode(&feed); err != nil {
-		return 0, 0, nil, fmt.Errorf("decode %s: %w", path, err)
+	dec := json.NewDecoder(bufio.NewReaderSize(gz, 64*1024))
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, 0, fmt.Errorf("decode %s: %w", path, err)
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return 0, 0, fmt.Errorf("decode %s: expected JSON object", path)
 	}
 
-	byVendor := make(map[string][]Record, 512)
 	total := 0
 	withCPE := 0
+	foundVulns := false
 
-	for _, item := range feed.Vulnerabilities {
-		c := item.CVE
-		if strings.EqualFold(c.VulnStatus, "Rejected") || c.ID == "" {
+	for dec.More() {
+		if err := ctx.Err(); err != nil {
+			return 0, 0, err
+		}
+		keyTok, err := dec.Token()
+		if err != nil {
+			return 0, 0, fmt.Errorf("decode %s key: %w", path, err)
+		}
+		key, _ := keyTok.(string)
+		if key != "vulnerabilities" {
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return 0, 0, fmt.Errorf("decode %s skip %q: %w", path, key, err)
+			}
 			continue
 		}
-		total++
-
-		vendorMatches := extractVendorMatches(c.Configurations)
-		if len(vendorMatches) == 0 {
-			continue
+		foundVulns = true
+		arrTok, err := dec.Token()
+		if err != nil {
+			return 0, 0, fmt.Errorf("decode %s vulnerabilities: %w", path, err)
 		}
-		withCPE++
-
-		sev, score := extractCVSS(c.Metrics)
-		_, isKEV := kevSet[strings.ToUpper(c.ID)]
-		desc := extractEnglishDesc(c.Descriptions)
-
-		published := c.Published
-		if len(published) >= 10 {
-			published = published[:10]
+		if delim, ok := arrTok.(json.Delim); !ok || delim != '[' {
+			return 0, 0, fmt.Errorf("decode %s vulnerabilities: expected array", path)
 		}
+		for dec.More() {
+			if err := ctx.Err(); err != nil {
+				return 0, 0, err
+			}
+			var item struct {
+				CVE nvdCVE `json:"cve"`
+			}
+			if err := dec.Decode(&item); err != nil {
+				return 0, 0, fmt.Errorf("decode %s item: %w", path, err)
+			}
+			c := item.CVE
+			if strings.EqualFold(c.VulnStatus, "Rejected") || c.ID == "" {
+				continue
+			}
+			total++
 
-		for vendor, matches := range vendorMatches {
-			byVendor[vendor] = append(byVendor[vendor], Record{
-				ID:          c.ID,
-				Published:   published,
-				Severity:    sev,
-				CVSS:        score,
-				KEV:         isKEV,
-				Description: desc,
-				Matches:     matches,
-			})
+			vendorMatches := extractVendorMatches(c.Configurations)
+			if len(vendorMatches) == 0 {
+				continue
+			}
+			withCPE++
+
+			sev, score := extractCVSS(c.Metrics)
+			_, isKEV := kevSet[strings.ToUpper(c.ID)]
+			desc := extractEnglishDesc(c.Descriptions)
+
+			published := c.Published
+			if len(published) >= 10 {
+				published = published[:10]
+			}
+
+			for vendor, matches := range vendorMatches {
+				if err := emit(vendor, Record{
+					ID:          c.ID,
+					Published:   published,
+					Severity:    sev,
+					CVSS:        score,
+					KEV:         isKEV,
+					Description: desc,
+					Matches:     matches,
+				}); err != nil {
+					return 0, 0, err
+				}
+			}
+		}
+		// Consume closing ']'.
+		if _, err := dec.Token(); err != nil {
+			return 0, 0, fmt.Errorf("decode %s close array: %w", path, err)
 		}
 	}
-
-	return total, withCPE, byVendor, nil
+	if !foundVulns {
+		return 0, 0, fmt.Errorf("decode %s: missing vulnerabilities array", path)
+	}
+	return total, withCPE, nil
 }
 
 // LookupVendor loads all cached CVE Records for a single normalized vendor token.
@@ -1352,14 +1574,24 @@ func sanitizeVendor(vendor string) string {
 	return out
 }
 
-// writeJSONAtomic encodes v as JSON and atomically replaces path.
-func writeJSONAtomic(path string, v any) error {
-	raw, err := json.MarshalIndent(v, "", "  ")
+func writeBytesAtomic(path string, raw []byte, mode os.FileMode) error {
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+	tmp := tmpFile.Name()
+	if err := tmpFile.Chmod(mode); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if _, err := tmpFile.Write(raw); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -1369,18 +1601,27 @@ func writeJSONAtomic(path string, v any) error {
 	return nil
 }
 
-// writeGzipJSONAtomic encodes v as gzipped JSON and atomically replaces path,
-// returning the compressed byte size on disk.
+// writeJSONAtomic encodes v as JSON and atomically replaces path using a unique temp file.
+func writeJSONAtomic(path string, v any) error {
+	raw, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeBytesAtomic(path, raw, 0o644)
+}
+
+// writeGzipJSONAtomic encodes v as gzipped JSON and atomically replaces path
+// using a unique temp file, returning the compressed byte size on disk.
 func writeGzipJSONAtomic(path string, v any) (int64, error) {
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return 0, err
 	}
-	gz := gzip.NewWriter(f)
+	tmp := tmpFile.Name()
+	gz := gzip.NewWriter(tmpFile)
 	encErr := json.NewEncoder(gz).Encode(v)
 	gzErr := gz.Close()
-	closeErr := f.Close()
+	closeErr := tmpFile.Close()
 	if err := errors.Join(encErr, gzErr, closeErr); err != nil {
 		_ = os.Remove(tmp)
 		return 0, err

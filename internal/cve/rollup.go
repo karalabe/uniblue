@@ -180,7 +180,14 @@ func (s ProductSummary) Headline() string {
 	if s.MinFixedVersion != "" {
 		extra += fmt.Sprintf(", verify >= %s", s.MinFixedVersion)
 	} else if s.MaxAffectedVersion != "" {
-		extra += fmt.Sprintf(", verify > %s", s.MaxAffectedVersion)
+		// When a 4-part UniFi build (e.g. 6.6.55.15189) matched a 3-part
+		// inclusive bound (6.6.55), clarify the release train so the advice
+		// never reads as already satisfied.
+		if s.Product.Version != "" && CompareVersions(s.Product.Version, s.MaxAffectedVersion) > 0 {
+			extra += fmt.Sprintf(", verify > %s.x", s.MaxAffectedVersion)
+		} else {
+			extra += fmt.Sprintf(", verify > %s", s.MaxAffectedVersion)
+		}
 	}
 	return fmt.Sprintf("%s%s: %d CVE(s) (max CVSS %.1f%s)", s.Product.Label, ver, s.TotalCVEs, s.MaxCVSS, extra)
 }

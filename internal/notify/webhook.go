@@ -40,6 +40,28 @@ const (
 	maxNtfyBodyBytes = 3900
 )
 
+// HTTPStatusError is returned when a webhook endpoint responds with a non-2xx
+// HTTP status code.
+type HTTPStatusError struct {
+	StatusCode int
+	Redirect   bool
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e.Redirect {
+		return fmt.Sprintf("webhook returned redirect HTTP %d (redirects are disabled)", e.StatusCode)
+	}
+	return fmt.Sprintf("webhook returned HTTP %d", e.StatusCode)
+}
+
+// Permanent reports whether the HTTP status represents a non-retryable client
+// rejection (4xx other than 408 Request Timeout and 429 Too Many Requests).
+func (e *HTTPStatusError) Permanent() bool {
+	return e.StatusCode >= 400 && e.StatusCode < 500 &&
+		e.StatusCode != http.StatusRequestTimeout &&
+		e.StatusCode != http.StatusTooManyRequests
+}
+
 // Notifier formats and delivers change-driven alerts from a risk.Diff.
 type Notifier struct {
 	// webhookURL is the target HTTP(S) endpoint; empty disables delivery.
@@ -244,10 +266,10 @@ func (n *Notifier) SendWithID(ctx context.Context, id, site string, diff risk.Di
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return fmt.Errorf("webhook returned redirect HTTP %d (redirects are disabled)", resp.StatusCode)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Redirect: true}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
+		return &HTTPStatusError{StatusCode: resp.StatusCode}
 	}
 	return nil
 }

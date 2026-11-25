@@ -12,12 +12,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +55,24 @@ const (
 	// briefly sleep or roam between APs. Wired clients evict immediately on leave
 	// or physical switch port link-down.
 	defaultLeaveGrace = 60 * time.Second
+
+	// maxWebhookCVEsPerBatch caps how many CVEAlert entries are packed into a
+	// single webhook delivery so large initial or update bursts stay well below
+	// typical 1 MB reverse-proxy body limits.
+	maxWebhookCVEsPerBatch = 50
+
+	// maxCoalescedEventsPerBatch caps how many live events can be merged into
+	// a single queued live-event batch during extended webhook outages.
+	maxCoalescedEventsPerBatch = 200
+
+	// exactCVETransientGrace retains exact CVE baseline keys across brief banner
+	// or probe misses so a single flaky scan does not drop and immediately
+	// re-alert the same CVE on the next cycle.
+	exactCVETransientGrace = 15 * time.Minute
+
+	// exactCVEOfflineTTL bounds how long exact CVE baseline keys are carried
+	// forward for offline or unprobed hosts before aging out.
+	exactCVEOfflineTTL = 7 * 24 * time.Hour
 )
 
 // Options tunes the live server daemon's polling, reconciliation, and HTTP settings.
@@ -540,7 +560,10 @@ func (e *Engine) cveSyncLoop(ctx context.Context) {
 
 	initialDelay := time.Duration(0)
 	if st, err := cache.Stats(); err == nil && st.VendorCount > 0 && !st.SyncedAt.IsZero() {
-		if age := time.Since(st.SyncedAt); age < interval {
+		age := time.Since(st.SyncedAt)
+		if age < 0 {
+			initialDelay = 0
+		} else if age < interval {
 			initialDelay = interval - age
 		}
 	}
@@ -1069,7 +1092,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 				pendingEvents = append(pendingEvents, e.anomalies.EvaluateClientJoinAnomalies(cl, now)...)
 			}
 			queueScan(cl, true)
-		case !sameClientIPSet(prev, cl) || prev.NetworkName != cl.NetworkName:
+		case !sameClientStableIP(prev, cl) || prev.NetworkName != cl.NetworkName:
 			changed = true
 			delete(e.profilesByMAC, k)
 			delete(e.findingsByMAC, k)
@@ -1340,6 +1363,7 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	e.mu.RLock()
 	hints := e.snap.PortHintsByIP()
 	sitePrefixes := snapshotSubnets(e.snap)
+	reflectorIPs := snapshotReflectorIPs(e.snap)
 	cacheTTL := e.opts.ReconcileInterval
 	if cacheTTL <= 0 {
 		cacheTTL = 30 * time.Minute
@@ -1352,6 +1376,7 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 
 	fp := probe.NewFingerprinter(e.scanPorts, 1, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
 	fp.SetAllowedSubnets(sitePrefixes)
+	fp.SetTrustedReflectors(reflectorIPs)
 	if cachedDisc != nil {
 		fp.SetCachedDiscovery(cachedDisc)
 	}
@@ -1466,22 +1491,22 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	}
 }
 
-func sameClientIPSet(a, b unifi.Client) bool {
-	ipsA := a.AllIPs()
-	ipsB := b.AllIPs()
-	if len(ipsA) != len(ipsB) {
+// sameClientStableIP reports whether a and b have the same primary routing
+// identity without treating IPv6 temporary privacy-address rotations on a
+// dual-stack host (where IPv4 is unchanged) as a client move.
+func sameClientStableIP(a, b unifi.Client) bool {
+	ipA := strings.ToLower(strings.TrimSpace(a.IP))
+	ipB := strings.ToLower(strings.TrimSpace(b.IP))
+	if ipA != ipB {
 		return false
 	}
-	set := make(map[string]struct{}, len(ipsA))
-	for _, ip := range ipsA {
-		set[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
+	if ipA != "" {
+		// Both carry the same IPv4 address; rotating temporary IPv6 privacy
+		// addresses on the same VLAN is normal and not a client move.
+		return true
 	}
-	for _, ip := range ipsB {
-		if _, ok := set[strings.ToLower(strings.TrimSpace(ip))]; !ok {
-			return false
-		}
-	}
-	return true
+	// IPv6-only client: compare the primary routable IPv6 address.
+	return strings.EqualFold(strings.TrimSpace(a.PrimaryIP()), strings.TrimSpace(b.PrimaryIP()))
 }
 
 func clientHasIP(cl unifi.Client, target string) bool {
@@ -1533,6 +1558,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 
 	fp := probe.NewFingerprinter(e.scanPorts, e.cfg.Scan.Concurrency, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
 	fp.SetAllowedSubnets(snapshotSubnets(snap))
+	fp.SetTrustedReflectors(snapshotReflectorIPs(snap))
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
 	fp.SetProgressFunc(func(phase string, done, total int, host string) {
 		switch phase {
@@ -1746,6 +1772,23 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		visCopy.MissingFeeds = append([]string(nil), snapPtr.Visibility.MissingFeeds...)
 		snapCopy.Visibility = &visCopy
 	}
+	// Retain briefly sleeping/roaming wireless clients still within their
+	// defaultLeaveGrace window so /api/v1/hosts/{id} and the dashboard do not
+	// flap them out of existence with transient 404s mid-scan.
+	if len(e.missingClients) > 0 {
+		clients := make([]unifi.Client, 0, len(snapPtr.Clients)+len(e.missingClients))
+		seenCl := make(map[string]struct{}, len(snapPtr.Clients))
+		for _, cl := range snapPtr.Clients {
+			clients = append(clients, cl)
+			seenCl[clientKey(cl)] = struct{}{}
+		}
+		for k, mc := range e.missingClients {
+			if _, ok := seenCl[k]; !ok {
+				clients = append(clients, mc.client)
+			}
+		}
+		snapCopy.Clients = clients
+	}
 	snap := &snapCopy
 
 	profiles := make([]probe.HostProfile, 0, len(e.profilesByMAC))
@@ -1779,13 +1822,18 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	var exactCVEs, potentialCVEs []cve.ProductSummary
 	var rawExactMatches []cve.Match
 	cveLoaded := false
+	cveMatched := false
 	if cveCache != nil && cveIdent != nil {
 		cveLoaded = true
 		products := cveIdent.Identify(snap, profiles)
-		if matches, err := cveCache.MatchProducts(products, cve.MatchOptions{
+		matches, err := cveCache.MatchProducts(products, cve.MatchOptions{
 			MinSeverity:          checks.SeverityHigh,
 			PotentialMaxAgeYears: 2,
-		}); err == nil {
+		})
+		if err != nil {
+			e.logger.Warn("failed to match products against local CVE cache; preserving CVE baseline", "err", err)
+		} else {
+			cveMatched = true
 			for _, m := range matches {
 				if m.Confidence == cve.ConfidenceExact {
 					rawExactMatches = append(rawExactMatches, m)
@@ -1868,14 +1916,15 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	// never stalls recomputeMu/pollDelta or re-emits finding_new infinitely.
 	postEvents := append([]LiveEvent(nil), extraEvents...)
 	nextState := prevRisk
-	var webhookToSend *pendingWebhook
+	var webhooksToSend []pendingWebhook
 	var liveEventsToPush []risk.AlertEvent
 	if baselineReady {
 		diff := risk.ComputeDiffWithProbed(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
 		var nextExactCVEs map[string]string
-		if cveLoaded {
+		var nextExactCVELastSeen map[string]time.Time
+		if cveMatched {
 			var newCVEs []risk.CVEAlert
-			newCVEs, nextExactCVEs = diffExactCVEs(prevRisk, snap, probedHostKeys, rawExactMatches, exactCVEs)
+			newCVEs, nextExactCVEs, nextExactCVELastSeen = diffExactCVEs(prevRisk, snap, probedHostKeys, rawExactMatches, exactCVEs)
 			diff.NewCVEs = newCVEs
 		}
 		if prevRisk != nil {
@@ -1893,15 +1942,22 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 			if e.notifier != nil {
 				if diff.HasAlerts(e.minNotify) {
 					diff.Events = append(diff.Events, pushEvents...)
-					webhookToSend = &pendingWebhook{id: notify.NewWebhookID(), site: snap.Site, diff: diff}
+					webhooksToSend = splitWebhookByCVEs(snap.Site, diff, maxWebhookCVEsPerBatch)
 				} else if len(pushEvents) > 0 {
 					liveEventsToPush = pushEvents
 				}
 			}
 		}
 		nextState = risk.BuildStateWithPrev(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
-		if cveLoaded {
+		if cveMatched {
 			nextState.ExactCVEs = nextExactCVEs
+			nextState.ExactCVELastSeen = nextExactCVELastSeen
+		}
+		// Persist any outbound alert batches to disk BEFORE advancing the
+		// saved state baseline so a crash between the two writes never loses
+		// an alert. The async drainer starts right after publishing state below.
+		if len(webhooksToSend) > 0 {
+			e.enqueueWebhooks(ctx, webhooksToSend, false)
 		}
 		if e.cfg != nil && e.cfg.State.Path != "" {
 			if err := risk.SaveState(e.cfg.State.Path, nextState); err != nil {
@@ -1949,8 +2005,8 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	}
 	e.mu.Unlock()
 
-	if webhookToSend != nil {
-		e.enqueueWebhook(ctx, *webhookToSend)
+	if len(webhooksToSend) > 0 {
+		e.startWebhookDrainer(ctx)
 	} else if len(liveEventsToPush) > 0 {
 		e.enqueueLiveEvents(ctx, snap.Site, liveEventsToPush)
 	}
@@ -2096,27 +2152,72 @@ func (e *Engine) resumePendingWebhooks(ctx context.Context) {
 	}
 }
 
-func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
-	if item.id == "" {
-		item.id = notify.NewWebhookID()
+func splitWebhookByCVEs(site string, diff risk.Diff, maxCVEs int) []pendingWebhook {
+	if maxCVEs <= 0 || len(diff.NewCVEs) <= maxCVEs {
+		return []pendingWebhook{{id: notify.NewWebhookID(), site: site, diff: diff}}
 	}
-	if item.queuedAt.IsZero() {
-		item.queuedAt = time.Now().UTC()
+	var out []pendingWebhook
+	first := diff
+	first.NewCVEs = append([]risk.CVEAlert(nil), diff.NewCVEs[:maxCVEs]...)
+	out = append(out, pendingWebhook{id: notify.NewWebhookID(), site: site, diff: first})
+	for off := maxCVEs; off < len(diff.NewCVEs); off += maxCVEs {
+		end := off + maxCVEs
+		if end > len(diff.NewCVEs) {
+			end = len(diff.NewCVEs)
+		}
+		chunk := make([]risk.CVEAlert, end-off)
+		copy(chunk, diff.NewCVEs[off:end])
+		out = append(out, pendingWebhook{
+			id:   notify.NewWebhookID(),
+			site: site,
+			diff: risk.Diff{NewCVEs: chunk},
+		})
+	}
+	return out
+}
+
+func isLiveEventOnlyDiff(d risk.Diff) bool {
+	return len(d.NewFindings) == 0 &&
+		len(d.EscalatedFindings) == 0 &&
+		len(d.NewTrustedClients) == 0 &&
+		len(d.NewPortForwards) == 0 &&
+		len(d.NewCVEs) == 0 &&
+		len(d.Events) > 0
+}
+
+func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
+	e.enqueueWebhooks(ctx, []pendingWebhook{item}, true)
+}
+
+func (e *Engine) enqueueWebhooks(ctx context.Context, items []pendingWebhook, startDrainer bool) {
+	if len(items) == 0 {
+		return
 	}
 	e.webhookMu.Lock()
-	// Merge any coalesced live events into this immediate webhook so bursts are
-	// delivered together without a duplicate follow-up push.
+	// Merge any coalesced live events into the first immediate webhook so bursts
+	// are delivered together without a duplicate follow-up push.
 	if len(e.coalescedEvents) > 0 {
 		if e.coalesceCancel != nil {
 			e.coalesceCancel()
 			e.coalesceCancel = nil
 		}
 		e.coalesceGen++
-		item.diff.Events = appendUniqueAlertEvents(e.coalescedEvents, item.diff.Events)
+		items[0].diff.Events = appendUniqueAlertEvents(e.coalescedEvents, items[0].diff.Events)
 		e.coalescedEvents = nil
 		e.coalescedSite = ""
 	}
-	e.enqueueWebhookLocked(ctx, item, true)
+	for _, item := range items {
+		e.enqueueWebhookLocked(ctx, item, startDrainer)
+	}
+	e.webhookMu.Unlock()
+}
+
+func (e *Engine) startWebhookDrainer(ctx context.Context) {
+	e.webhookMu.Lock()
+	if len(e.pendingWebhooks) > 0 && !e.webhookRunning && e.notifier != nil {
+		e.webhookRunning = true
+		go e.drainWebhooks(ctx)
+	}
 	e.webhookMu.Unlock()
 }
 
@@ -2127,17 +2228,64 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 	if item.queuedAt.IsZero() {
 		item.queuedAt = time.Now().UTC()
 	}
-	e.webhookSeq++
-	item.seq = e.webhookSeq
 	if len(e.pendingWebhooks) >= maxPendingWebhooks {
-		// Never drop index 0 while drainWebhooks may be actively sending it;
-		// evict the oldest non-in-flight queued batch at index 1 instead.
+		// Never drop index 0 while drainWebhooks may be actively sending it.
+		startIdx := 0
 		if e.webhookRunning && len(e.pendingWebhooks) > 1 {
-			e.pendingWebhooks = append(e.pendingWebhooks[:1], e.pendingWebhooks[2:]...)
+			startIdx = 1
+		}
+		if isLiveEventOnlyDiff(item.diff) {
+			// Prefer merging into an existing non-in-flight live-event batch so
+			// steady live-event bursts during an outage never evict queued diffs.
+			merged := false
+			for i := len(e.pendingWebhooks) - 1; i >= startIdx; i-- {
+				if isLiveEventOnlyDiff(e.pendingWebhooks[i].diff) && e.pendingWebhooks[i].site == item.site {
+					combined := appendUniqueAlertEvents(e.pendingWebhooks[i].diff.Events, item.diff.Events)
+					if len(combined) > maxCoalescedEventsPerBatch {
+						combined = combined[len(combined)-maxCoalescedEventsPerBatch:]
+					}
+					e.pendingWebhooks[i].diff.Events = combined
+					merged = true
+					break
+				}
+			}
+			if merged {
+				e.persistPendingWebhooksLocked()
+				if startDrainer && !e.webhookRunning && e.notifier != nil {
+					e.webhookRunning = true
+					go e.drainWebhooks(ctx)
+				}
+				return
+			}
+			// Otherwise evict the oldest non-in-flight live-event batch if one exists;
+			// never evict a queued diff/finding batch for a live-event-only batch.
+			evictIdx := -1
+			for i := startIdx; i < len(e.pendingWebhooks); i++ {
+				if isLiveEventOnlyDiff(e.pendingWebhooks[i].diff) {
+					evictIdx = i
+					break
+				}
+			}
+			if evictIdx < 0 {
+				e.logger.Warn("webhook queue full of state-diff alerts; dropping live-event-only batch to preserve queued findings")
+				return
+			}
+			e.pendingWebhooks = append(e.pendingWebhooks[:evictIdx], e.pendingWebhooks[evictIdx+1:]...)
 		} else {
-			e.pendingWebhooks = e.pendingWebhooks[1:]
+			// Incoming diff-bearing batch: evict the oldest non-in-flight
+			// live-event-only batch first, falling back to startIdx.
+			evictIdx := startIdx
+			for i := startIdx; i < len(e.pendingWebhooks); i++ {
+				if isLiveEventOnlyDiff(e.pendingWebhooks[i].diff) {
+					evictIdx = i
+					break
+				}
+			}
+			e.pendingWebhooks = append(e.pendingWebhooks[:evictIdx], e.pendingWebhooks[evictIdx+1:]...)
 		}
 	}
+	e.webhookSeq++
+	item.seq = e.webhookSeq
 	e.pendingWebhooks = append(e.pendingWebhooks, item)
 	e.persistPendingWebhooksLocked()
 	if startDrainer && !e.webhookRunning && e.notifier != nil {
@@ -2211,15 +2359,44 @@ func (e *Engine) flushCoalescedEvents(ctx context.Context, gen uint64, startDrai
 	e.enqueueWebhookLocked(ctx, item, startDrainer)
 }
 
+func splitEventCount(summary string) (string, int) {
+	s := strings.TrimSpace(summary)
+	if idx := strings.LastIndex(s, " (x"); idx > 0 && strings.HasSuffix(s, ")") {
+		numStr := s[idx+3 : len(s)-1]
+		if n, err := strconv.Atoi(numStr); err == nil && n > 1 {
+			return s[:idx], n
+		}
+	}
+	return s, 1
+}
+
 func appendUniqueAlertEvents(dst, src []risk.AlertEvent) []risk.AlertEvent {
-	seen := make(map[string]struct{}, len(dst)+len(src))
+	idxByKey := make(map[string]int, len(dst)+len(src))
+	counts := make([]int, 0, len(dst)+len(src))
+	bases := make([]string, 0, len(dst)+len(src))
 	out := make([]risk.AlertEvent, 0, len(dst)+len(src))
 	add := func(ev risk.AlertEvent) {
-		key := ev.Type + "|" + ev.Host + "|" + ev.IP + "|" + ev.Summary
-		if _, dup := seen[key]; dup {
+		base, n := splitEventCount(ev.Summary)
+		key := ev.Type + "|" + ev.Host + "|" + ev.IP + "|" + base
+		if idx, dup := idxByKey[key]; dup {
+			counts[idx] += n
+			if ev.Severity > out[idx].Severity {
+				out[idx].Severity = ev.Severity
+			}
+			if ev.Time.After(out[idx].Time) {
+				out[idx].Time = ev.Time
+			}
+			out[idx].Summary = fmt.Sprintf("%s (x%d)", bases[idx], counts[idx])
 			return
 		}
-		seen[key] = struct{}{}
+		idxByKey[key] = len(out)
+		bases = append(bases, base)
+		counts = append(counts, n)
+		if n > 1 {
+			ev.Summary = fmt.Sprintf("%s (x%d)", base, n)
+		} else {
+			ev.Summary = base
+		}
 		out = append(out, ev)
 	}
 	for _, ev := range dst {
@@ -2233,16 +2410,53 @@ func appendUniqueAlertEvents(dst, src []risk.AlertEvent) []risk.AlertEvent {
 
 // diffExactCVEs compares freshly matched exact-version CVEs against the
 // previous baseline state, returning newly matched (or newly KEV-promoted)
-// CVE alerts and the next persisted ExactCVEs map. When prev == nil or
-// prev.ExactCVEs == nil (initial seed or first run after upgrade), it seeds
-// the baseline silently without emitting a storm of historical CVEs.
+// CVE alerts, the next persisted ExactCVEs map, and last-seen timestamps.
+// Keys are anchored to device MAC addresses when known (falling back to IP
+// only when MAC is unavailable) so DHCP renumbering does not cause re-alerts
+// while a new host reusing an old IP is alerted cleanly.
 func diffExactCVEs(
 	prev *risk.State,
 	snap *unifi.Snapshot,
 	probedHostKeys map[string]struct{},
 	exactMatches []cve.Match,
 	exactRollups []cve.ProductSummary,
-) ([]risk.CVEAlert, map[string]string) {
+) ([]risk.CVEAlert, map[string]string, map[string]time.Time) {
+	now := time.Now().UTC()
+	ipToDevKey := make(map[string]string)
+	activeKeys := make(map[string]struct{})
+	infraKeys := make(map[string]struct{})
+	if snap != nil {
+		for _, d := range snap.Devices {
+			dmac := strings.ToLower(strings.TrimSpace(d.MAC))
+			dip := strings.ToLower(strings.TrimSpace(d.IP))
+			if dmac != "" {
+				activeKeys[dmac] = struct{}{}
+				infraKeys[dmac] = struct{}{}
+			}
+			if dip != "" {
+				activeKeys[dip] = struct{}{}
+				infraKeys[dip] = struct{}{}
+				if dmac != "" {
+					ipToDevKey[dip] = dmac
+				}
+			}
+		}
+		for _, cl := range snap.Clients {
+			cmac := strings.ToLower(strings.TrimSpace(cl.MAC))
+			if cmac != "" {
+				activeKeys[cmac] = struct{}{}
+			}
+			for _, ip := range cl.AllIPs() {
+				if low := strings.ToLower(strings.TrimSpace(ip)); low != "" {
+					activeKeys[low] = struct{}{}
+					if cmac != "" {
+						ipToDevKey[low] = cmac
+					}
+				}
+			}
+		}
+	}
+
 	fixedByProd := make(map[string]string, len(exactRollups))
 	for _, s := range exactRollups {
 		pk := fmt.Sprintf("%s|%s|%s",
@@ -2256,24 +2470,39 @@ func diffExactCVEs(
 	}
 
 	next := make(map[string]string, len(exactMatches))
+	nextLastSeen := make(map[string]time.Time, len(exactMatches))
+	migratedLegacy := make(map[string]struct{})
 	var alerts []risk.CVEAlert
 	seeded := prev != nil && prev.ExactCVEs != nil
 
 	for _, m := range exactMatches {
 		hostIP := strings.ToLower(strings.TrimSpace(m.Product.HostIP))
+		devKey := ipToDevKey[hostIP]
+		if devKey == "" {
+			devKey = hostIP
+		}
 		label := strings.ToLower(strings.TrimSpace(m.Product.Label))
 		ver := strings.ToLower(strings.TrimSpace(m.Product.Version))
-		key := fmt.Sprintf("%s|%s|%s|%s", hostIP, label, ver, m.Record.ID)
+		key := fmt.Sprintf("%s|%s|%s|%s", devKey, label, ver, m.Record.ID)
+		legacyKey := fmt.Sprintf("%s|%s|%s|%s", hostIP, label, ver, m.Record.ID)
 		status := m.Record.Severity.String()
 		if m.Record.KEV {
 			status += "|kev"
 		}
 		next[key] = status
+		nextLastSeen[key] = now
 
 		if !seeded {
 			continue
 		}
 		prevStatus, existed := prev.ExactCVEs[key]
+		if !existed && legacyKey != key {
+			if legStatus, legOK := prev.ExactCVEs[legacyKey]; legOK {
+				prevStatus = legStatus
+				existed = true
+				migratedLegacy[legacyKey] = struct{}{}
+			}
+		}
 		kevPromoted := m.Record.KEV && !strings.HasSuffix(prevStatus, "|kev")
 		if existed && !kevPromoted {
 			continue
@@ -2294,34 +2523,35 @@ func diffExactCVEs(
 		})
 	}
 
-	// Carry forward exact CVE keys for hosts not currently online/probed so a
-	// sleeping laptop or briefly disconnected appliance does not re-alert its
-	// existing CVEs when it reconnects.
+	// Carry forward exact CVE keys for offline/unprobed hosts (up to 7 days)
+	// and across brief transient banner misses (up to 15 minutes) so sleeping
+	// laptops or single flaky probes do not drop and re-alert existing CVEs.
 	if seeded {
-		activeIPs := make(map[string]struct{})
-		if snap != nil {
-			for _, d := range snap.Devices {
-				if ip := strings.ToLower(strings.TrimSpace(d.IP)); ip != "" {
-					activeIPs[ip] = struct{}{}
-				}
-			}
-			for _, cl := range snap.Clients {
-				for _, ip := range cl.AllIPs() {
-					if low := strings.ToLower(strings.TrimSpace(ip)); low != "" {
-						activeIPs[low] = struct{}{}
-					}
-				}
-			}
-		}
 		for k, v := range prev.ExactCVEs {
 			if _, exists := next[k]; exists {
 				continue
 			}
-			hostIP, _, _ := strings.Cut(k, "|")
-			_, isActive := activeIPs[hostIP]
-			_, wasProbed := probedHostKeys[hostIP]
-			if !isActive || (probedHostKeys != nil && !wasProbed && !isInfraDeviceIP(snap, hostIP)) {
+			if _, migrated := migratedLegacy[k]; migrated {
+				continue
+			}
+			lastSeen := prev.UpdatedAt
+			if prev.ExactCVELastSeen != nil {
+				if ts, ok := prev.ExactCVELastSeen[k]; ok && !ts.IsZero() {
+					lastSeen = ts
+				}
+			}
+			if lastSeen.IsZero() {
+				lastSeen = now
+			}
+			age := now.Sub(lastSeen)
+			hostKey, _, _ := strings.Cut(k, "|")
+			_, isActive := activeKeys[hostKey]
+			_, wasProbed := probedHostKeys[hostKey]
+			_, isInfra := infraKeys[hostKey]
+			offlineOrUnprobed := !isActive || (probedHostKeys != nil && !wasProbed && !isInfra)
+			if (offlineOrUnprobed && age <= exactCVEOfflineTTL) || age <= exactCVETransientGrace {
 				next[k] = v
+				nextLastSeen[k] = lastSeen
 			}
 		}
 	}
@@ -2341,19 +2571,7 @@ func diffExactCVEs(
 		}
 		return alerts[i].CVEID < alerts[j].CVEID
 	})
-	return alerts, next
-}
-
-func isInfraDeviceIP(snap *unifi.Snapshot, hostIPLow string) bool {
-	if snap == nil || hostIPLow == "" {
-		return false
-	}
-	for _, d := range snap.Devices {
-		if strings.ToLower(strings.TrimSpace(d.IP)) == hostIPLow {
-			return true
-		}
-	}
-	return false
+	return alerts, next, nextLastSeen
 }
 
 // selectPushWorthyEvents filters live engine events down to high-signal
@@ -2456,6 +2674,25 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 		}
 
 		err := e.notifier.SendWithID(ctx, item.id, item.site, item.diff)
+		if err == nil {
+			// Always remove a successfully delivered batch even if ctx was
+			// cancelled concurrently during shutdown so restart never resends it.
+			e.webhookMu.Lock()
+			for i := range e.pendingWebhooks {
+				if e.pendingWebhooks[i].seq == item.seq {
+					e.pendingWebhooks = append(e.pendingWebhooks[:i], e.pendingWebhooks[i+1:]...)
+					e.persistPendingWebhooksLocked()
+					break
+				}
+			}
+			if ctx.Err() != nil {
+				e.webhookRunning = false
+				e.webhookMu.Unlock()
+				return
+			}
+			e.webhookMu.Unlock()
+			continue
+		}
 		if ctx.Err() != nil {
 			// Leave unsent batches persisted on disk for delivery after restart.
 			e.webhookMu.Lock()
@@ -2471,7 +2708,9 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 				break
 			}
 		}
-		if err == nil {
+		var statusErr *notify.HTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.Permanent() {
+			e.logger.Error("webhook rejected permanently by receiver; dropping alert batch to prevent queue stall", "status", statusErr.StatusCode, "err", err)
 			if idx >= 0 {
 				e.pendingWebhooks = append(e.pendingWebhooks[:idx], e.pendingWebhooks[idx+1:]...)
 				e.persistPendingWebhooksLocked()
@@ -2537,9 +2776,33 @@ func preserveUnavailableTelemetry(prevSnap, nextSnap *unifi.Snapshot) {
 			for pi := range nextSnap.Devices[di].Ports {
 				p := &nextSnap.Devices[di].Ports[pi]
 				if old, ok := prevPorts[portKey(dmac, p.PortIdx)]; ok {
-					p.OpMode = old.OpMode
-					p.Forward = old.Forward
-					p.TaggedVLANMgmt = old.TaggedVLANMgmt
+					if p.ProfileManaged {
+						p.Enabled = old.Enabled
+						p.OpMode = old.OpMode
+						p.Forward = old.Forward
+						p.TaggedVLANMgmt = old.TaggedVLANMgmt
+						p.NativeNetworkName = old.NativeNetworkName
+						p.NativeNetworkID = old.NativeNetworkID
+						p.PoEMode = old.PoEMode
+						p.PortSecurityEnabled = old.PortSecurityEnabled
+						if len(p.PortSecurityMACs) == 0 && len(old.PortSecurityMACs) > 0 {
+							p.PortSecurityMACs = append([]string(nil), old.PortSecurityMACs...)
+						}
+						p.Isolation = old.Isolation
+						if p.PortConfID == "" && old.PortConfID != "" {
+							p.PortConfID = old.PortConfID
+						}
+						continue
+					}
+					if p.OpMode == "" && old.OpMode != "" {
+						p.OpMode = old.OpMode
+					}
+					if p.Forward == "" && old.Forward != "" {
+						p.Forward = old.Forward
+					}
+					if p.TaggedVLANMgmt == "" && old.TaggedVLANMgmt != "" {
+						p.TaggedVLANMgmt = old.TaggedVLANMgmt
+					}
 					if p.NativeNetworkName == "" && old.NativeNetworkName != "" {
 						p.NativeNetworkName = old.NativeNetworkName
 						if p.NativeNetworkID == "" {
@@ -2694,6 +2957,44 @@ func snapshotSubnets(snap *unifi.Snapshot) []netip.Prefix {
 		}
 		if p, err := netip.ParsePrefix(strings.TrimSpace(n.IPv6Subnet)); err == nil {
 			out = append(out, p.Masked())
+		}
+	}
+	return out
+}
+
+func snapshotReflectorIPs(snap *unifi.Snapshot) []string {
+	if snap == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(raw string) {
+		addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+		if err != nil {
+			return
+		}
+		norm := addr.Unmap().String()
+		if _, dup := seen[norm]; dup {
+			return
+		}
+		seen[norm] = struct{}{}
+		out = append(out, norm)
+	}
+	for _, d := range snap.Devices {
+		t := strings.ToLower(strings.TrimSpace(d.Type))
+		if t == "ugw" || t == "udm" || t == "uxg" || t == "ucg" {
+			add(d.IP)
+		}
+	}
+	for _, n := range snap.Networks {
+		p := strings.ToLower(strings.TrimSpace(n.Purpose))
+		if p == "wan" || p == "wan2" {
+			continue
+		}
+		if pfx, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil {
+			if pfx.Addr().IsValid() && pfx.Addr() != pfx.Masked().Addr() {
+				add(pfx.Addr().String())
+			}
 		}
 	}
 	return out

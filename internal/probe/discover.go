@@ -46,17 +46,19 @@ const (
 	ssdpFetchBudget = 2500 * time.Millisecond
 
 	// mDNS anti-DoS memory caps.
-	maxDNSNameWireBytes         = 255
-	maxDNSQuestionsPerPacket    = 64
-	maxDNSRecordsPerPacket      = 128
-	maxMDNSTXTEntriesPerRR      = 64
-	maxMDNSServicesPerHost      = 64
-	maxMDNSServicesPerResponder = 128
-	maxMDNSHostsPerResponder    = 128
-	maxMDNSServicesTotal        = 4096
-	maxMDNSHostsTotal           = 4096
-	maxMDNSIPsPerHost           = 16
-	maxMDNSRespondersPerInst    = 8
+	maxDNSNameWireBytes               = 255
+	maxDNSQuestionsPerPacket          = 64
+	maxDNSRecordsPerPacket            = 128
+	maxMDNSTXTEntriesPerRR            = 64
+	maxMDNSTXTBytesPerInst            = 512
+	maxMDNSServicesPerHost            = 64
+	maxMDNSServicesPerResponder       = 512
+	maxMDNSHostsPerResponder          = 512
+	maxMDNSReflectedPerSenderTarget   = 16
+	maxMDNSServicesTotal              = 4096
+	maxMDNSHostsTotal                 = 4096
+	maxMDNSIPsPerHost                 = 16
+	maxMDNSRespondersPerInst          = 8
 
 	// SSDP anti-DoS caps and string length bounds.
 	maxSSDPHeaderLen        = 256
@@ -203,6 +205,10 @@ type MDNSService struct {
 	// indicating an mDNS proxy/reflector forwarded the advertisement across VLANs.
 	Reflected bool `json:"reflected,omitempty"`
 
+	// TrustedReflector is true when Reflected is set and ResponderIP matches a
+	// configured local gateway mDNS reflector.
+	TrustedReflector bool `json:"trusted_reflector,omitempty"`
+
 	// AddressFamily records "ipv4", "ipv6", or "dual".
 	AddressFamily string `json:"address_family,omitempty"`
 
@@ -293,19 +299,116 @@ type LANDiscovery struct {
 	Unavailable map[string]string // observer VLAN/interface -> reason when discovery was unavailable
 }
 
+// senderBuckets tracks per-sender entry counts with O(1) amortized updates and
+// O(1) lookup of the heaviest sender so cache eviction never performs full-table
+// scans under spoofed multi-source floods.
+type senderBuckets struct {
+	counts   map[string]int
+	byCount  map[int]map[string]struct{}
+	maxCount int
+}
+
+func newSenderBuckets() *senderBuckets {
+	return &senderBuckets{
+		counts:  make(map[string]int),
+		byCount: make(map[int]map[string]struct{}),
+	}
+}
+
+func (b *senderBuckets) inc(sender string) {
+	if sender == "" {
+		return
+	}
+	old := b.counts[sender]
+	if old > 0 {
+		if set := b.byCount[old]; set != nil {
+			delete(set, sender)
+			if len(set) == 0 {
+				delete(b.byCount, old)
+			}
+		}
+	}
+	next := old + 1
+	b.counts[sender] = next
+	if b.byCount[next] == nil {
+		b.byCount[next] = make(map[string]struct{})
+	}
+	b.byCount[next][sender] = struct{}{}
+	if next > b.maxCount {
+		b.maxCount = next
+	}
+}
+
+func (b *senderBuckets) dec(sender string) {
+	if sender == "" {
+		return
+	}
+	old := b.counts[sender]
+	if old <= 0 {
+		return
+	}
+	if set := b.byCount[old]; set != nil {
+		delete(set, sender)
+		if len(set) == 0 {
+			delete(b.byCount, old)
+		}
+	}
+	next := old - 1
+	if next > 0 {
+		b.counts[sender] = next
+		if b.byCount[next] == nil {
+			b.byCount[next] = make(map[string]struct{})
+		}
+		b.byCount[next][sender] = struct{}{}
+	} else {
+		delete(b.counts, sender)
+	}
+	for b.maxCount > 0 && len(b.byCount[b.maxCount]) == 0 {
+		b.maxCount--
+	}
+}
+
+func (b *senderBuckets) heaviest() (string, int) {
+	for b.maxCount > 0 && len(b.byCount[b.maxCount]) == 0 {
+		b.maxCount--
+	}
+	if b.maxCount == 0 {
+		return "", 0
+	}
+	for s := range b.byCount[b.maxCount] {
+		return s, b.maxCount
+	}
+	return "", 0
+}
+
 // DiscoveryCache retains durable, TTL-bounded passive discovery observations
 // across full-scan and live recomputations, supporting IPv4/IPv6 AAAA records,
 // RFC 6762 TTL=0 goodbye withdrawal, and reflection tracking.
 type DiscoveryCache struct {
 	mu                  sync.RWMutex
+	trustedReflectors   map[string]struct{}
 	mdnsInst            map[string]*cachedMDNSInst
 	respInstCount       map[string]int
 	respUnresolvedCount map[string]int
 	targetInstCount     map[string]int
+	allInstBuckets      *senderBuckets
+	reflInstBuckets     *senderBuckets
+	respInstKeys        map[string]map[string]struct{}
+	respReflNonSinkKeys map[string]map[string]struct{}
+	respReflSinkKeys    map[string]map[string]struct{}
+	targetReflKeys      map[string]map[string]struct{}
+	respTargetInstCount map[string]map[string]int
 	hostIPs             map[string]map[string]cachedHostIP // hostname -> ip -> expiry + authority
 	hostOwner           map[string]string                  // hostname -> first responderIP that created it
+	hostReflected       map[string]bool                    // hostname -> currently indexed as reflected
 	respHostCount       map[string]int
 	ipHostCount         map[string]int
+	allHostBuckets      *senderBuckets
+	reflHostBuckets     *senderBuckets
+	respHostKeys        map[string]map[string]struct{}
+	respReflHostKeys    map[string]map[string]struct{}
+	ipReflHosts         map[string]map[string]struct{}
+	respIPHostCount     map[string]map[string]int
 	upnp                map[string][]UPnPDevice
 	wsd                 map[string][]WSDiscoveryRecord
 	unavail             map[string]string
@@ -320,6 +423,10 @@ type cachedMDNSInst struct {
 	svc               MDNSService
 	targetHost        string
 	createdBy         string
+	srvResponder      string
+	srvAuthoritative  bool
+	reflectedIndexed  bool
+	reflectedSink     bool
 	countedTargetIPs  []string
 	countedUnresolved bool
 	responderIPs      map[string]struct{}
@@ -332,14 +439,54 @@ func NewDiscoveryCache() *DiscoveryCache {
 		respInstCount:       make(map[string]int),
 		respUnresolvedCount: make(map[string]int),
 		targetInstCount:     make(map[string]int),
+		allInstBuckets:      newSenderBuckets(),
+		reflInstBuckets:     newSenderBuckets(),
+		respInstKeys:        make(map[string]map[string]struct{}),
+		respReflNonSinkKeys: make(map[string]map[string]struct{}),
+		respReflSinkKeys:    make(map[string]map[string]struct{}),
+		targetReflKeys:      make(map[string]map[string]struct{}),
+		respTargetInstCount: make(map[string]map[string]int),
 		hostIPs:             make(map[string]map[string]cachedHostIP),
 		hostOwner:           make(map[string]string),
+		hostReflected:       make(map[string]bool),
 		respHostCount:       make(map[string]int),
 		ipHostCount:         make(map[string]int),
+		allHostBuckets:      newSenderBuckets(),
+		reflHostBuckets:     newSenderBuckets(),
+		respHostKeys:        make(map[string]map[string]struct{}),
+		respReflHostKeys:    make(map[string]map[string]struct{}),
+		ipReflHosts:         make(map[string]map[string]struct{}),
+		respIPHostCount:     make(map[string]map[string]int),
 		upnp:                make(map[string][]UPnPDevice),
 		wsd:                 make(map[string][]WSDiscoveryRecord),
 		unavail:             make(map[string]string),
 	}
+}
+
+// SetTrustedReflectors configures local gateway/router IP addresses that are
+// authorized to reflect cross-VLAN mDNS advertisements.
+func (c *DiscoveryCache) SetTrustedReflectors(ips []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(ips) == 0 {
+		c.trustedReflectors = nil
+		return
+	}
+	set := make(map[string]struct{}, len(ips))
+	for _, raw := range ips {
+		if norm := canonicalIPKey(raw); norm != "" {
+			set[norm] = struct{}{}
+		}
+	}
+	c.trustedReflectors = set
+}
+
+func (c *DiscoveryCache) isTrustedReflectorLocked(ip string) bool {
+	if ip == "" || len(c.trustedReflectors) == 0 {
+		return false
+	}
+	_, ok := c.trustedReflectors[ip]
+	return ok
 }
 
 // MarkUnavailable records that passive discovery could not run on observerVLAN
@@ -443,6 +590,11 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 				continue
 			}
 			key := strings.ToLower(observerVLAN + "|" + rr.target)
+			if existing := c.mdnsInst[key]; existing != nil && existing.srvAuthoritative && normResp != "" && !containsString(existing.countedTargetIPs, normResp) {
+				// Never let a non-authoritative responder withdraw or tamper
+				// with an authoritative instance's TTL.
+				continue
+			}
 			targetIPs := resolveTargetIPs(rr.target, "")
 			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.target, svcType), normResp, observerIface, observerVLAN, targetIPs, now)
 			if inst == nil {
@@ -457,6 +609,24 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 			key := strings.ToLower(observerVLAN + "|" + rr.name)
 			targetHost := strings.ToLower(rr.target)
 			targetIPs := resolveTargetIPs(rr.name, targetHost)
+			srvIsAuth := normResp != "" && containsString(targetIPs, normResp)
+			if existing := c.mdnsInst[key]; existing != nil && existing.srvResponder != "" && existing.srvResponder != normResp {
+				if existing.srvAuthoritative && !srvIsAuth {
+					// Never let a third-party responder rewrite an authoritative
+					// instance's SRV port or targetHost (or inherit its authority).
+					continue
+				}
+				if !existing.srvAuthoritative && !srvIsAuth {
+					// Never let an unrelated third party overwrite another
+					// responder's existing reflected SRV.
+					continue
+				}
+				if !existing.srvAuthoritative && srvIsAuth {
+					// Authoritative host claims its own instance: replace the
+					// prior reflected entry cleanly so the forger is never merged.
+					c.deleteMDNSInstLocked(key)
+				}
+			}
 			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.name, svcType), normResp, observerIface, observerVLAN, targetIPs, now)
 			if inst == nil {
 				continue
@@ -464,6 +634,11 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 			inst.svc.Port = rr.port
 			inst.targetHost = targetHost
 			inst.svc.TargetHost = inst.targetHost
+			inst.srvResponder = normResp
+			if srvIsAuth {
+				inst.srvAuthoritative = true
+				c.unindexReflectedInstLocked(key, inst)
+			}
 			applyMDNSTTL(&inst.svc, rr.ttl, now)
 		case 16: // TXT
 			svcType := extractMDNSTypeFromFull(rr.name)
@@ -471,6 +646,11 @@ func (c *DiscoveryCache) IngestMDNSPacket(pkt []byte, responderIP, observerIface
 				continue
 			}
 			key := strings.ToLower(observerVLAN + "|" + rr.name)
+			if existing := c.mdnsInst[key]; existing != nil && existing.srvAuthoritative && normResp != "" && !containsString(existing.countedTargetIPs, normResp) {
+				// Never let a non-authoritative responder poison TXT or TTL
+				// on an authoritative instance.
+				continue
+			}
 			targetIPs := resolveTargetIPs(rr.name, "")
 			inst := c.ensureMDNSInstLocked(key, svcType, extractMDNSInstance(rr.name, svcType), normResp, observerIface, observerVLAN, targetIPs, now)
 			if inst == nil {
@@ -514,18 +694,120 @@ func containsString(list []string, want string) bool {
 	return false
 }
 
+func addNestedSet(m map[string]map[string]struct{}, outer, inner string) {
+	if outer == "" || inner == "" {
+		return
+	}
+	if m[outer] == nil {
+		m[outer] = make(map[string]struct{})
+	}
+	m[outer][inner] = struct{}{}
+}
+
+func delNestedSet(m map[string]map[string]struct{}, outer, inner string) {
+	if set := m[outer]; set != nil {
+		delete(set, inner)
+		if len(set) == 0 {
+			delete(m, outer)
+		}
+	}
+}
+
+func incNestedCount(m map[string]map[string]int, outer, inner string) {
+	if outer == "" || inner == "" {
+		return
+	}
+	if m[outer] == nil {
+		m[outer] = make(map[string]int)
+	}
+	m[outer][inner]++
+}
+
+func decNestedCount(m map[string]map[string]int, outer, inner string) {
+	if innerMap := m[outer]; innerMap != nil {
+		if innerMap[inner] > 1 {
+			innerMap[inner]--
+		} else {
+			delete(innerMap, inner)
+			if len(innerMap) == 0 {
+				delete(m, outer)
+			}
+		}
+	}
+}
+
+func pickAnyKey(set map[string]struct{}) string {
+	for k := range set {
+		return k
+	}
+	return ""
+}
+
+func (c *DiscoveryCache) indexReflectedInstLocked(k string, inst *cachedMDNSInst) {
+	if inst.reflectedIndexed {
+		return
+	}
+	inst.reflectedIndexed = true
+	inst.reflectedSink = isMDNSZeroByteSink(inst.svc.Type)
+	if inst.createdBy != "" {
+		c.reflInstBuckets.inc(inst.createdBy)
+		if inst.reflectedSink {
+			addNestedSet(c.respReflSinkKeys, inst.createdBy, k)
+		} else {
+			addNestedSet(c.respReflNonSinkKeys, inst.createdBy, k)
+		}
+	}
+	for _, tip := range inst.countedTargetIPs {
+		addNestedSet(c.targetReflKeys, tip, k)
+		incNestedCount(c.respTargetInstCount, inst.createdBy, tip)
+	}
+}
+
+func (c *DiscoveryCache) unindexReflectedInstLocked(k string, inst *cachedMDNSInst) {
+	if !inst.reflectedIndexed {
+		return
+	}
+	inst.reflectedIndexed = false
+	if inst.createdBy != "" {
+		c.reflInstBuckets.dec(inst.createdBy)
+		if inst.reflectedSink {
+			delNestedSet(c.respReflSinkKeys, inst.createdBy, k)
+		} else {
+			delNestedSet(c.respReflNonSinkKeys, inst.createdBy, k)
+		}
+	}
+	for _, tip := range inst.countedTargetIPs {
+		delNestedSet(c.targetReflKeys, tip, k)
+		decNestedCount(c.respTargetInstCount, inst.createdBy, tip)
+	}
+}
+
 func (c *DiscoveryCache) deleteHostLocked(host string) {
 	ipMap, ok := c.hostIPs[host]
 	if !ok {
 		return
 	}
-	for ip := range ipMap {
+	owner := c.hostOwner[host]
+	for ip, entry := range ipMap {
 		decCountMap(c.ipHostCount, ip)
+		if !entry.authoritative {
+			delNestedSet(c.ipReflHosts, ip, host)
+			decNestedCount(c.respIPHostCount, owner, ip)
+		}
 	}
 	delete(c.hostIPs, host)
-	if owner, hasOwner := c.hostOwner[host]; hasOwner {
+	if c.hostReflected[host] {
+		delete(c.hostReflected, host)
+		if owner != "" {
+			c.reflHostBuckets.dec(owner)
+			delNestedSet(c.respReflHostKeys, owner, host)
+		}
+	}
+	if owner != "" {
 		delete(c.hostOwner, host)
 		decCountMap(c.respHostCount, owner)
+		c.allHostBuckets.dec(owner)
+		delNestedSet(c.respHostKeys, owner, host)
 	}
 }
 
@@ -534,8 +816,13 @@ func (c *DiscoveryCache) deleteMDNSInstLocked(k string) {
 	if !ok {
 		return
 	}
+	c.unindexReflectedInstLocked(k, inst)
 	delete(c.mdnsInst, k)
-	decCountMap(c.respInstCount, inst.createdBy)
+	if inst.createdBy != "" {
+		decCountMap(c.respInstCount, inst.createdBy)
+		c.allInstBuckets.dec(inst.createdBy)
+		delNestedSet(c.respInstKeys, inst.createdBy, k)
+	}
 	if inst.countedUnresolved {
 		decCountMap(c.respUnresolvedCount, inst.createdBy)
 	}
@@ -544,228 +831,193 @@ func (c *DiscoveryCache) deleteMDNSInstLocked(k string) {
 	}
 }
 
-func (c *DiscoveryCache) isHostReflectedLocked(host string) bool {
-	for _, entry := range c.hostIPs[host] {
-		if entry.authoritative {
-			return false
-		}
+func (c *DiscoveryCache) evictReflectedHostForIPLocked(ip, incomingResp string, incomingIsAuth, incomingIsTrusted bool) bool {
+	candidates := c.ipReflHosts[ip]
+	if len(candidates) == 0 {
+		return false
 	}
-	return true
-}
-
-func (c *DiscoveryCache) isInstReflectedLocked(inst *cachedMDNSInst) bool {
-	if len(inst.countedTargetIPs) == 0 {
-		return true
+	incomingPerIP := 0
+	if incomingResp != "" {
+		incomingPerIP = c.respIPHostCount[incomingResp][ip]
 	}
-	for _, tip := range inst.countedTargetIPs {
-		if _, auth := inst.responderIPs[tip]; auth {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *DiscoveryCache) evictReflectedHostForIPLocked(ip string) bool {
 	bestHost := ""
-	bestOwnerCount := -1
-	for h, ipMap := range c.hostIPs {
-		entry, ok := ipMap[ip]
-		if !ok || entry.authoritative {
+	bestPerIP := -1
+	bestGlobal := -1
+	for h := range candidates {
+		owner := c.hostOwner[h]
+		if !incomingIsAuth && c.isTrustedReflectorLocked(owner) {
 			continue
 		}
-		cnt := c.respHostCount[c.hostOwner[h]]
-		if bestHost == "" || cnt > bestOwnerCount || (cnt == bestOwnerCount && h > bestHost) {
+		perIP := c.respIPHostCount[owner][ip]
+		glob := c.respHostCount[owner]
+		if bestHost == "" || perIP > bestPerIP || (perIP == bestPerIP && glob > bestGlobal) {
 			bestHost = h
-			bestOwnerCount = cnt
+			bestPerIP = perIP
+			bestGlobal = glob
 		}
 	}
 	if bestHost == "" {
 		return false
 	}
+	if !incomingIsAuth && !incomingIsTrusted {
+		if !(bestPerIP > incomingPerIP+1 || (incomingPerIP == 0 && bestPerIP >= 1)) {
+			return false
+		}
+	}
+	owner := c.hostOwner[bestHost]
 	delete(c.hostIPs[bestHost], ip)
 	decCountMap(c.ipHostCount, ip)
+	delNestedSet(c.ipReflHosts, ip, bestHost)
+	decNestedCount(c.respIPHostCount, owner, ip)
 	if len(c.hostIPs[bestHost]) == 0 {
-		delete(c.hostIPs, bestHost)
-		if owner, ok := c.hostOwner[bestHost]; ok {
-			delete(c.hostOwner, bestHost)
-			decCountMap(c.respHostCount, owner)
-		}
-	}
-	return true
-}
-
-func (c *DiscoveryCache) evictGlobalHostLocked(incomingResp string, incomingIsAuth bool) bool {
-	// Pass 1: evict from the heaviest reflected/third-party sender.
-	bestHost := ""
-	bestCount := 0
-	for h := range c.hostIPs {
-		if !c.isHostReflectedLocked(h) {
-			continue
-		}
-		cnt := c.respHostCount[c.hostOwner[h]]
-		if cnt < 1 {
-			cnt = 1
-		}
-		if cnt <= 1 && !incomingIsAuth {
-			continue
-		}
-		if bestHost == "" || cnt > bestCount || (cnt == bestCount && h > bestHost) {
-			bestHost = h
-			bestCount = cnt
-		}
-	}
-	if bestHost != "" {
 		c.deleteHostLocked(bestHost)
-		return true
 	}
+	return true
+}
 
-	// Pass 2: max-min fairness across all senders so a single noisy host cannot
-	// starve a newly responding device.
+func (c *DiscoveryCache) evictGlobalHostLocked(incomingResp string, incomingIsAuth, incomingIsTrusted bool) bool {
+	// Pass 1 (O(1)): evict from the heaviest reflected/third-party sender.
+	if sender, cnt := c.reflHostBuckets.heaviest(); sender != "" && cnt > 0 {
+		if cnt > 1 || incomingIsAuth || incomingIsTrusted {
+			if h := pickAnyKey(c.respReflHostKeys[sender]); h != "" {
+				c.deleteHostLocked(h)
+				return true
+			}
+		}
+	}
+	// Pass 2 (O(1)): max-min fairness across all senders.
 	incomingCount := c.respHostCount[incomingResp]
-	maxCount := 0
-	for h := range c.hostIPs {
-		if cnt := c.respHostCount[c.hostOwner[h]]; cnt > maxCount {
-			maxCount = cnt
-		}
-	}
-	if !(maxCount > incomingCount+1 || (incomingCount == 0 && maxCount > 1)) {
+	sender, maxCount := c.allHostBuckets.heaviest()
+	if sender == "" || !(maxCount > incomingCount+1 || (incomingCount == 0 && maxCount > 1)) {
 		return false
 	}
-	for h := range c.hostIPs {
-		if c.respHostCount[c.hostOwner[h]] != maxCount {
-			continue
-		}
-		if bestHost == "" || h > bestHost {
-			bestHost = h
-		}
-	}
-	if bestHost == "" {
-		return false
-	}
-	c.deleteHostLocked(bestHost)
-	return true
-}
-
-func (c *DiscoveryCache) evictReflectedInstForTargetLocked(targetIP string) bool {
-	bestKey := ""
-	bestSink := true
-	bestOwnerCount := -1
-	for k, inst := range c.mdnsInst {
-		if !containsString(inst.countedTargetIPs, targetIP) {
-			continue
-		}
-		if _, auth := inst.responderIPs[targetIP]; auth {
-			continue
-		}
-		sink := isMDNSZeroByteSink(inst.svc.Type)
-		cnt := c.respInstCount[inst.createdBy]
-		if bestKey == "" ||
-			(bestSink && !sink) ||
-			(sink == bestSink && (cnt > bestOwnerCount || (cnt == bestOwnerCount && k > bestKey))) {
-			bestKey = k
-			bestSink = sink
-			bestOwnerCount = cnt
-		}
-	}
-	if bestKey == "" {
-		return false
-	}
-	c.deleteMDNSInstLocked(bestKey)
-	return true
-}
-
-func (c *DiscoveryCache) evictGlobalMDNSInstLocked(incomingResp string, incomingIsAuth bool) bool {
-	// Pass 1: evict an entry from the heaviest reflected/third-party sender.
-	bestKey := ""
-	bestSink := true
-	bestCount := 0
-	for k, inst := range c.mdnsInst {
-		if !c.isInstReflectedLocked(inst) {
-			continue
-		}
-		cnt := c.respInstCount[inst.createdBy]
-		if cnt < 1 {
-			cnt = 1
-		}
-		if cnt <= 1 && !incomingIsAuth {
-			continue
-		}
-		sink := isMDNSZeroByteSink(inst.svc.Type)
-		if bestKey == "" ||
-			(bestSink && !sink) ||
-			(sink == bestSink && (cnt > bestCount || (cnt == bestCount && k > bestKey))) {
-			bestKey = k
-			bestSink = sink
-			bestCount = cnt
-		}
-	}
-	if bestKey != "" {
-		c.deleteMDNSInstLocked(bestKey)
+	if h := pickAnyKey(c.respHostKeys[sender]); h != "" {
+		c.deleteHostLocked(h)
 		return true
 	}
+	return false
+}
 
-	// Pass 2: max-min fairness across all senders when no reflected entries remain.
-	incomingCount := c.respInstCount[incomingResp]
-	maxCount := 0
-	for _, inst := range c.mdnsInst {
-		if cnt := c.respInstCount[inst.createdBy]; cnt > maxCount {
-			maxCount = cnt
-		}
-	}
-	if !(maxCount > incomingCount+1 || (incomingCount == 0 && maxCount > 1)) {
+func (c *DiscoveryCache) evictReflectedInstForTargetLocked(targetIP, incomingResp string, incomingIsAuth, incomingIsTrusted, incomingIsSink bool) bool {
+	candidates := c.targetReflKeys[targetIP]
+	if len(candidates) == 0 {
 		return false
 	}
-	for k, inst := range c.mdnsInst {
-		if c.respInstCount[inst.createdBy] != maxCount {
+	incomingPerTarget := 0
+	if incomingResp != "" {
+		incomingPerTarget = c.respTargetInstCount[incomingResp][targetIP]
+	}
+	bestKey := ""
+	bestSink := true
+	bestPerTarget := -1
+	bestGlobal := -1
+	for k := range candidates {
+		inst := c.mdnsInst[k]
+		if inst == nil {
+			continue
+		}
+		if !incomingIsAuth && c.isTrustedReflectorLocked(inst.createdBy) {
 			continue
 		}
 		sink := isMDNSZeroByteSink(inst.svc.Type)
+		perTarget := c.respTargetInstCount[inst.createdBy][targetIP]
+		glob := c.respInstCount[inst.createdBy]
 		if bestKey == "" ||
 			(bestSink && !sink) ||
-			(sink == bestSink && k > bestKey) {
+			(sink == bestSink && (perTarget > bestPerTarget || (perTarget == bestPerTarget && glob > bestGlobal))) {
 			bestKey = k
 			bestSink = sink
+			bestPerTarget = perTarget
+			bestGlobal = glob
 		}
 	}
 	if bestKey == "" {
 		return false
 	}
+	if !incomingIsAuth && !incomingIsTrusted {
+		sinkReplacesNonSink := incomingIsSink && !bestSink
+		fair := bestPerTarget > incomingPerTarget+1 || (incomingPerTarget == 0 && bestPerTarget >= 1)
+		if !sinkReplacesNonSink && !fair {
+			return false
+		}
+	}
 	c.deleteMDNSInstLocked(bestKey)
 	return true
+}
+
+func (c *DiscoveryCache) evictGlobalMDNSInstLocked(incomingResp string, incomingIsAuth, incomingIsTrusted bool) bool {
+	// Pass 1 (O(1)): evict from the heaviest reflected/third-party sender,
+	// preferring non-sink entries so zero-byte sink guards survive churn.
+	if sender, cnt := c.reflInstBuckets.heaviest(); sender != "" && cnt > 0 {
+		if cnt > 1 || incomingIsAuth || incomingIsTrusted {
+			k := pickAnyKey(c.respReflNonSinkKeys[sender])
+			if k == "" {
+				k = pickAnyKey(c.respReflSinkKeys[sender])
+			}
+			if k != "" {
+				c.deleteMDNSInstLocked(k)
+				return true
+			}
+		}
+	}
+	// Pass 2 (O(1)): max-min fairness across all senders when no reflected entries remain.
+	incomingCount := c.respInstCount[incomingResp]
+	sender, maxCount := c.allInstBuckets.heaviest()
+	if sender == "" || !(maxCount > incomingCount+1 || (incomingCount == 0 && maxCount > 1)) {
+		return false
+	}
+	if k := pickAnyKey(c.respInstKeys[sender]); k != "" {
+		c.deleteMDNSInstLocked(k)
+		return true
+	}
+	return false
 }
 
 func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl uint32, now time.Time) {
 	if host == "" || ip == "" {
 		return
 	}
+	isAuth := responderIP != "" && responderIP == ip
+	isTrusted := c.isTrustedReflectorLocked(responderIP)
 	if ttl == 0 {
 		if m := c.hostIPs[host]; m != nil {
-			if _, existed := m[ip]; existed {
+			if prev, existed := m[ip]; existed {
+				if prev.authoritative && !isAuth {
+					// Never let a non-authoritative responder withdraw an authoritative host A/AAAA.
+					return
+				}
+				owner := c.hostOwner[host]
 				delete(m, ip)
 				decCountMap(c.ipHostCount, ip)
+				if !prev.authoritative {
+					delNestedSet(c.ipReflHosts, ip, host)
+					decNestedCount(c.respIPHostCount, owner, ip)
+				}
 			}
 			if len(m) == 0 {
-				delete(c.hostIPs, host)
-				if owner, ok := c.hostOwner[host]; ok {
-					delete(c.hostOwner, host)
-					decCountMap(c.respHostCount, owner)
-				}
+				c.deleteHostLocked(host)
 			}
 		}
 		return
 	}
-	isAuth := responderIP != "" && responderIP == ip
+	maxRespHosts := maxMDNSHostsPerResponder
+	if isTrusted {
+		maxRespHosts = maxMDNSHostsTotal / 2
+	}
 	if c.hostIPs[host] == nil {
-		if responderIP != "" && c.respHostCount[responderIP] >= maxMDNSHostsPerResponder {
+		if responderIP != "" && c.respHostCount[responderIP] >= maxRespHosts {
+			return
+		}
+		if !isAuth && !isTrusted && responderIP != "" && c.respIPHostCount[responderIP][ip] >= maxMDNSReflectedPerSenderTarget {
 			return
 		}
 		if c.ipHostCount[ip] >= maxMDNSServicesPerHost {
-			if !isAuth || !c.evictReflectedHostForIPLocked(ip) {
+			if !c.evictReflectedHostForIPLocked(ip, responderIP, isAuth, isTrusted) {
 				return
 			}
 		}
 		if len(c.hostIPs) >= maxMDNSHostsTotal {
-			if !c.evictGlobalHostLocked(responderIP, isAuth) {
+			if !c.evictGlobalHostLocked(responderIP, isAuth, isTrusted) {
 				return
 			}
 		}
@@ -773,17 +1025,27 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 		if responderIP != "" {
 			c.hostOwner[host] = responderIP
 			c.respHostCount[responderIP]++
+			c.allHostBuckets.inc(responderIP)
+			addNestedSet(c.respHostKeys, responderIP, host)
+			if !isAuth {
+				c.hostReflected[host] = true
+				c.reflHostBuckets.inc(responderIP)
+				addNestedSet(c.respReflHostKeys, responderIP, host)
+			}
 		}
 	}
 	if prev, exists := c.hostIPs[host][ip]; !exists {
+		if !isAuth && !isTrusted && responderIP != "" && c.respIPHostCount[responderIP][ip] >= maxMDNSReflectedPerSenderTarget {
+			return
+		}
 		if c.ipHostCount[ip] >= maxMDNSServicesPerHost {
-			if !isAuth || !c.evictReflectedHostForIPLocked(ip) {
+			if !c.evictReflectedHostForIPLocked(ip, responderIP, isAuth, isTrusted) {
 				return
 			}
 		}
 		if len(c.hostIPs[host]) >= maxMDNSIPsPerHost {
 			evicted := ""
-			if isAuth {
+			if isAuth || isTrusted {
 				for candIP, candEntry := range c.hostIPs[host] {
 					if !candEntry.authoritative && (evicted == "" || candIP > evicted) {
 						evicted = candIP
@@ -793,12 +1055,32 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 			if evicted == "" {
 				return
 			}
+			owner := c.hostOwner[host]
 			delete(c.hostIPs[host], evicted)
 			decCountMap(c.ipHostCount, evicted)
+			delNestedSet(c.ipReflHosts, evicted, host)
+			decNestedCount(c.respIPHostCount, owner, evicted)
 		}
 		c.ipHostCount[ip]++
-	} else if prev.authoritative {
-		isAuth = true
+		if !isAuth {
+			addNestedSet(c.ipReflHosts, ip, host)
+			incNestedCount(c.respIPHostCount, c.hostOwner[host], ip)
+		}
+	} else {
+		if prev.authoritative {
+			isAuth = true
+		} else if isAuth {
+			// Promoted from reflected to authoritative for this IP.
+			delNestedSet(c.ipReflHosts, ip, host)
+			decNestedCount(c.respIPHostCount, c.hostOwner[host], ip)
+		}
+	}
+	if isAuth && c.hostReflected[host] {
+		delete(c.hostReflected, host)
+		if owner := c.hostOwner[host]; owner != "" {
+			c.reflHostBuckets.dec(owner)
+			delNestedSet(c.respReflHostKeys, owner, host)
+		}
 	}
 	c.hostIPs[host][ip] = cachedHostIP{
 		expiresAt:     now.UTC().Add(time.Duration(ttl) * time.Second),
@@ -809,17 +1091,37 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderIP, observerIface, observerVLAN string, targetIPs []string, now time.Time) *cachedMDNSInst {
 	inst := c.mdnsInst[key]
 	if inst == nil {
-		if responderIP != "" && c.respInstCount[responderIP] >= maxMDNSServicesPerResponder {
+		incomingIsTrusted := c.isTrustedReflectorLocked(responderIP)
+		maxPerResp := maxMDNSServicesPerResponder
+		if incomingIsTrusted {
+			maxPerResp = maxMDNSServicesTotal / 2
+		}
+		if responderIP != "" && c.respInstCount[responderIP] >= maxPerResp {
 			return nil
 		}
 		incomingIsAuth := responderIP != "" && containsString(targetIPs, responderIP)
+		incomingIsSink := isMDNSZeroByteSink(svcType)
 		if len(targetIPs) == 0 {
 			if responderIP != "" && c.respUnresolvedCount[responderIP] >= maxMDNSServicesPerHost {
 				return nil
 			}
 		} else {
-			if incomingIsAuth && c.targetInstCount[responderIP] >= maxMDNSServicesPerHost {
-				c.evictReflectedInstForTargetLocked(responderIP)
+			if !incomingIsAuth && !incomingIsTrusted && responderIP != "" {
+				allOverSenderTargetCap := true
+				for _, tip := range targetIPs {
+					if c.respTargetInstCount[responderIP][tip] < maxMDNSReflectedPerSenderTarget {
+						allOverSenderTargetCap = false
+						break
+					}
+				}
+				if allOverSenderTargetCap {
+					return nil
+				}
+			}
+			for _, tip := range targetIPs {
+				if c.targetInstCount[tip] >= maxMDNSServicesPerHost {
+					c.evictReflectedInstForTargetLocked(tip, responderIP, incomingIsAuth, incomingIsTrusted, incomingIsSink)
+				}
 			}
 			allAtCap := true
 			for _, tip := range targetIPs {
@@ -833,7 +1135,7 @@ func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderI
 			}
 		}
 		if len(c.mdnsInst) >= maxMDNSServicesTotal {
-			if !c.evictGlobalMDNSInstLocked(responderIP, incomingIsAuth) {
+			if !c.evictGlobalMDNSInstLocked(responderIP, incomingIsAuth, incomingIsTrusted) {
 				return nil
 			}
 		}
@@ -854,6 +1156,8 @@ func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderI
 		if responderIP != "" {
 			inst.responderIPs[responderIP] = struct{}{}
 			c.respInstCount[responderIP]++
+			c.allInstBuckets.inc(responderIP)
+			addNestedSet(c.respInstKeys, responderIP, key)
 		}
 		if len(targetIPs) == 0 {
 			if responderIP != "" {
@@ -867,6 +1171,9 @@ func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderI
 			}
 		}
 		c.mdnsInst[key] = inst
+		if !incomingIsAuth {
+			c.indexReflectedInstLocked(key, inst)
+		}
 	} else {
 		ts := now.UTC()
 		inst.svc.ObservedAt = &ts
@@ -886,6 +1193,9 @@ func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderI
 			}
 			if inst.svc.ResponderIP == "" {
 				inst.svc.ResponderIP = responderIP
+			}
+			if containsString(inst.countedTargetIPs, responderIP) {
+				c.unindexReflectedInstLocked(key, inst)
 			}
 		}
 	}
@@ -954,12 +1264,36 @@ func isWellKnownSerialSinkPort(port int) bool {
 	}
 }
 
+// isKnownNonSerialServicePort lists standard non-serial administrative, database,
+// web, remote-desktop, and messaging TCP ports that a reflected serial-bridge
+// advertisement must never be allowed to hide from active security checks.
+func isKnownNonSerialServicePort(port int) bool {
+	if port < 1024 {
+		return true
+	}
+	if port >= 5900 && port <= 5919 {
+		return true
+	}
+	switch port {
+	case 1080, 1433, 1521, 1883, 2049, 2181, 2375, 2376, 2379,
+		3000, 3128, 3306, 3389, 4444, 5000, 5001, 5432, 5601, 5672,
+		5984, 5985, 5986, 6379, 6443, 7001, 8000, 8006, 8008, 8080,
+		8081, 8086, 8088, 8123, 8200, 8443, 8883, 9000, 9090,
+		9200, 9300, 10000, 10250, 11211, 15672, 27017, 32400:
+		return true
+	default:
+		return false
+	}
+}
+
 // shouldProtectMDNSSinkPort reports whether an mDNS zero-byte sink (raw print
 // or serial/Zigbee UART bridge) should enforce connect-only protection on port.
 // Authoritative self-announcements are always honored; reflected announcements
-// from a local reflector are honored only for known serial coordinator ports
-// (6638, 6639, 20108) and raw print port 9100 so spoofed third-party replies
-// cannot hide unrelated services such as Redis, Docker, RDP, VNC, or HTTP.
+// from a local reflector are honored for JetDirect raw print ports (9100-9107)
+// and for serial coordinator ports (6638, 6639, 20108, or custom high ports
+// outside well-known non-serial services) so legitimate relayed coordinators
+// and printers stay zero-byte protected while forged adverts cannot hide
+// Redis, Docker, RDP, VNC, SMB, SSH, or HTTP admin ports.
 func shouldProtectMDNSSinkPort(svcType string, port int, authoritative bool, responderIP string) bool {
 	if port <= 0 || !isMDNSZeroByteSink(svcType) {
 		return false
@@ -971,10 +1305,10 @@ func shouldProtectMDNSSinkPort(svcType string, port int, authoritative bool, res
 		return false
 	}
 	if isMDNSRawSerialSink(svcType) {
-		return isWellKnownSerialSinkPort(port)
+		return isWellKnownSerialSinkPort(port) || !isKnownNonSerialServicePort(port)
 	}
 	if isMDNSRawPrintSink(svcType) {
-		return port == 9100
+		return port >= 9100 && port <= 9107
 	}
 	return false
 }
@@ -989,18 +1323,19 @@ func (c *DiscoveryCache) PruneExpired(now time.Time) {
 		}
 	}
 	for host, ipMap := range c.hostIPs {
+		owner := c.hostOwner[host]
 		for ip, entry := range ipMap {
 			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
 				delete(ipMap, ip)
 				decCountMap(c.ipHostCount, ip)
+				if !entry.authoritative {
+					delNestedSet(c.ipReflHosts, ip, host)
+					decNestedCount(c.respIPHostCount, owner, ip)
+				}
 			}
 		}
 		if len(ipMap) == 0 {
-			delete(c.hostIPs, host)
-			if owner, ok := c.hostOwner[host]; ok {
-				delete(c.hostOwner, host)
-				decCountMap(c.respHostCount, owner)
-			}
+			c.deleteHostLocked(host)
 		}
 	}
 }
@@ -1086,19 +1421,29 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 			return ok
 		}
 
-		// Compute authority strictly per target IP: a target IP is non-reflected
-		// only when the responder IP set contains that specific IP, never because
-		// another A/AAAA record on the same SRV target matched a third-party sender.
+		// Compute authority strictly per target IP and per SRV responder so a
+		// third-party SRV can never inherit another responder's authority.
 		for _, ip := range ips {
 			svcForIP := svc
-			directMatch := hasResponder(ip)
+			var directMatch bool
+			if inst.srvResponder != "" {
+				directMatch = inst.srvAuthoritative && inst.srvResponder == canonicalIPKey(ip)
+			} else {
+				directMatch = hasResponder(ip)
+			}
 			if len(allResponders) > 0 {
 				if directMatch {
 					svcForIP.ResponderIP = ip
 					svcForIP.Reflected = false
+					svcForIP.TrustedReflector = false
 				} else {
-					svcForIP.ResponderIP = allResponders[0]
+					if inst.srvResponder != "" {
+						svcForIP.ResponderIP = inst.srvResponder
+					} else {
+						svcForIP.ResponderIP = allResponders[0]
+					}
 					svcForIP.Reflected = true
+					svcForIP.TrustedReflector = c.isTrustedReflectorLocked(svcForIP.ResponderIP)
 				}
 			}
 
@@ -1242,10 +1587,10 @@ func DiscoverLAN(ctx context.Context, httpClient *http.Client) *LANDiscovery {
 // sweep while ensuring that any IP in excluded never receives unicast SSDP
 // description HTTP GETs or discovery-derived port hints.
 func DiscoverLANWithExclusions(ctx context.Context, httpClient *http.Client, excluded map[string]struct{}) *LANDiscovery {
-	return discoverLANWithOptions(ctx, httpClient, excluded, nil)
+	return discoverLANWithOptions(ctx, httpClient, excluded, nil, nil)
 }
 
-func discoverLANWithOptions(ctx context.Context, httpClient *http.Client, excluded map[string]struct{}, allowedSubnets []netip.Prefix) *LANDiscovery {
+func discoverLANWithOptions(ctx context.Context, httpClient *http.Client, excluded map[string]struct{}, allowedSubnets []netip.Prefix, trustedReflectors []string) *LANDiscovery {
 	res := &LANDiscovery{
 		MDNS:        make(map[string][]MDNSService),
 		UPnP:        make(map[string][]UPnPDevice),
@@ -1267,7 +1612,7 @@ func discoverLANWithOptions(ctx context.Context, httpClient *http.Client, exclud
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		mdnsSnap = discoverMDNSSnapshot(listenCtx)
+		mdnsSnap = discoverMDNSSnapshotWithReflectors(listenCtx, trustedReflectors)
 	}()
 	go func() {
 		defer wg.Done()
@@ -1366,7 +1711,14 @@ func discoverMDNS(ctx context.Context) map[string][]MDNSService {
 }
 
 func discoverMDNSSnapshot(ctx context.Context) *LANDiscovery {
+	return discoverMDNSSnapshotWithReflectors(ctx, nil)
+}
+
+func discoverMDNSSnapshotWithReflectors(ctx context.Context, trustedReflectors []string) *LANDiscovery {
 	cache := NewDiscoveryCache()
+	if len(trustedReflectors) > 0 {
+		cache.SetTrustedReflectors(trustedReflectors)
+	}
 	collectMDNSIntoCache(ctx, cache)
 	return cache.Snapshot(time.Now().UTC())
 }
@@ -1683,7 +2035,16 @@ func mergeSafeTXT(existing, incoming []string) []string {
 		out = append(out, k+"="+v)
 	}
 	sort.Strings(out)
-	return out
+	totalBytes := 0
+	kept := out[:0]
+	for _, entry := range out {
+		if totalBytes+len(entry) > maxMDNSTXTBytesPerInst && len(kept) > 0 {
+			break
+		}
+		totalBytes += len(entry)
+		kept = append(kept, entry)
+	}
+	return kept
 }
 
 type ssdpHit struct {

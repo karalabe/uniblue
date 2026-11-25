@@ -887,3 +887,443 @@ func TestTransitBoundaryProbePerformanceManyDenyPorts(t *testing.T) {
 		t.Fatalf("expected 18 transit cells (3x3 dual-stack), got %d", transitCount)
 	}
 }
+
+// TestPartialPortRangeApprovalAndPartialSourceBlockNeverHideAccess verifies:
+// (1) approving one port inside an allowed port range does not hide the other
+//     permitted ports (including across a synthetic sweep of controller port
+//     range representations);
+// (2) an earlier block on one source IP or MAC does not hide a neighbor source
+//     permitted by a later allow rule (both on transit and gateway-admin paths);
+// (3) when an allow rule's uncovered equivalence space exceeds the exact
+//     verification cap, UniBlue returns IsolationUnknown rather than false
+//     blocked-ok.
+func TestPartialPortRangeApprovalAndPartialSourceBlockNeverHideAccess(t *testing.T) {
+	baseSnap := func(policies []unifi.FirewallPolicy) *unifi.Snapshot {
+		return &unifi.Snapshot{
+			Site: "default",
+			Devices: []unifi.Device{
+				{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "10.0.1.1", Model: "UDM-Pro", Type: "udm"},
+			},
+			Networks: []unifi.Network{
+				{ID: "net-office", Name: "Office", VLAN: "1", Subnet: "10.0.1.0/24", ZoneName: "Internal"},
+				{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "10.0.50.0/24", ZoneName: "Guest", IsolationEnabled: true},
+			},
+			Clients: []unifi.Client{
+				{MAC: "02:00:00:50:00:10", Name: "guest-1", IP: "10.0.50.10", NetworkID: "net-guest", NetworkName: "Guest"},
+				{MAC: "02:00:00:50:00:11", Name: "guest-2", IP: "10.0.50.11", NetworkID: "net-guest", NetworkName: "Guest"},
+				{MAC: "02:00:00:01:00:20", Name: "office-srv", IP: "10.0.1.20", NetworkID: "net-office", NetworkName: "Office"},
+			},
+			FirewallPolicies: policies,
+			Visibility:       &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+		}
+	}
+
+	findTransit := func(mat *IsolationMatrix) *IsolationCell {
+		for i := range mat.Cells {
+			c := &mat.Cells[i]
+			if c.DestFunction == "trusted-lan-transit" && c.SourceNetwork == "Guest" && c.DestNetwork == "Office" && c.IPFamily == "ipv4" {
+				return c
+			}
+		}
+		return nil
+	}
+
+	// 1. Rule permits 17 TCP ports (8000-8016) on 10.0.1.20; operator approved
+	// only 8000. The remaining 16 ports must produce IsolationViolation.
+	t.Run("partial_port_range_approval_catches_unapproved_ports", func(t *testing.T) {
+		snap := baseSnap([]unifi.FirewallPolicy{
+			{
+				ID: "p-range", Index: 10, Name: "Allow Range 8000-8016", Enabled: true,
+				Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+				Source: unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{
+					ZoneName:   "Internal",
+					IPs:        []string{"10.0.1.20"},
+					PortRanges: []unifi.PortRange{{Start: 8000, End: 8016}},
+				},
+			},
+			{
+				ID: "p-deny", Index: 100, Name: "Block Guest -> Internal", Enabled: true,
+				Action: "BLOCK", IPVersion: "both", Protocol: "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+		})
+		netCfg := config.NetworkConfig{
+			TrustedVLANs:  []string{"Office"},
+			IsolatedVLANs: []string{"Guest"},
+			IsolationPolicy: config.IsolationIntent{
+				ApprovedPaths: []config.ApprovedPath{
+					{SourceZone: "Guest", DestZone: "Internal", DestIP: "10.0.1.20", Transport: "tcp", Port: 8000},
+				},
+			},
+		}
+		mat, _, _ := EvaluateIsolation(snap, nil, netCfg)
+		cell := findTransit(mat)
+		if cell == nil || cell.Verdict != IsolationViolation || cell.Port < 8001 || cell.Port > 8016 {
+			t.Fatalf("expected IsolationViolation on unapproved port in 8001..8016, got %+v", cell)
+		}
+	})
+
+	// 2. Synthetic sweep across port-range + partial-approval + partial-block
+	// combinations: whenever any unapproved port remains allowed, verdict must
+	// be IsolationViolation; when every port is approved or earlier-blocked,
+	// verdict must be IsolationBlockedOK.
+	t.Run("port_range_synthetic_sweep", func(t *testing.T) {
+		type sweepCase struct {
+			name        string
+			allowRanges []unifi.PortRange
+			blockRanges []unifi.PortRange
+			approved    []int
+			want        IsolationVerdict
+		}
+		cases := []sweepCase{
+			{
+				name:        "first_of_17_approved",
+				allowRanges: []unifi.PortRange{{Start: 8000, End: 8016}},
+				approved:    []int{8000},
+				want:        IsolationViolation,
+			},
+			{
+				name:        "last_of_17_approved",
+				allowRanges: []unifi.PortRange{{Start: 8000, End: 8016}},
+				approved:    []int{8016},
+				want:        IsolationViolation,
+			},
+			{
+				name:        "ends_approved_middle_open",
+				allowRanges: []unifi.PortRange{{Start: 8000, End: 8016}},
+				approved:    []int{8000, 8016},
+				want:        IsolationViolation,
+			},
+			{
+				name:        "first_approved_rest_blocked_except_last",
+				allowRanges: []unifi.PortRange{{Start: 8000, End: 8016}},
+				blockRanges: []unifi.PortRange{{Start: 8001, End: 8015}},
+				approved:    []int{8000},
+				want:        IsolationViolation,
+			},
+			{
+				name:        "first_approved_rest_fully_blocked",
+				allowRanges: []unifi.PortRange{{Start: 8000, End: 8016}},
+				blockRanges: []unifi.PortRange{{Start: 8001, End: 8016}},
+				approved:    []int{8000},
+				want:        IsolationBlockedOK,
+			},
+			{
+				name:        "all_3_ports_individually_approved",
+				allowRanges: []unifi.PortRange{{Start: 9000, End: 9002}},
+				approved:    []int{9000, 9001, 9002},
+				want:        IsolationBlockedOK,
+			},
+		}
+		for _, tc := range cases {
+			var pols []unifi.FirewallPolicy
+			if len(tc.blockRanges) > 0 {
+				pols = append(pols, unifi.FirewallPolicy{
+					ID: "p-blk-sub", Index: 5, Name: "Block Subrange", Enabled: true,
+					Action: "BLOCK", IPVersion: "ipv4", Protocol: "tcp",
+					Source: unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{
+						ZoneName:   "Internal",
+						IPs:        []string{"10.0.1.20"},
+						PortRanges: tc.blockRanges,
+					},
+				})
+			}
+			pols = append(pols,
+				unifi.FirewallPolicy{
+					ID: "p-allow", Index: 10, Name: "Allow Range", Enabled: true,
+					Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					Source: unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{
+						ZoneName:   "Internal",
+						IPs:        []string{"10.0.1.20"},
+						PortRanges: tc.allowRanges,
+					},
+				},
+				unifi.FirewallPolicy{
+					ID: "p-deny", Index: 100, Name: "Block Default", Enabled: true,
+					Action: "BLOCK", IPVersion: "both", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			)
+			var aps []config.ApprovedPath
+			for _, p := range tc.approved {
+				aps = append(aps, config.ApprovedPath{
+					SourceZone: "Guest", DestZone: "Internal", DestIP: "10.0.1.20", Transport: "tcp", Port: p,
+				})
+			}
+			mat, _, _ := EvaluateIsolation(baseSnap(pols), nil, config.NetworkConfig{
+				TrustedVLANs:    []string{"Office"},
+				IsolatedVLANs:   []string{"Guest"},
+				IsolationPolicy: config.IsolationIntent{ApprovedPaths: aps},
+			})
+			cell := findTransit(mat)
+			if cell == nil || cell.Verdict != tc.want {
+				t.Fatalf("%s: verdict=%v, want %v (cell=%+v)", tc.name, cell.Verdict, tc.want, cell)
+			}
+		}
+	})
+
+	// 3. Earlier rule denies guest-1 (10.0.50.10); later rule allows guest-1
+	// and neighbor guest-2 (10.0.50.11) to reach Office service 10.0.1.20:8443.
+	// UniBlue must catch guest-2's access instead of reporting blocked-ok.
+	for _, tc := range []struct {
+		name      string
+		allowSrc  unifi.PolicyEndpoint
+		blockSrc  unifi.PolicyEndpoint
+		wantState IsolationVerdict
+	}{
+		{
+			name:     "block_first_client_allow_both_explicit_ips",
+			blockSrc: unifi.PolicyEndpoint{ZoneName: "Guest", IPs: []string{"10.0.50.10"}, AnyPort: true},
+			allowSrc: unifi.PolicyEndpoint{ZoneName: "Guest", IPs: []string{"10.0.50.10", "10.0.50.11"}, AnyPort: true},
+		},
+		{
+			name:     "block_first_client_allow_range_covering_neighbor",
+			blockSrc: unifi.PolicyEndpoint{ZoneName: "Guest", IPs: []string{"10.0.50.10"}, AnyPort: true},
+			allowSrc: unifi.PolicyEndpoint{ZoneName: "Guest", IPs: []string{"10.0.50.10-10.0.50.11"}, AnyPort: true},
+		},
+		{
+			name:     "block_first_client_allow_any_guest",
+			blockSrc: unifi.PolicyEndpoint{ZoneName: "Guest", IPs: []string{"10.0.50.10"}, AnyPort: true},
+			allowSrc: unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+		},
+		{
+			name:     "block_first_mac_allow_any_guest",
+			blockSrc: unifi.PolicyEndpoint{ZoneName: "Guest", MACs: []string{"02:00:00:50:00:10"}, AnyPort: true},
+			allowSrc: unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := baseSnap([]unifi.FirewallPolicy{
+				{
+					ID: "p-block-one", Index: 10, Name: "Block Guest 1", Enabled: true,
+					Action: "BLOCK", IPVersion: "ipv4", Protocol: "tcp",
+					Source:      tc.blockSrc,
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"10.0.1.20"}, Ports: []int{8443}},
+				},
+				{
+					ID: "p-allow-both", Index: 20, Name: "Allow Guests to Office", Enabled: true,
+					Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					Source:      tc.allowSrc,
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"10.0.1.20"}, Ports: []int{8443}},
+				},
+				{
+					ID: "p-deny-rest", Index: 100, Name: "Block Guest -> Internal", Enabled: true,
+					Action: "BLOCK", IPVersion: "both", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			})
+			mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{
+				TrustedVLANs:  []string{"Office"},
+				IsolatedVLANs: []string{"Guest"},
+			})
+			cell := findTransit(mat)
+			if cell == nil || cell.Verdict != IsolationViolation || cell.DecisiveRuleID != "p-allow-both" {
+				t.Fatalf("%s: expected IsolationViolation via p-allow-both, got %+v", tc.name, cell)
+			}
+		})
+	}
+
+	// 4. Same source-masking check on Gateway Admin boundary: blocking guest-1
+	// from Gateway HTTPS must not hide guest-2 allowed by a subsequent rule.
+	t.Run("gateway_admin_block_one_source_does_not_hide_neighbor", func(t *testing.T) {
+		snap := baseSnap([]unifi.FirewallPolicy{
+			{
+				ID: "p-gw-block-one", Index: 10, Name: "Block Guest 1 -> GW", Enabled: true,
+				Action: "BLOCK", IPVersion: "ipv4", Protocol: "tcp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Guest", IPs: []string{"10.0.50.10"}, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, Ports: []int{443}},
+			},
+			{
+				ID: "p-gw-allow-both", Index: 20, Name: "Allow Guests -> GW HTTPS", Enabled: true,
+				Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Guest", IPs: []string{"10.0.50.10-10.0.50.11"}, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, Ports: []int{443}},
+			},
+			{
+				ID: "p-gw-deny", Index: 100, Name: "Block Guest -> GW", Enabled: true,
+				Action: "BLOCK", IPVersion: "both", Protocol: "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, AnyPort: true},
+			},
+		})
+		mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{
+			TrustedVLANs:  []string{"Office"},
+			IsolatedVLANs: []string{"Guest"},
+		})
+		var gwCell *IsolationCell
+		for i := range mat.Cells {
+			c := &mat.Cells[i]
+			if c.DestFunction == "gateway-admin" && c.SourceNetwork == "Guest" && c.IPFamily == "ipv4" {
+				gwCell = c
+				break
+			}
+		}
+		if gwCell == nil || gwCell.Verdict != IsolationViolation || gwCell.DecisiveRuleID != "p-gw-allow-both" {
+			t.Fatalf("expected gateway-admin IsolationViolation via p-gw-allow-both, got %+v", gwCell)
+		}
+	})
+
+	// 5. Differential oracle over 500 synthetic policies combining partial
+	// source/dest/port blocks, allow port ranges, and partial approvals:
+	// zero false blocked-ok and zero false violations.
+	t.Run("differential_oracle_500_synthetic_policies", func(t *testing.T) {
+		var seed uint64 = 0x5eed1234abcd9876
+		nextInt := func(n int) int {
+			seed = seed*6364136223846793005 + 1442695040888963407
+			return int((seed >> 33) % uint64(n))
+		}
+		srcPool := []string{"10.0.50.10", "10.0.50.11", "10.0.50.12", "10.0.50.13"}
+		dstPool := []string{"10.0.1.20", "10.0.1.21", "10.0.1.22", "10.0.1.23"}
+		pickIPSel := func(pool []string) ([]string, bool) {
+			switch nextInt(5) {
+			case 0:
+				return nil, true // AnyTarget
+			case 1:
+				return []string{pool[nextInt(len(pool))]}, false
+			case 2:
+				a := nextInt(len(pool))
+				b := nextInt(len(pool))
+				if a > b {
+					a, b = b, a
+				}
+				return []string{pool[a] + "-" + pool[b]}, false
+			case 3:
+				a := nextInt(len(pool))
+				b := nextInt(len(pool))
+				return []string{pool[a], pool[b]}, false
+			default:
+				return []string{pool[nextInt(len(pool))]}, false
+			}
+		}
+		pickPortEP := func(base unifi.PolicyEndpoint) unifi.PolicyEndpoint {
+			switch nextInt(4) {
+			case 0:
+				p := 8000 + nextInt(17)
+				base.Ports = []int{p}
+			case 1:
+				a := 8000 + nextInt(17)
+				b := 8000 + nextInt(17)
+				if a > b {
+					a, b = b, a
+				}
+				base.PortRanges = []unifi.PortRange{{Start: a, End: b}}
+			case 2:
+				a := 8000 + nextInt(10)
+				base.PortRanges = []unifi.PortRange{{Start: a, End: a + 5}}
+				base.Ports = []int{8016}
+			default:
+				base.Ports = []int{8000 + nextInt(17), 8000 + nextInt(17)}
+			}
+			return base
+		}
+
+		for trial := 0; trial < 500; trial++ {
+			var pols []unifi.FirewallPolicy
+			// 0..2 earlier partial BLOCK rules.
+			numBlocks := nextInt(3)
+			for b := 0; b < numBlocks; b++ {
+				sIPs, sAny := pickIPSel(srcPool)
+				dIPs, dAny := pickIPSel(dstPool)
+				srcEP := unifi.PolicyEndpoint{ZoneName: "Guest", IPs: sIPs, AnyTarget: sAny, AnyPort: true}
+				dstEP := pickPortEP(unifi.PolicyEndpoint{ZoneName: "Internal", IPs: dIPs, AnyTarget: dAny})
+				if nextInt(6) == 0 && !sAny {
+					srcEP.NegateTarget = true
+				}
+				if nextInt(6) == 0 && !dAny {
+					dstEP.NegateTarget = true
+				}
+				pols = append(pols, unifi.FirewallPolicy{
+					ID: fmt.Sprintf("blk-%d-%d", trial, b), Index: 10 + b, Name: "Block", Enabled: true,
+					Action: "BLOCK", IPVersion: "ipv4", Protocol: "tcp",
+					Source: srcEP, Destination: dstEP,
+				})
+			}
+			// 1 ALLOW rule scoped to srcPool/dstPool and ports in 8000..8016.
+			sIPs, sAny := pickIPSel(srcPool)
+			if sAny {
+				sIPs = []string{"10.0.50.10-10.0.50.13"}
+			}
+			dIPs, dAny := pickIPSel(dstPool)
+			if dAny {
+				dIPs = []string{"10.0.1.20-10.0.1.23"}
+			}
+			allowDst := pickPortEP(unifi.PolicyEndpoint{ZoneName: "Internal", IPs: dIPs})
+			pols = append(pols,
+				unifi.FirewallPolicy{
+					ID: fmt.Sprintf("allow-%d", trial), Index: 50, Name: "Allow", Enabled: true,
+					Action: "ALLOW", IPVersion: "ipv4", Protocol: "tcp",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Guest", IPs: sIPs, AnyPort: true},
+					Destination: allowDst,
+				},
+				unifi.FirewallPolicy{
+					ID: "deny-all", Index: 100, Name: "Block Rest", Enabled: true,
+					Action: "BLOCK", IPVersion: "both", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Guest", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+			)
+
+			// 0..2 partial ApprovedPath entries.
+			var aps []config.ApprovedPath
+			for a := 0; a < nextInt(3); a++ {
+				aps = append(aps, config.ApprovedPath{
+					SourceZone: "Guest",
+					DestZone:   "Internal",
+					DestIP:     dstPool[nextInt(len(dstPool))],
+					Transport:  "tcp",
+					Port:       8000 + nextInt(17),
+				})
+			}
+
+			snap := baseSnap(pols)
+			netCfg := config.NetworkConfig{
+				TrustedVLANs:    []string{"Office"},
+				IsolatedVLANs:   []string{"Guest"},
+				IsolationPolicy: config.IsolationIntent{ApprovedPaths: aps},
+			}
+
+			// Brute-force oracle over every (src, dst, port) in the finite rule domain.
+			oracleAllowed := false
+			for _, sip := range srcPool {
+				for _, dip := range dstPool {
+					for port := 8000; port <= 8016; port++ {
+						if isTransitProbeApproved(snap, nil, aps, "Guest", "Guest", snap.Networks[0], dip, "tcp", port, "ipv4") {
+							continue
+						}
+						dec := evaluateGatewayPolicies(pols, pathQuery{
+							srcZone: "Guest", srcNetID: "net-guest", srcNetName: "Guest", srcIP: sip,
+							dstZone: "Internal", dstNetID: "net-office", dstNetName: "Office", dstIP: dip,
+							proto: "tcp", port: port, ipFamily: "ipv4", state: "new",
+						})
+						if dec.action == "allow" {
+							oracleAllowed = true
+							break
+						}
+					}
+					if oracleAllowed {
+						break
+					}
+				}
+				if oracleAllowed {
+					break
+				}
+			}
+
+			mat, _, _ := EvaluateIsolation(snap, nil, netCfg)
+			cell := findTransit(mat)
+			want := IsolationBlockedOK
+			if oracleAllowed {
+				want = IsolationViolation
+			}
+			if cell == nil || cell.Verdict != want {
+				t.Fatalf("trial %d: EvaluateIsolation verdict=%v, brute-force oracle wants %v (cell=%+v, aps=%+v)", trial, cell.Verdict, want, cell, aps)
+			}
+		}
+	})
+}

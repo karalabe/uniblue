@@ -471,6 +471,14 @@ type SwitchPort struct {
 	// NativeNetworkName is the resolved human-readable native VLAN/network name.
 	NativeNetworkName string `json:"native_network_name,omitempty"`
 
+	// PortConfID is the UniFi switch port profile ID assigned to this port, if any.
+	PortConfID string `json:"port_conf_id,omitempty"`
+
+	// ProfileManaged reports whether this port's VLAN, forwarding, PoE, isolation,
+	// or port-security settings are governed by its referenced port profile rather
+	// than manual per-port overrides.
+	ProfileManaged bool `json:"profile_managed,omitempty"`
+
 	// PoEEnabled reports whether PoE power is currently being delivered on this port.
 	PoEEnabled bool `json:"poe_enabled,omitempty"`
 

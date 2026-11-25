@@ -1163,6 +1163,7 @@ func TestReloginCooldownIgnoresCallerTimeoutAndTransientErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctrl.transientReloginCooldown = 60 * time.Millisecond
 	if err := ctrl.Login(context.Background()); err != nil {
 		t.Fatalf("initial Login: %v", err)
 	}
@@ -1177,24 +1178,36 @@ func TestReloginCooldownIgnoresCallerTimeoutAndTransientErrors(t *testing.T) {
 		t.Fatal("expected timeout error for short-deadline caller")
 	}
 
-	// Immediately afterward, a healthy caller must succeed without hitting the 30s cooldown.
+	// Immediately afterward, a healthy caller must succeed without hitting any cooldown.
 	slowLogin.Store(false)
 	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/sta", &out); err != nil {
 		t.Fatalf("healthy caller blocked after prior caller timeout: %v", err)
 	}
 
-	// 2. Transient HTTP 503 during relogin must also not activate the 30s cooldown.
+	// 2. Transient HTTP 503 during relogin coalesces a burst of concurrent 401s
+	// into one login attempt, then recovers right after the short transient window
+	// (without engaging the full 30s credential lockout cooldown).
 	expired.Store(true)
 	return503.Store(true)
-	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/sta", &out); err == nil {
-		t.Fatal("expected 503 relogin error")
+	before503 := loginCalls.Load()
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var tmp apiEnvelope[rawClient]
+			_ = ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/sta", &tmp)
+		}()
 	}
+	wg.Wait()
+	if delta := loginCalls.Load() - before503; delta != 1 {
+		t.Fatalf("expected 6 concurrent 401s on 503 login to coalesce into 1 login attempt, got %d", delta)
+	}
+
 	return503.Store(false)
+	time.Sleep(80 * time.Millisecond)
 	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/stat/sta", &out); err != nil {
-		t.Fatalf("healthy caller blocked after transient 503 login failure: %v", err)
-	}
-	if loginCalls.Load() < 5 {
-		t.Fatalf("expected relogin retries to execute after non-auth errors, loginCalls=%d", loginCalls.Load())
+		t.Fatalf("healthy caller blocked after transient 503 burst window expired: %v", err)
 	}
 }
 

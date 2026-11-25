@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -563,7 +564,7 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 			{
 				MAC: "aa:00:00:00:00:02", Name: "Switch", Type: "usw",
 				Ports: []unifi.SwitchPort{
-					{PortIdx: 1, Enabled: true, Up: true, NativeNetworkName: "IoT", TaggedVLANMgmt: "block_all", PortSecurityEnabled: true},
+					{PortIdx: 1, Enabled: true, Up: true, NativeNetworkName: "IoT", TaggedVLANMgmt: "block_all", PortConfID: "prof-iot", ProfileManaged: true, PortSecurityEnabled: true},
 				},
 			},
 		},
@@ -578,7 +579,7 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 			{
 				MAC: "aa:00:00:00:00:02", Name: "Switch", Type: "usw",
 				Ports: []unifi.SwitchPort{
-					{PortIdx: 1, Enabled: true, Up: true, NativeNetworkName: "", TaggedVLANMgmt: "auto", PortSecurityEnabled: true},
+					{PortIdx: 1, Enabled: true, Up: true, NativeNetworkName: "", TaggedVLANMgmt: "auto", PortConfID: "prof-iot", ProfileManaged: true, PortSecurityEnabled: true},
 				},
 			},
 		},
@@ -643,8 +644,8 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 		t.Fatalf("expected port_config_changed for direct per-port change during portconf outage, got %+v", eng.Snapshot().Events)
 	}
 	changedPort := eng.snap.Devices[0].Ports[0]
-	if changedPort.Enabled || changedPort.PortSecurityEnabled || changedPort.NativeNetworkName != "Management" || changedPort.TaggedVLANMgmt != "block_all" {
-		t.Fatalf("expected direct fields preserved live and profile field carried forward, got %+v", changedPort)
+	if changedPort.Enabled || changedPort.PortSecurityEnabled || changedPort.NativeNetworkName != "Management" || changedPort.TaggedVLANMgmt != "auto" {
+		t.Fatalf("expected direct manual per-port edits preserved live, got %+v", changedPort)
 	}
 
 	// Verify runFullScan adoption keeps briefly dozing Wi-Fi clients (<60s)
@@ -790,13 +791,16 @@ func TestClientSkipReasonAndIPv6ClassLookup(t *testing.T) {
 }
 
 // TestHTTPAuthBruteForceLockout verifies per-IP lockout throttling on repeated
-// bad dashboard/API token attempts without penalizing cookie-less initial loads.
+// bad dashboard/API token attempts without locking out valid Bearer/session
+// holders behind a shared reverse proxy, without letting a valid Bearer reset
+// an attacker's failure counter, and with IPv6 /64 prefix bucketing.
 func TestHTTPAuthBruteForceLockout(t *testing.T) {
 	eng := NewDemoEngineForTest(t)
 	eng.opts.ListenAddr = "0.0.0.0:8080"
 	eng.opts.APIToken = "super-secret-token"
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	eng.authLimiter.nowFn = func() time.Time { return now }
+	eng.sessions.nowFn = func() time.Time { return now }
 	h := eng.Handler()
 
 	// Unauthenticated GET /api/v1/state without Authorization header never locks out.
@@ -808,6 +812,24 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("attempt %d: expected 401 for unauthenticated page check, got %d", i+1, rec.Code)
 		}
+	}
+
+	// Obtain a valid session cookie for 10.0.0.50 before bad login attempts occur.
+	reqInit := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"super-secret-token"}`))
+	reqInit.RemoteAddr = "10.0.0.50:39999"
+	recInit := httptest.NewRecorder()
+	h.ServeHTTP(recInit, reqInit)
+	if recInit.Code != http.StatusOK {
+		t.Fatalf("initial login expected 200, got %d", recInit.Code)
+	}
+	var validCookie *http.Cookie
+	for _, ck := range recInit.Result().Cookies() {
+		if ck.Name == sessionCookieName {
+			validCookie = ck
+		}
+	}
+	if validCookie == nil {
+		t.Fatal("expected session cookie from initial login")
 	}
 
 	// 4 bad POST /api/v1/session attempts return 401; the 5th triggers 429 lockout.
@@ -828,15 +850,35 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		}
 	}
 
-	// Even the valid token is rejected while locked out (including IPv4-mapped form).
+	// While locked out, further POST /api/v1/session attempts from the same IP
+	// (including IPv4-mapped form) are rejected with 429 to throttle guessing.
 	for _, remote := range []string{"10.0.0.50:55555", "[::ffff:10.0.0.50]:55556"} {
 		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"super-secret-token"}`))
 		req.RemoteAddr = remote
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusTooManyRequests {
-			t.Fatalf("remote %s while locked out: expected 429, got %d", remote, rec.Code)
+			t.Fatalf("remote %s login while locked out: expected 429, got %d", remote, rec.Code)
 		}
+	}
+
+	// Valid Bearer token and valid session cookie from the SAME IP (e.g. shared
+	// reverse proxy) MUST still succeed while bad attempts are locked out.
+	reqBearer := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
+	reqBearer.RemoteAddr = "10.0.0.50:55557"
+	reqBearer.Header.Set("Authorization", "Bearer super-secret-token")
+	recBearer := httptest.NewRecorder()
+	h.ServeHTTP(recBearer, reqBearer)
+	if recBearer.Code != http.StatusOK {
+		t.Fatalf("valid Bearer while locked out expected 200, got %d", recBearer.Code)
+	}
+	reqCk := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
+	reqCk.RemoteAddr = "10.0.0.50:55558"
+	reqCk.AddCookie(validCookie)
+	recCk := httptest.NewRecorder()
+	h.ServeHTTP(recCk, reqCk)
+	if recCk.Code != http.StatusOK {
+		t.Fatalf("valid session cookie while locked out expected 200, got %d", recCk.Code)
 	}
 
 	// Another IP is unaffected and can authenticate normally.
@@ -848,7 +890,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		t.Fatalf("different IP expected 200, got %d", recOther.Code)
 	}
 
-	// After lockout expires, valid auth succeeds and resets state.
+	// After lockout expires, valid login succeeds and resets state.
 	now = now.Add(authLockoutDuration + time.Second)
 	reqUnlock := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"super-secret-token"}`))
 	reqUnlock.RemoteAddr = "10.0.0.50:60000"
@@ -858,8 +900,8 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 		t.Fatalf("after lockout expiry expected 200, got %d", recUnlock.Code)
 	}
 
-	// Bad Bearer tokens on /api/v1/state also count toward lockout, and a valid
-	// Bearer token before the threshold resets the counter.
+	// Bad Bearer tokens count toward lockout, and a valid Bearer token from a
+	// legitimate client on the same IP does NOT reset the failure counter.
 	for i := 0; i < authMaxFailedAttempts-1; i++ {
 		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
 		req.RemoteAddr = "10.0.0.52:1000"
@@ -878,21 +920,34 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 	if recGood.Code != http.StatusOK {
 		t.Fatalf("valid bearer before threshold expected 200, got %d", recGood.Code)
 	}
-	// One more bad attempt must be 401 (counter was reset), not 429.
-	reqAfterReset := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
-	reqAfterReset.RemoteAddr = "10.0.0.52:1002"
-	reqAfterReset.Header.Set("Authorization", "Bearer bad-again")
-	recAfterReset := httptest.NewRecorder()
-	h.ServeHTTP(recAfterReset, reqAfterReset)
-	if recAfterReset.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 after reset, got %d", recAfterReset.Code)
+	// The 5th bad attempt MUST still trigger 429 (valid Bearer did not reset it).
+	reqFifthBad := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
+	reqFifthBad.RemoteAddr = "10.0.0.52:1002"
+	reqFifthBad.Header.Set("Authorization", "Bearer bad-again")
+	recFifthBad := httptest.NewRecorder()
+	h.ServeHTTP(recFifthBad, reqFifthBad)
+	if recFifthBad.Code != http.StatusTooManyRequests {
+		t.Fatalf("5th bad bearer after valid bearer expected 429, got %d", recFifthBad.Code)
 	}
 
-	// Forged session cookies also count toward lockout and are cleared on rejection.
-	for i := 1; i <= authMaxFailedAttempts; i++ {
+	// Stale/invalid session cookies are cleared cleanly without triggering lockout
+	// (so multiple browser tabs after token rotation never lock out the user).
+	for i := 1; i <= authMaxFailedAttempts+2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/v1/state", nil)
 		req.RemoteAddr = "10.0.0.53:1000"
-		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "forged-cookie"})
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "stale-cookie"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("stale cookie %d: expected 401, got %d", i, rec.Code)
+		}
+	}
+
+	// IPv6 clients sharing a /64 prefix share a single rate-limit bucket so
+	// rotating privacy suffixes cannot bypass brute-force lockout.
+	for i := 1; i <= authMaxFailedAttempts; i++ {
+		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/v1/session", strings.NewReader(`{"token":"wrong"}`))
+		req.RemoteAddr = fmt.Sprintf("[2001:db8:abcd:1::%x]:40000", i+10)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		want := http.StatusUnauthorized
@@ -900,7 +955,7 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 			want = http.StatusTooManyRequests
 		}
 		if rec.Code != want {
-			t.Fatalf("forged cookie %d: expected %d, got %d", i, want, rec.Code)
+			t.Fatalf("ipv6 /64 attempt %d: expected %d, got %d", i, want, rec.Code)
 		}
 	}
 }
@@ -1501,11 +1556,42 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 
 	ck1 := login()
 	ck2 := login()
-	if len(ck1.Value) != 64 || len(ck2.Value) != 64 {
-		t.Fatalf("expected 64-char hex random session tokens, got lengths %d and %d", len(ck1.Value), len(ck2.Value))
+	if strings.Contains(ck1.Value, eng.opts.APIToken) || strings.Contains(ck2.Value, eng.opts.APIToken) {
+		t.Fatalf("session cookie must never contain raw API token")
+	}
+	if len(strings.Split(ck1.Value, ".")) != 3 || len(strings.Split(ck2.Value, ".")) != 3 {
+		t.Fatalf("expected signed 3-part session cookies, got %q and %q", ck1.Value, ck2.Value)
 	}
 	if ck1.Value == ck2.Value {
 		t.Fatalf("expected distinct random session cookies per login, both were %q", ck1.Value)
+	}
+
+	// Signed cookies survive a server restart with the same API token.
+	engRestarted := NewDemoEngineForTest(t)
+	engRestarted.opts.ListenAddr = "127.0.0.1:8080"
+	engRestarted.opts.APIToken = "session-secret-token"
+	engRestarted.sessions.nowFn = func() time.Time { return now }
+	reqRestart := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
+	reqRestart.Host = "127.0.0.1:8080"
+	reqRestart.AddCookie(ck2)
+	recRestart := httptest.NewRecorder()
+	engRestarted.Handler().ServeHTTP(recRestart, reqRestart)
+	if recRestart.Code != http.StatusOK {
+		t.Fatalf("signed cookie after restart with same token status = %d, want 200", recRestart.Code)
+	}
+
+	// Rotating the API token immediately invalidates prior signed cookies.
+	engRotated := NewDemoEngineForTest(t)
+	engRotated.opts.ListenAddr = "127.0.0.1:8080"
+	engRotated.opts.APIToken = "rotated-secret-token"
+	engRotated.sessions.nowFn = func() time.Time { return now }
+	reqRot := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/v1/state", nil)
+	reqRot.Host = "127.0.0.1:8080"
+	reqRot.AddCookie(ck2)
+	recRot := httptest.NewRecorder()
+	engRotated.Handler().ServeHTTP(recRot, reqRot)
+	if recRot.Code != http.StatusUnauthorized {
+		t.Fatalf("signed cookie after token rotation status = %d, want 401", recRot.Code)
 	}
 
 	checkState := func(ck *http.Cookie, want int) {
