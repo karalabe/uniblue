@@ -231,11 +231,17 @@ type StateConfig struct {
 	Path string `yaml:"path"`
 }
 
-// NotifyConfig controls outbound webhook alerts during watch mode.
+// NotifyConfig controls outbound webhook alerts during watch and serve modes.
 type NotifyConfig struct {
 	// WebhookURL is the HTTP(S) endpoint receiving alert payloads. Leaving it
 	// empty disables webhook notifications.
 	WebhookURL string `yaml:"webhook_url"`
+
+	// WebhookSecret optionally signs outbound webhook POSTs using the Standard
+	// Webhooks scheme (webhook-id, webhook-timestamp, webhook-signature). Accepts
+	// either a raw shared secret or a whsec_<base64> secret. Leave empty to send
+	// unsigned webhooks.
+	WebhookSecret string `yaml:"webhook_secret"`
 
 	// Format selects the payload shape: "json", "discord", "slack", or "ntfy".
 	Format string `yaml:"format"`
@@ -317,6 +323,15 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("UNIBLUE_WEBHOOK_URL"); v != "" {
 		cfg.Notify.WebhookURL = v
+	}
+	if v := os.Getenv("UNIBLUE_WEBHOOK_SECRET"); v != "" {
+		cfg.Notify.WebhookSecret = v
+	}
+	if v := os.Getenv("UNIBLUE_WEBHOOK_FORMAT"); v != "" {
+		cfg.Notify.Format = v
+	}
+	if v := os.Getenv("UNIBLUE_WEBHOOK_MIN_SEVERITY"); v != "" {
+		cfg.Notify.MinSeverity = v
 	}
 
 	// Re-apply safe defaults for zero-valued fields that may have been explicitly

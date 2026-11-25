@@ -9,12 +9,17 @@ package server
 import (
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -980,4 +985,101 @@ func TestBackgroundCVESyncAutoLoadsAndSkipsUnchanged(t *testing.T) {
 	<-done
 	t.Fatalf("expected nginx ExactCVEs with TotalCount=2 after background sync, got CVELoaded=%v ExactCVEs=%+v",
 		eng.Snapshot().CVELoaded, eng.Snapshot().ExactCVEs)
+}
+
+// TestWebhookRetryPreservesIDAndResigns verifies that Engine.drainWebhooks
+// keeps the exact same webhook-id across retry attempts while signing each
+// attempt with a valid Standard Webhooks HMAC-SHA256 signature.
+func TestWebhookRetryPreservesIDAndResigns(t *testing.T) {
+	rawKey := []byte("hermes-webhook-signing-key-32bytes")
+	secret := "whsec_" + base64.StdEncoding.EncodeToString(rawKey)
+
+	type attempt struct {
+		id   string
+		ts   int64
+		sig  string
+		body []byte
+	}
+	var mu sync.Mutex
+	var attempts []attempt
+	doneCh := make(chan struct{})
+
+	whSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		ts, _ := strconv.ParseInt(r.Header.Get("webhook-timestamp"), 10, 64)
+		mu.Lock()
+		attempts = append(attempts, attempt{
+			id:   r.Header.Get("webhook-id"),
+			ts:   ts,
+			sig:  r.Header.Get("webhook-signature"),
+			body: body,
+		})
+		n := len(attempts)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if n == 2 {
+			close(doneCh)
+		}
+	}))
+	defer whSrv.Close()
+
+	cfg := config.Default()
+	cfg.UniFi.URL = "https://192.0.2.1"
+	cfg.UniFi.APIKey = "test"
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	cfg.Notify.WebhookURL = whSrv.URL
+	cfg.Notify.WebhookSecret = secret
+	cfg.Notify.Format = "json"
+
+	eng, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	eng.webhookRetryBase = 15 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eng.enqueueWebhook(ctx, pendingWebhook{
+		site: "default",
+		diff: risk.Diff{
+			NewFindings: []checks.Finding{{
+				CheckID:           "UB-0001",
+				Title:             "Telnet open",
+				EffectiveSeverity: checks.SeverityHigh,
+				Client:            unifi.Client{IP: "192.0.2.50", Name: "nas"},
+			}},
+		},
+	})
+
+	select {
+	case <-doneCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for webhook retry delivery")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attempts) != 2 {
+		t.Fatalf("expected 2 webhook attempts, got %d", len(attempts))
+	}
+	if !strings.HasPrefix(attempts[0].id, "msg_") || attempts[0].id != attempts[1].id {
+		t.Fatalf("expected identical msg_* webhook-id across retry, got %q and %q", attempts[0].id, attempts[1].id)
+	}
+	if attempts[1].ts < attempts[0].ts {
+		t.Fatalf("expected non-decreasing timestamp on retry, got %d then %d", attempts[0].ts, attempts[1].ts)
+	}
+	for i, a := range attempts {
+		mac := hmac.New(sha256.New, rawKey)
+		_, _ = mac.Write([]byte(a.id + "." + strconv.FormatInt(a.ts, 10) + "."))
+		_, _ = mac.Write(a.body)
+		want := "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+		if a.sig != want {
+			t.Fatalf("attempt %d signature mismatch: got %q want %q", i+1, a.sig, want)
+		}
+	}
 }

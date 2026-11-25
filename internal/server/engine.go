@@ -272,6 +272,7 @@ const (
 )
 
 type pendingWebhook struct {
+	id          string
 	site        string
 	diff        risk.Diff
 	attempts    int
@@ -1742,7 +1743,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 				})
 			}
 			if diff.HasAlerts(e.minNotify) && e.notifier != nil {
-				webhookToSend = &pendingWebhook{site: snap.Site, diff: diff}
+				webhookToSend = &pendingWebhook{id: notify.NewWebhookID(), site: snap.Site, diff: diff}
 			}
 		}
 		nextState = risk.BuildStateWithPrev(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
@@ -1798,6 +1799,9 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 }
 
 func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
+	if item.id == "" {
+		item.id = notify.NewWebhookID()
+	}
 	e.webhookMu.Lock()
 	if len(e.pendingWebhooks) >= maxPendingWebhooks {
 		// Drop the oldest queued notification under sustained outage so memory stays bounded.
@@ -1845,7 +1849,7 @@ func (e *Engine) drainWebhooks(ctx context.Context) {
 			return
 		}
 
-		err := e.notifier.Send(ctx, item.site, item.diff)
+		err := e.notifier.SendWithID(ctx, item.id, item.site, item.diff)
 		e.webhookMu.Lock()
 		if err == nil {
 			if len(e.pendingWebhooks) > 0 {

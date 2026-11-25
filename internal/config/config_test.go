@@ -225,3 +225,40 @@ func TestStatePathPreservesLegacyCWDBaselineOnUpgrade(t *testing.T) {
 		t.Fatalf("migrated state.path = %q, want %q", cfgMigrated.State.Path, wantCfgState)
 	}
 }
+
+// TestLoadWebhookSecretFromYAMLAndEnv verifies notify.webhook_secret parsing
+// from YAML and UNIBLUE_WEBHOOK_SECRET environment overrides.
+func TestLoadWebhookSecretFromYAMLAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	raw := `
+unifi:
+  url: "https://192.0.2.1"
+  api_key: "k"
+notify:
+  webhook_url: "https://hooks.example.test/uniblue"
+  webhook_secret: "whsec_eWFtbC1zZWNyZXQ="
+`
+	if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load(yaml): %v", err)
+	}
+	if cfg.Notify.WebhookSecret != "whsec_eWFtbC1zZWNyZXQ=" {
+		t.Fatalf("expected yaml webhook_secret, got %q", cfg.Notify.WebhookSecret)
+	}
+
+	t.Setenv("UNIBLUE_WEBHOOK_SECRET", "env-override-secret")
+	t.Setenv("UNIBLUE_WEBHOOK_FORMAT", "json")
+	t.Setenv("UNIBLUE_WEBHOOK_MIN_SEVERITY", "high")
+	cfgEnv, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load(env): %v", err)
+	}
+	if cfgEnv.Notify.WebhookSecret != "env-override-secret" || cfgEnv.Notify.Format != "json" || cfgEnv.Notify.MinSeverity != "high" {
+		t.Fatalf("unexpected env notify config: %+v", cfgEnv.Notify)
+	}
+}

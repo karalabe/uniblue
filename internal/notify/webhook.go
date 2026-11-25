@@ -11,12 +11,18 @@ package notify
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -39,6 +45,9 @@ type Notifier struct {
 	// webhookURL is the target HTTP(S) endpoint; empty disables delivery.
 	webhookURL string
 
+	// signingKey holds the optional HMAC-SHA256 key for Standard Webhooks signing.
+	signingKey []byte
+
 	// format chooses the outgoing payload layout ("json", "discord", "slack", "ntfy").
 	format string
 
@@ -47,6 +56,9 @@ type Notifier struct {
 
 	// httpClient bounds outbound webhook delivery time.
 	httpClient *http.Client
+
+	// nowFn optionally overrides time.Now in tests.
+	nowFn func() time.Time
 }
 
 // New creates a Notifier from NotifyConfig. If WebhookURL is empty, Send is a
@@ -56,8 +68,13 @@ func New(cfg config.NotifyConfig) (*Notifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("notify min_severity: %w", err)
 	}
+	signingKey, err := parseWebhookSecret(cfg.WebhookSecret)
+	if err != nil {
+		return nil, err
+	}
 	return &Notifier{
 		webhookURL:  strings.TrimSpace(cfg.WebhookURL),
+		signingKey:  signingKey,
 		format:      strings.ToLower(strings.TrimSpace(cfg.Format)),
 		minSeverity: minSev,
 		httpClient: &http.Client{
@@ -71,9 +88,62 @@ func New(cfg config.NotifyConfig) (*Notifier, error) {
 	}, nil
 }
 
+// NewWebhookID generates a unique Standard Webhooks message identifier that
+// callers can preserve across retry attempts for receiver-side deduplication.
+func NewWebhookID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		return "msg_" + hex.EncodeToString(buf[:])
+	}
+	return "msg_" + strconv.FormatInt(time.Now().UnixNano(), 16)
+}
+
+// parseWebhookSecret decodes either a Standard Webhooks whsec_<base64> secret
+// or a raw shared secret string without leaking the secret value on error.
+func parseWebhookSecret(raw string) ([]byte, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(s, "whsec_") {
+		encoded := strings.TrimPrefix(s, "whsec_")
+		if encoded == "" {
+			return nil, errors.New("notify webhook_secret: empty whsec_ base64 payload")
+		}
+		key, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			key, err = base64.RawStdEncoding.DecodeString(encoded)
+		}
+		if err != nil || len(key) == 0 {
+			return nil, errors.New("notify webhook_secret: invalid whsec_ base64 payload")
+		}
+		return key, nil
+	}
+	return []byte(s), nil
+}
+
+// signStandardWebhook computes the Standard Webhooks v1 HMAC-SHA256 signature
+// header value over "<id>.<timestamp>.<body>".
+func signStandardWebhook(key []byte, id, timestamp string, body []byte) string {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(id))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write([]byte(timestamp))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write(body)
+	return "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
 // Send delivers an alert for diff if a webhook URL is configured and at least
 // one item meets the minimum severity threshold.
 func (n *Notifier) Send(ctx context.Context, site string, diff risk.Diff) error {
+	return n.SendWithID(ctx, "", site, diff)
+}
+
+// SendWithID delivers an alert for diff using a caller-supplied message id
+// (generating one if empty) so retry loops can reuse the same webhook-id while
+// signing each attempt with a fresh webhook-timestamp.
+func (n *Notifier) SendWithID(ctx context.Context, id, site string, diff risk.Diff) error {
 	if n.webhookURL == "" || !diff.HasAlerts(n.minSeverity) {
 		return nil
 	}
@@ -128,6 +198,20 @@ func (n *Notifier) Send(ctx context.Context, site string, diff risk.Diff) error 
 	req.Header.Set("User-Agent", "UniBlue/0.1")
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	if len(n.signingKey) > 0 {
+		msgID := strings.TrimSpace(id)
+		if msgID == "" {
+			msgID = NewWebhookID()
+		}
+		now := time.Now()
+		if n.nowFn != nil {
+			now = n.nowFn()
+		}
+		ts := strconv.FormatInt(now.Unix(), 10)
+		req.Header.Set("webhook-id", msgID)
+		req.Header.Set("webhook-timestamp", ts)
+		req.Header.Set("webhook-signature", signStandardWebhook(n.signingKey, msgID, ts, body))
 	}
 
 	resp, err := n.httpClient.Do(req)

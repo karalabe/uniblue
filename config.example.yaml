@@ -80,5 +80,6 @@ unifi:
 
 # notify:
 #   webhook_url: ""        # Or UNIBLUE_WEBHOOK_URL
+#   webhook_secret: ""     # Or UNIBLUE_WEBHOOK_SECRET (raw secret or whsec_<base64> for Standard Webhooks signing)
 #   format: "ntfy"         # json | discord | slack | ntfy
 #   min_severity: "medium" # info | low | medium | high | critical

@@ -8,13 +8,18 @@ package notify
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/karalabe/uniblue/internal/checks"
@@ -299,4 +304,161 @@ func TestNotifierTruncatesNtfyBody(t *testing.T) {
 	if !utf8.Valid(receivedBody) {
 		t.Fatal("truncated ntfy body is not valid UTF-8")
 	}
+}
+
+// TestNotifierStandardWebhooksSigning verifies unsigned fallback when no secret
+// is set, Standard Webhooks HMAC-SHA256 signing for both raw and whsec_<base64>
+// secrets, secret redaction on invalid whsec_ input, and stable webhook-id with
+// fresh webhook-timestamp across SendWithID retries.
+func TestNotifierStandardWebhooksSigning(t *testing.T) {
+	diff := risk.Diff{
+		NewFindings: []checks.Finding{
+			{
+				CheckID:           "UB-0001",
+				Title:             "Telnet open",
+				EffectiveSeverity: checks.SeverityHigh,
+				Client:            unifi.Client{IP: "192.168.1.10", Name: "router"},
+				Evidence:          "TCP 23 login banner",
+			},
+		},
+	}
+
+	verifySig := func(t *testing.T, key []byte, hdr http.Header, body []byte) {
+		t.Helper()
+		id := hdr.Get("webhook-id")
+		ts := hdr.Get("webhook-timestamp")
+		sig := hdr.Get("webhook-signature")
+		if !strings.HasPrefix(id, "msg_") || len(id) < 12 {
+			t.Fatalf("expected msg_* webhook-id, got %q", id)
+		}
+		if _, err := strconv.ParseInt(ts, 10, 64); err != nil {
+			t.Fatalf("expected Unix seconds webhook-timestamp, got %q: %v", ts, err)
+		}
+		mac := hmac.New(sha256.New, key)
+		_, _ = mac.Write([]byte(id + "." + ts + "."))
+		_, _ = mac.Write(body)
+		want := "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+		if sig != want {
+			t.Fatalf("webhook-signature mismatch: got %q want %q", sig, want)
+		}
+	}
+
+	t.Run("unsigned_when_secret_empty", func(t *testing.T) {
+		var hdr http.Header
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hdr = r.Header.Clone()
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		n, err := New(config.NotifyConfig{WebhookURL: srv.URL, Format: "json", MinSeverity: "medium"})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if err := n.Send(context.Background(), "default", diff); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		for _, h := range []string{"webhook-id", "webhook-timestamp", "webhook-signature"} {
+			if got := hdr.Get(h); got != "" {
+				t.Fatalf("expected unsigned webhook to omit %s, got %q", h, got)
+			}
+		}
+	})
+
+	t.Run("raw_secret", func(t *testing.T) {
+		var hdr http.Header
+		var body []byte
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hdr = r.Header.Clone()
+			body, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		n, err := New(config.NotifyConfig{
+			WebhookURL:    srv.URL,
+			WebhookSecret: "my-plain-shared-secret",
+			Format:        "json",
+			MinSeverity:   "medium",
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if err := n.Send(context.Background(), "default", diff); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		verifySig(t, []byte("my-plain-shared-secret"), hdr, body)
+	})
+
+	t.Run("whsec_base64_and_retry_fresh_timestamp", func(t *testing.T) {
+		rawKey := []byte("0123456789abcdef0123456789abcdef")
+		secret := "whsec_" + base64.StdEncoding.EncodeToString(rawKey)
+
+		type capture struct {
+			hdr  http.Header
+			body []byte
+		}
+		var caps []capture
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			caps = append(caps, capture{hdr: r.Header.Clone(), body: b})
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		n, err := New(config.NotifyConfig{
+			WebhookURL:    srv.URL,
+			WebhookSecret: secret,
+			Format:        "json",
+			MinSeverity:   "medium",
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		now := time.Unix(1770000000, 0).UTC()
+		n.nowFn = func() time.Time { return now }
+		msgID := NewWebhookID()
+		if err := n.SendWithID(context.Background(), msgID, "default", diff); err != nil {
+			t.Fatalf("attempt 1: %v", err)
+		}
+
+		// Retry 400 seconds later must keep webhook-id but re-sign a fresh timestamp.
+		now = now.Add(400 * time.Second)
+		if err := n.SendWithID(context.Background(), msgID, "default", diff); err != nil {
+			t.Fatalf("attempt 2: %v", err)
+		}
+
+		if len(caps) != 2 {
+			t.Fatalf("expected 2 deliveries, got %d", len(caps))
+		}
+		verifySig(t, rawKey, caps[0].hdr, caps[0].body)
+		verifySig(t, rawKey, caps[1].hdr, caps[1].body)
+		if caps[0].hdr.Get("webhook-id") != msgID || caps[1].hdr.Get("webhook-id") != msgID {
+			t.Fatalf("expected identical webhook-id %q across retries, got %q and %q",
+				msgID, caps[0].hdr.Get("webhook-id"), caps[1].hdr.Get("webhook-id"))
+		}
+		if caps[0].hdr.Get("webhook-timestamp") != "1770000000" || caps[1].hdr.Get("webhook-timestamp") != "1770000400" {
+			t.Fatalf("expected fresh timestamp on retry, got %q then %q",
+				caps[0].hdr.Get("webhook-timestamp"), caps[1].hdr.Get("webhook-timestamp"))
+		}
+		if caps[0].hdr.Get("webhook-signature") == caps[1].hdr.Get("webhook-signature") {
+			t.Fatal("expected distinct signature when timestamp changed on retry")
+		}
+	})
+
+	t.Run("invalid_whsec_rejected_without_echoing_secret", func(t *testing.T) {
+		_, err := New(config.NotifyConfig{
+			WebhookURL:    "https://hooks.example.test/x",
+			WebhookSecret: "whsec_!!!NOT_BASE64_TOPSECRET!!!",
+			Format:        "json",
+			MinSeverity:   "medium",
+		})
+		if err == nil {
+			t.Fatal("expected error for malformed whsec_ secret")
+		}
+		if strings.Contains(err.Error(), "TOPSECRET") {
+			t.Fatalf("error leaked secret: %v", err)
+		}
+	})
 }

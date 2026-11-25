@@ -114,10 +114,12 @@ Built-in checks live in `checks/generic/` and `checks/community/` and are compil
 
 ### 4. Offline security bug (CVE) & hardware vendor databases
 
-Sync the official NVD + CISA KEV vulnerability catalog (~38 MB) and IEEE MAC vendor tables (~550 KB) once, then match your UniFi firmware and LAN services completely offline:
+UniBlue matches your UniFi firmware and LAN services against the official NVD + CISA KEV vulnerability catalog (~38 MB) and IEEE MAC vendor tables (~550 KB) completely offline. In `uniblue serve` mode (including Docker/Unraid), the local CVE cache is **automatically downloaded on first startup and checked hourly** in the background (configurable via `-cve-refresh 1h`, or `-cve-refresh 0` to disable auto-sync); unchanged feeds do zero work, and new CVEs are re-correlated in memory immediately without rescanning your LAN.
+
+You can also sync or query the databases manually from the CLI:
 
 ```sh
-# Sync local NVD + CISA KEV vulnerability cache (~17s first run, ~1s updates)
+# Sync local NVD + CISA KEV vulnerability cache manually (~17s first run, ~1s updates)
 ./uniblue cve sync
 
 # Match your UniFi gear & LAN hosts against known vulnerabilities
@@ -150,10 +152,30 @@ UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_R
 
 ### Integrating with AI agents
 
-Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes, discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
+Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes in real time, discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
 
-- **Push alerts via webhooks:** Point `notify.webhook_url` (`format: "json"`) at your agent's webhook listener (e.g., `hermes webhook subscribe`). Whenever UniBlue finds a new exposure, severity escalation, new port forward, or unexpected device on a trusted VLAN, it wakes your agent to summarize the alert and notify you.
-- **Inspect and verify via API:** Let your agent query `GET /api/state` and `GET /api/events` to pull host findings, CVEs, and remediation steps. Once you approve a fix (applied manually in UniFi or by your agent on a managed host), it can call `POST /api/rescan?ip=<ip>` to verify the issue is closed.
+- **Push alerts with Standard Webhooks signing:** Point `UNIBLUE_WEBHOOK_URL` (`notify.webhook_url`, default `format: "json"`) at your agent's webhook listener and set `UNIBLUE_WEBHOOK_SECRET` (`notify.webhook_secret`, accepting either a raw shared secret or `whsec_<base64>`). Each POST is signed using the Standard Webhooks v1 scheme (`webhook-id`, `webhook-timestamp`, and `webhook-signature: v1,<base64 HMAC-SHA256>`). Retries preserve the exact same `webhook-id` for deduplication while re-signing a fresh `webhook-timestamp` so backoff retries stay within replay windows. Agents without persistent SSE listeners do not need to poll `/api/state`.
+- **Inspect and verify via API:** Set `UNIBLUE_API_TOKEN` so your agent can authenticate with `Authorization: Bearer <token>` to query `GET /api/state` (findings, CVEs, topology, recent events) or subscribe to the live SSE stream at `GET /api/events`. Once you approve a fix (applied manually in UniFi or by your agent on a managed host), it can call `POST /api/rescan?ip=<ip>` to verify the issue is closed.
+- **Keep your dashboard locked down on LAN:** Whenever `UNIBLUE_API_TOKEN` is set, `/api/*` requires either a Bearer token or an `HttpOnly` `SameSite=Strict` session cookie established through the built-in login prompt, with per-IP brute-force lockout (5 bad attempts within 15 minutes triggers a 15-minute lockout, escalating up to 1 hour). If you expose UniBlue behind a reverse proxy or custom domain, add that hostname to `UNIBLUE_ALLOWED_HOSTS` so DNS-rebinding Host checks permit it.
+
+### Environment variables (Docker / Unraid / zero-config)
+
+UniBlue can run with a `config.yaml` or purely from environment variables (mount `/data` in Docker so `uniblue-state.json` and the auto-synced CVE cache under `/data/.cache/uniblue/cve` persist across container restarts):
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `UNIBLUE_UNIFI_URL` | Yes | UniFi controller URL (e.g., `https://192.168.1.1`) |
+| `UNIBLUE_UNIFI_API_KEY` | Yes* | UniFi local Integration API key (recommended with 2FA) |
+| `UNIBLUE_UNIFI_USERNAME` / `UNIBLUE_UNIFI_PASSWORD` | *Fallback | Local view-only UniFi credentials (when not using an API key) |
+| `UNIBLUE_UNIFI_SITE` | No | UniFi site ID (default: `default`) |
+| `UNIBLUE_API_TOKEN` | Recommended | Shared secret protecting `/api/*` (Bearer auth for agents/scripts + login prompt cookie for browsers) |
+| `UNIBLUE_ALLOWED_HOSTS` | Optional | Comma-separated reverse-proxy hostnames allowed past DNS-rebinding Host checks (IPs and `.local`/`.lan`/`.home` work automatically) |
+| `UNIBLUE_WEBHOOK_URL` | Optional | Outbound alert webhook URL (for Hermes, ntfy, Discord, Slack, or custom receivers) |
+| `UNIBLUE_WEBHOOK_SECRET` | Optional | Standard Webhooks signing secret (`whsec_<base64>` or raw string); omit to send unsigned |
+| `UNIBLUE_WEBHOOK_FORMAT` | No | Payload format: `json` (default, recommended for agents), `ntfy`, `discord`, or `slack` |
+| `UNIBLUE_WEBHOOK_MIN_SEVERITY` | No | Minimum severity to push: `info`, `low`, `medium` (default), `high`, or `critical` |
+
+Useful `uniblue serve` flags: `-listen 0.0.0.0:8080`, `-reconcile 30m`, `-cve-refresh 1h` (`0` disables auto-sync), and `-no-cve`.
 
 ### Why not run UniBlue inside your agent?
 
