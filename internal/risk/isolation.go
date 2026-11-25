@@ -292,7 +292,8 @@ func EvaluateIsolation(
 		}
 	}
 
-	// 2. Evaluate Guest/Untrusted -> Printer (Approved IPPS Printing vs Blocked Printer Admin).
+	// 2. Evaluate Guest/Untrusted -> Printer (Approved IPPS Printing vs Blocked Printer Admin)
+	// across both IPv4 and IPv6 whenever IPv6 context is present on the site/printer.
 	for _, prn := range printerClients {
 		prnNet := lookupClientNetwork(prn, netByID, netByName)
 		prnZone := strings.TrimSpace(prnNet.ZoneName)
@@ -305,89 +306,19 @@ func EvaluateIsolation(
 			}
 			srcZone := strings.TrimSpace(srcNet.ZoneName)
 
-			// 2a. IPPS/IPP Printing (default TCP 631).
-			ippsExpected := "deny"
-			if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, prn, prnZone, "printing", "tcp", printPort, "ipv4") {
-				ippsExpected = "allow"
-			}
-			ippsCell := evaluateRoutedPath(
-				snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-				switchACLStatus, switchACLReason, gwName, srcNet, prnNet,
-				pathQuery{
-					srcZone:    srcZone,
-					srcNetID:   srcNet.ID,
-					srcNetName: srcNet.Name,
-					dstZone:    prnZone,
-					dstNetID:   prnNet.ID,
-					dstNetName: prnNet.Name,
-					dstIP:      clientAddressForFamily(prn, "ipv4"),
-					dstMAC:     prn.MAC,
-					proto:      "tcp",
-					port:       printPort,
-					ipFamily:   "ipv4",
-					state:      "new",
-				}, prn.DisplayName(), "ipps-printing", ippsExpected,
-			)
-			if ippsCell.Verdict == IsolationBrokenDependency {
-				ippsCell.RecommendedFix = fmt.Sprintf(
-					"Allow %s -> %s (%s) strictly on TCP %d (IPPS) for approved printing while keeping printer administration (TCP 80/443) denied.",
-					srcNet.Name, prn.DisplayName(), prn.IP, printPort,
-				)
-				notes = append(notes, PostureNote{
-					Severity: checks.SeverityMedium,
-					Title:    fmt.Sprintf("Approved guest printing path blocked (%s -> %s IPPS :%d)", srcNet.Name, prn.DisplayName(), printPort),
-					Detail:   ippsCell.RecommendedFix,
-				})
-			}
-			addCell(ippsCell)
-
-			// If CUPS exposes unauthenticated /admin on the same 631 printing socket
-			// and guests can reach 631, surface the shared-socket admin violation.
-			if cupsAdminOn631 && ippsCell.Effective == "allow" {
-				sharedCell := IsolationCell{
-					SourceZone:       srcZone,
-					SourceNetwork:    srcNet.Name,
-					DestZone:         prnZone,
-					DestNetwork:      prnNet.Name,
-					DestHost:         prn.DisplayName(),
-					DestIP:           prn.IP,
-					DestFunction:     "printer-admin-shared-ipp",
-					Transport:        "tcp",
-					Port:             printPort,
-					IPFamily:         "ipv4",
-					PathKind:         ippsCell.PathKind,
-					Enforcer:         ippsCell.Enforcer + " + CUPS /admin",
-					Expected:         "deny",
-					Effective:        "allow",
-					Verdict:          IsolationViolation,
-					DecisiveRuleID:   ippsCell.DecisiveRuleID,
-					DecisiveRuleName: ippsCell.DecisiveRuleName,
-					DecisiveReason:   fmt.Sprintf("CUPS serves /admin on TCP %d alongside IPP printing, reachable via %q", printPort, ippsCell.DecisiveRuleName),
-					RecommendedFix:   fmt.Sprintf("Restrict CUPS /admin on %s to localhost/admin IPs in cupsd.conf because firewall rules on TCP %d cannot separate printing from CUPS administration.", prn.DisplayName(), printPort),
+			for _, fam := range []string{"ipv4", "ipv6"} {
+				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, prnNet, prn) {
+					continue
 				}
-				findings = append(findings, checks.Finding{
-					CheckID:           "UB-UNIFI-ISO-PRINTER-ADMIN",
-					Title:             fmt.Sprintf("Guest Network Can Reach CUPS Administration on Shared Print Port (%s -> %s:%d)", srcNet.Name, prn.DisplayName(), printPort),
-					Category:          "isolation-policy",
-					ClaimKind:         checks.ClaimConfiguredAccess,
-					Property:          fmt.Sprintf("isolation-printer-admin-%s-%d", strings.ToLower(srcNet.Name), printPort),
-					Transport:         "tcp",
-					BaseSeverity:      checks.SeverityHigh,
-					EffectiveSeverity: checks.SeverityHigh,
-					Client:            prn,
-					Port:              printPort,
-					Evidence:          sharedCell.DecisiveReason,
-					Remediation: checks.Remediation{
-						Summary:      sharedCell.RecommendedFix,
-						UniFiActions: []string{"restrict_cups_admin_acl"},
-					},
-				})
-				addCell(sharedCell)
-			}
+				prnAddr := clientAddressForFamily(prn, fam)
+				addrDisp := firstNonEmptyStr(prnAddr, prn.IP)
 
-			// 2b. Dedicated Printer Web Administration (TCP 443 / 80) must be denied from Guest.
-			for _, adminPort := range []int{443, 80} {
-				adminCell := evaluateRoutedPath(
+				// 2a. IPPS/IPP Printing (default TCP 631).
+				ippsExpected := "deny"
+				if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, prn, prnZone, "printing", "tcp", printPort, fam) {
+					ippsExpected = "allow"
+				}
+				ippsCell := evaluateRoutedPath(
 					snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
 					switchACLStatus, switchACLReason, gwName, srcNet, prnNet,
 					pathQuery{
@@ -397,39 +328,218 @@ func EvaluateIsolation(
 						dstZone:    prnZone,
 						dstNetID:   prnNet.ID,
 						dstNetName: prnNet.Name,
-						dstIP:      clientAddressForFamily(prn, "ipv4"),
+						dstIP:      prnAddr,
 						dstMAC:     prn.MAC,
 						proto:      "tcp",
-						port:       adminPort,
-						ipFamily:   "ipv4",
+						port:       printPort,
+						ipFamily:   fam,
 						state:      "new",
-					}, prn.DisplayName(), "printer-admin", "deny",
+					}, prn.DisplayName(), "ipps-printing", ippsExpected,
 				)
-
-				if adminCell.Verdict == IsolationViolation {
-					adminCell.RecommendedFix = fmt.Sprintf(
-						"Restrict rule %q so %s can reach %s (%s) only on TCP %d (IPPS printing) and deny printer web administration on TCP %d.",
-						adminCell.DecisiveRuleName, srcNet.Name, prn.DisplayName(), prn.IP, printPort, adminPort,
+				if ippsCell.Verdict == IsolationBrokenDependency {
+					ippsCell.RecommendedFix = fmt.Sprintf(
+						"Allow %s -> %s (%s, %s) strictly on TCP %d (IPPS) for approved printing while keeping printer administration (TCP 80/443) denied.",
+						srcNet.Name, prn.DisplayName(), addrDisp, fam, printPort,
 					)
-					findings = append(findings, checks.Finding{
-						CheckID:           "UB-UNIFI-ISO-PRINTER-ADMIN",
-						Title:             fmt.Sprintf("Guest Network Can Reach Printer Administration (%s -> %s:%d)", srcNet.Name, prn.DisplayName(), adminPort),
-						Category:          "isolation-policy",
-						ClaimKind:         checks.ClaimConfiguredAccess,
-						Property:          fmt.Sprintf("isolation-printer-admin-%s-%d", strings.ToLower(srcNet.Name), adminPort),
-						Transport:         "tcp",
-						BaseSeverity:      checks.SeverityMedium,
-						EffectiveSeverity: checks.SeverityMedium,
-						Client:            prn,
-						Port:              adminPort,
-						Evidence:          fmt.Sprintf("source=%s (%s) -> printer=%s (%s:%d) allowed by %q", srcNet.Name, srcZone, prn.DisplayName(), prn.IP, adminPort, adminCell.DecisiveRuleName),
-						Remediation: checks.Remediation{
-							Summary:      adminCell.RecommendedFix,
-							UniFiActions: []string{"scope_inter_zone_policy"},
-						},
+					notes = append(notes, PostureNote{
+						Severity: checks.SeverityMedium,
+						Title:    fmt.Sprintf("Approved guest printing path blocked (%s -> %s IPPS :%d, %s)", srcNet.Name, prn.DisplayName(), printPort, fam),
+						Detail:   ippsCell.RecommendedFix,
 					})
 				}
-				addCell(adminCell)
+				addCell(ippsCell)
+
+				// If CUPS exposes unauthenticated /admin on the same 631 printing socket
+				// and guests can reach 631, surface the shared-socket admin violation.
+				if cupsAdminOn631 && ippsCell.Effective == "allow" {
+					sharedCell := IsolationCell{
+						SourceZone:       srcZone,
+						SourceNetwork:    srcNet.Name,
+						DestZone:         prnZone,
+						DestNetwork:      prnNet.Name,
+						DestHost:         prn.DisplayName(),
+						DestIP:           addrDisp,
+						DestFunction:     "printer-admin-shared-ipp",
+						Transport:        "tcp",
+						Port:             printPort,
+						IPFamily:         fam,
+						PathKind:         ippsCell.PathKind,
+						Enforcer:         ippsCell.Enforcer + " + CUPS /admin",
+						Expected:         "deny",
+						Effective:        "allow",
+						Verdict:          IsolationViolation,
+						DecisiveRuleID:   ippsCell.DecisiveRuleID,
+						DecisiveRuleName: ippsCell.DecisiveRuleName,
+						DecisiveReason:   fmt.Sprintf("CUPS serves /admin on TCP %d (%s) alongside IPP printing, reachable via %q", printPort, fam, ippsCell.DecisiveRuleName),
+						RecommendedFix:   fmt.Sprintf("Restrict CUPS /admin on %s to localhost/admin IPs in cupsd.conf because firewall rules on TCP %d cannot separate printing from CUPS administration.", prn.DisplayName(), printPort),
+					}
+					findings = append(findings, checks.Finding{
+						CheckID:           "UB-UNIFI-ISO-PRINTER-ADMIN",
+						Title:             fmt.Sprintf("Guest Network Can Reach CUPS Administration on Shared Print Port (%s -> %s:%d, %s)", srcNet.Name, prn.DisplayName(), printPort, fam),
+						Category:          "isolation-policy",
+						ClaimKind:         checks.ClaimConfiguredAccess,
+						Property:          fmt.Sprintf("isolation-printer-admin-%s-%s-%d", strings.ToLower(srcNet.Name), fam, printPort),
+						Transport:         "tcp",
+						BaseSeverity:      checks.SeverityHigh,
+						EffectiveSeverity: checks.SeverityHigh,
+						Client:            prn,
+						Port:              printPort,
+						Evidence:          sharedCell.DecisiveReason,
+						Remediation: checks.Remediation{
+							Summary:      sharedCell.RecommendedFix,
+							UniFiActions: []string{"restrict_cups_admin_acl"},
+						},
+					})
+					addCell(sharedCell)
+				}
+
+				// 2b. Dedicated Printer Web Administration (TCP 443 / 80) must be denied from Guest.
+				for _, adminPort := range []int{443, 80} {
+					adminCell := evaluateRoutedPath(
+						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
+						switchACLStatus, switchACLReason, gwName, srcNet, prnNet,
+						pathQuery{
+							srcZone:    srcZone,
+							srcNetID:   srcNet.ID,
+							srcNetName: srcNet.Name,
+							dstZone:    prnZone,
+							dstNetID:   prnNet.ID,
+							dstNetName: prnNet.Name,
+							dstIP:      prnAddr,
+							dstMAC:     prn.MAC,
+							proto:      "tcp",
+							port:       adminPort,
+							ipFamily:   fam,
+							state:      "new",
+						}, prn.DisplayName(), "printer-admin", "deny",
+					)
+
+					if adminCell.Verdict == IsolationViolation {
+						adminCell.RecommendedFix = fmt.Sprintf(
+							"Restrict rule %q so %s can reach %s (%s, %s) only on TCP %d (IPPS printing) and deny printer web administration on TCP %d.",
+							adminCell.DecisiveRuleName, srcNet.Name, prn.DisplayName(), addrDisp, fam, printPort, adminPort,
+						)
+						findings = append(findings, checks.Finding{
+							CheckID:           "UB-UNIFI-ISO-PRINTER-ADMIN",
+							Title:             fmt.Sprintf("Guest Network Can Reach Printer Administration (%s -> %s:%d, %s)", srcNet.Name, prn.DisplayName(), adminPort, fam),
+							Category:          "isolation-policy",
+							ClaimKind:         checks.ClaimConfiguredAccess,
+							Property:          fmt.Sprintf("isolation-printer-admin-%s-%s-%d", strings.ToLower(srcNet.Name), fam, adminPort),
+							Transport:         "tcp",
+							BaseSeverity:      checks.SeverityMedium,
+							EffectiveSeverity: checks.SeverityMedium,
+							Client:            prn,
+							Port:              adminPort,
+							Evidence:          fmt.Sprintf("source=%s (%s) -> printer=%s (%s:%d, %s) allowed by %q", srcNet.Name, srcZone, prn.DisplayName(), addrDisp, adminPort, fam, adminCell.DecisiveRuleName),
+							Remediation: checks.Remediation{
+								Summary:      adminCell.RecommendedFix,
+								UniFiActions: []string{"scope_inter_zone_policy"},
+							},
+						})
+					}
+					addCell(adminCell)
+				}
+			}
+		}
+	}
+
+	// 2c. Evaluate any custom operator-declared ApprovedPaths (e.g., camera->NVR,
+	// monitor->UPS, workstation->backup) not already handled by BMC or Printer checks.
+	for _, ap := range intent.ApprovedPaths {
+		if ap.Port <= 0 {
+			continue
+		}
+		fnLow := strings.ToLower(strings.TrimSpace(ap.Function))
+		if strings.Contains(fnLow, "bmc") || strings.Contains(fnLow, "print") || strings.Contains(fnLow, "ipp") {
+			continue
+		}
+		proto := strings.ToLower(strings.TrimSpace(ap.Transport))
+		if proto == "" {
+			proto = "tcp"
+		}
+		funcLabel := firstNonEmptyStr(ap.Function, ap.Name, fmt.Sprintf("approved-%s-%d", proto, ap.Port))
+		var srcNets []unifi.Network
+		if strings.TrimSpace(ap.SourceZone) != "" {
+			for _, n := range snap.Networks {
+				if strings.EqualFold(n.ZoneName, ap.SourceZone) || strings.EqualFold(n.Name, ap.SourceZone) {
+					srcNets = append(srcNets, n)
+				}
+			}
+		}
+		if len(srcNets) == 0 {
+			continue
+		}
+		var dstClient unifi.Client
+		var dstNet unifi.Network
+		if ap.DestIP != "" {
+			dstClient.IP = ap.DestIP
+			for _, cl := range snap.Clients {
+				for _, ip := range cl.AllIPs() {
+					if strings.EqualFold(ip, strings.TrimSpace(ap.DestIP)) {
+						dstClient = cl
+						break
+					}
+				}
+			}
+			dstNet = lookupClientNetwork(dstClient, netByID, netByName)
+		}
+		if dstNet.Name == "" && ap.DestZone != "" {
+			for _, n := range snap.Networks {
+				if strings.EqualFold(n.ZoneName, ap.DestZone) || strings.EqualFold(n.Name, ap.DestZone) {
+					dstNet = n
+					break
+				}
+			}
+		}
+		if dstNet.Name == "" {
+			continue
+		}
+		dstZone := firstNonEmptyStr(dstNet.ZoneName, ap.DestZone)
+		dstName := firstNonEmptyStr(dstClient.DisplayName(), ap.DestIP, dstNet.Name)
+		fams := []string{"ipv4"}
+		switch strings.ToLower(strings.TrimSpace(ap.IPVersion)) {
+		case "ipv6":
+			fams = []string{"ipv6"}
+		case "both", "ipv4_and_ipv6":
+			fams = []string{"ipv4", "ipv6"}
+		}
+		for _, srcNet := range srcNets {
+			srcZone := strings.TrimSpace(srcNet.ZoneName)
+			for _, fam := range fams {
+				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, dstClient) {
+					continue
+				}
+				dstAddr := firstNonEmptyStr(clientAddressForFamily(dstClient, fam), ap.DestIP)
+				cell := evaluateRoutedPath(
+					snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
+					switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
+					pathQuery{
+						srcZone:    srcZone,
+						srcNetID:   srcNet.ID,
+						srcNetName: srcNet.Name,
+						dstZone:    dstZone,
+						dstNetID:   dstNet.ID,
+						dstNetName: dstNet.Name,
+						dstIP:      dstAddr,
+						dstMAC:     dstClient.MAC,
+						proto:      proto,
+						port:       ap.Port,
+						ipFamily:   fam,
+						state:      "new",
+					}, dstName, funcLabel, "allow",
+				)
+				if cell.Verdict == IsolationBrokenDependency {
+					cell.RecommendedFix = fmt.Sprintf(
+						"Allow %s -> %s (%s, %s) on %s %d to restore approved workflow %q.",
+						srcNet.Name, dstName, dstAddr, fam, strings.ToUpper(proto), ap.Port, firstNonEmptyStr(ap.Name, funcLabel),
+					)
+					notes = append(notes, PostureNote{
+						Severity: checks.SeverityMedium,
+						Title:    fmt.Sprintf("Approved workflow blocked (%s -> %s %s:%d, %s)", srcNet.Name, dstName, strings.ToUpper(proto), ap.Port, fam),
+						Detail:   cell.RecommendedFix,
+					})
+				}
+				addCell(cell)
 			}
 		}
 	}

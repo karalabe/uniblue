@@ -1253,9 +1253,9 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	e.mu.RUnlock()
 
 	sort.Slice(profiles, func(i, j int) bool {
-		return profiles[i].Client.IP < profiles[j].Client.IP
+		return profiles[i].Client.PrimaryIP() < profiles[j].Client.PrimaryIP()
 	})
-	attachConfiguredEnrichments(snap, profiles, e.cfg.Network)
+	devChildren := attachConfiguredEnrichments(snap, profiles, e.cfg.Network)
 
 	rawFindings := append([]checks.Finding(nil), cachedFindings...)
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
@@ -1362,6 +1362,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		_ = risk.SaveState(e.cfg.State.Path, nextState)
 	}
 	viewModel := BuildPresentationModel(snap, report, topoModel, clientViews, exactCVEs, potentialCVEs, profiles)
+	AttachDeviceChildren(viewModel, devChildren)
 
 	now := time.Now().UTC()
 	e.mu.Lock()
@@ -1434,10 +1435,13 @@ func clientKey(cl unifi.Client) string {
 // attachConfiguredEnrichments merges any owner-provided read-only bridge/NVR
 // inventories, passive flow records, and site supplement telemetry without
 // network I/O, recording any load errors into snap.Visibility.MissingFeeds.
-func attachConfiguredEnrichments(snap *unifi.Snapshot, profiles []probe.HostProfile, netCfg config.NetworkConfig) {
+// Children owned by UniFi infrastructure devices (e.g., UDM Pro / UNVR Protect)
+// are returned keyed by lowercase UniFi device MAC.
+func attachConfiguredEnrichments(snap *unifi.Snapshot, profiles []probe.HostProfile, netCfg config.NetworkConfig) map[string][]probe.ChildDevice {
 	if snap != nil && strings.TrimSpace(netCfg.SiteSupplementPath) != "" {
 		_ = unifi.ApplySiteSupplement(snap, netCfg.SiteSupplementPath)
 	}
+	var devChildren map[string][]probe.ChildDevice
 	for _, bi := range netCfg.BridgeInventories {
 		if strings.TrimSpace(bi.Path) == "" {
 			continue
@@ -1456,6 +1460,14 @@ func attachConfiguredEnrichments(snap *unifi.Snapshot, profiles []probe.HostProf
 		}
 		if len(children) > 0 {
 			probe.AttachBridgeChildren(profiles, children)
+			if snap != nil && len(snap.Devices) > 0 {
+				for mac, list := range probe.MatchDeviceBridgeChildren(snap.Devices, children) {
+					if devChildren == nil {
+						devChildren = make(map[string][]probe.ChildDevice)
+					}
+					devChildren[mac] = append(devChildren[mac], list...)
+				}
+			}
 		}
 	}
 	if strings.TrimSpace(netCfg.PassiveFlowsPath) != "" {
@@ -1466,6 +1478,7 @@ func attachConfiguredEnrichments(snap *unifi.Snapshot, profiles []probe.HostProf
 			probe.ApplyPassiveFlows(profiles, flows)
 		}
 	}
+	return devChildren
 }
 
 func fallbackVLAN(name string) string {

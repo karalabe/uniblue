@@ -254,6 +254,70 @@ type PresentationModel struct {
 }
 
 func devEntityID(mac string) string { return "dev:" + strings.ToLower(strings.TrimSpace(mac)) }
+
+// AttachDeviceChildren registers enrolled child devices (for example, UniFi
+// Protect cameras or accessories managed by a UDM Pro / UNVR gateway) beneath
+// their owning UniFi infrastructure device entity in pm.
+func AttachDeviceChildren(pm *PresentationModel, devChildren map[string][]probe.ChildDevice) {
+	if pm == nil || len(devChildren) == 0 {
+		return
+	}
+	for mac, children := range devChildren {
+		ent := pm.Entities[devEntityID(mac)]
+		if ent == nil {
+			continue
+		}
+		registerChildEntities(pm, ent, children)
+	}
+}
+
+func registerChildEntities(pm *PresentationModel, parent *Entity, children []probe.ChildDevice) {
+	if pm == nil || parent == nil || len(children) == 0 {
+		return
+	}
+	existing := make(map[string]struct{}, len(parent.ChildIDs))
+	for _, cid := range parent.ChildIDs {
+		existing[cid] = struct{}{}
+	}
+	for _, ch := range children {
+		cid := fmt.Sprintf("child:%s/%s", parent.ID, ch.ID)
+		if _, dup := existing[cid]; dup {
+			continue
+		}
+		existing[cid] = struct{}{}
+		reach := ch.DirectLANReachability
+		if reach == "" {
+			reach = "unknown"
+		}
+		chState := VerdictOK
+		chLabel := "Child inventory"
+		if reach == "unknown" {
+			chState = VerdictUnknown
+			chLabel = "Direct LAN reachability unknown"
+		}
+		parent.ChildIDs = append(parent.ChildIDs, cid)
+		pm.Entities[cid] = &Entity{
+			ID:                    cid,
+			Kind:                  "child",
+			Label:                 firstStr(ch.Name, ch.Model, ch.ID),
+			Subtitle:              firstStr(ch.Role, "Bridged Child Device"),
+			Role:                  firstStr(ch.Category, "iot"),
+			Side:                  parent.Side,
+			Weight:                1,
+			State:                 chState,
+			MaxSeverity:           "ok",
+			StateLabel:            chLabel,
+			ParentID:              parent.ID,
+			NetworkID:             parent.NetworkID,
+			NetworkName:           parent.NetworkName,
+			Vendor:                ch.Vendor,
+			Model:                 ch.Model,
+			Firmware:              ch.Firmware,
+			IdentitySource:        ch.IdentitySource,
+			DirectLANReachability: reach,
+		}
+	}
+}
 func portEntityID(mac string, idx int) string {
 	return fmt.Sprintf("port:%s/%d", strings.ToLower(strings.TrimSpace(mac)), idx)
 }
@@ -307,8 +371,8 @@ func BuildPresentationModel(
 	}
 	profileByIP := make(map[string]probe.HostProfile, len(profiles))
 	for _, hp := range profiles {
-		if hp.Client.IP != "" {
-			profileByIP[hp.Client.IP] = hp
+		for _, ip := range hp.Client.AllIPs() {
+			profileByIP[ip] = hp
 		}
 	}
 
@@ -599,7 +663,7 @@ func BuildPresentationModel(
 		}
 
 		// Build structured Services[] with computed reachability.
-		hp := profileByIP[cl.IP]
+		hp := profileByIP[cl.PrimaryIP()]
 		behindCGNAT := isSnapshotWANBehindCGNAT(snap)
 		ent.Services = buildHostServices(cv, hp, wanByIP[cl.IP], netIsolated[strings.ToLower(cl.NetworkName)], behindCGNAT)
 		if len(hp.OutboundDependencies) > 0 {
@@ -609,40 +673,7 @@ func BuildPresentationModel(
 		// Register enrolled child devices managed behind bridges/NVRs/coordinators
 		// (e.g., cameras on an NVR's private PoE network) with explicit provenance
 		// and DirectLANReachability ("unknown" when behind private PoE).
-		for _, ch := range hp.Children {
-			cid := fmt.Sprintf("child:%s/%s", hid, ch.ID)
-			reach := ch.DirectLANReachability
-			if reach == "" {
-				reach = "unknown"
-			}
-			chState := VerdictOK
-			chLabel := "Child inventory"
-			if reach == "unknown" {
-				chState = VerdictUnknown
-				chLabel = "Direct LAN reachability unknown"
-			}
-			ent.ChildIDs = append(ent.ChildIDs, cid)
-			pm.Entities[cid] = &Entity{
-				ID:                    cid,
-				Kind:                  "child",
-				Label:                 firstStr(ch.Name, ch.Model, ch.ID),
-				Subtitle:              firstStr(ch.Role, "Bridged Child Device"),
-				Role:                  firstStr(ch.Category, "iot"),
-				Side:                  side,
-				Weight:                1,
-				State:                 chState,
-				MaxSeverity:           "ok",
-				StateLabel:            chLabel,
-				ParentID:              hid,
-				NetworkID:             ent.NetworkID,
-				NetworkName:           ent.NetworkName,
-				Vendor:                ch.Vendor,
-				Model:                 ch.Model,
-				Firmware:              ch.Firmware,
-				IdentitySource:        ch.IdentitySource,
-				DirectLANReachability: reach,
-			}
-		}
+		registerChildEntities(pm, ent, hp.Children)
 
 		pm.Entities[hid] = ent
 	}

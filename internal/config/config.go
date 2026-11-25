@@ -190,24 +190,12 @@ type IsolationIntent struct {
 	// GuestVLANs lists VLAN/network names reserved for guests/visitors.
 	GuestVLANs []string `yaml:"guest_vlans,omitempty" json:"guest_vlans,omitempty"`
 
-	// AdminSourceIPs lists explicitly approved administrator workstation/jump-host IPs.
-	AdminSourceIPs []string `yaml:"admin_source_ips,omitempty" json:"admin_source_ips,omitempty"`
-
 	// ApprovedPaths lists explicitly permitted cross-zone service paths.
 	ApprovedPaths []ApprovedPath `yaml:"approved_paths,omitempty" json:"approved_paths,omitempty"`
 
 	// RequireSameVLANIsolation lists network/VLAN names where same-VLAN peer
 	// isolation is required by policy (triggering switch ACL / AP isolation checks).
 	RequireSameVLANIsolation []string `yaml:"require_same_vlan_isolation,omitempty" json:"require_same_vlan_isolation,omitempty"`
-
-	// ApprovedDHCPServers lists authorized DHCPv4 server IPs on the site.
-	ApprovedDHCPServers []string `yaml:"approved_dhcp_servers,omitempty" json:"approved_dhcp_servers,omitempty"`
-
-	// ApprovedMDNSServices lists service types intentionally reflected across VLANs (e.g., "_ipps._tcp").
-	ApprovedMDNSServices []string `yaml:"approved_mdns_services,omitempty" json:"approved_mdns_services,omitempty"`
-
-	// VPNOnlyVLANs lists VLANs that must fail closed if a VPN uplink drops.
-	VPNOnlyVLANs []string `yaml:"vpn_only_vlans,omitempty" json:"vpn_only_vlans,omitempty"`
 }
 
 // ScanConfig controls probing concurrency, timeouts, and check loading.

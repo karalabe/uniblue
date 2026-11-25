@@ -592,3 +592,100 @@ func TestOmittedSwitchACLYieldsUnknownIsolationVerdict(t *testing.T) {
 		t.Fatalf("expected BOTH L3 switch-routed (%v) and L2 wired-same-vlan (%v) cells to resolve to blocked-ok once switch ACLs are provided, got %+v", resolvedL3, resolvedL2, repComplete.Isolation.Cells)
 	}
 }
+
+// TestGuestPrinterIPv6IsolationCustomApprovedPathAndDeviceChildren verifies
+// IPv6 parity on guest-to-printer admin isolation, evaluation of custom
+// operator-declared ApprovedPaths (e.g. monitor -> UPS), and attachment of
+// bridge children owned by a UniFi gateway device.
+func TestGuestPrinterIPv6IsolationCustomApprovedPathAndDeviceChildren(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Devices: []unifi.Device{
+			{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "192.0.2.1", Model: "UDM-Pro", Type: "udm"},
+		},
+		Networks: []unifi.Network{
+			{ID: "net-lan", Name: "Main", VLAN: "1", Subnet: "192.0.2.1/24", IPv6Subnet: "2001:db8:1::/64", Purpose: "corporate", ZoneName: "Internal"},
+			{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "198.51.100.1/24", IPv6Subnet: "2001:db8:50::/64", Purpose: "guest", ZoneName: "Hotspot", IsolationEnabled: true},
+		},
+		Clients: []unifi.Client{
+			{MAC: "02:aa:bb:00:00:10", IP: "192.0.2.10", IPv6: []string{"2001:db8:1::10"}, Name: "Office Printer", NetworkName: "Main", VLAN: "1", IsWired: true},
+			{MAC: "02:aa:bb:00:00:11", IP: "192.0.2.11", Name: "Rack UPS", NetworkName: "Main", VLAN: "1", IsWired: true},
+		},
+		FirewallPolicies: []unifi.FirewallPolicy{
+			{
+				ID: "p-v4-block", Name: "Block Guest IPv4 to Internal", Enabled: true, Action: "BLOCK",
+				Origin: "USER_DEFINED", Index: 100, IPVersion: "ipv4", Protocol: "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+			{
+				ID: "p-v6-allow", Name: "Legacy Guest IPv6 Allow", Enabled: true, Action: "ALLOW",
+				Origin: "USER_DEFINED", Index: 110, IPVersion: "ipv6", Protocol: "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+		},
+		Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+	}
+
+	netCfg := config.NetworkConfig{
+		IsolationPolicy: config.IsolationIntent{
+			GuestVLANs: []string{"Guest"},
+			ApprovedPaths: []config.ApprovedPath{
+				{
+					Name:       "UPS Telemetry Check",
+					SourceZone: "Hotspot",
+					DestIP:     "192.0.2.11",
+					Function:   "ups-monitoring",
+					Transport:  "tcp",
+					Port:       3493,
+					IPVersion:  "ipv4",
+				},
+			},
+		},
+	}
+
+	rawFindings := []checks.Finding{
+		{
+			CheckID:   "UB-0042",
+			Title:     "IPP / IPPS Network Printer Discovered",
+			Category:  "service-inventory",
+			ClaimKind: checks.ClaimServiceObserved,
+			Client:    snap.Clients[0],
+			Port:      631,
+		},
+	}
+
+	rep := risk.Evaluate(snap, rawFindings, netCfg)
+	foundIPv6PrinterViolation := false
+	foundBlockedUPSWorkflow := false
+	for _, cell := range rep.Isolation.Cells {
+		if cell.DestFunction == "printer-admin" && cell.IPFamily == "ipv6" && cell.Verdict == risk.IsolationViolation {
+			foundIPv6PrinterViolation = true
+		}
+		if cell.DestFunction == "ups-monitoring" && cell.Port == 3493 && cell.Verdict == risk.IsolationBrokenDependency {
+			foundBlockedUPSWorkflow = true
+		}
+	}
+	if !foundIPv6PrinterViolation {
+		t.Fatalf("expected IPv6 Guest -> Printer admin isolation violation, got cells=%+v", rep.Isolation.Cells)
+	}
+	if !foundBlockedUPSWorkflow {
+		t.Fatalf("expected custom ApprovedPath ups-monitoring:3493 to report broken-dependency when blocked, got cells=%+v", rep.Isolation.Cells)
+	}
+
+	// Verify UniFi gateway infrastructure device can own Protect child cameras in PresentationModel.
+	pm := BuildPresentationModel(snap, rep, nil, nil, nil, nil, nil)
+	AttachDeviceChildren(pm, map[string][]probe.ChildDevice{
+		"aa:00:00:00:00:01": {
+			{ID: "cam-front", Name: "Front Doorbell", Category: "camera", IdentitySource: "protect-inventory", DirectLANReachability: "unknown"},
+		},
+	})
+	gwEnt := pm.Entities["dev:aa:00:00:00:00:01"]
+	if gwEnt == nil || len(gwEnt.ChildIDs) != 1 {
+		t.Fatalf("expected Gateway entity to own 1 child device, got %+v", gwEnt)
+	}
+	if ch := pm.Entities[gwEnt.ChildIDs[0]]; ch == nil || ch.ParentID != gwEnt.ID || ch.Label != "Front Doorbell" {
+		t.Fatalf("unexpected gateway child entity: %+v", ch)
+	}
+}
