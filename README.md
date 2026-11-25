@@ -34,15 +34,15 @@ You can quickly look around in demo mode: `./uniblue demo -listen 127.0.0.1:8080
 
 ## What makes UniBlue different?
 
-- **Built for real humans, with full technical proof one click away:** The built-in web UI organizes your network into four calm tabs: **Checkup**, **House & Cables**, **Devices & Wi-Fi**, and **Activity**. Click any alert, device, cable port, or isolation check to slide open plain-English fix steps, with collapsible raw technical details underneath.
-- **Knows your UniFi setup, not just raw ports:** A risky service on an isolated IoT network is very different from the same service sitting next to your personal laptop or forwarded to the internet. UniBlue reads your real UniFi networks, Firewall Zones, port forwards (matching exact TCP vs. UDP transport), and switch ports automatically.
-- **Honest about what it knows:** UniBlue never flashes a fake green "all clear" while devices are still being checked, never invents "blocked" when the controller did not provide firewall or switch ACL evidence, and never guesses an application name behind opaque TLS or a shared CDN.
-- **Gentle and strictly read-only:** Probes are rate-paced and read-only so fragile IoT gadgets (HVAC controllers, solar inverters, cameras) are not knocked offline. Raw print ports (`9100`, `515`, `_pdl-datastream`) have a hard zero-byte guard so UniBlue will never spit garbage pages out of your printer.
-- **122 built-in checks + 170+ protocol recognizers:** Combines Praetorian's `nerva` fingerprinter with 122 declarative read-only YAML checks and wire protocol probes (covering smart-home gear, cameras/NVRs, printers, server BMCs, Bitcoin/Ethereum nodes, NUT UPSs, PJLink projectors, DNS/NTP/PCP/STUN, and more).
+- **Human-first UI with full technical proof one click away:** The built-in web dashboard organizes your network into four calm tabs: **Checkup**, **House & Cables**, **Devices & Wi-Fi**, and **Activity**. Click any alert, device, switch port, or isolation check for clear fix steps, with collapsible raw technical details underneath.
+- **UniFi-aware risk scoring:** An exposed service on an isolated IoT VLAN is very different from the same service sitting next to your personal laptop or forwarded to the internet. UniBlue reads your UniFi networks, Firewall Zones, port forwards (distinguishing TCP vs. UDP), and switch ports automatically.
+- **Honest about what it knows:** UniBlue never flashes a fake green "all clear" while devices are still being checked, never assumes "blocked" when firewall or switch ACL telemetry is missing, and never guesses an application name behind opaque TLS or a shared CDN.
+- **Gentle and strictly read-only:** Probes are rate-paced and read-only so fragile IoT gear (HVAC controllers, solar inverters, cameras) stays undisturbed. Raw print ports (`9100`, `515`, `_pdl-datastream`) have a hard zero-byte guard so UniBlue never prints garbage pages.
+- **122 built-in checks + 170+ protocol recognizers:** Combines Praetorian's `nerva` fingerprinter with 122 declarative YAML checks and wire protocol probes covering smart-home gear, cameras/NVRs, printers, server BMCs, UPSs, projectors, Bitcoin/Ethereum nodes, DNS/NTP/PCP/STUN, and more.
 
 ## Quickstart
 
-You only need your UniFi console URL and a read-only credential. Networks, VLAN isolation tiers, and port hints are discovered automatically.
+All you need is your UniFi console URL and a read-only credential. Networks, VLAN isolation tiers, and port hints are discovered automatically.
 
 ```sh
 # 1. Build UniBlue
@@ -59,14 +59,13 @@ export UNIBLUE_UNIFI_API_KEY="your-local-api-key"
 # In UniFi Network -> Settings -> Admins & Users -> add a Local-Only View-Only admin
 # export UNIBLUE_UNIFI_PASSWORD="your-local-readonly-password"
 
-# 3. Start the live web dashboard (opens a clean UI at http://127.0.0.1:8080)
+# 3. Start the live web dashboard at http://127.0.0.1:8080
 ./uniblue serve -config config.yaml -listen 127.0.0.1:8080
-
-# Or preview the dashboard offline with synthetic demo data (no UniFi login needed)
-./uniblue demo -listen 127.0.0.1:8080
 ```
 
-Prefer the terminal or scheduled reports? Every feature works from the CLI too:
+You can also skip `config.yaml` completely by setting `UNIBLUE_UNIFI_URL` and `UNIBLUE_UNIFI_API_KEY` in your environment.
+
+Prefer the terminal or scheduled checks? Every feature works from the CLI too:
 
 ```sh
 # Quick read-only inventory of your UniFi networks & devices (no LAN probing)
@@ -85,22 +84,20 @@ Prefer the terminal or scheduled reports? Every feature works from the CLI too:
 ./uniblue watch -config config.yaml
 ```
 
-> **Tip:** You can even skip `config.yaml` completely by setting `UNIBLUE_UNIFI_URL` and `UNIBLUE_UNIFI_API_KEY` in your environment.
-
 ## How UniBlue checks your network
 
 ### 1. Network isolation & shared services (IPv4 + IPv6)
 
-UniBlue evaluates your actual UniFi Zone-Based Firewall rules in order, respecting IPv4 vs. IPv6, new vs. established return traffic, and whether a path is routed by your gateway or an L3 switch:
+UniBlue evaluates your UniFi Zone-Based Firewall rules in order, respecting IPv4 vs. IPv6, new vs. established return traffic, and whether a path is routed by your gateway or an L3 switch:
 
-- **Approved workflows stay out of your way:** Declare intentional shared paths (like guests printing to an office IPPS printer on TCP 631) in `network.isolation_policy.approved_paths`. UniBlue verifies printing works while confirming printer admin pages stay blocked, leaving your action queue clear.
-- **Catches subtle leaks:** Spots IPv6 rules that quietly bypass IPv4 blocks (for example, a guest network reaching a server BMC over IPv6), distinguishes UDP game forwards from TCP admin services sharing the same port number, and marks boundaries `unknown` whenever switch ACLs or firewall feeds are not available.
+- **Approved workflows stay out of your way:** Declare intentional shared paths (such as guests printing to an office IPPS printer on TCP 631) in `network.isolation_policy.approved_paths`. UniBlue verifies printing works while confirming printer admin pages stay blocked, keeping your action queue clean.
+- **Catches subtle leaks:** Spots IPv6 rules that quietly bypass IPv4 blocks (such as a guest network reaching a server BMC over IPv6), separates UDP game forwards from TCP admin services sharing a port number, and marks boundaries `unknown` whenever switch ACLs or firewall feeds are unavailable.
 
 ### 2. Outdoor cables & physical switch ports
 
-UniBlue inspects every switch, gateway, and In-Wall AP port, including link state, VLAN tagging (`Block All` vs `Allow All`), PoE wattage, connected devices, and MAC port security:
+UniBlue inspects every switch, gateway, and In-Wall AP port, including link state, VLAN tagging (`Block All` vs. `Allow All`), PoE wattage, connected devices, and MAC port security:
 
-- **Outdoor switches & feeder cables (`network.external_devices`):** Mark any switch or AP installed outside (garage, shed, exterior wall). UniBlue flags open unused sockets on it **and** traces the indoor feeder cable back to the parent switch so you know if an outdoor cable carries all of your home networks.
+- **Outdoor switches & feeder cables (`network.external_devices`):** Mark any switch or AP installed outside (garage, shed, exterior wall). UniBlue flags active unused sockets on it **and** traces the indoor feeder cable back to the parent switch so you know whether an outdoor cable carries all of your home networks.
 - **Live tamper & health alerts (`uniblue serve`):** Watches for physical link changes, PoE power drops (cable-swap indicator), inline hub MAC-table surges, STP loops, Evil-Twin Wi-Fi SSIDs, dormant devices waking up, wired/Wi-Fi swaps, and UniFi firewall or port-forward drift.
 
 ### 3. Declarative checks & safe protocol probes
@@ -136,7 +133,7 @@ Sync the official NVD + CISA KEV vulnerability catalog (~38 MB) and IEEE MAC ven
 
 ### 5. Optional local feeds (NVRs, smart-home bridges, flows & switch ACLs)
 
-Everything works out of the box with just your UniFi console. When you want deeper visibility into things UniFi cannot see directly, `config.example.yaml` shows how to plug in optional read-only local files:
+Everything works out of the box with just your UniFi console. For deeper visibility into things UniFi cannot see directly, `config.example.yaml` shows how to attach optional read-only local files:
 
 - **`network.bridge_inventories`:** Attach downstream devices reported by an NVR (private-PoE cameras), Zigbee2MQTT, Z-Wave JS, Matter fabric, BLE proxy, or energy gateway as clickable child devices under their parent.
 - **`network.passive_flows_path`:** Ingest Zeek `known_services`, IPFIX summaries, or JSON/YAML flow exports to enrich UDP/TLS service visibility and track outbound internet dependencies separately from local listeners.
@@ -144,27 +141,27 @@ Everything works out of the box with just your UniFi console. When you want deep
 
 ## Where to run UniBlue
 
-UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_RAW` required), so you can run it almost anywhere depending on whether you want ad-hoc checkups or 24/7 monitoring:
+UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_RAW` required), so you can run it on demand or leave it running 24/7:
 
-| Setup | Best for | Pros | Trade-offs |
-| :--- | :--- | :--- | :--- |
-| **On your laptop** | First try & ad-hoc audits (`./uniblue serve`) | Zero extra hardware; instant local web UI at `127.0.0.1:8080`. | Stops watching when your laptop sleeps or leaves home; cross-VLAN probes from a personal laptop can trigger your own UniFi IPS alerts. |
-| **In a Docker container** | Existing home server or NAS | Tiny footprint, easy restarts and volume mounts for `state.json` and the CVE/OUI cache. Use **`macvlan`** so UniBlue gets its own static LAN IP and native mDNS/UPnP discovery. | Default `bridge` networking blocks link-local multicast discovery (mDNS/UPnP) and NATs probes behind the Docker host IP; `network_mode: host` shares the host's IP in UniFi IPS logs. |
-| **In a VM or Proxmox LXC** | Hypervisor homelabs (recommended) | Dedicated static LAN IP, clean OS isolation, native mDNS/UPnP (plus optional extra VLAN NICs), and simple single-IP UniFi firewall/IPS rules. | Slightly more setup than running a local binary; LXC gives VM-like networking with container-level RAM overhead. |
-| **On a dedicated machine** (e.g. Raspberry Pi) | Always-on standalone security appliance | Plugs straight into your switch on a fixed IP; keeps detecting cable swaps, new devices, and firewall drift even while your main server or hypervisor is down for maintenance. | One extra physical device to power and keep patched. |
+- **On your laptop:** Fastest way to try UniBlue or run ad-hoc checkups (`./uniblue serve`) with zero extra hardware. The trade-off is that monitoring stops when your laptop sleeps or leaves home, and cross-VLAN probes from a personal workstation can trigger your own UniFi IPS alerts.
+- **In a Docker container:** Lightweight and easy to run 24/7 on an existing server or NAS, with a small mounted volume for `config.yaml`, `state.json`, and the CVE/OUI cache. Use **`macvlan`** networking so UniBlue gets its own dedicated static LAN IP and native mDNS/UPnP discovery; default `bridge` networking blocks link-local multicast discovery and NATs probes behind the host IP, while `network_mode: host` shares the Docker host's IP in UniFi firewall and IPS logs.
+- **In a VM or Proxmox LXC (recommended):** Gives UniBlue its own static LAN IP, clean OS isolation, native mDNS/UPnP discovery (plus optional extra VLAN interfaces), and straightforward per-IP UniFi firewall and IPS rules. LXC gives you VM-like networking with container-level memory overhead.
+- **On a dedicated machine (e.g., Raspberry Pi or mini PC):** A standalone 24/7 security appliance plugged directly into your switch on a fixed IP. It keeps catching cable swaps, new devices, and firewall drift even while your main server or hypervisor is down for maintenance, at the cost of one more box to keep updated.
 
-### Integrating with AI agents (e.g., Hermes)
+### Integrating with AI agents
 
-Running UniBlue 24/7 pairs well with an AI agent like **Hermes** so you get proactive notifications, can discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
+Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes, can discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
 
-- **Push alerts (webhooks):** Set `notify.webhook_url` (`format: "json"`) in `config.yaml` to point at your agent's webhook endpoint (for example, `hermes webhook subscribe`). Whenever UniBlue detects a new exposure, severity escalation, new port forward, or unexpected device on a trusted VLAN, it wakes your agent to summarize what happened and ping you.
-- **Inspect & verify (local API + CLI):** Let your agent query `GET /api/state` (or `GET /api/events`) on your UniBlue instance to pull device findings, CVEs, and plain-English fix steps. Once you review and approve a fix (applied manually in UniFi or by your agent on a managed host), the agent can call `POST /api/rescan?ip=<ip>` to confirm the vulnerability is actually gone.
+- **Push alerts via webhooks:** Configure `notify.webhook_url` (`format: "json"`) in `config.yaml` to target your agent's webhook listener (for example, `hermes webhook subscribe`). Whenever UniBlue detects a new exposure, severity escalation, new port forward, or unexpected device on a trusted VLAN, it wakes your agent to summarize what happened and ping you.
+- **Inspect and verify via API:** Allow your agent to reach UniBlue's HTTP endpoints (`GET /api/state`, `GET /api/events`) to inspect specific hosts, CVEs, and remediation steps. Once you approve a fix (applied manually in UniFi or by your agent on a managed host), the agent can call `POST /api/rescan?ip=<ip>` to confirm the issue is actually resolved.
 
-> **Why not run UniBlue *inside* your agent framework?**
-> Resist the temptation to run UniBlue inside the same container or process as your AI agent:
-> 1. **Privilege and blast-radius separation:** UniBlue needs a UniFi API credential and L3 reachability across your VLANs (IoT, Servers, Cameras, BMCs). An LLM agent has shell, web, and chat access and is a much larger prompt-injection target. Co-locating them gives the agent direct network access to your router/BMCs and your UniFi credentials on disk.
-> 2. **Independent uptime:** If you restart your agent, break a skill, or hit an LLM outage, a separate UniBlue container/VM/Pi keeps watching your network and firing fallback alerts uninterrupted.
-> 3. **Clean read/write split:** Keep UniBlue strictly read-only on its own IP, expose only its narrow HTTP/webhook boundary to your agent, and keep any remediation writes explicitly human-approved on the agent side.
+### Why not run UniBlue inside your agent?
+
+It can be tempting to run UniBlue inside the same container or process as your AI agent, but keeping them separate is strongly recommended:
+
+- **Blast-radius and credential isolation:** UniBlue needs a UniFi API key and L3 reachability across your VLANs (IoT, servers, cameras, BMCs). An LLM agent has shell, web, and chat access and presents a much larger prompt-injection surface; co-locating them exposes your UniFi credentials and internal VLANs to the agent.
+- **Independent 24/7 uptime:** When you restart your agent, break a skill, or hit an LLM outage, a separate UniBlue container, VM, or appliance keeps monitoring your network and sending fallback alerts uninterrupted.
+- **Clean read/write boundary:** Keep UniBlue strictly read-only on its own IP, expose only its narrow HTTP/webhook interface to your agent, and keep any remediation changes explicitly human-approved on the agent side.
 
 ## Controller compatibility
 
