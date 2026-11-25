@@ -30,10 +30,13 @@ probe:
   match:
     status: [200]
     headers_absent: ["WWW-Authenticate"]
-    body_contains_all:
-      - '"implementation":'
-      - '"capabilities":'
-      - "ValetudoRobot"
+    json_match:
+      - path: "$.manufacturer"
+        exists: true
+      - path: "$.modelName"
+        exists: true
+      - path: "$.implementation"
+        regex: "ValetudoRobot"
     redact_body: true
 
 remediation:

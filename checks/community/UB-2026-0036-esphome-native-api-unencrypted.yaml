@@ -21,7 +21,7 @@ metadata:
 
 preconditions:
   mdns_type_any: ["_esphomelib._tcp"]
-  mdns_txt_regex: "(?i)^api_encryption=none$"
+  mdns_txt_not_regex: "(?i)^api_encryption=(noise_|tls|true|1|yes)"
 
 probe:
   type: observe
@@ -29,9 +29,9 @@ probe:
 remediation:
   summary: >
     ESPHome node advertised its native API on port 6053 without Noise protocol
-    encryption (api_encryption=none). Any host on the LAN can connect to read
-    sensors or trigger relays/garage doors. Add an api.encryption.key in your
-    ESPHome YAML and move IoT nodes to an isolated VLAN.
+    encryption (no active api_encryption TXT attribute). Any host on the LAN can
+    connect to read sensors or trigger relays/garage doors. Add an
+    api.encryption.key in your ESPHome YAML and move IoT nodes to an isolated VLAN.
   unifi_actions:
     - enable_esphome_api_encryption
     - move_to_iot_vlan

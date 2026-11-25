@@ -20,7 +20,7 @@ metadata:
     - https://dresden-elektronik.github.io/deconz-rest-doc/endpoints/configuration/
 
 preconditions:
-  upnp_device_regex: "(?i)dresden-elektronik"
+  upnp_device_regex: "(?i)(deconz|phoscon|dresden|ipbridge|hue\\s*bridge)"
 
 probe:
   type: http
@@ -34,6 +34,8 @@ probe:
         exists: true
       - path: "$.swversion"
         exists: true
+      - path: "$.modelid"
+        regex: "(?i)deconz"
     evidence_summary: "deCONZ/Phoscon gateway responded with public bridge metadata on /api/config"
     redact_body: true
 

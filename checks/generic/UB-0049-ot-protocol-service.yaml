@@ -22,7 +22,7 @@ metadata:
     - https://csrc.nist.gov/pubs/sp/800/82/r3/final
 
 preconditions:
-  service_proto_any: ["bacnet", "knxip", "opcua", "s7comm", "ethernetip", "dnp3", "iec104"]
+  service_proto_any: ["opcua", "s7comm", "ethernetip", "dnp3", "iec104"]
   discovery_only: true
 
 probe:

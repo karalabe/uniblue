@@ -13,5 +13,5 @@ import "embed"
 // BuiltinFS contains all built-in YAML check definitions grouped under generic/
 // and community/.
 //
-//go:embed generic/*.yaml community/*.yaml
+//go:embed generic community
 var BuiltinFS embed.FS

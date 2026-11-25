@@ -22,7 +22,7 @@ metadata:
     - https://docs.nats.io/learn/security/
 
 preconditions:
-  service_proto_any: ["amqp", "kafka", "nats", "pulsar", "activemq"]
+  service_proto_any: ["amqp", "kafka", "nats", "pulsar", "activemq", "activemq-openwire"]
   discovery_only: true
 
 probe:

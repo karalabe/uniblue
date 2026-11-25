@@ -22,7 +22,7 @@ metadata:
 preconditions:
   ports_any: [80, 8080]
   http_status_any: [200]
-  http_title_regex: "(?i)(tasmota|shelly|esphome|ventilation|hvac|inverter|modbus|smart\\s*meter|controller)"
+  http_title_regex: "(?i)(tasmota|shelly|esphome|ventilation|hvac|solar\\s*inverter|modbus|smart\\s*meter)"
 
 probe:
   type: http
@@ -32,6 +32,13 @@ probe:
   match:
     status: [200]
     headers_absent: ["WWW-Authenticate"]
+    body_not_contains:
+      - 'type="password"'
+      - "type='password'"
+      - 'type=password'
+      - 'TYPE="PASSWORD"'
+      - "TYPE='PASSWORD'"
+      - 'autocomplete="current-password"'
     redact_body: true
 
 remediation:

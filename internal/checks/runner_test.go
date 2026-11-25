@@ -200,16 +200,58 @@ func TestProtocolProbes(t *testing.T) {
 		}
 	})
 
-	t.Run("rtsp unauthenticated options", func(t *testing.T) {
-		port, closeFn := startMockTCP(t, func(conn net.Conn) {
-			buf := make([]byte, 256)
-			_, _ = conn.Read(buf)
-			_, _ = io.WriteString(conn, "RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS, DESCRIBE, PLAY\r\n\r\n")
+	t.Run("rtsp unauthenticated describe vs auth challenge", func(t *testing.T) {
+		portOpen, closeOpen := startMockTCP(t, func(conn net.Conn) {
+			br := bufio.NewReader(conn)
+			for range 2 {
+				reqLine, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil || strings.TrimSpace(line) == "" {
+						break
+					}
+				}
+				if strings.HasPrefix(reqLine, "OPTIONS ") {
+					_, _ = io.WriteString(conn, "RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS, DESCRIBE, PLAY\r\n\r\n")
+				} else if strings.HasPrefix(reqLine, "DESCRIBE ") {
+					sdp := "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Cam\r\nm=video 0 RTP/AVP 96\r\n"
+					_, _ = io.WriteString(conn, "RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Type: application/sdp\r\nContent-Length: "+strconv.Itoa(len(sdp))+"\r\n\r\n"+sdp)
+				}
+			}
 		})
-		defer closeFn()
+		defer closeOpen()
 
-		if _, ok := probeRTSP(context.Background(), "127.0.0.1", port); !ok {
-			t.Fatal("expected unauthenticated RTSP probe to match")
+		if _, ok := probeRTSP(context.Background(), "127.0.0.1", portOpen); !ok {
+			t.Fatal("expected unauthenticated RTSP DESCRIBE probe to match")
+		}
+
+		portAuth, closeAuth := startMockTCP(t, func(conn net.Conn) {
+			br := bufio.NewReader(conn)
+			for range 2 {
+				reqLine, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil || strings.TrimSpace(line) == "" {
+						break
+					}
+				}
+				if strings.HasPrefix(reqLine, "OPTIONS ") {
+					_, _ = io.WriteString(conn, "RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS, DESCRIBE, PLAY\r\n\r\n")
+				} else if strings.HasPrefix(reqLine, "DESCRIBE ") {
+					_, _ = io.WriteString(conn, "RTSP/1.0 401 Unauthorized\r\nCSeq: 2\r\nWWW-Authenticate: Digest realm=\"cam\"\r\n\r\n")
+				}
+			}
+		})
+		defer closeAuth()
+
+		if ev, ok := probeRTSP(context.Background(), "127.0.0.1", portAuth); ok {
+			t.Fatalf("expected password-protected RTSP camera (DESCRIBE 401) NOT to match, got ev=%q", ev)
 		}
 	})
 

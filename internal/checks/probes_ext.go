@@ -7,6 +7,7 @@
 package checks
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -33,23 +34,24 @@ func probeObserve(chk *Check, hp probe.HostProfile, port int) (string, bool) {
 	var parts []string
 	if len(chk.Preconditions.MDNSTypeAny) > 0 {
 		for _, s := range hp.MDNSServices {
-			for _, want := range chk.Preconditions.MDNSTypeAny {
-				if strings.EqualFold(s.Type, want) {
-					detail := fmt.Sprintf("mDNS %s", s.Type)
-					if s.Port > 0 {
-						detail += fmt.Sprintf(" (port %d)", s.Port)
-					}
-					if len(s.TXT) > 0 {
-						detail += " [" + strings.Join(s.TXT, ", ") + "]"
-					}
-					parts = append(parts, detail)
-					break
-				}
+			if !matchesMDNSService(chk, s) {
+				continue
 			}
+			detail := fmt.Sprintf("mDNS %s", s.Type)
+			if s.Port > 0 {
+				detail += fmt.Sprintf(" (port %d)", s.Port)
+			}
+			if len(s.TXT) > 0 {
+				detail += " [" + strings.Join(s.TXT, ", ") + "]"
+			}
+			parts = append(parts, detail)
 		}
 	}
 	if chk.compiled.upnpDevice != nil || chk.compiled.upnpService != nil {
 		for _, d := range hp.UPnPDevices {
+			if !matchesUPnPDevice(chk, d) {
+				continue
+			}
 			label := strings.TrimSpace(strings.Join([]string{d.Manufacturer, d.ModelName, d.DeviceType}, " "))
 			if label == "" {
 				label = d.ST
@@ -61,6 +63,9 @@ func probeObserve(chk *Check, hp probe.HostProfile, port int) (string, bool) {
 	}
 	if chk.compiled.wsType != nil {
 		for _, w := range hp.WSDiscovery {
+			if !matchesWSRecord(chk, w) {
+				continue
+			}
 			if len(w.Types) > 0 {
 				parts = append(parts, "WS-Discovery "+strings.Join(w.Types, ", "))
 			}
@@ -265,7 +270,9 @@ func decodeASN1Int(b []byte) int {
 
 // probeTLSLegacy performs a single read-only TLS handshake pinned to TLS 1.0-1.1
 // to prove whether an HTTPS endpoint still accepts deprecated legacy TLS
-// protocols (RFC 8996).
+// protocols (RFC 8996). It explicitly offers both standard and legacy/insecure
+// cipher suites (including RSA key exchange and 3DES) so old embedded appliances
+// (iLO, iDRAC, printers, NAS) that lack ECDHE are still detected.
 func probeTLSLegacy(ctx context.Context, ip string, port int) (string, bool) {
 	dialer := &tls.Dialer{
 		NetDialer: &net.Dialer{},
@@ -273,6 +280,7 @@ func probeTLSLegacy(ctx context.Context, ip string, port int) (string, bool) {
 			InsecureSkipVerify: true, //nolint:gosec // read-only LAN protocol negotiation check
 			MinVersion:         tls.VersionTLS10,
 			MaxVersion:         tls.VersionTLS11,
+			CipherSuites:       allLegacyTLSCipherSuites(),
 		},
 	}
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
@@ -293,6 +301,22 @@ func probeTLSLegacy(ctx context.Context, ip string, port int) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// allLegacyTLSCipherSuites returns the combined list of standard and insecure
+// cipher suite IDs supported by crypto/tls so legacy TLS 1.0/1.1 servers
+// offering only RSA key exchange or 3DES can still complete the probe handshake.
+func allLegacyTLSCipherSuites() []uint16 {
+	safe := tls.CipherSuites()
+	insecure := tls.InsecureCipherSuites()
+	suites := make([]uint16, 0, len(safe)+len(insecure))
+	for _, cs := range safe {
+		suites = append(suites, cs.ID)
+	}
+	for _, cs := range insecure {
+		suites = append(suites, cs.ID)
+	}
+	return suites
 }
 
 // probeMemcached sends a single read-only "version\r\n" command to TCP 11211.
@@ -330,18 +354,51 @@ func probeRsync(ctx context.Context, ip string, port int) (string, bool) {
 	return "", false
 }
 
-// probeMPD passively reads the initial "OK MPD " greeting banner on TCP 6600.
+// probeMPD reads the initial "OK MPD " greeting on TCP 6600 and sends a
+// strictly read-only "status\n" command to verify whether the daemon actually
+// allows unauthenticated queries (password-protected MPD servers still emit
+// "OK MPD " on connect but reject "status" with an ACK permission error).
 func probeMPD(ctx context.Context, ip string, port int) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
 	}
 	defer conn.Close()
-	buf := make([]byte, 128)
-	n, _ := conn.Read(buf)
-	line := compactASCII(string(buf[:n]), 80)
-	if strings.HasPrefix(line, "OK MPD ") {
-		return fmt.Sprintf("Music Player Daemon greeting observed (%q)", line), true
+
+	br := bufio.NewReader(io.LimitReader(conn, 8192))
+	greetingRaw, err := br.ReadString('\n')
+	if err != nil && len(greetingRaw) == 0 {
+		return "", false
+	}
+	greeting := compactASCII(greetingRaw, 80)
+	if !strings.HasPrefix(greeting, "OK MPD ") {
+		return "", false
+	}
+
+	if _, err := io.WriteString(conn, "status\n"); err != nil {
+		return "", false
+	}
+
+	sawState := false
+	for range 64 {
+		line, err := br.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "ACK ") {
+			return "", false
+		}
+		if strings.HasPrefix(trimmed, "state:") {
+			sawState = true
+		}
+		if trimmed == "OK" {
+			_, _ = io.WriteString(conn, "close\n")
+			if sawState {
+				return fmt.Sprintf("Music Player Daemon allowed unauthenticated status query (%q)", greeting), true
+			}
+			return "", false
+		}
+		if err != nil {
+			break
+		}
 	}
 	return "", false
 }

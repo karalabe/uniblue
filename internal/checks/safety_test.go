@@ -160,7 +160,13 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 			PortsAny:      []int{rawPort},
 			DiscoveryOnly: true,
 		},
-		Probe: ProbeSpec{Type: "http", Method: "GET", Path: "/", Scheme: "http"},
+		Probe: ProbeSpec{
+			Type:   "http",
+			Method: "GET",
+			Path:   "/",
+			Scheme: "http",
+			Match:  MatchSpec{Status: []int{200}},
+		},
 	}
 	if err := httpChk.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)

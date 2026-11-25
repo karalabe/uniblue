@@ -30,9 +30,11 @@ probe:
   match:
     status: [200]
     headers_absent: ["WWW-Authenticate"]
-    body_contains_all:
-      - '"type":"directory"'
-      - '"content":'
+    json_match:
+      - path: "$.type"
+        equals: "directory"
+      - path: "$.content"
+        exists: true
     redact_body: true
 
 remediation:

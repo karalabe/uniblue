@@ -29,9 +29,9 @@ probe:
 
 remediation:
   summary: >
-    Music Player Daemon (MPD) answered with its greeting banner on TCP port
-    6600. Verify that an MPD password is configured (or bind MPD to localhost)
-    and isolate standalone audio streamers onto an IoT/Media VLAN.
+    Music Player Daemon (MPD) allowed an unauthenticated read-only status query
+    on TCP port 6600. Configure an MPD password (or bind MPD to localhost) and
+    isolate standalone audio streamers onto an IoT/Media VLAN.
   unifi_actions:
     - set_mpd_password_or_bind_localhost
     - move_to_iot_vlan

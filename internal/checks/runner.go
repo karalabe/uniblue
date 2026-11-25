@@ -89,11 +89,11 @@ func (f Finding) Key() string {
 		hostID = f.Client.IP
 	}
 	base := fmt.Sprintf("%s|%s|%d", f.CheckID, hostID, f.Port)
-	if f.Category == "isolation-policy" && f.Property != "" {
-		return base + "|" + f.Property
+	if p := strings.TrimSpace(f.Property); p != "" {
+		base += "|" + p
 	}
 	if t := strings.ToLower(strings.TrimSpace(f.Transport)); t != "" && t != "tcp" {
-		return base + "|" + t
+		base += "|" + t
 	}
 	return base
 }
@@ -158,6 +158,8 @@ func NewRunner(list []*Check, concurrency int) *Runner {
 		concurrency: concurrency,
 		httpClient: &http.Client{
 			Transport: &http.Transport{
+				DisableKeepAlives: true,
+				IdleConnTimeout:   5 * time.Second,
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true, //nolint:gosec // local LAN appliances routinely use self-signed certificates
 				},
@@ -174,6 +176,7 @@ func NewRunner(list []*Check, concurrency int) *Runner {
 // RunAll evaluates all checks across the provided host profiles concurrently
 // via a channel worker pool, returning findings sorted deterministically.
 func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Finding {
+	defer r.httpClient.CloseIdleConnections()
 	if len(profiles) == 0 || len(r.checks) == 0 {
 		return nil
 	}
@@ -253,6 +256,7 @@ func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Fin
 // RunHost evaluates all checks whose preconditions match hp and executes
 // their verification probes sequentially against that host.
 func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
+	defer r.httpClient.CloseIdleConnections()
 	var findings []Finding
 	// Track (checkID|port) pairs superseded by more specific device checks on
 	// the same host so operators aren't shown redundant generic warnings.
@@ -283,7 +287,7 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 				if targetIP == "" {
 					continue
 				}
-				evidence, matched = r.executeProbe(ctx, chk, targetIP, port)
+				evidence, matched = r.executeProbeProfile(ctx, chk, hp, targetIP, port)
 			}
 			if matched {
 				for _, supID := range chk.Supersedes {
@@ -418,27 +422,8 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	if len(chk.Preconditions.MDNSTypeAny) > 0 {
 		mdnsMatched := false
 		for _, svc := range hp.MDNSServices {
-			typeOK := false
-			for _, want := range chk.Preconditions.MDNSTypeAny {
-				if strings.EqualFold(svc.Type, want) {
-					typeOK = true
-					break
-				}
-			}
-			if !typeOK {
+			if !matchesMDNSService(chk, svc) {
 				continue
-			}
-			if chk.compiled.mdnsTXT != nil {
-				txtOK := false
-				for _, kv := range svc.TXT {
-					if chk.compiled.mdnsTXT.MatchString(kv) {
-						txtOK = true
-						break
-					}
-				}
-				if !txtOK {
-					continue
-				}
 			}
 			mdnsMatched = true
 			if svc.Port > 0 {
@@ -454,23 +439,8 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	if chk.compiled.upnpDevice != nil || chk.compiled.upnpService != nil {
 		upnpMatched := false
 		for _, dev := range hp.UPnPDevices {
-			if chk.compiled.upnpDevice != nil {
-				combined := strings.Join([]string{dev.ST, dev.DeviceType, dev.Manufacturer, dev.ModelName, dev.ModelNumber, dev.Server}, " ")
-				if !chk.compiled.upnpDevice.MatchString(combined) {
-					continue
-				}
-			}
-			if chk.compiled.upnpService != nil {
-				svcOK := false
-				for _, st := range dev.ServiceTypes {
-					if chk.compiled.upnpService.MatchString(st) {
-						svcOK = true
-						break
-					}
-				}
-				if !svcOK && !chk.compiled.upnpService.MatchString(dev.ST) {
-					continue
-				}
+			if !matchesUPnPDevice(chk, dev) {
+				continue
 			}
 			upnpMatched = true
 			if dev.Port > 0 {
@@ -486,8 +456,7 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	if chk.compiled.wsType != nil {
 		wsMatched := false
 		for _, rec := range hp.WSDiscovery {
-			combined := strings.Join(append(append([]string(nil), rec.Types...), rec.Scopes...), " ")
-			if !chk.compiled.wsType.MatchString(combined) {
+			if !matchesWSRecord(chk, rec) {
 				continue
 			}
 			wsMatched = true
@@ -527,6 +496,23 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 		}
 	}
 
+	// When a host already exposed a base VNC port (5900/5901), also probe any
+	// higher display ports (5902..5919) discovered by Fingerprinter.walkVNCDisplays.
+	if chk.Probe.Type == "vnc" && len(matchedPorts) > 0 {
+		seen := make(map[int]struct{}, len(matchedPorts))
+		for _, p := range matchedPorts {
+			seen[p] = struct{}{}
+		}
+		for _, p := range hp.OpenPorts {
+			if p >= 5900 && p <= 5919 {
+				if _, dup := seen[p]; !dup {
+					seen[p] = struct{}{}
+					matchedPorts = append(matchedPorts, p)
+				}
+			}
+		}
+	}
+
 	// Allow probe.port to pin a single specific port once preconditions pass.
 	if chk.Probe.Port > 0 {
 		return []int{chk.Probe.Port}, true
@@ -540,8 +526,83 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	return matchedPorts, true
 }
 
+// matchesMDNSService reports whether a single passive mDNS service record
+// satisfies chk's mDNS type and positive/negative TXT regex preconditions.
+func matchesMDNSService(chk *Check, svc probe.MDNSService) bool {
+	typeOK := false
+	for _, want := range chk.Preconditions.MDNSTypeAny {
+		if strings.EqualFold(svc.Type, want) {
+			typeOK = true
+			break
+		}
+	}
+	if !typeOK {
+		return false
+	}
+	if chk.compiled.mdnsTXT != nil {
+		txtOK := false
+		for _, kv := range svc.TXT {
+			if chk.compiled.mdnsTXT.MatchString(kv) {
+				txtOK = true
+				break
+			}
+		}
+		if !txtOK {
+			return false
+		}
+	}
+	if chk.compiled.mdnsTXTNot != nil {
+		for _, kv := range svc.TXT {
+			if chk.compiled.mdnsTXTNot.MatchString(kv) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// matchesUPnPDevice reports whether a single UPnP/SSDP device record satisfies
+// chk's UPnP device and service regex preconditions.
+func matchesUPnPDevice(chk *Check, dev probe.UPnPDevice) bool {
+	if chk.compiled.upnpDevice != nil {
+		combined := strings.Join([]string{dev.ST, dev.DeviceType, dev.Manufacturer, dev.ModelName, dev.ModelNumber, dev.Server}, " ")
+		if !chk.compiled.upnpDevice.MatchString(combined) {
+			return false
+		}
+	}
+	if chk.compiled.upnpService != nil {
+		svcOK := false
+		for _, st := range dev.ServiceTypes {
+			if chk.compiled.upnpService.MatchString(st) {
+				svcOK = true
+				break
+			}
+		}
+		if !svcOK && !chk.compiled.upnpService.MatchString(dev.ST) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchesWSRecord reports whether a single WS-Discovery record satisfies chk's
+// WS-Discovery type/scope regex precondition.
+func matchesWSRecord(chk *Check, rec probe.WSDiscoveryRecord) bool {
+	if chk.compiled.wsType == nil {
+		return true
+	}
+	combined := strings.Join(append(append([]string(nil), rec.Types...), rec.Scopes...), " ")
+	return chk.compiled.wsType.MatchString(combined)
+}
+
 // executeProbe runs the verification probe for a single check against ip:port.
 func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port int) (string, bool) {
+	return r.executeProbeProfile(ctx, chk, probe.HostProfile{}, ip, port)
+}
+
+// executeProbeProfile runs the verification probe for a single check against
+// ip:port with access to already-fingerprinted host metadata (such as TLS state).
+func (r *Runner) executeProbeProfile(ctx context.Context, chk *Check, hp probe.HostProfile, ip string, port int) (string, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, chk.Probe.Timeout)
 	defer cancel()
 
@@ -551,7 +612,7 @@ func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port i
 	case "telnet":
 		return probeTelnet(probeCtx, ip, port)
 	case "http":
-		return r.probeHTTP(probeCtx, ip, port, chk)
+		return r.probeHTTP(probeCtx, hp, ip, port, chk)
 	case "mqtt":
 		return probeMQTT(probeCtx, ip, port)
 	case "modbus":
@@ -683,15 +744,8 @@ func probeTCP(ctx context.Context, ip string, port int, chk *Check) (string, boo
 
 // probeHTTP executes strictly read-only, target-IP-only HTTP request(s) across
 // Path / Paths and evaluates status, header, body, negative, and JSONPath matchers.
-func (r *Runner) probeHTTP(ctx context.Context, ip string, port int, chk *Check) (string, bool) {
-	scheme := chk.Probe.Scheme
-	if scheme == "" {
-		if port == 443 || port == 8443 || port == 9443 || port == 10443 {
-			scheme = "https"
-		} else {
-			scheme = "http"
-		}
-	}
+func (r *Runner) probeHTTP(ctx context.Context, hp probe.HostProfile, ip string, port int, chk *Check) (string, bool) {
+	scheme := inferHTTPScheme(hp, port, chk)
 
 	for _, path := range chk.httpPaths() {
 		if ctx.Err() != nil {
@@ -731,6 +785,31 @@ func (r *Runner) probeHTTP(ctx context.Context, ip string, port int, chk *Check)
 		return fmt.Sprintf("%s %s returned HTTP %d without required authentication", chk.Probe.Method, path, resp.StatusCode), true
 	}
 	return "", false
+}
+
+// inferHTTPScheme resolves whether an HTTP probe should speak "http" or "https"
+// by honoring explicit probe.scheme first, then fingerprinted HTTP banner or
+// Nerva service TLS state, and finally well-known TLS management/web ports.
+func inferHTTPScheme(hp probe.HostProfile, port int, chk *Check) string {
+	if chk != nil && chk.Probe.Scheme != "" {
+		return chk.Probe.Scheme
+	}
+	if banner, ok := hp.HTTP[port]; ok {
+		if s := strings.ToLower(strings.TrimSpace(banner.Scheme)); s == "http" || s == "https" {
+			return s
+		}
+	}
+	for _, svc := range hp.Services {
+		if svc.Port == port && (svc.TLS || strings.EqualFold(svc.Protocol, "https")) {
+			return "https"
+		}
+	}
+	switch port {
+	case 443, 636, 993, 995, 5986, 8006, 8007, 8443, 9443, 10443, 16993, 16995:
+		return "https"
+	default:
+		return "http"
+	}
 }
 
 func matchHTTPResponse(resp *http.Response, bodyBytes []byte, chk *Check) bool {
@@ -880,8 +959,18 @@ func probeModbus(ctx context.Context, ip string, port int) (string, bool) {
 	return fmt.Sprintf("Modbus TCP slave responded without authentication (function code 0x%02X)", fc), true
 }
 
-// probeRTSP sends a read-only RTSP OPTIONS request and checks for an
-// unauthenticated 200 OK response advertising stream inspection methods.
+type rtspResponse struct {
+	statusCode       int
+	hasAuthChallenge bool
+	publicHeader     string
+	contentType      string
+	body             string
+}
+
+// probeRTSP sends a read-only RTSP OPTIONS request followed by a read-only
+// DESCRIBE request (Accept: application/sdp) and reports an unauthenticated
+// media server only when DESCRIBE returns 200 OK with SDP and no
+// WWW-Authenticate challenge.
 func probeRTSP(ctx context.Context, ip string, port int) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
@@ -889,42 +978,130 @@ func probeRTSP(ctx context.Context, ip string, port int) (string, bool) {
 	}
 	defer conn.Close()
 
-	req := fmt.Sprintf("OPTIONS rtsp://%s:%d/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: UniBlue/0.1\r\n\r\n", ip, port)
-	if _, err := io.WriteString(conn, req); err != nil {
+	hostPort := net.JoinHostPort(ip, strconv.Itoa(port))
+	optReq := fmt.Sprintf("OPTIONS rtsp://%s/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: UniBlue/0.1\r\n\r\n", hostPort)
+	if _, err := io.WriteString(conn, optReq); err != nil {
 		return "", false
 	}
 
-	reader := bufio.NewReader(io.LimitReader(conn, maxBannerReadBytes))
+	reader := bufio.NewReader(conn)
+	optResp, ok := readRTSPResponse(ctx, conn, reader, false)
+	if !ok || optResp.statusCode != 200 || optResp.hasAuthChallenge {
+		return "", false
+	}
+
+	// Many password-protected cameras and RTSP servers answer OPTIONS 200 OK
+	// without WWW-Authenticate and only enforce auth on DESCRIBE/SETUP/PLAY.
+	descReq := fmt.Sprintf("DESCRIBE rtsp://%s/ RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\nUser-Agent: UniBlue/0.1\r\n\r\n", hostPort)
+	descResp, ok := sendRTSPDescribe(ctx, conn, reader, ip, port, descReq)
+	if !ok || descResp.statusCode != 200 || descResp.hasAuthChallenge {
+		return "", false
+	}
+
+	hasSDP := strings.Contains(strings.ToLower(descResp.contentType), "application/sdp") ||
+		strings.Contains(descResp.body, "v=0") ||
+		strings.Contains(descResp.body, "\nm=") ||
+		strings.HasPrefix(descResp.body, "m=")
+	if !hasSDP {
+		return "", false
+	}
+	if optResp.publicHeader != "" {
+		return fmt.Sprintf("RTSP DESCRIBE returned 200 OK with SDP without authentication (Public: %s)", optResp.publicHeader), true
+	}
+	return "RTSP DESCRIBE returned 200 OK with SDP without authentication", true
+}
+
+func sendRTSPDescribe(ctx context.Context, conn net.Conn, reader *bufio.Reader, ip string, port int, req string) (rtspResponse, bool) {
+	if _, err := io.WriteString(conn, req); err == nil {
+		if resp, ok := readRTSPResponse(ctx, conn, reader, true); ok {
+			return resp, true
+		}
+	}
+	// Some RTSP servers close the TCP connection after OPTIONS; reconnect once
+	// for the read-only DESCRIBE probe.
+	conn2, err := dialWithContextDeadline(ctx, ip, port)
+	if err != nil {
+		return rtspResponse{}, false
+	}
+	defer conn2.Close()
+	if _, err := io.WriteString(conn2, req); err != nil {
+		return rtspResponse{}, false
+	}
+	return readRTSPResponse(ctx, conn2, bufio.NewReader(conn2), true)
+}
+
+func readRTSPResponse(ctx context.Context, conn net.Conn, reader *bufio.Reader, wantBody bool) (rtspResponse, bool) {
 	statusLine, err := reader.ReadString('\n')
 	if err != nil {
-		return "", false
+		return rtspResponse{}, false
 	}
 	statusLine = strings.TrimSpace(statusLine)
-	if !strings.HasPrefix(statusLine, "RTSP/1.") || !strings.Contains(statusLine, " 200 ") {
-		return "", false
+	if !strings.HasPrefix(statusLine, "RTSP/1.") {
+		return rtspResponse{}, false
+	}
+	fields := strings.Fields(statusLine)
+	if len(fields) < 2 {
+		return rtspResponse{}, false
+	}
+	code, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return rtspResponse{}, false
 	}
 
-	// Read remaining headers to confirm no authentication challenge was returned.
-	var publicHeader string
-	for {
+	resp := rtspResponse{statusCode: code}
+	contentLen := 0
+	totalHeaderBytes := len(statusLine)
+	for range 64 {
 		line, err := reader.ReadString('\n')
+		totalHeaderBytes += len(line)
+		if totalHeaderBytes > 8192 {
+			break
+		}
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || err != nil {
+		if trimmed == "" {
 			break
 		}
 		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "www-authenticate:") {
-			return "", false
+		switch {
+		case strings.HasPrefix(lower, "www-authenticate:"):
+			resp.hasAuthChallenge = true
+		case strings.HasPrefix(lower, "public:"):
+			resp.publicHeader = strings.TrimSpace(trimmed[len("public:"):])
+		case strings.HasPrefix(lower, "content-type:"):
+			resp.contentType = strings.TrimSpace(trimmed[len("content-type:"):])
+		case strings.HasPrefix(lower, "content-length:"):
+			if n, convErr := strconv.Atoi(strings.TrimSpace(trimmed[len("content-length:"):])); convErr == nil && n > 0 {
+				contentLen = n
+			}
 		}
-		if strings.HasPrefix(lower, "public:") {
-			publicHeader = strings.TrimSpace(trimmed[len("public:"):])
+		if err != nil {
+			break
 		}
 	}
 
-	if publicHeader != "" {
-		return fmt.Sprintf("RTSP OPTIONS returned 200 OK without auth (Public: %s)", publicHeader), true
+	if contentLen > 0 {
+		toRead := contentLen
+		if toRead > 4096 {
+			toRead = 4096
+		}
+		body := make([]byte, toRead)
+		n, _ := io.ReadFull(reader, body)
+		if wantBody {
+			resp.body = string(body[:n])
+		}
+	} else if wantBody && resp.statusCode == 200 && !strings.Contains(strings.ToLower(resp.contentType), "application/sdp") {
+		shortDeadline := time.Now().Add(150 * time.Millisecond)
+		if dl, ok := ctx.Deadline(); ok && dl.Before(shortDeadline) {
+			shortDeadline = dl
+		}
+		_ = conn.SetReadDeadline(shortDeadline)
+		buf := make([]byte, maxBannerReadBytes)
+		n, _ := reader.Read(buf)
+		if n > 0 {
+			resp.body = string(buf[:n])
+		}
 	}
-	return "RTSP OPTIONS returned 200 OK without authentication", true
+	return resp, true
 }
 
 // probeTelnet connects to a Telnet service, politely declines IAC option
@@ -1294,18 +1471,42 @@ func probeADB(ctx context.Context, ip string, port int) (string, bool) {
 }
 
 // probeRDPNoNLA sends a read-only TPKT + X.224 Connection Request with an
-// RDP_NEG_REQ offering ONLY classic PROTOCOL_RDP (0x00000000, no CredSSP/NLA).
+// RDP_NEG_REQ offering PROTOCOL_RDP | PROTOCOL_SSL (0x00000001, no CredSSP/NLA).
 // Servers enforcing Network Level Authentication reply with TYPE_RDP_NEG_FAILURE
-// (0x03) and HYBRID_REQUIRED_BY_SERVER; servers with NLA disabled reply with
-// TYPE_RDP_NEG_RSP (0x02) accepting PROTOCOL_RDP or PROTOCOL_SSL without NLA.
+// (0x03) and HYBRID_REQUIRED_BY_SERVER; servers with NLA disabled (including
+// TLS-required SecurityLayer=2 servers) accept PROTOCOL_SSL (0x01) or
+// PROTOCOL_RDP (0x00). If a legacy server refuses SSL with
+// SSL_NOT_ALLOWED_BY_SERVER (0x02) or SSL_CERT_NOT_ON_SERVER (0x03), the probe
+// retries once offering only PROTOCOL_RDP (0x00000000).
 func probeRDPNoNLA(ctx context.Context, ip string, port int) (string, bool) {
+	const (
+		rdpProtoRDP               uint32 = 0x00000000
+		rdpProtoSSL               uint32 = 0x00000001
+		rdpFailSSLRequired        uint32 = 0x00000001
+		rdpFailSSLNotAllowed      uint32 = 0x00000002
+		rdpFailSSLCertNotOnServer uint32 = 0x00000003
+	)
+
+	ev, matched, failCode := probeRDPWithProtocol(ctx, ip, port, rdpProtoSSL)
+	if matched {
+		return ev, true
+	}
+	if failCode == rdpFailSSLNotAllowed || failCode == rdpFailSSLCertNotOnServer {
+		ev, matched, _ = probeRDPWithProtocol(ctx, ip, port, rdpProtoRDP)
+		return ev, matched
+	}
+	_ = rdpFailSSLRequired
+	return "", false
+}
+
+func probeRDPWithProtocol(ctx context.Context, ip string, port int, requestedProto uint32) (string, bool, uint32) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
-		return "", false
+		return "", false, 0
 	}
 	defer conn.Close()
 
-	// 19-byte TPKT + X.224 CR + 8-byte RDP_NEG_REQ (requestedProtocols = 0x00000000).
+	// 19-byte TPKT + X.224 CR + 8-byte RDP_NEG_REQ.
 	req := []byte{
 		0x03, 0x00, 0x00, 0x13, // TPKT v3, reserved 0, total length 19
 		0x0e,       // X.224 length indicator (14 bytes follow)
@@ -1315,52 +1516,56 @@ func probeRDPNoNLA(ctx context.Context, ip string, port int) (string, bool) {
 		0x00,       // Class 0
 		0x01, 0x00, // TYPE_RDP_NEG_REQ (0x01), flags (0x00)
 		0x08, 0x00, // length = 8 (little-endian)
-		0x00, 0x00, 0x00, 0x00, // requestedProtocols = PROTOCOL_RDP (no NLA)
+		0x00, 0x00, 0x00, 0x00, // requestedProtocols (filled below)
 	}
+	binary.LittleEndian.PutUint32(req[15:19], requestedProto)
 	if _, err := conn.Write(req); err != nil {
-		return "", false
+		return "", false, 0
 	}
 
 	// Read TPKT 4-byte header first, then the remaining payload (bounded to 512B).
 	tpkt := make([]byte, 4)
 	if _, err := io.ReadFull(conn, tpkt); err != nil {
-		return "", false
+		return "", false, 0
 	}
 	if tpkt[0] != 0x03 || tpkt[1] != 0x00 {
-		return "", false
+		return "", false, 0
 	}
 	totalLen := int(binary.BigEndian.Uint16(tpkt[2:4]))
 	if totalLen < 11 || totalLen > 512 {
-		return "", false
+		return "", false, 0
 	}
 	body := make([]byte, totalLen-4)
 	if _, err := io.ReadFull(conn, body); err != nil {
-		return "", false
+		return "", false, 0
 	}
 	// body[1] must be X.224 Connection Confirm (0xD0).
 	if len(body) < 7 || body[1] != 0xd0 {
-		return "", false
+		return "", false, 0
 	}
 	// If the server omitted RDP_NEG_RSP entirely, it accepted legacy RDP security.
 	if len(body) == 7 {
-		return "RDP server accepted legacy PROTOCOL_RDP without Network Level Authentication (no RDP_NEG_RSP)", true
+		return "RDP server accepted legacy PROTOCOL_RDP without Network Level Authentication (no RDP_NEG_RSP)", true, 0
 	}
 	// Otherwise inspect the 8-byte RDP_NEG_RSP / RDP_NEG_FAILURE block at body[7:].
 	if len(body) < 15 {
-		return "", false
+		return "", false, 0
 	}
 	negType := body[7]
-	if negType != 0x02 { // 0x02 = TYPE_RDP_NEG_RSP; 0x03 = TYPE_RDP_NEG_FAILURE (NLA enforced)
-		return "", false
+	if negType == 0x03 { // TYPE_RDP_NEG_FAILURE
+		return "", false, binary.LittleEndian.Uint32(body[11:15])
+	}
+	if negType != 0x02 { // 0x02 = TYPE_RDP_NEG_RSP
+		return "", false, 0
 	}
 	selectedProto := binary.LittleEndian.Uint32(body[11:15])
 	switch selectedProto {
 	case 0x00000000:
-		return "RDP server accepted standard PROTOCOL_RDP with Network Level Authentication (NLA) disabled", true
+		return "RDP server accepted standard PROTOCOL_RDP with Network Level Authentication (NLA) disabled", true, 0
 	case 0x00000001:
-		return "RDP server accepted TLS-only PROTOCOL_SSL with Network Level Authentication (NLA) disabled", true
+		return "RDP server accepted TLS-only PROTOCOL_SSL with Network Level Authentication (NLA) disabled", true, 0
 	default:
-		return "", false
+		return "", false, 0
 	}
 }
 

@@ -22,7 +22,7 @@ metadata:
     - https://datatracker.ietf.org/doc/html/rfc5389
 
 preconditions:
-  service_proto_any: ["stun", "turn"]
+  ports_any: [3478, 5349]
   discovery_only: true
 
 probe:

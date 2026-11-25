@@ -213,10 +213,15 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 
 		mpdPort, closeMPD := startMockTCP(t, func(conn net.Conn) {
 			_, _ = io.WriteString(conn, "OK MPD 0.23.5\n")
+			buf := make([]byte, 64)
+			n, _ := conn.Read(buf)
+			if strings.HasPrefix(string(buf[:n]), "status") {
+				_, _ = io.WriteString(conn, "volume: 50\nstate: stop\nOK\n")
+			}
 		})
 		defer closeMPD()
 		if _, ok := probeMPD(context.Background(), "127.0.0.1", mpdPort); !ok {
-			t.Fatal("expected MPD match")
+			t.Fatal("expected unauthenticated MPD status match")
 		}
 	})
 

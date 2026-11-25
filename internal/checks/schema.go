@@ -9,6 +9,7 @@
 package checks
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -267,6 +268,10 @@ type Preconditions struct {
 	// MDNSTXTRegex matches allowlisted DNS-SD TXT key=value pairs on matched services.
 	MDNSTXTRegex string `yaml:"mdns_txt_regex"`
 
+	// MDNSTXTNotRegex rejects a matched mDNS service if any allowlisted TXT
+	// key=value pair matches this pattern (e.g., excluding encrypted nodes).
+	MDNSTXTNotRegex string `yaml:"mdns_txt_not_regex"`
+
 	// UPnPDeviceRegex matches SSDP/UPnP deviceType, ST, manufacturer, model, or Server.
 	UPnPDeviceRegex string `yaml:"upnp_device_regex"`
 
@@ -404,6 +409,7 @@ type compiledPatterns struct {
 	httpTitle   *regexp.Regexp
 	httpServer  *regexp.Regexp
 	mdnsTXT     *regexp.Regexp
+	mdnsTXTNot  *regexp.Regexp
 	upnpDevice  *regexp.Regexp
 	upnpService *regexp.Regexp
 	wsType      *regexp.Regexp
@@ -482,10 +488,13 @@ func Merge(groups ...[]*Check) ([]*Check, error) {
 }
 
 // Parse decodes a single YAML check definition and enforces all schema and
-// safety guardrails.
+// safety guardrails. Unknown YAML fields are rejected so typos in matchers or
+// preconditions fail loudly during validation.
 func Parse(raw []byte, source string) (*Check, error) {
 	var chk Check
-	if err := yaml.Unmarshal(raw, &chk); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&chk); err != nil {
 		return nil, fmt.Errorf("parse check %q: %w", source, err)
 	}
 	chk.Source = source
@@ -579,6 +588,9 @@ func (c *Check) Validate() error {
 				return fmt.Errorf("http probe request header %q is not in the read-only allowlist (Accept, Accept-Language, Cache-Control)", hk)
 			}
 		}
+		if !c.Probe.Match.hasHTTPMatcher() {
+			return errors.New("http probe requires at least one response matcher in probe.match")
+		}
 	default:
 		return fmt.Errorf("unsupported probe.type %q", c.Probe.Type)
 	}
@@ -613,6 +625,11 @@ func (c *Check) Validate() error {
 	if c.Preconditions.MDNSTXTRegex != "" {
 		if c.compiled.mdnsTXT, err = regexp.Compile(c.Preconditions.MDNSTXTRegex); err != nil {
 			return fmt.Errorf("preconditions.mdns_txt_regex: %w", err)
+		}
+	}
+	if c.Preconditions.MDNSTXTNotRegex != "" {
+		if c.compiled.mdnsTXTNot, err = regexp.Compile(c.Preconditions.MDNSTXTNotRegex); err != nil {
+			return fmt.Errorf("preconditions.mdns_txt_not_regex: %w", err)
 		}
 	}
 	if c.Preconditions.UPnPDeviceRegex != "" {
@@ -651,6 +668,20 @@ func (c *Check) Validate() error {
 	}
 
 	return nil
+}
+
+// hasHTTPMatcher reports whether MatchSpec defines at least one active HTTP
+// response matching condition (beyond non-matching metadata like redact_body).
+func (m MatchSpec) hasHTTPMatcher() bool {
+	return len(m.Status) > 0 ||
+		len(m.BodyContainsAll) > 0 ||
+		len(m.BodyContainsAny) > 0 ||
+		len(m.BodyNotContains) > 0 ||
+		strings.TrimSpace(m.BodyRegex) != "" ||
+		len(m.JSONMatch) > 0 ||
+		len(m.HeadersAbsent) > 0 ||
+		len(m.HeadersPresent) > 0 ||
+		len(m.HeaderContains) > 0
 }
 
 // httpPaths returns the ordered deduplicated list of relative paths configured

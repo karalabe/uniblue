@@ -25,22 +25,27 @@ preconditions:
 probe:
   type: http
   method: GET
-  path: /admin
+  path: /admin/conf/cupsd.conf
   timeout: 3s
   match:
     status: [200]
     headers_absent: ["WWW-Authenticate"]
-    body_contains_all:
-      - "CUPS"
-      - "Add Printer"
+    body_contains_any:
+      - "<Location"
+      - "<Policy"
+      - "Listen "
+      - "Port 631"
+      - "DefaultAuthType"
+      - "LogLevel"
+    evidence_summary: "CUPS served /admin/conf/cupsd.conf without authentication"
     redact_body: true
 
 remediation:
   summary: >
-    CUPS exposed its /admin web interface on port 631 without requiring HTTP
-    authentication. Remote users on the LAN can add malicious printer queues,
-    modify cupsd settings, or intercept jobs. Restrict /admin in cupsd.conf to
-    localhost and require @SYSTEM authentication.
+    CUPS exposed its admin configuration endpoint (/admin/conf/cupsd.conf) on
+    port 631 without requiring HTTP authentication. Remote users on the LAN can
+    add malicious printer queues, modify cupsd settings, or intercept jobs.
+    Restrict /admin in cupsd.conf to localhost and require @SYSTEM authentication.
   unifi_actions:
     - require_cups_admin_auth
     - bind_cups_to_localhost

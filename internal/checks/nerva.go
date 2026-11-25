@@ -25,18 +25,21 @@ import (
 func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Finding {
 	// Key deduplication strictly by (hostIP, port, transport, property) so
 	// independent security properties on the same endpoint (e.g., an HTTP
-	// product check vs. an expired TLS cert, or SMBv1 vs. SMB signing) never
-	// suppress each other.
-	coveredProp := make(map[string]struct{}, len(existing))
+	// product check vs. an expired TLS cert, TLS protocol version vs. TLS weak
+	// cipher, or SMBv1 vs. SMB signing) never suppress each other.
+	coveredByExisting := make(map[string]struct{}, len(existing))
 	for _, f := range existing {
 		prop := existingFindingProperty(f)
 		if prop == "" {
 			continue
 		}
-		key := fmt.Sprintf("%s|%d|%s|%s", f.Client.IP, f.Port, f.EffectiveTransport(), prop)
-		coveredProp[key] = struct{}{}
+		key := fmt.Sprintf("%s|%d|%s|%s", f.Client.PrimaryIP(), f.Port, f.EffectiveTransport(), prop)
+		coveredByExisting[key] = struct{}{}
 	}
 
+	// Track the highest-severity Nerva finding per dedup key so weaker findings
+	// emitted earlier on the same port/property never drop higher-severity ones.
+	bestIdxByKey := make(map[string]int)
 	var out []Finding
 	for _, hp := range profiles {
 		for _, svc := range hp.Services {
@@ -51,10 +54,9 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 			for _, sf := range svc.Findings {
 				prop := nervaFindingProperty(sf.ID)
 				key := fmt.Sprintf("%s|%d|%s|%s", hp.Client.PrimaryIP(), svc.Port, transport, prop)
-				if _, ok := coveredProp[key]; ok {
+				if _, ok := coveredByExisting[key]; ok {
 					continue
 				}
-				coveredProp[key] = struct{}{}
 
 				sev, err := ParseSeverity(sf.Severity)
 				if err != nil {
@@ -66,7 +68,7 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 					evidence = fmt.Sprintf("detected on %s %s/%d (%s)", svc.Protocol, transport, svc.Port, sf.ID)
 				}
 
-				out = append(out, Finding{
+				candidate := Finding{
 					CheckID:           normalizeNervaCheckID(sf.ID),
 					Title:             title,
 					Category:          nervaCategory(sf.ID),
@@ -82,7 +84,15 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 						Summary:      summary,
 						UniFiActions: actions,
 					},
-				})
+				}
+				if idx, seen := bestIdxByKey[key]; seen {
+					if candidate.BaseSeverity > out[idx].BaseSeverity {
+						out[idx] = candidate
+					}
+					continue
+				}
+				bestIdxByKey[key] = len(out)
+				out = append(out, candidate)
 			}
 		}
 	}
@@ -126,23 +136,48 @@ func nervaFindingProperty(rawID string) string {
 		return "tls-cert"
 	case strings.Contains(id, "weak-key") || strings.Contains(id, "key-size"):
 		return "tls-weak-key"
+	case isTLSCipherFinding(id):
+		return "tls-cipher"
 	case strings.HasPrefix(id, "tls-"):
 		return "tls-protocol"
 	case id == "smb-v1-enabled":
 		return "smb-v1"
 	case id == "smb-signing-not-required":
 		return "smb-signing"
-	case strings.Contains(id, "anon") || strings.Contains(id, "no-auth") || strings.HasSuffix(id, "-none"):
+	case isNervaUnauthFinding(id):
 		return "auth-anon"
 	default:
 		return id
 	}
 }
 
+func isTLSCipherFinding(id string) bool {
+	if !strings.HasPrefix(id, "tls-") {
+		return false
+	}
+	return strings.Contains(id, "cipher") ||
+		strings.Contains(id, "anon") ||
+		strings.Contains(id, "null") ||
+		strings.Contains(id, "export") ||
+		strings.Contains(id, "rc4") ||
+		strings.Contains(id, "3des") ||
+		strings.Contains(id, "-des")
+}
+
+func isNervaUnauthFinding(id string) bool {
+	if strings.HasPrefix(id, "tls-") || strings.HasPrefix(id, "smb-") {
+		return false
+	}
+	return strings.Contains(id, "unauth") ||
+		strings.Contains(id, "no-auth") ||
+		strings.Contains(id, "anon") ||
+		strings.HasSuffix(id, "-none")
+}
+
 func nervaClaimKind(rawID string) ClaimKind {
 	id := strings.ToLower(strings.TrimSpace(rawID))
 	switch {
-	case strings.Contains(id, "anon") || strings.Contains(id, "no-auth"):
+	case isNervaUnauthFinding(id):
 		return ClaimConfirmedPermission
 	default:
 		return ClaimServiceObserved
@@ -186,7 +221,7 @@ func describeNervaFinding(sf probe.ServiceFinding, svc probe.Service) (title, su
 		return "Expired Local TLS Certificate",
 			"Service presents an expired TLS certificate. Renew or regenerate the local certificate so clients can verify identity cleanly.",
 			[]string{"renew_tls_certificate"}
-	case strings.Contains(id, "anon-access") || svc.AnonymousAccess:
+	case strings.Contains(id, "anon-access") || (isNervaUnauthFinding(id) && sf.Title == "") || (svc.AnonymousAccess && !strings.HasPrefix(id, "tls-") && !strings.HasPrefix(id, "smb-")):
 		label := strings.ToUpper(svc.Protocol)
 		if name, _, ok := strings.Cut(sf.ID, ":"); ok && name != "" {
 			label = strings.ToUpper(name[:1]) + name[1:]
@@ -209,9 +244,9 @@ func describeNervaFinding(sf probe.ServiceFinding, svc probe.Service) (title, su
 
 // nervaCategory groups Nerva findings into UniBlue's standard finding categories.
 func nervaCategory(rawID string) string {
-	id := strings.ToLower(rawID)
+	id := strings.ToLower(strings.TrimSpace(rawID))
 	switch {
-	case strings.Contains(id, "anon"):
+	case isNervaUnauthFinding(id):
 		return "unauth-control"
 	case strings.HasPrefix(id, "smb-"):
 		return "exposed-protocol"
