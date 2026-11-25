@@ -9,6 +9,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,8 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +33,11 @@ func (e *Engine) Serve(ctx context.Context) error {
 	addr := e.opts.ListenAddr
 	if addr == "" {
 		addr = "127.0.0.1:8080"
+		e.opts.ListenAddr = addr
+	}
+
+	if !isLoopbackListenAddr(addr) && e.effectiveAPIToken() == "" {
+		e.logger.Warn("uniblue web UI listening on non-loopback address without UNIBLUE_API_TOKEN; set UNIBLUE_API_TOKEN to require bearer auth on /api/*", "listen", addr)
 	}
 
 	mux := e.Handler()
@@ -67,7 +75,9 @@ func (e *Engine) Serve(ctx context.Context) error {
 	}
 }
 
-// Handler builds the HTTP router for UniBlue's live dashboard and APIs.
+// Handler builds the HTTP router for UniBlue's live dashboard and APIs wrapped
+// with Host (DNS-rebinding), Origin/Sec-Fetch-Site (CSRF), and optional Bearer
+// token protection.
 func (e *Engine) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", e.handleIndex)
@@ -78,7 +88,90 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("GET /assets/logo-dark.svg", serveEmbeddedSVG("logo-horizontal-dark.svg"))
 	mux.HandleFunc("GET /assets/favicon.svg", serveEmbeddedSVG("logo-light.svg"))
 	mux.HandleFunc("GET /favicon.ico", serveEmbeddedSVG("logo-light.svg"))
-	return mux
+	return e.protectHTTP(mux)
+}
+
+func (e *Engine) effectiveAPIToken() string {
+	if tok := strings.TrimSpace(e.opts.APIToken); tok != "" {
+		return tok
+	}
+	return strings.TrimSpace(os.Getenv("UNIBLUE_API_TOKEN"))
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	if strings.TrimSpace(addr) == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return isLoopbackHostName(host)
+}
+
+func isLoopbackHostName(host string) bool {
+	h := strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func requestHostName(hostHeader string) string {
+	h := strings.TrimSpace(hostHeader)
+	if h == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	return strings.Trim(h, "[]")
+}
+
+// protectHTTP rejects DNS-rebinding Host headers on loopback listeners, blocks
+// cross-origin / cross-site browser requests (especially POST /api/rescan CSRF),
+// and enforces Bearer token authentication on /api/* when UNIBLUE_API_TOKEN is set.
+func (e *Engine) protectHTTP(next http.Handler) http.Handler {
+	loopbackOnly := isLoopbackListenAddr(e.opts.ListenAddr)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if loopbackOnly && r.Host != "" && !isLoopbackHostName(requestHostName(r.Host)) {
+			http.Error(w, "forbidden host header", http.StatusForbidden)
+			return
+		}
+
+		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
+		if isAPI || (r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions) {
+			if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+				parsedOrigin, err := url.Parse(origin)
+				if err != nil || !strings.EqualFold(parsedOrigin.Host, r.Host) {
+					http.Error(w, "forbidden cross-origin request", http.StatusForbidden)
+					return
+				}
+			}
+			if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" && sfs != "same-origin" && sfs != "none" {
+				http.Error(w, "forbidden cross-site request", http.StatusForbidden)
+				return
+			}
+		}
+
+		if isAPI {
+			if tok := e.effectiveAPIToken(); tok != "" {
+				auth := strings.TrimSpace(r.Header.Get("Authorization"))
+				const prefix = "Bearer "
+				if !strings.HasPrefix(auth, prefix) ||
+					subtle.ConstantTimeCompare([]byte(strings.TrimSpace(auth[len(prefix):])), []byte(tok)) != 1 {
+					w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RenderStaticHTML renders a self-contained, offline interactive HTML snapshot
@@ -168,19 +261,24 @@ func (e *Engine) handleEventsSSE(w http.ResponseWriter, r *http.Request) {
 
 func (e *Engine) handleRescan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if ip := r.URL.Query().Get("ip"); ip != "" {
-		if !e.TriggerHostRescan(ip) {
+	if ip := strings.TrimSpace(r.URL.Query().Get("ip")); ip != "" {
+		switch e.triggerHostRescanStatus(ip) {
+		case hostRescanNotFound:
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"status":"not_found"}`))
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "not_found"})
+			return
+		case hostRescanQueueFull:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "queue_full"})
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = fmt.Fprintf(w, `{"status":"queued","ip":%q}`, ip)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "queued", "ip": ip})
 		return
 	}
 	e.TriggerFullRescan()
 	w.WriteHeader(http.StatusAccepted)
-	_, _ = w.Write([]byte(`{"status":"queued","scope":"full"}`))
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "queued", "scope": "full"})
 }
 
 func serveEmbeddedSVG(name string) http.HandlerFunc {

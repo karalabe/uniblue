@@ -93,6 +93,8 @@ type Entity struct {
 	Reasons       []Reason             `json:"reasons,omitempty"`
 	PinNumber     int                  `json:"pin_number,omitempty"`
 	ScannedAt     *time.Time           `json:"scanned_at,omitempty"`
+	Skipped       bool                 `json:"skipped,omitempty"`
+	SkipReason    string               `json:"skip_reason,omitempty"`
 	DeviceID      string               `json:"device_id,omitempty"`
 	PortID        string               `json:"port_id,omitempty"`
 	NetworkID     string               `json:"network_id,omitempty"`
@@ -415,6 +417,15 @@ func BuildPresentationModel(
 			NetworkName: n.Name,
 		}
 	}
+	// Honor operator-configured isolated_vlans and custom isolated firewall zones
+	// resolved by topology.Build when deciding service reachability ("vlan-only" vs "lan").
+	if topo != nil {
+		for _, vg := range topo.VLANs {
+			if vg.Isolated {
+				netIsolated[strings.ToLower(strings.TrimSpace(vg.Name))] = true
+			}
+		}
+	}
 
 	// Index exact & potential CVEs per host IP (deduplicated per host+product).
 	exactByIP := make(map[string][]cve.ProductSummary)
@@ -515,6 +526,40 @@ func BuildPresentationModel(
 				Source:      "unifi-controller",
 			})
 		}
+		// Attach Exact and Potential CVEs matched against UniFi gateway/switch/AP firmware.
+		if d.IP != "" {
+			if exList := exactByIP[d.IP]; len(exList) > 0 {
+				ent.ExactCVEs = exList
+				for i, s := range exList {
+					ent.ExactCVECount += s.TotalCVEs
+					sev := s.MaxSeverity.String()
+					ver := strings.TrimSpace(s.Product.Label + " " + s.Product.Version)
+					fix := "Upgrade to patched release"
+					if s.MinFixedVersion != "" {
+						fix = "Upgrade to >= " + s.MinFixedVersion
+					}
+					ent.Reasons = append(ent.Reasons, Reason{
+						ID:          fmt.Sprintf("cve-exact:%s/%d", id, i),
+						State:       VerdictExposed,
+						Kind:        "cve",
+						Ref:         strings.Join(s.TopCVEs, ", "),
+						Title:       fmt.Sprintf("%s: %d exact CVE(s) (max CVSS %.1f)", ver, s.TotalCVEs, s.MaxCVSS),
+						Severity:    sev,
+						Expected:    fix,
+						Observed:    ver,
+						Evidence:    fmt.Sprintf("%s matched %d exact CVE(s)%s: %s", ver, s.TotalCVEs, formatKEV(s.KEVCount), strings.Join(s.TopCVEs, ", ")),
+						Remediation: fix,
+						Source:      "nvd-cve",
+					})
+				}
+			}
+			if potList := potByIP[d.IP]; len(potList) > 0 {
+				ent.PotentialCVEs = potList
+				for _, s := range potList {
+					ent.PotCVECount += s.TotalCVEs
+				}
+			}
+		}
 		pm.Entities[id] = ent
 	}
 
@@ -532,6 +577,13 @@ func BuildPresentationModel(
 		if cl.IP != "" {
 			clientByIP[cl.IP] = cv
 			hostIDByIP[cl.IP] = hid
+		}
+		for _, v6 := range cl.IPv6 {
+			v6 = strings.TrimSpace(v6)
+			if v6 != "" {
+				hostIDByIP[v6] = hid
+				hostIDByIP[strings.ToLower(v6)] = hid
+			}
 		}
 		if mac != "" {
 			clientByMAC[mac] = cv
@@ -584,6 +636,11 @@ func BuildPresentationModel(
 			}
 		}
 
+		var scannedAt *time.Time
+		if cv.LastScannedAt != nil && !cv.LastScannedAt.IsZero() {
+			scannedAt = cv.LastScannedAt
+		}
+
 		ent := &Entity{
 			ID:          hid,
 			Kind:        "host",
@@ -595,7 +652,9 @@ func BuildPresentationModel(
 			State:       VerdictOK,
 			MaxSeverity: "ok",
 			StateLabel:  "No findings",
-			ScannedAt:   cv.LastScannedAt,
+			ScannedAt:   scannedAt,
+			Skipped:     cv.Skipped,
+			SkipReason:  cv.SkipReason,
 			DeviceID:    devID,
 			PortID:      portID,
 			NetworkID:   netEntByName[strings.ToLower(cl.NetworkName)],
@@ -610,8 +669,12 @@ func BuildPresentationModel(
 			IsBMC:       isBMC,
 		}
 
-		// Attach placement verdict computed by topology.Build.
-		if pl, ok := placementByIP[cl.IP]; ok {
+		// Attach placement verdict computed by topology.Build (with MAC fallback for IPv6-only hosts).
+		pl, hasPlacement := placementByIP[cl.IP]
+		if !hasPlacement && mac != "" {
+			pl, hasPlacement = placementByMAC[mac]
+		}
+		if hasPlacement {
 			if pl.Placement == topology.PlacementIsolate || pl.Placement == topology.PlacementReview {
 				ent.Reasons = append(ent.Reasons, Reason{
 					ID:          "place:" + hid,
@@ -789,6 +852,24 @@ func BuildPresentationModel(
 		}
 	}
 
+	// Helper to resolve a host entity by IPv4, IPv6, or MAC.
+	lookupHostID := func(cl unifi.Client) string {
+		if ip := strings.TrimSpace(cl.IP); ip != "" {
+			if hid := hostIDByIP[ip]; hid != "" {
+				return hid
+			}
+			if hid := hostIDByIP[strings.ToLower(ip)]; hid != "" {
+				return hid
+			}
+		}
+		if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
+			if hid := hostIDByMAC[m]; hid != "" {
+				return hid
+			}
+		}
+		return ""
+	}
+
 	// 4. Attach confirmed findings from report.Findings to their target entities.
 	for idxF, f := range report.Findings {
 		if f.CheckID == "UB-UNIFI-PORTFWD" || f.CheckID == "UB-UNIFI-FIRMWARE" {
@@ -799,20 +880,72 @@ func BuildPresentationModel(
 
 		switch {
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-PORT-"):
-			swMAC := strings.ToLower(f.Client.MAC)
-			pid := portEntityID(swMAC, f.Port)
+			swMAC := strings.ToLower(strings.TrimSpace(f.Client.SwitchMAC))
+			portIdx := f.Client.SwitchPort
+			if portIdx <= 0 {
+				portIdx = f.Port
+			}
+			if swMAC == "" && strings.HasPrefix(f.Property, "port:") {
+				rest := strings.TrimPrefix(f.Property, "port:")
+				if mPart, pPart, ok := strings.Cut(rest, "/"); ok {
+					swMAC = strings.ToLower(strings.TrimSpace(mPart))
+					if portIdx <= 0 {
+						_, _ = fmt.Sscanf(pPart, "%d", &portIdx)
+					}
+				}
+			}
+			if swMAC == "" {
+				cand := strings.ToLower(strings.TrimSpace(f.Client.MAC))
+				if _, ok := swByMAC[cand]; ok {
+					swMAC = cand
+				} else if _, ok := pm.Entities[portEntityID(cand, portIdx)]; ok {
+					swMAC = cand
+				} else if cand != "" || f.Client.IP != "" {
+					for _, sw := range report.SwitchPorts {
+						for _, sp := range sw.Ports {
+							if portIdx > 0 && sp.PortIdx != portIdx {
+								continue
+							}
+							for _, peer := range sp.Peers {
+								if (cand != "" && strings.EqualFold(peer.MAC, cand)) ||
+									(f.Client.IP != "" && peer.IP == f.Client.IP) {
+									swMAC = strings.ToLower(sw.MAC)
+									portIdx = sp.PortIdx
+									break
+								}
+							}
+							if swMAC != "" {
+								break
+							}
+						}
+						if swMAC != "" {
+							break
+						}
+					}
+				}
+				if swMAC == "" {
+					swMAC = cand
+				}
+			}
+
+			pid := portEntityID(swMAC, portIdx)
 			if f.CheckID == "UB-UNIFI-PORT-EXT-UNUSED-OPEN" {
-				// Attach to each unused external port on this switch and the switch device itself.
+				// Attach to each unused external/restricted port on this switch and the switch device itself.
+				attached := false
 				if sw, ok := swByMAC[swMAC]; ok {
 					for _, sp := range sw.Ports {
 						if (sp.Zone == "external" || sp.Zone == "unused") && sp.State == "inactive_enabled" {
 							if pe, ok := pm.Entities[portEntityID(swMAC, sp.PortIdx)]; ok {
+								title := "Unused port left enabled"
+								if sp.Zone == "external" || sw.ExternalDevice {
+									title = "Unused external port left enabled"
+								}
 								pe.Reasons = append(pe.Reasons, Reason{
 									ID:          fmt.Sprintf("%s/%d", fid, sp.PortIdx),
 									State:       VerdictExposed,
 									Kind:        "policy",
 									Ref:         f.CheckID,
-									Title:       "Unused external port left enabled",
+									Title:       title,
 									Severity:    sev,
 									Expected:    "Operation = Disabled",
 									Observed:    "Enabled (inactive, " + sp.TaggedPolicy + ")",
@@ -821,11 +954,16 @@ func BuildPresentationModel(
 									Source:      "unifi-port",
 									Port:        sp.PortIdx,
 								})
+								attached = true
 							}
 						}
 					}
 				}
 				if de, ok := pm.Entities[devEntityID(swMAC)]; ok {
+					expected := "Unused ports disabled"
+					if de.Side == "outside" {
+						expected = "Unused external ports disabled"
+					}
 					de.Reasons = append(de.Reasons, Reason{
 						ID:          fid,
 						State:       VerdictExposed,
@@ -833,39 +971,173 @@ func BuildPresentationModel(
 						Ref:         f.CheckID,
 						Title:       f.Title,
 						Severity:    sev,
-						Expected:    "Unused external ports disabled",
+						Expected:    expected,
 						Observed:    f.Evidence,
 						Evidence:    f.Evidence,
 						Remediation: f.Remediation.Summary,
 						Source:      "unifi-port",
-						Port:        f.Port,
+						Port:        portIdx,
 					})
+					attached = true
 				}
-			} else if pe, ok := pm.Entities[pid]; ok {
+				if !attached {
+					if gw, ok := pm.Entities[pm.GatewayID]; ok {
+						gw.Reasons = append(gw.Reasons, Reason{
+							ID:          fid,
+							State:       VerdictExposed,
+							Kind:        "policy",
+							Ref:         f.CheckID,
+							Title:       f.Title,
+							Severity:    sev,
+							Expected:    "Unused ports disabled",
+							Observed:    f.Evidence,
+							Evidence:    f.Evidence,
+							Remediation: f.Remediation.Summary,
+							Source:      "unifi-port",
+							Port:        portIdx,
+						})
+					}
+				}
+			} else {
 				expected := "Isolated VLAN + Block All + MAC Port Security"
-				if f.CheckID == "UB-UNIFI-PORT-EXT-UPLINK" {
+				switch f.CheckID {
+				case "UB-UNIFI-PORT-EXT-UPLINK":
 					expected = "Custom/Block All (isolated VLANs only)"
-				} else if f.CheckID == "UB-UNIFI-PORT-EXT-MULTI-MAC" {
+				case "UB-UNIFI-PORT-EXT-MULTI-MAC":
 					expected = "1 learned MAC on exterior drop"
+				case "UB-UNIFI-PORT-UNAUTHORIZED-MAC":
+					expected = "Authorized MAC address in allowed_macs"
+				case "UB-UNIFI-PORT-STP-BLOCKED":
+					expected = "STP Forwarding (no L2 loop)"
 				}
-				pe.Reasons = append(pe.Reasons, Reason{
-					ID:          fid,
-					State:       VerdictExposed,
-					Kind:        "policy",
-					Ref:         f.CheckID,
-					Title:       f.Title,
-					Severity:    sev,
-					Expected:    expected,
-					Observed:    fmt.Sprintf("VLAN=%s, Tagged=%s, MAC-lock=%v", pe.NativeVLAN, pe.TaggedPolicy, pe.PortSecurity),
-					Evidence:    f.Evidence,
-					Remediation: f.Remediation.Summary,
-					Source:      "unifi-port",
-					Port:        f.Port,
-				})
+				attached := false
+				if pe, ok := pm.Entities[pid]; ok {
+					pe.Reasons = append(pe.Reasons, Reason{
+						ID:          fid,
+						State:       VerdictExposed,
+						Kind:        "policy",
+						Ref:         f.CheckID,
+						Title:       f.Title,
+						Severity:    sev,
+						Expected:    expected,
+						Observed:    fmt.Sprintf("VLAN=%s, Tagged=%s, MAC-lock=%v", pe.NativeVLAN, pe.TaggedPolicy, pe.PortSecurity),
+						Evidence:    f.Evidence,
+						Remediation: f.Remediation.Summary,
+						Source:      "unifi-port",
+						Port:        portIdx,
+					})
+					attached = true
+				}
+				// Also attach unauthorized-MAC findings to the intruding host when present.
+				if f.CheckID == "UB-UNIFI-PORT-UNAUTHORIZED-MAC" ||
+					(f.Client.SwitchMAC != "" && !strings.EqualFold(f.Client.MAC, swMAC)) {
+					if hid := lookupHostID(f.Client); hid != "" {
+						if he, ok := pm.Entities[hid]; ok {
+							he.Reasons = append(he.Reasons, Reason{
+								ID:          fid + "/host",
+								State:       VerdictExposed,
+								Kind:        "policy",
+								Ref:         f.CheckID,
+								Title:       f.Title,
+								Severity:    sev,
+								Expected:    expected,
+								Observed:    f.Evidence,
+								Evidence:    f.Evidence,
+								Remediation: f.Remediation.Summary,
+								Source:      "unifi-port",
+								Port:        portIdx,
+							})
+							attached = true
+						}
+					}
+				}
+				// Never silently drop an unattached port finding: fall back to host, switch device, or gateway.
+				if !attached {
+					var fallback *Entity
+					if hid := lookupHostID(f.Client); hid != "" {
+						fallback = pm.Entities[hid]
+					}
+					if fallback == nil && swMAC != "" {
+						fallback = pm.Entities[devEntityID(swMAC)]
+					}
+					if fallback == nil {
+						fallback = pm.Entities[pm.GatewayID]
+					}
+					if fallback != nil {
+						fallback.Reasons = append(fallback.Reasons, Reason{
+							ID:          fid,
+							State:       VerdictExposed,
+							Kind:        "policy",
+							Ref:         f.CheckID,
+							Title:       f.Title,
+							Severity:    sev,
+							Expected:    expected,
+							Observed:    f.Evidence,
+							Evidence:    f.Evidence,
+							Remediation: f.Remediation.Summary,
+							Source:      "unifi-port",
+							Port:        portIdx,
+						})
+					}
+				}
 			}
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-FW-"):
+			isWANSourced := f.CheckID == "UB-UNIFI-FW-WAN-GW" ||
+				f.CheckID == "UB-UNIFI-FW-WAN-LAN" ||
+				strings.HasPrefix(strings.ToLower(strings.TrimSpace(f.Client.NetworkName)), "external")
+			if !isWANSourced {
+				// Internal isolation leaks (e.g. UB-UNIFI-FW-ISO-LEAK) belong to isolation/gateway,
+				// never "Open Doors to the Internet" (WANFlows).
+				target := pm.Entities[lookupHostID(f.Client)]
+				if target == nil {
+					target = pm.Entities[pm.GatewayID]
+				}
+				if target != nil {
+					target.Reasons = append(target.Reasons, Reason{
+						ID:          fid,
+						State:       VerdictExposed,
+						Kind:        "policy",
+						Ref:         f.CheckID,
+						Title:       f.Title,
+						Severity:    sev,
+						Expected:    "Deny untrusted cross-zone path",
+						Observed:    f.Evidence,
+						Evidence:    f.Evidence,
+						Remediation: f.Remediation.Summary,
+						Source:      "unifi-isolation",
+						Port:        f.Port,
+					})
+				}
+				break
+			}
+
 			rid := fmt.Sprintf("rule:%s/%d", f.CheckID, idxF)
+			targetIP := strings.TrimSpace(f.Client.IP)
+			targetID := pm.GatewayID
+			targetName := f.Client.DisplayName()
+			if f.CheckID == "UB-UNIFI-FW-WAN-LAN" {
+				if hid := lookupHostID(f.Client); hid != "" {
+					if he, ok := pm.Entities[hid]; ok {
+						targetID = hid
+						targetName = he.Label
+						he.Reasons = append(he.Reasons, Reason{
+							ID:          fid + "/host",
+							State:       VerdictExposed,
+							Kind:        "policy",
+							Ref:         f.CheckID,
+							Title:       f.Title,
+							Severity:    sev,
+							Expected:    "Block / Restrict External ingress",
+							Observed:    f.Evidence,
+							Evidence:    f.Evidence,
+							Remediation: f.Remediation.Summary,
+							Source:      "unifi-policy",
+							Port:        f.Port,
+						})
+					}
+				}
+			}
 			ruleEnt := &Entity{
 				ID:          rid,
 				Kind:        "rule",
@@ -877,7 +1149,7 @@ func BuildPresentationModel(
 				State:       VerdictExposed,
 				MaxSeverity: sev,
 				StateLabel:  "Mismatch",
-				IP:          f.Client.IP,
+				IP:          targetIP,
 				DeviceID:    pm.GatewayID,
 				Reasons: []Reason{{
 					ID:          fid,
@@ -899,17 +1171,15 @@ func BuildPresentationModel(
 				Kind:       "firewall",
 				Label:      f.Client.NetworkName + " ALLOW",
 				RuleName:   f.Title,
-				TargetID:   pm.GatewayID,
-				TargetName: f.Client.DisplayName(),
+				TargetID:   targetID,
+				TargetIP:   targetIP,
+				TargetName: targetName,
 				State:      VerdictExposed,
 				Severity:   sev,
 			})
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-BMC-"):
-			hid := hostIDByIP[f.Client.IP]
-			if hid == "" {
-				hid = hostIDByMAC[strings.ToLower(f.Client.MAC)]
-			}
+			hid := lookupHostID(f.Client)
 			if he, ok := pm.Entities[hid]; ok {
 				he.IsBMC = true
 				he.Role = "bmc"
@@ -929,16 +1199,26 @@ func BuildPresentationModel(
 					Remediation: f.Remediation.Summary,
 					Source:      "unifi-policy",
 				})
+			} else if gw, ok := pm.Entities[pm.GatewayID]; ok {
+				gw.Reasons = append(gw.Reasons, Reason{
+					ID:          fid,
+					State:       VerdictExposed,
+					Kind:        "policy",
+					Ref:         f.CheckID,
+					Title:       f.Title,
+					Severity:    sev,
+					Expected:    "Dedicated OOB Management VLAN",
+					Observed:    f.Evidence,
+					Evidence:    f.Evidence,
+					Remediation: f.Remediation.Summary,
+					Source:      "unifi-policy",
+				})
 			}
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-ISO-"):
 			// Effective isolation policy violations attach to their target host
 			// (e.g. BMC or Printer) when known, falling back to Gateway.
-			hid := hostIDByIP[f.Client.IP]
-			if hid == "" {
-				hid = hostIDByMAC[strings.ToLower(f.Client.MAC)]
-			}
-			target := pm.Entities[hid]
+			target := pm.Entities[lookupHostID(f.Client)]
 			if target == nil {
 				target = pm.Entities[pm.GatewayID]
 			}
@@ -960,9 +1240,21 @@ func BuildPresentationModel(
 			}
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-"):
-			// Site-level controller, SSH, UPnP, honeypot, and Wi-Fi findings attach to Gateway.
-			if gw, ok := pm.Entities[pm.GatewayID]; ok {
-				gw.Reasons = append(gw.Reasons, Reason{
+			// Host-scoped UniFi findings (rogue wired AP, public admin tunnel/proxy,
+			// dynamic NAT mapping) attach to the concrete host entity first, falling
+			// back to a matching UniFi device or the gateway for site/WLAN findings.
+			var target *Entity
+			if hid := lookupHostID(f.Client); hid != "" {
+				target = pm.Entities[hid]
+			}
+			if target == nil && f.Client.MAC != "" {
+				target = pm.Entities[devEntityID(f.Client.MAC)]
+			}
+			if target == nil {
+				target = pm.Entities[pm.GatewayID]
+			}
+			if target != nil {
+				target.Reasons = append(target.Reasons, Reason{
 					ID:          fid,
 					State:       VerdictExposed,
 					Kind:        "policy",
@@ -980,10 +1272,7 @@ func BuildPresentationModel(
 
 		default:
 			// Host-level LAN service or BMC probe finding.
-			hid := hostIDByIP[f.Client.IP]
-			if hid == "" {
-				hid = hostIDByMAC[strings.ToLower(f.Client.MAC)]
-			}
+			hid := lookupHostID(f.Client)
 			if he, ok := pm.Entities[hid]; ok {
 				if f.Category == "oob-bmc" {
 					he.IsBMC = true
@@ -1019,7 +1308,7 @@ func BuildPresentationModel(
 		}
 	}
 
-	// 5. Add WAN Port Forwards to WANFlows.
+	// 5. Add WAN Port Forwards and missing WAN telemetry coverage indicators to WANFlows.
 	for i, a := range report.WANSurface {
 		targetIP := a.Forward.FwdIP
 		targetID := hostIDByIP[targetIP]
@@ -1045,6 +1334,39 @@ func BuildPresentationModel(
 			State:      st,
 			Severity:   a.Severity.String(),
 		})
+	}
+	if vis := snap.Visibility; vis != nil {
+		missingFW := !vis.GatewayPoliciesAvailable
+		missingPF := !vis.PortForwardsAvailable && len(snap.PortForwards) == 0
+		for _, mf := range vis.MissingFeeds {
+			low := strings.ToLower(mf)
+			if strings.Contains(low, "firewall") {
+				missingFW = true
+			}
+			if strings.Contains(low, "port-forward") || strings.Contains(low, "port_forward") {
+				missingPF = true
+			}
+		}
+		if missingFW || missingPF {
+			var missing []string
+			if missingFW {
+				missing = append(missing, "firewall policies")
+			}
+			if missingPF {
+				missing = append(missing, "port forwards")
+			}
+			pm.WANFlows = append(pm.WANFlows, WANFlow{
+				ID:         "wan-coverage:missing",
+				Kind:       "coverage",
+				Label:      "Missing telemetry: " + strings.Join(missing, ", "),
+				RuleName:   "Internet edge visibility incomplete",
+				TargetID:   pm.GatewayID,
+				TargetName: "Gateway / Internet Edge",
+				Expected:   false,
+				State:      VerdictUnknown,
+				Severity:   "unknown",
+			})
+		}
 	}
 
 	// 6. Finalize verdict state and label for every entity.
@@ -1118,9 +1440,14 @@ func BuildPresentationModel(
 			case VerdictReview:
 				pm.Census.ReviewCount++
 			case VerdictUnknown:
-				pm.Census.UnassessedCount++
+				if !ent.Skipped {
+					pm.Census.UnassessedCount++
+				}
 			}
 		case "port", "rule", "device":
+			if ent.Kind == "device" && ent.ExactCVECount > 0 {
+				pm.Census.ExactCVEHosts++
+			}
 			if ent.State == VerdictExposed {
 				pm.Census.ExposedCount++
 			} else if ent.State == VerdictReview {
@@ -1130,8 +1457,26 @@ func BuildPresentationModel(
 	}
 
 	// 11. Build one-sentence verdict headline.
+	unexpectedWAN := 0
+	unknownWAN := 0
+	for _, wf := range pm.WANFlows {
+		if wf.Kind == "coverage" || wf.State == VerdictUnknown {
+			unknownWAN++
+		} else if !wf.Expected || wf.State == VerdictExposed {
+			unexpectedWAN++
+		}
+	}
 	if len(pm.Queue) == 0 {
-		pm.Headline = fmt.Sprintf("All clear: %d VLANs, %d devices, and %d wall gates match policy.", len(pm.Logical), len(snap.Devices), pm.Census.TotalWallGates)
+		switch {
+		case unexpectedWAN > 0:
+			pm.Headline = fmt.Sprintf("%d unexpected WAN exposure%s require review.", unexpectedWAN, pluralS(unexpectedWAN))
+		case unknownWAN > 0:
+			pm.Headline = fmt.Sprintf("Coverage incomplete: %d WAN telemetry feed%s unavailable.", unknownWAN, pluralS(unknownWAN))
+		case pm.Census.UnassessedCount > 0:
+			pm.Headline = fmt.Sprintf("Assessment incomplete: %d host%s still unassessed.", pm.Census.UnassessedCount, pluralS(pm.Census.UnassessedCount))
+		default:
+			pm.Headline = fmt.Sprintf("All clear: %d VLANs, %d devices, and %d wall gates match policy.", len(pm.Logical), len(snap.Devices), pm.Census.TotalWallGates)
+		}
 	} else if len(pm.Queue) == 1 {
 		pm.Headline = pm.Queue[0].Sentence
 	} else {
@@ -1150,13 +1495,49 @@ func finalizeEntityVerdict(ent *Entity) {
 		return sevStrRank(ent.Reasons[i].Severity) > sevStrRank(ent.Reasons[j].Severity)
 	})
 
-	if len(ent.Reasons) == 0 {
-		if ent.Kind == "host" && ent.ScannedAt == nil {
-			ent.State = VerdictUnknown
-			ent.MaxSeverity = "unknown"
-			ent.StateLabel = "Unassessed"
+	isUnscannedHost := ent.Kind == "host" && (ent.ScannedAt == nil || ent.ScannedAt.IsZero())
+
+	worstState := VerdictOK
+	worstSev := "ok"
+	if len(ent.Reasons) > 0 {
+		worstSev = "info"
+		for _, r := range ent.Reasons {
+			if verdictRank(r.State) > verdictRank(worstState) {
+				worstState = r.State
+			}
+			if sevStrRank(r.Severity) > sevStrRank(worstSev) {
+				worstSev = r.Severity
+			}
+		}
+	}
+
+	if ent.Kind == "host" && ent.Skipped {
+		if worstState == VerdictExposed {
+			ent.State = VerdictExposed
+			ent.MaxSeverity = worstSev
+			ent.StateLabel = "Exposed"
 			return
 		}
+		ent.State = VerdictUnknown
+		ent.MaxSeverity = "unknown"
+		if strings.Contains(strings.ToLower(ent.SkipReason), "exclud") {
+			ent.StateLabel = "Excluded"
+		} else {
+			ent.StateLabel = "Skipped"
+		}
+		return
+	}
+
+	// An unscanned host stays Unknown (preserving any heuristic Review reasons)
+	// unless concrete Exposed evidence already applies.
+	if isUnscannedHost && worstState != VerdictExposed {
+		ent.State = VerdictUnknown
+		ent.MaxSeverity = "unknown"
+		ent.StateLabel = "Unassessed"
+		return
+	}
+
+	if len(ent.Reasons) == 0 {
 		ent.State = VerdictOK
 		ent.MaxSeverity = "ok"
 		if ent.Kind == "host" {
@@ -1167,16 +1548,6 @@ func finalizeEntityVerdict(ent *Entity) {
 		return
 	}
 
-	worstState := VerdictOK
-	worstSev := "info"
-	for _, r := range ent.Reasons {
-		if verdictRank(r.State) > verdictRank(worstState) {
-			worstState = r.State
-		}
-		if sevStrRank(r.Severity) > sevStrRank(worstSev) {
-			worstSev = r.Severity
-		}
-	}
 	ent.State = worstState
 	ent.MaxSeverity = worstSev
 	switch worstState {
@@ -1201,33 +1572,71 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 		if ent.State != VerdictExposed {
 			continue
 		}
-		if ent.Kind == "device" && ent.Role != "gateway" {
-			// Skip redundant device-level wrapper when its individual ports are already queued.
-			hasOnlyPortRollup := true
-			for _, r := range ent.Reasons {
-				if r.Ref != "UB-UNIFI-PORT-EXT-UNUSED-OPEN" {
-					hasOnlyPortRollup = false
-				}
-			}
-			if hasOnlyPortRollup {
-				// Keep one concise queue item for unused external ports on this switch.
-				top := ent.Reasons[0]
-				items = append(items, QueueItem{
-					Sentence:  fmt.Sprintf("%s has unused external ports left open (%s)", ent.Label, top.Title),
-					Category:  "perimeter",
-					Severity:  top.Severity,
-					State:     ent.State,
-					Score:     sevStrRank(top.Severity)*10*ent.Weight + 5,
-					SubjectID: ent.ID,
-					EntityIDs: []string{ent.ID},
-					ReasonRef: top.Ref,
-				})
-				continue
-			}
-		}
 		if len(ent.Reasons) == 0 {
 			continue
 		}
+
+		// Emit one queue item per distinct exposed device/controller reason so
+		// multiple gateway posture issues and firmware CVEs are each surfaced.
+		if ent.Kind == "device" {
+			seenKey := make(map[string]bool)
+			for _, r := range ent.Reasons {
+				if r.State != VerdictExposed {
+					continue
+				}
+				if r.Ref == "UB-UNIFI-PORT-EXT-UNUSED-OPEN" {
+					if seenKey[r.Ref] {
+						continue
+					}
+					seenKey[r.Ref] = true
+					hasExternal := ent.Side == "outside"
+					if !hasExternal {
+						for _, other := range pm.Entities {
+							if other.Kind == "port" && other.DeviceID == ent.ID && other.PortZone == "external" && other.PortState == "inactive_enabled" {
+								hasExternal = true
+								break
+							}
+						}
+					}
+					phrase := "unused ports"
+					if hasExternal {
+						phrase = "unused external ports"
+					}
+					items = append(items, QueueItem{
+						Sentence:  fmt.Sprintf("%s has %s left open (%s)", ent.Label, phrase, r.Title),
+						Category:  "perimeter",
+						Severity:  r.Severity,
+						State:     ent.State,
+						Score:     sevStrRank(r.Severity)*10*ent.Weight + 15,
+						SubjectID: ent.ID,
+						EntityIDs: []string{ent.ID},
+						ReasonRef: r.Ref,
+					})
+					continue
+				}
+				key := r.Ref + "|" + r.Title
+				if seenKey[key] {
+					continue
+				}
+				seenKey[key] = true
+				score := sevStrRank(r.Severity) * 10 * ent.Weight
+				if r.Kind == "cve" {
+					score += 10
+				}
+				items = append(items, QueueItem{
+					Sentence:  fmt.Sprintf("%s: %s", ent.Label, r.Title),
+					Category:  "controller",
+					Severity:  r.Severity,
+					State:     ent.State,
+					Score:     score,
+					SubjectID: ent.ID,
+					EntityIDs: []string{ent.ID},
+					ReasonRef: r.Ref,
+				})
+			}
+			continue
+		}
+
 		top := ent.Reasons[0]
 		cat := "service"
 		sentence := fmt.Sprintf("%s: %s", ent.Label, top.Title)
@@ -1236,14 +1645,25 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 		switch ent.Kind {
 		case "port":
 			cat = "perimeter"
+			onlyUnusedOpen := ent.PortState == "inactive_enabled" && (ent.PortZone == "external" || ent.PortZone == "unused")
+			if onlyUnusedOpen {
+				for _, r := range ent.Reasons {
+					if r.State == VerdictExposed && r.Ref != "UB-UNIFI-PORT-EXT-UNUSED-OPEN" {
+						onlyUnusedOpen = false
+						break
+					}
+				}
+			}
+			if onlyUnusedOpen && pm.Entities[ent.DeviceID] != nil {
+				// Already aggregated once per switch device above so each unused port is counted once.
+				continue
+			}
 			if ent.PortZone == "external_uplink" {
 				sentence = fmt.Sprintf("%s carries %s VLANs to external %s", ent.Label, ent.TaggedPolicy, ent.Subtitle)
-			} else if ent.PortZone == "external" {
-				if ent.PortState == "inactive_enabled" {
-					// Already aggregated per external switch device above to keep the queue concise.
-					continue
-				}
+			} else if ent.PortZone == "external" && top.Ref == "UB-UNIFI-PORT-EXT-UNRESTRICTED" {
 				sentence = fmt.Sprintf("%s (external) is unrestricted (%s / %s)", ent.Label, ent.NativeVLAN, ent.TaggedPolicy)
+			} else {
+				sentence = fmt.Sprintf("%s: %s", ent.Label, top.Title)
 			}
 			if ent.DeviceID != "" {
 				related = append(related, ent.DeviceID)
@@ -1257,17 +1677,19 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 				related = append(related, ent.DeviceID)
 			}
 
-		case "device":
-			cat = "controller"
-			sentence = fmt.Sprintf("%s: %s", ent.Label, top.Title)
-
 		case "host":
 			if ent.IsBMC {
 				cat = "bmc"
 				sentence = fmt.Sprintf("BMC %s (%s) on %s: %s", ent.Label, ent.IP, ent.NetworkName, top.Title)
 			} else if ent.ExactCVECount > 0 && top.Kind == "cve" {
 				cat = "service"
-				sentence = fmt.Sprintf("%s (%s): %d exact CVE(s) · 0 check findings", ent.Label, ent.NetworkName, ent.ExactCVECount)
+				checkCount := 0
+				for _, r := range ent.Reasons {
+					if r.Kind == "check" {
+						checkCount++
+					}
+				}
+				sentence = fmt.Sprintf("%s (%s): %d exact CVE(s) · %d check finding%s", ent.Label, ent.NetworkName, ent.ExactCVECount, checkCount, pluralS(checkCount))
 			} else {
 				cat = "service"
 				sentence = fmt.Sprintf("%s (%s): %s", ent.Label, ent.NetworkName, top.Title)
@@ -1308,7 +1730,13 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 		if sevStrRank(items[i].Severity) != sevStrRank(items[j].Severity) {
 			return sevStrRank(items[i].Severity) > sevStrRank(items[j].Severity)
 		}
-		return items[i].SubjectID < items[j].SubjectID
+		if items[i].SubjectID != items[j].SubjectID {
+			return items[i].SubjectID < items[j].SubjectID
+		}
+		if items[i].ReasonRef != items[j].ReasonRef {
+			return items[i].ReasonRef < items[j].ReasonRef
+		}
+		return items[i].Sentence < items[j].Sentence
 	})
 	return items
 }
@@ -1447,22 +1875,38 @@ func buildLogicalLanes(
 	entities map[string]*Entity,
 	netEntByName map[string]string,
 ) []LogicalLane {
-	// Index all host entities by lowercase VLAN name.
+	// Index all host entities by lowercase VLAN name, mapping empty/unresolved names
+	// to "unassigned" so they match topology.Build's "Unassigned" VLAN group.
 	hostsByNet := make(map[string][]*Entity)
+	labelByNetKey := make(map[string]string)
 	trustedExposedIoT := 0
 	for _, ent := range entities {
 		if ent.Kind != "host" {
 			continue
 		}
-		key := strings.ToLower(ent.NetworkName)
+		rawName := strings.TrimSpace(ent.NetworkName)
+		if rawName == "" {
+			rawName = "Unassigned"
+		}
+		key := strings.ToLower(rawName)
 		hostsByNet[key] = append(hostsByNet[key], ent)
+		if _, ok := labelByNetKey[key]; !ok {
+			labelByNetKey[key] = rawName
+		}
 	}
 
 	var lanes []LogicalLane
 	seenNet := make(map[string]bool)
 
 	addLane := func(id, name, vlan, subnet, zone string, isolated bool) {
-		key := strings.ToLower(name)
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" {
+			name = "Unassigned"
+			key = "unassigned"
+		}
+		if seenNet[key] {
+			return
+		}
 		seenNet[key] = true
 		lane := LogicalLane{
 			NetworkID:  id,
@@ -1516,6 +1960,23 @@ func buildLogicalLanes(
 		}
 	}
 
+	// Ensure any host whose network was absent from topo.VLANs / snap.Networks
+	// (including "Unassigned") always appears in a deterministic lane.
+	var extraKeys []string
+	for k := range hostsByNet {
+		if !seenNet[k] {
+			extraKeys = append(extraKeys, k)
+		}
+	}
+	sort.Strings(extraKeys)
+	for _, k := range extraKeys {
+		name := labelByNetKey[k]
+		if name == "" {
+			name = "Unassigned"
+		}
+		addLane(netEntityID("", name), name, "", "", "Internal", false)
+	}
+
 	// Add subtle migration hint only on empty isolated VLANs when exposed IoT actually sits on Trusted.
 	for i := range lanes {
 		if lanes[i].Isolated && lanes[i].TotalHosts == 0 && trustedExposedIoT > 0 {
@@ -1529,7 +1990,6 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 	type wanPortInfo struct {
 		restricted bool
 	}
-	wanTCPPorts := make(map[int]wanPortInfo)
 	wanUDPPorts := make(map[int]wanPortInfo)
 	recordWAN := func(m map[int]wanPortInfo, port int, restricted bool) {
 		if cur, exists := m[port]; exists {
@@ -1543,13 +2003,10 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		if !a.Forward.Enabled {
 			continue
 		}
-		ports := a.Forward.ExpandFwdPorts(64)
-		restricted := a.Forward.IsSourceRestricted()
-		for _, p := range ports {
-			if a.Forward.MatchesTransport("tcp") {
-				recordWAN(wanTCPPorts, p, restricted)
-			}
-			if a.Forward.MatchesTransport("udp") {
+		if a.Forward.MatchesTransport("udp") {
+			ports := a.Forward.ExpandFwdPorts(64)
+			restricted := a.Forward.IsSourceRestricted()
+			for _, p := range ports {
 				recordWAN(wanUDPPorts, p, restricted)
 			}
 		}
@@ -1562,6 +2019,25 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			return "wan-restricted"
 		}
 		return "wan"
+	}
+	// Decide WAN reachability for any observed port+transport directly via
+	// Forward.ExposesEndpoint so port ranges wider than 64 ports still match.
+	wanReachForEndpoint := func(port int, transport string) (string, bool, bool) {
+		matched := false
+		allRestricted := true
+		for _, a := range wan {
+			if !a.Forward.ExposesEndpoint(port, transport) {
+				continue
+			}
+			matched = true
+			if !a.Forward.IsSourceRestricted() {
+				allRestricted = false
+			}
+		}
+		if !matched {
+			return "", false, false
+		}
+		return wanReachLabel(wanPortInfo{restricted: allRestricted}), allRestricted, true
 	}
 
 	protoByKey := make(map[string]probe.Service)
@@ -1589,9 +2065,9 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		seen[key] = true
 		reach := defaultReach
 		srcRestricted := false
-		if info, ok := wanTCPPorts[p]; ok {
-			reach = wanReachLabel(info)
-			srcRestricted = info.restricted
+		if lbl, restr, ok := wanReachForEndpoint(p, "tcp"); ok {
+			reach = lbl
+			srcRestricted = restr
 		}
 		svcMeta := protoByKey[key]
 		name := svcMeta.Protocol
@@ -1624,16 +2100,9 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		seen[key] = true
 		reach := defaultReach
 		srcRestricted := false
-		if t == "tcp" {
-			if info, ok := wanTCPPorts[svc.Port]; ok {
-				reach = wanReachLabel(info)
-				srcRestricted = info.restricted
-			}
-		} else if t == "udp" {
-			if info, ok := wanUDPPorts[svc.Port]; ok {
-				reach = wanReachLabel(info)
-				srcRestricted = info.restricted
-			}
+		if lbl, restr, ok := wanReachForEndpoint(svc.Port, t); ok {
+			reach = lbl
+			srcRestricted = restr
 		}
 		name := firstStr(svc.Protocol, commonPortLabel(svc.Port))
 		out = append(out, ServiceView{
@@ -1646,9 +2115,15 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(firstStr(name, t)), svc.Port),
 		})
 	}
-	// Also record UDP-only WAN forwards as distinct UDP endpoints so a UDP forward
-	// never conflates with a TCP service sharing the same port number.
-	for p, info := range wanUDPPorts {
+	// Also record UDP-only WAN forwards as distinct UDP endpoints in deterministic
+	// sorted port order so a UDP forward never conflates with a TCP service.
+	udpPorts := make([]int, 0, len(wanUDPPorts))
+	for p := range wanUDPPorts {
+		udpPorts = append(udpPorts, p)
+	}
+	sort.Ints(udpPorts)
+	for _, p := range udpPorts {
+		info := wanUDPPorts[p]
 		key := fmt.Sprintf("udp:%d", p)
 		if seen[key] {
 			continue
@@ -1694,7 +2169,9 @@ func recordObservedService(ent *Entity, f checks.Finding) {
 	}
 	for i := range ent.Services {
 		if ent.Services[i].Port == f.Port && strings.EqualFold(ent.Services[i].Proto, proto) {
-			ent.Services[i].Label = compactCheckChip(f)
+			if !ent.Services[i].Exposed {
+				ent.Services[i].Label = compactCheckChip(f)
+			}
 			if obsState == probe.ServiceStateObservedProtocol {
 				ent.Services[i].State = obsState
 			}
@@ -1721,13 +2198,15 @@ func markServiceExposed(ent *Entity, f checks.Finding) {
 		return
 	}
 	proto := f.EffectiveTransport()
+	newSev := f.EffectiveSeverity.String()
 	for i := range ent.Services {
 		if ent.Services[i].Port == f.Port && strings.EqualFold(ent.Services[i].Proto, proto) {
+			wasExposed := ent.Services[i].Exposed
 			ent.Services[i].Exposed = true
-			if sevStrRank(f.EffectiveSeverity.String()) > sevStrRank(ent.Services[i].Severity) {
-				ent.Services[i].Severity = f.EffectiveSeverity.String()
+			if !wasExposed || sevStrRank(newSev) > sevStrRank(ent.Services[i].Severity) {
+				ent.Services[i].Severity = newSev
+				ent.Services[i].Label = compactCheckChip(f)
 			}
-			ent.Services[i].Label = compactCheckChip(f)
 			return
 		}
 	}
@@ -1737,7 +2216,7 @@ func markServiceExposed(ent *Entity, f checks.Finding) {
 		Name:      commonPortLabel(f.Port),
 		Reachable: "lan",
 		Exposed:   true,
-		Severity:  f.EffectiveSeverity.String(),
+		Severity:  newSev,
 		Label:     compactCheckChip(f),
 	})
 }

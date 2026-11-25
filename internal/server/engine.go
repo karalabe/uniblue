@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +67,9 @@ type Options struct {
 
 	// SkipCVE disables local NVD+KEV correlation even when a cache exists.
 	SkipCVE bool
+
+	// APIToken optionally requires Authorization: Bearer <token> on /api/* endpoints.
+	APIToken string
 
 	// Logger receives structured daemon logs.
 	Logger *slog.Logger
@@ -121,6 +125,14 @@ type ClientView struct {
 
 	// LastScannedAt records when this host was last actively probed.
 	LastScannedAt *time.Time `json:"last_scanned_at,omitempty"`
+
+	// Skipped is true when this host is intentionally excluded or unprobeable
+	// (e.g., in network.exclude_ips, no IP, or public non-local IP) so the UI
+	// never treats it as permanently pending assessment.
+	Skipped bool `json:"skipped,omitempty"`
+
+	// SkipReason explains why active probing was skipped for this host.
+	SkipReason string `json:"skip_reason,omitempty"`
 }
 
 // StateSnapshot is the complete, immutable read model served by GET /api/state
@@ -134,6 +146,10 @@ type StateSnapshot struct {
 
 	// LastFullScanAt records when the latest full LAN reconciliation finished.
 	LastFullScanAt time.Time `json:"last_full_scan_at"`
+
+	// LastScanError records the most recent full-scan error (cleared once a
+	// scan succeeds) so the UI can surface errors instead of hanging at 4%.
+	LastScanError string `json:"last_scan_error,omitempty"`
 
 	// EventMode describes the active UniFi ingestion mode ("websocket" or "poll-5s").
 	EventMode string `json:"event_mode"`
@@ -235,7 +251,16 @@ type portLiveState struct {
 	PoEPowerWatts float64
 	MACTableCount int
 	STPState      string
+	HasUniFiPeer  bool
 }
+
+type hostRescanStatus int
+
+const (
+	hostRescanQueued hostRescanStatus = iota
+	hostRescanNotFound
+	hostRescanQueueFull
+)
 
 // Engine coordinates UniFi event ingestion, targeted single-host live checks,
 // periodic full reconciliation, webhook alerting, and SSE broadcasting.
@@ -257,9 +282,21 @@ type Engine struct {
 	eventMode string
 	eventSeq  atomic.Int64
 
+	// pollMu serializes UniFi delta polls so concurrent websocket + ticker polls
+	// never apply an older snapshot on top of a newer one.
+	pollMu sync.Mutex
+
+	// recomputeMu serializes read-diff-notify-save-publish so concurrent scans
+	// never double-alert, roll back dashboard state, or race on state.json.
+	recomputeMu sync.Mutex
+
+	// fullScanMu serializes full scans executed on their own goroutine.
+	fullScanMu sync.Mutex
+
 	// mu protects the live state maps and the published StateSnapshot.
 	mu               sync.RWMutex
 	snap             *unifi.Snapshot
+	deltaGen         uint64
 	profilesByMAC    map[string]probe.HostProfile
 	findingsByMAC    map[string][]checks.Finding
 	missingClients   map[string]missingClient
@@ -268,6 +305,11 @@ type Engine struct {
 	lastClasses      map[string]classify.Result
 	lastPolicySig    string
 	lastFwdSig       string
+	sigsInitialized  bool
+	baselineComplete bool
+	lastScanError    string
+	lastDiscovery    *probe.LANDiscovery
+	lastDiscoveryAt  time.Time
 	prevRiskState    *risk.State
 	events           []LiveEvent
 	current          StateSnapshot
@@ -386,15 +428,23 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.snap = snap
 	e.lastFwdSig = portForwardSignature(snap.PortForwards)
 	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
+	e.sigsInitialized = true
 	e.lastPorts = initPorts
 	e.anomalies.Seed(snap, e.lastPorts, time.Now().UTC())
 	e.mu.Unlock()
+	// Publish initial UniFi topology immediately WITHOUT diffing/notifying/saving
+	// state, so existing host findings in uniblue-state.json are preserved until
+	// the initial baseline probe finishes.
 	e.recomputeAndPublish(ctx, false, nil)
 
 	// Start single-host live scan worker pool (bounded by 2 workers to stay gentle).
 	for range 2 {
 		go e.hostScanWorker(ctx)
 	}
+
+	// Start single-flight full-scan worker so live delta polling continues
+	// uninterrupted even while a multi-minute full LAN scan is running.
+	go e.fullScanLoop(ctx)
 
 	// Start event ingestion (WebSocket push when supported, plus 5s delta polling).
 	if e.ctrl.SupportsWebSocket() {
@@ -403,7 +453,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	// Queue the full LAN baseline probe asynchronously so Serve binds immediately.
 	e.setScanProgress(&ScanProgress{
 		Phase:   "topology",
-		Label:   "Preparing initial network checkup…",
+		Label:   "Preparing initial network checkup...",
 		Total:   len(snap.Clients),
 		Percent: 4,
 		Initial: true,
@@ -419,6 +469,7 @@ func (e *Engine) Snapshot() StateSnapshot {
 	defer e.mu.RUnlock()
 	cp := e.current
 	cp.Scanning = e.activeScans.Load() > 0 || (e.scanProgress != nil && e.scanProgress.Initial)
+	cp.LastScanError = e.lastScanError
 	if e.scanProgress != nil {
 		sp := *e.scanProgress
 		cp.ScanProgress = &sp
@@ -497,12 +548,16 @@ func (e *Engine) queueFullRescan(reason string) {
 
 // TriggerHostRescan queues a targeted live probe against a single client IP.
 func (e *Engine) TriggerHostRescan(ip string) bool {
+	return e.triggerHostRescanStatus(ip) == hostRescanQueued
+}
+
+func (e *Engine) triggerHostRescanStatus(ip string) hostRescanStatus {
 	ip = strings.TrimSpace(ip)
 	e.mu.RLock()
 	var target *unifi.Client
 	if e.snap != nil {
 		for _, cl := range e.snap.Clients {
-			if cl.IP == ip {
+			if cl.IP == ip || cl.PrimaryIP() == ip {
 				cp := cl
 				target = &cp
 				break
@@ -511,18 +566,18 @@ func (e *Engine) TriggerHostRescan(ip string) bool {
 	}
 	e.mu.RUnlock()
 	if target == nil {
-		return false
+		return hostRescanNotFound
 	}
 	if e.demoMode {
 		e.emit(LiveEvent{
 			Type:      "host_scanned",
 			Severity:  "info",
 			Host:      target.DisplayName(),
-			IP:        target.IP,
+			IP:        target.PrimaryIP(),
 			SubjectID: hostEntityID(*target),
-			Summary:   fmt.Sprintf("Demo host %s (%s) rechecked (simulated, zero packets sent)", target.DisplayName(), target.IP),
+			Summary:   fmt.Sprintf("Demo host %s (%s) rechecked (simulated, zero packets sent)", target.DisplayName(), target.PrimaryIP()),
 		})
-		return true
+		return hostRescanQueued
 	}
 	select {
 	case e.hostScanCh <- hostScanTask{client: *target}:
@@ -530,13 +585,13 @@ func (e *Engine) TriggerHostRescan(ip string) bool {
 			Type:      "host_scanning",
 			Severity:  "info",
 			Host:      target.DisplayName(),
-			IP:        target.IP,
+			IP:        target.PrimaryIP(),
 			SubjectID: hostEntityID(*target),
-			Summary:   fmt.Sprintf("Rescanning %s (%s)...", target.DisplayName(), target.IP),
+			Summary:   fmt.Sprintf("Rescanning %s (%s)...", target.DisplayName(), target.PrimaryIP()),
 		})
-		return true
+		return hostRescanQueued
 	default:
-		return false
+		return hostRescanQueueFull
 	}
 }
 
@@ -553,8 +608,56 @@ func (e *Engine) Subscribe() (chan LiveEvent, func()) {
 	}
 }
 
-// pollAndReconcileLoop runs the 5-second lightweight UniFi delta check and the
-// slower periodic full reconciliation loop until ctx is cancelled.
+// fullScanLoop executes queued full scans sequentially in a dedicated goroutine
+// so delta polling stays responsive during multi-minute scans, and retries a
+// failed initial baseline scan with bounded exponential backoff so the UI never
+// hangs indefinitely at 4%.
+func (e *Engine) fullScanLoop(ctx context.Context) {
+	backoff := 5 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case reason := <-e.fullRescanCh:
+			err := e.runFullScan(ctx, reason)
+			if err != nil && ctx.Err() == nil {
+				e.logger.Error("full scan failed", "reason", reason, "err", err)
+				e.mu.Lock()
+				e.lastScanError = err.Error()
+				e.current.LastScanError = err.Error()
+				e.scanProgress = nil
+				needInitialRetry := !e.baselineComplete
+				e.emitTransientLocked(LiveEvent{
+					Type:     "scan_error",
+					Severity: "high",
+					Summary:  fmt.Sprintf("Full scan failed (%s): %v", reason, err),
+				})
+				e.mu.Unlock()
+
+				if needInitialRetry {
+					delay := backoff
+					if backoff < 60*time.Second {
+						backoff *= 2
+					}
+					go func(d time.Duration) {
+						t := time.NewTimer(d)
+						select {
+						case <-ctx.Done():
+							t.Stop()
+						case <-t.C:
+							e.queueFullRescan("initial baseline retry")
+						}
+					}(delay)
+				}
+			} else if err == nil {
+				backoff = 5 * time.Second
+			}
+		}
+	}
+}
+
+// pollAndReconcileLoop runs the 5-second lightweight UniFi delta check and
+// triggers periodic full reconciliation without blocking delta polls on scans.
 func (e *Engine) pollAndReconcileLoop(ctx context.Context) {
 	pollTicker := time.NewTicker(e.opts.PollInterval)
 	defer pollTicker.Stop()
@@ -565,14 +668,8 @@ func (e *Engine) pollAndReconcileLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case reason := <-e.fullRescanCh:
-			if err := e.runFullScan(ctx, reason); err != nil && ctx.Err() == nil {
-				e.logger.Error("full scan failed", "reason", reason, "err", err)
-			}
 		case <-reconcileTicker.C:
-			if err := e.runFullScan(ctx, "periodic reconciliation"); err != nil && ctx.Err() == nil {
-				e.logger.Error("periodic reconciliation failed", "err", err)
-			}
+			e.queueFullRescan("periodic reconciliation")
 		case <-pollTicker.C:
 			e.pollDelta(ctx)
 		}
@@ -623,8 +720,12 @@ func (e *Engine) websocketLoop(ctx context.Context) {
 
 // pollDelta fetches a fresh UniFi topology snapshot (no LAN probing) and reacts
 // immediately to newly appearing clients, IP/VLAN changes, departures, physical
-// switch port link transitions, or firewall/port-forward changes.
+// switch port link transitions, or firewall/port-forward changes. Serialized by
+// pollMu so concurrent websocket and ticker polls never apply snapshots out of order.
 func (e *Engine) pollDelta(ctx context.Context) {
+	e.pollMu.Lock()
+	defer e.pollMu.Unlock()
+
 	pollCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -685,6 +786,17 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 
 	e.mu.Lock()
 	prevSnap := e.snap
+	// Preserve last-known settings/WLANs across transient telemetry fetch errors
+	// so temporary 500s do not make settings-derived findings vanish and re-alert.
+	if prevSnap != nil && snap.Visibility != nil {
+		if !snap.Visibility.SettingsAvailable && snap.SecuritySettings == nil && prevSnap.SecuritySettings != nil {
+			cp := *prevSnap.SecuritySettings
+			snap.SecuritySettings = &cp
+		}
+		if !snap.Visibility.WLANsAvailable && len(snap.WLANs) == 0 && len(prevSnap.WLANs) > 0 {
+			snap.WLANs = append([]unifi.WLANConfig(nil), prevSnap.WLANs...)
+		}
+	}
 	prevClients := make(map[string]unifi.Client)
 	if prevSnap != nil {
 		for _, cl := range prevSnap.Clients {
@@ -796,10 +908,11 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 		}
 	}
 
-	// Detect WAN port-forward or user firewall policy changes.
+	// Detect WAN port-forward or user firewall policy changes (including the
+	// transition from 0 rules to the first rule once signatures are seeded).
 	fwdSig := portForwardSignature(snap.PortForwards)
 	polSig := firewallPolicySignature(snap.FirewallPolicies)
-	if e.lastFwdSig != "" && fwdSig != e.lastFwdSig {
+	if e.sigsInitialized && fwdSig != e.lastFwdSig {
 		changed = true
 		pendingEvents = append(pendingEvents, LiveEvent{
 			Type:     "policy_changed",
@@ -819,7 +932,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 			}
 		}
 	}
-	if e.lastPolicySig != "" && polSig != e.lastPolicySig {
+	if e.sigsInitialized && polSig != e.lastPolicySig {
 		changed = true
 		pendingEvents = append(pendingEvents, LiveEvent{
 			Type:     "policy_changed",
@@ -936,8 +1049,10 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 	}
 
 	e.snap = snap
+	e.deltaGen++
 	e.lastFwdSig = fwdSig
 	e.lastPolicySig = polSig
+	e.sigsInitialized = true
 	e.lastPorts = currPorts
 	e.mu.Unlock()
 
@@ -983,9 +1098,18 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 
 	e.mu.RLock()
 	hints := e.snap.PortHintsByIP()
+	sitePrefixes := snapshotSubnets(e.snap)
+	var cachedDisc *probe.LANDiscovery
+	if e.lastDiscovery != nil && time.Since(e.lastDiscoveryAt) < 10*time.Minute {
+		cachedDisc = e.lastDiscovery
+	}
 	e.mu.RUnlock()
 
 	fp := probe.NewFingerprinter(e.scanPorts, 1, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
+	fp.SetAllowedSubnets(sitePrefixes)
+	if cachedDisc != nil {
+		fp.SetCachedDiscovery(cachedDisc)
+	}
 	fp.SetHostPortHints(checks.PlanHostPorts([]unifi.Client{cl}, e.checkList, hints))
 	profiles := fp.FingerprintAll(ctx, []unifi.Client{cl})
 	if len(profiles) == 0 {
@@ -997,18 +1121,21 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	runner := checks.NewRunner(e.checkList, 1)
 	hostCheckFindings := runner.RunHost(ctx, enrichedSingle[0])
 
+	if ctx.Err() != nil {
+		return
+	}
 	k := clientKey(cl)
 	e.mu.Lock()
-	stillActive := false
+	stillMatches := false
 	if e.snap != nil {
 		for _, cur := range e.snap.Clients {
-			if clientKey(cur) == k {
-				stillActive = true
+			if clientKey(cur) == k && cur.PrimaryIP() == cl.PrimaryIP() && cur.NetworkName == cl.NetworkName {
+				stillMatches = true
 				break
 			}
 		}
 	}
-	if !stillActive {
+	if !stillMatches {
 		e.mu.Unlock()
 		return
 	}
@@ -1085,23 +1212,31 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 }
 
 // runFullScan executes a complete UniFi snapshot + uniform LAN probe sweep and
-// publishes the refreshed StateSnapshot.
+// publishes the refreshed StateSnapshot without clobbering live delta updates
+// that occurred while the scan ran.
 func (e *Engine) runFullScan(ctx context.Context, reason string) error {
+	e.fullScanMu.Lock()
+	defer e.fullScanMu.Unlock()
+
 	e.activeScans.Add(1)
 	defer e.activeScans.Add(-1)
-	defer e.setScanProgress(nil)
 
 	isInitial := e.Snapshot().LastFullScanAt.IsZero()
 	e.setScanProgress(&ScanProgress{
 		Phase:   "topology",
-		Label:   "Reading UniFi router, switches, cables & firewall rules…",
+		Label:   "Reading UniFi router, switches, cables & firewall rules...",
 		Percent: 5,
 		Initial: isInitial,
 	})
 
+	e.mu.RLock()
+	startGen := e.deltaGen
+	e.mu.RUnlock()
+
 	e.logger.Info("starting full scan", "reason", reason)
 	snap, err := e.ctrl.FetchSnapshot(ctx)
 	if err != nil {
+		e.setScanProgress(nil)
 		return err
 	}
 	currPorts := snapshotPortStates(snap, e.cfg.Network)
@@ -1109,6 +1244,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	totalClients := len(snap.Clients)
 
 	fp := probe.NewFingerprinter(e.scanPorts, e.cfg.Scan.Concurrency, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
+	fp.SetAllowedSubnets(snapshotSubnets(snap))
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
 	fp.SetProgressFunc(func(phase string, done, total int, host string) {
 		switch phase {
@@ -1179,6 +1315,10 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		Initial: isInitial,
 	})
 	freshFindings := runner.RunAll(ctx, enriched)
+	if ctx.Err() != nil {
+		e.setScanProgress(nil)
+		return ctx.Err()
+	}
 	byMAC := make(map[string][]checks.Finding, len(profiles))
 	for _, f := range freshFindings {
 		k := clientKey(f.Client)
@@ -1187,7 +1327,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 
 	e.setScanProgress(&ScanProgress{
 		Phase:     "evaluating",
-		Label:     "Evaluating firewall isolation, risk & security bugs (CVEs)…",
+		Label:     "Evaluating firewall isolation, risk & security bugs (CVEs)...",
 		Completed: totalClients,
 		Total:     totalClients,
 		Percent:   96,
@@ -1195,19 +1335,45 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	})
 
 	e.mu.Lock()
-	e.snap = snap
-	e.lastFwdSig = portForwardSignature(snap.PortForwards)
-	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
-	e.lastPorts = currPorts
-	e.profilesByMAC = make(map[string]probe.HostProfile, len(profiles))
-	for _, hp := range profiles {
-		e.profilesByMAC[clientKey(hp.Client)] = hp
+	if e.deltaGen == startGen || e.snap == nil {
+		// No live delta arrived while the full scan ran; adopt the full snapshot cleanly.
+		e.snap = snap
+		e.lastFwdSig = portForwardSignature(snap.PortForwards)
+		e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
+		e.sigsInitialized = true
+		e.lastPorts = currPorts
+		e.missingClients = make(map[string]missingClient)
 	}
-	e.findingsByMAC = byMAC
-	e.missingClients = make(map[string]missingClient)
-	e.scanProgress = nil
+	// Merge scanned host profiles/findings carefully: keep only hosts still active
+	// at the same IP/network, and never overwrite a fresher per-host rescan that
+	// completed while this full scan was running.
+	activeByKey := make(map[string]unifi.Client, len(e.snap.Clients))
+	for _, cl := range e.snap.Clients {
+		activeByKey[clientKey(cl)] = cl
+	}
+	for _, hp := range profiles {
+		k := clientKey(hp.Client)
+		cur, ok := activeByKey[k]
+		if !ok || cur.PrimaryIP() != hp.Client.PrimaryIP() || cur.NetworkName != hp.Client.NetworkName {
+			continue
+		}
+		if existing, has := e.profilesByMAC[k]; has && existing.ScannedAt.After(hp.ScannedAt) {
+			continue
+		}
+		hp.Client = cur
+		e.profilesByMAC[k] = hp
+		e.findingsByMAC[k] = byMAC[k]
+	}
+	e.baselineComplete = true
+	e.lastScanError = ""
+	if disc := fp.Discovery(); disc != nil {
+		e.lastDiscovery = disc
+		e.lastDiscoveryAt = time.Now().UTC()
+	}
 	e.mu.Unlock()
 
+	// Keep scanProgress in the "evaluating" state until recomputeAndPublish
+	// atomically publishes LastFullScanAt and clears scanProgress together.
 	e.recomputeAndPublish(ctx, true, nil)
 
 	snapView := e.Snapshot()
@@ -1226,6 +1392,12 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 // broadcast over SSE only after e.current is atomically updated so UI clients
 // immediately fetch the fresh snapshot.
 func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extraEvents []LiveEvent) {
+	// Serialize the entire read -> diff -> notify -> save -> publish sequence so
+	// concurrent host scans, delta polls, and full scans never double-alert,
+	// publish stale snapshots out of order, or race on state.json.
+	e.recomputeMu.Lock()
+	defer e.recomputeMu.Unlock()
+
 	e.mu.RLock()
 	snapPtr := e.snap
 	if snapPtr == nil {
@@ -1242,14 +1414,20 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	snap := &snapCopy
 
 	profiles := make([]probe.HostProfile, 0, len(e.profilesByMAC))
+	probedHostKeys := make(map[string]struct{}, len(e.profilesByMAC)*2)
 	var cachedFindings []checks.Finding
 	for k, hp := range e.profilesByMAC {
 		profiles = append(profiles, hp.Clone())
+		probedHostKeys[k] = struct{}{}
+		for _, ip := range hp.Client.AllIPs() {
+			probedHostKeys[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
+		}
 		if fl := e.findingsByMAC[k]; len(fl) > 0 {
 			cachedFindings = append(cachedFindings, fl...)
 		}
 	}
 	prevRisk := e.prevRiskState
+	baselineReady := e.baselineComplete || isFullScan
 	e.mu.RUnlock()
 
 	sort.Slice(profiles, func(i, j int) bool {
@@ -1300,10 +1478,11 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		}
 	}
 
+	excludedSet := e.cfg.Network.ExcludedSet()
 	clientViews := make([]ClientView, 0, len(snap.Clients))
 	for _, cl := range snap.Clients {
 		k := clientKey(cl)
-		clsKey := cl.IP
+		clsKey := cl.PrimaryIP()
 		if clsKey == "" {
 			clsKey = cl.MAC
 		}
@@ -1314,8 +1493,13 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		}
 		if hp, ok := profileByKey[k]; ok {
 			cv.OpenPorts = hp.OpenPorts
-			ts := hp.ScannedAt
-			cv.LastScannedAt = &ts
+			if !hp.ScannedAt.IsZero() {
+				ts := hp.ScannedAt
+				cv.LastScannedAt = &ts
+			}
+		} else if reason := clientSkipReason(cl, excludedSet); reason != "" {
+			cv.Skipped = true
+			cv.SkipReason = reason
 		}
 		if fl := findingsByIP[cl.IP]; len(fl) > 0 {
 			cv.FindingCount = len(fl)
@@ -1333,44 +1517,60 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		if clientViews[i].Client.NetworkName != clientViews[j].Client.NetworkName {
 			return clientViews[i].Client.NetworkName < clientViews[j].Client.NetworkName
 		}
-		return clientViews[i].Client.IP < clientViews[j].Client.IP
+		return clientViews[i].Client.PrimaryIP() < clientViews[j].Client.PrimaryIP()
 	})
 
-	// Diff against previous baseline for webhook alerting and live finding events.
+	// Diff against previous baseline for webhook alerting and live finding events
+	// ONLY after the initial baseline probe has completed, so restarting `serve`
+	// never wipes existing host findings from uniblue-state.json or fires a storm
+	// of false "new" alerts.
 	postEvents := append([]LiveEvent(nil), extraEvents...)
-	diff := risk.ComputeDiff(prevRisk, snap, report, e.cfg.Network)
-	if prevRisk != nil {
-		for _, nf := range diff.NewFindings {
-			postEvents = append(postEvents, LiveEvent{
-				Type:      "finding_new",
-				Severity:  nf.EffectiveSeverity.String(),
-				Host:      nf.Client.DisplayName(),
-				IP:        nf.Client.IP,
-				SubjectID: hostEntityID(nf.Client),
-				Summary:   fmt.Sprintf("New [%s] %s: %s", strings.ToUpper(nf.EffectiveSeverity.String()), nf.CheckID, nf.Title),
-			})
-		}
-		if diff.HasAlerts(e.minNotify) && e.notifier != nil {
-			if err := e.notifier.Send(ctx, snap.Site, diff); err != nil {
-				e.logger.Error("webhook notification failed", "err", err)
+	nextState := prevRisk
+	if baselineReady {
+		diff := risk.ComputeDiff(prevRisk, snap, report, e.cfg.Network)
+		webhookFailed := false
+		if prevRisk != nil {
+			for _, nf := range diff.NewFindings {
+				postEvents = append(postEvents, LiveEvent{
+					Type:      "finding_new",
+					Severity:  nf.EffectiveSeverity.String(),
+					Host:      nf.Client.DisplayName(),
+					IP:        nf.Client.PrimaryIP(),
+					SubjectID: hostEntityID(nf.Client),
+					Summary:   fmt.Sprintf("New [%s] %s: %s", strings.ToUpper(nf.EffectiveSeverity.String()), nf.CheckID, nf.Title),
+				})
+			}
+			if diff.HasAlerts(e.minNotify) && e.notifier != nil {
+				if err := e.notifier.Send(ctx, snap.Site, diff); err != nil {
+					webhookFailed = true
+					e.logger.Error("webhook notification failed; preserving previous baseline for retry", "err", err)
+				}
 			}
 		}
-	}
-
-	nextState := risk.BuildState(snap, report, e.cfg.Network)
-	if e.cfg != nil && e.cfg.State.Path != "" {
-		_ = risk.SaveState(e.cfg.State.Path, nextState)
+		if !webhookFailed {
+			nextState = risk.BuildStateWithPrev(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
+			if e.cfg != nil && e.cfg.State.Path != "" {
+				if err := risk.SaveState(e.cfg.State.Path, nextState); err != nil {
+					e.logger.Error("failed to persist state baseline", "path", e.cfg.State.Path, "err", err)
+				}
+			}
+		}
 	}
 	viewModel := BuildPresentationModel(snap, report, topoModel, clientViews, exactCVEs, potentialCVEs, profiles)
 	AttachDeviceChildren(viewModel, devChildren)
 
 	now := time.Now().UTC()
 	e.mu.Lock()
-	e.prevRiskState = nextState
+	if nextState != nil {
+		e.prevRiskState = nextState
+	}
 	e.lastClasses = classes
 	lastFull := e.current.LastFullScanAt
 	if isFullScan {
 		lastFull = now
+		e.baselineComplete = true
+		e.scanProgress = nil
+		e.lastScanError = ""
 	}
 	eventsCopy := make([]LiveEvent, len(e.events))
 	copy(eventsCopy, e.events)
@@ -1378,6 +1578,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		StartedAt:      e.startedAt,
 		UpdatedAt:      now,
 		LastFullScanAt: lastFull,
+		LastScanError:  e.lastScanError,
 		EventMode:      e.eventMode,
 		Site:           snap.Site,
 		ControllerType: snap.ControllerType,
@@ -1497,17 +1698,51 @@ func portForwardSignature(pfs []unifi.PortForward) string {
 	return strings.Join(parts, ";")
 }
 
+func snapshotSubnets(snap *unifi.Snapshot) []netip.Prefix {
+	if snap == nil {
+		return nil
+	}
+	var out []netip.Prefix
+	for _, n := range snap.Networks {
+		if p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil {
+			out = append(out, p.Masked())
+		}
+		if p, err := netip.ParsePrefix(strings.TrimSpace(n.IPv6Subnet)); err == nil {
+			out = append(out, p.Masked())
+		}
+	}
+	return out
+}
+
+func clientSkipReason(cl unifi.Client, excluded map[string]struct{}) string {
+	for _, ip := range cl.AllIPs() {
+		if _, skip := excluded[ip]; skip {
+			return "Excluded via network.exclude_ips"
+		}
+	}
+	if cl.PrimaryIP() == "" {
+		return "No IP address reported by UniFi"
+	}
+	return ""
+}
+
 func firewallPolicySignature(pols []unifi.FirewallPolicy) string {
 	parts := make([]string, 0, len(pols))
 	for _, p := range pols {
+		if strings.EqualFold(strings.TrimSpace(p.Origin), "SYSTEM_DEFINED") {
+			continue
+		}
 		parts = append(parts, fmt.Sprintf(
-			"%d|%s|%s|%s|%v|%s|%s|%s|%v|%v|%s|%s(%v,%v,%v,%v)->%s(%v,%v,%v,%v)",
-			p.Index, p.Origin, p.ID, p.Name, p.Enabled, p.Action, p.IPVersion, p.Protocol,
-			p.ConnectionStates, p.MatchReturnTraffic, p.Schedule,
-			p.Source.ZoneName, p.Source.IPs, p.Source.NetworkIDs, p.Source.Ports, p.Source.NegateTarget,
-			p.Destination.ZoneName, p.Destination.IPs, p.Destination.NetworkIDs, p.Destination.Ports, p.Destination.NegateTarget,
+			"%d|%s|%s|%s|%v|%s|%s|%s|%v|%v|%v|%s|%s|%s(%v,%v,%v,%v,%v,%v,%v,%v,%v,%s)->%s(%v,%v,%v,%v,%v,%v,%v,%v,%v,%s)",
+			p.Index, p.Origin, p.ID, p.Name, p.Enabled, p.Action, p.IPVersion, p.Protocol, p.ProtocolNegated,
+			p.ConnectionStates, p.MatchReturnTraffic, p.Schedule, p.UnsupportedReason,
+			p.Source.ZoneName, p.Source.IPs, p.Source.NetworkIDs, p.Source.MACs, p.Source.Ports, p.Source.PortRanges,
+			p.Source.AnyTarget, p.Source.AnyPort, p.Source.NegateTarget, p.Source.NegatePort, p.Source.UnsupportedSelector,
+			p.Destination.ZoneName, p.Destination.IPs, p.Destination.NetworkIDs, p.Destination.MACs, p.Destination.Ports, p.Destination.PortRanges,
+			p.Destination.AnyTarget, p.Destination.AnyPort, p.Destination.NegateTarget, p.Destination.NegatePort, p.Destination.UnsupportedSelector,
 		))
 	}
+	sort.Strings(parts)
 	return strings.Join(parts, ";")
 }
 
@@ -1550,6 +1785,13 @@ func snapshotPortStates(snap *unifi.Snapshot, netCfg config.NetworkConfig) map[s
 		swMAC := strings.ToLower(strings.TrimSpace(sw.MAC))
 		for _, p := range sw.Ports {
 			key := portKey(swMAC, p.PortIdx)
+			hasUniFiPeer := false
+			for _, peer := range p.Peers {
+				if peer.Kind == "device" {
+					hasUniFiPeer = true
+					break
+				}
+			}
 			out[key] = portLiveState{
 				DeviceMAC:     swMAC,
 				DeviceName:    sw.Name,
@@ -1565,6 +1807,7 @@ func snapshotPortStates(snap *unifi.Snapshot, netCfg config.NetworkConfig) map[s
 				PoEPowerWatts: p.PoEPowerWatts,
 				MACTableCount: p.MACTableCount,
 				STPState:      p.STPState,
+				HasUniFiPeer:  hasUniFiPeer,
 			}
 		}
 	}

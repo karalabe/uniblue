@@ -439,9 +439,12 @@ drainedReplug:
 		t.Fatalf("expected reconnected client to appear as unassessed pending scan, got %+v", afterReplug.Clients)
 	}
 
-	// Step 3: Simulate scan completion restoring the finding; verify finding_new fires.
+	// Step 3: Simulate scan completion after replug: the unchanged UB-2026-0039
+	// finding returns to the live dashboard WITHOUT re-firing a false finding_new
+	// alert (carried forward across transient offline unplug), while a genuinely
+	// new exposure (UB-0001) DOES fire finding_new.
 	eng.mu.Lock()
-	eng.profilesByMAC[clMAC] = probe.HostProfile{Client: hvacClient, OpenPorts: []int{56747}, ScannedAt: now.Add(20 * time.Second)}
+	eng.profilesByMAC[clMAC] = probe.HostProfile{Client: hvacClient, OpenPorts: []int{23, 56747}, ScannedAt: now.Add(20 * time.Second)}
 	eng.findingsByMAC[clMAC] = []checks.Finding{
 		{
 			CheckID:           "UB-2026-0039",
@@ -451,24 +454,38 @@ drainedReplug:
 			Client:            hvacClient,
 			Port:              56747,
 		},
+		{
+			CheckID:           "UB-0001",
+			Title:             "Cleartext Telnet Service",
+			BaseSeverity:      checks.SeverityHigh,
+			EffectiveSeverity: checks.SeverityHigh,
+			Client:            hvacClient,
+			Port:              23,
+		},
 	}
 	eng.mu.Unlock()
 	eng.recomputeAndPublish(context.Background(), false, nil)
 
-	var sawFindingNew bool
+	var sawDuplicateOld, sawGenuineNew bool
 	for {
 		select {
 		case ev := <-subCh:
 			if ev.Type == "finding_new" && strings.Contains(ev.Summary, "UB-2026-0039") {
-				sawFindingNew = true
+				sawDuplicateOld = true
+			}
+			if ev.Type == "finding_new" && strings.Contains(ev.Summary, "UB-0001") {
+				sawGenuineNew = true
 			}
 		default:
 			goto drainedFinding
 		}
 	}
 drainedFinding:
-	if !sawFindingNew {
-		t.Fatalf("expected finding_new event when vulnerability reappeared after replug scan")
+	if sawDuplicateOld {
+		t.Fatalf("did not expect duplicate finding_new for unchanged UB-2026-0039 after brief unplug/replug")
+	}
+	if !sawGenuineNew {
+		t.Fatalf("expected finding_new event for genuinely new UB-0001 after replug scan")
 	}
 
 	// Step 4: Verify rapid link-up while client was still in prevClients also queues rescan.

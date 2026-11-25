@@ -787,7 +787,7 @@
   .act-row.clickable { cursor: pointer; transition: background .12s; }
   .act-row.clickable:hover { background: var(--surface-2); }
   .act-l { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 240px; }
-  .act-time { font-size: 12px; color: var(--muted); width: 72px; flex-shrink: 0; }
+  .act-time { font-size: 12px; color: var(--muted); min-width: 72px; white-space: nowrap; flex-shrink: 0; }
 
   .empty { padding: 28px 22px; text-align: center; color: var(--muted); font-size: 14px; }
 
@@ -1070,7 +1070,7 @@
 
 <header>
   <div class="hdr-inner">
-    <div class="brand" onclick="switchTab('checkup')" title="Back to Network Checkup">
+    <div class="brand" data-action="switch-tab" data-tab-target="checkup" title="Back to Network Checkup">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="/assets/logo-dark.svg">
         <img src="/assets/logo-light.svg" alt="UniBlue">
@@ -1098,7 +1098,7 @@
 
     <div class="hdr-r">
       <span id="status-pill" class="status-pill"><span class="sdot"></span><span id="status-lbl">Loading…</span></span>
-      <button id="rescan-btn" class="btn sm" onclick="triggerRescan()" title="Check all devices again">
+      <button id="rescan-btn" class="btn sm" data-action="rescan" title="Check all devices again">
         <svg class="icon" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
         Scan
       </button>
@@ -1115,11 +1115,11 @@
   <section id="view-activity" class="view"></section>
 </main>
 
-<div id="backdrop" class="backdrop" onclick="closeDrawer()"></div>
+<div id="backdrop" class="backdrop" data-action="close-drawer"></div>
 <aside id="drawer" class="drawer" aria-hidden="true">
   <div class="drawer-hd">
     <div id="drawer-hd-content" style="flex:1;min-width:0"></div>
-    <button class="btn sm ghost" onclick="closeDrawer()" title="Close (Esc)">✕</button>
+    <button class="btn sm ghost" data-action="close-drawer" title="Close (Esc)">✕</button>
   </div>
   <div id="drawer-body" class="drawer-body"></div>
 </aside>
@@ -1146,6 +1146,11 @@ let bypassInitialSplash = false;
 let fetchInFlight = false;
 let fetchQueued = false;
 let initialHashApplied = false;
+const lastRenderedHTML = Object.create(null);
+let sseSource = null;
+let sseRetryMs = 1000;
+let sseRetryTimer = null;
+let sseDisconnected = false;
 
 /* ============================================================================
    CRISP INLINE SVG ICONS (No external dependencies, works offline)
@@ -1193,7 +1198,64 @@ function esc(s) {
 
 function fmtTime(iso) {
   if (!iso || String(iso).startsWith("0001-")) return "-";
-  return new Date(iso).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "-";
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  const timePart = d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+  if (isStaticMode || !sameDay) {
+    return d.toLocaleDateString([], {month: "short", day: "numeric"}) + " " + timePart;
+  }
+  return timePart;
+}
+
+// Safely update a container's HTML while skipping unchanged renders and
+// preserving input focus/selection and open <details> elements across refreshes.
+function patchContainerHTML(container, html) {
+  if (!container) return false;
+  const key = container.id || "";
+  if (key && lastRenderedHTML[key] === html) return false;
+
+  const openDetails = new Set();
+  container.querySelectorAll("details").forEach((el, idx) => {
+    if (el.open) {
+      openDetails.add(el.getAttribute("data-details-key") || ("idx:" + idx));
+    }
+  });
+
+  let focusSnap = null;
+  const active = document.activeElement;
+  if (active && container.contains(active) && active.id) {
+    focusSnap = {
+      id: active.id,
+      start: typeof active.selectionStart === "number" ? active.selectionStart : null,
+      end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
+      dir: active.selectionDirection || "none"
+    };
+  }
+
+  container.innerHTML = html;
+  if (key) lastRenderedHTML[key] = html;
+
+  if (openDetails.size) {
+    container.querySelectorAll("details").forEach((el, idx) => {
+      const dk = el.getAttribute("data-details-key") || ("idx:" + idx);
+      if (openDetails.has(dk)) el.open = true;
+    });
+  }
+
+  if (focusSnap) {
+    const next = document.getElementById(focusSnap.id);
+    if (next && container.contains(next)) {
+      try { next.focus({ preventScroll: true }); } catch (_) { next.focus(); }
+      if (focusSnap.start !== null && typeof next.setSelectionRange === "function") {
+        try { next.setSelectionRange(focusSnap.start, focusSnap.end, focusSnap.dir); } catch (_) {}
+      }
+    }
+  }
+  return true;
 }
 
 function fmtSpeed(sp) {
@@ -1243,6 +1305,7 @@ function humanStateTone(entOrSev) {
     if (l === "ok" || l === "clean") return "ok";
     return "neutral";
   }
+  if (entOrSev.skipped && entOrSev.state === "unknown") return "neutral";
   if (entOrSev.state === "unknown") return "unk";
   if (entOrSev.state === "ok") return "ok";
   if (entOrSev.max_severity === "critical") return "crit";
@@ -1251,6 +1314,7 @@ function humanStateTone(entOrSev) {
 
 function humanStateLabel(ent) {
   if (!ent) return "";
+  if (ent.skipped && ent.state === "unknown") return ent.state_label || "Skipped";
   if (ent.state === "unknown") return "Checking…";
   if (ent.state === "ok") return "Looks good";
   if (ent.state === "review") return "Worth checking";
@@ -1376,10 +1440,15 @@ function humanReason(r) {
       why: "Anyone who walks up to this outdoor switch could plug an Ethernet cable straight into an empty socket and join your network.",
       fix: r.remediation || "In UniFi → Ports, select each unused socket on this outdoor switch and turn its Operation to 'Disabled'."
     },
-    "UB-UNIFI-PORT-EXT-OPEN": {
+    "UB-UNIFI-PORT-EXT-UNRESTRICTED": {
       title: "Outdoor cable socket isn't locked to one device",
       why: "If someone unplugs this outdoor device and plugs in their own laptop, the socket will let them onto your network.",
       fix: r.remediation || "In UniFi → Ports, put this socket on an isolated network, block extra tagged networks, and enable MAC Address Restriction."
+    },
+    "UB-UNIFI-PORT-UNAUTHORIZED-MAC": {
+      title: "Unauthorized device plugged into a restricted switch port",
+      why: "A device whose hardware address is not on this port's allowed list is currently connected.",
+      fix: r.remediation || "Verify the physical cable drop immediately and enforce UniFi Port Security MAC allowlisting."
     },
     "PORT-TRUNK-ACCESS": {
       title: "Single-device socket carries extra hidden networks",
@@ -1391,7 +1460,7 @@ function humanReason(r) {
       why: "Using SSH keys instead of passwords makes it much harder for someone on your network to guess your router's admin login.",
       fix: r.remediation || "In UniFi → Settings → System → Advanced, turn off Device SSH Authentication or switch to SSH keys only."
     },
-    "UB-UNIFI-UPNP": {
+    "UB-UNIFI-UPNP-ENABLED": {
       title: "Automatic port opening (UPnP) is turned on",
       why: "UPnP lets any gadget or infected app quietly open a door from the internet into your home network without asking you.",
       fix: r.remediation || "In UniFi → Settings → Internet, turn off UPnP and add manual port forwards only for apps you intentionally expose."
@@ -1637,6 +1706,24 @@ function syncHash(push = true) {
   history.pushState(snap, "", next);
 }
 
+function setPortFilter(f) {
+  portFilter = f;
+  syncHash(false);
+  renderHouse();
+}
+
+function setDeviceFilter(f) {
+  deviceFilter = f;
+  syncHash(false);
+  renderDevices();
+}
+
+function setActivityFilter(f) {
+  activityFilter = f;
+  syncHash(false);
+  renderActivity();
+}
+
 function applyHash(histState) {
   if (histState && typeof histState === "object" && histState.tab) {
     const tab = ["checkup", "house", "devices", "activity"].includes(histState.tab) ? histState.tab : "checkup";
@@ -1663,7 +1750,14 @@ function applyHash(histState) {
   let tab = slash === -1 ? h : h.slice(0, slash);
   const mapOld = { overview: "checkup", physical: "house", logical: "devices" };
   tab = mapOld[tab] || tab;
-  const ent = slash === -1 ? "" : decodeURIComponent(h.slice(slash + 1));
+  let ent = "";
+  if (slash !== -1) {
+    try {
+      ent = decodeURIComponent(h.slice(slash + 1));
+    } catch (_) {
+      return;
+    }
+  }
   if (["checkup", "house", "devices", "activity"].includes(tab)) {
     setActiveTabDOM(tab);
   }
@@ -1680,12 +1774,40 @@ document.querySelectorAll(".nav-btn").forEach(b => b.addEventListener("click", (
 document.addEventListener("keydown", e => { if (e.key === "Escape" && drawerStack.length) closeDrawer(true); });
 window.addEventListener("popstate", e => { applyHash(e.state); renderActiveTab(); });
 window.addEventListener("hashchange", () => { applyHash(history.state); renderActiveTab(); });
-// Safe delegated click handler for entity/panel navigation (prevents quote/script injection in dynamic IDs).
+// Safe delegated click handler for entity/panel/action navigation (eliminates inline JS string handlers).
 document.addEventListener("click", e => {
-  const portEl = e.target.closest("[data-stop-entity-id]");
-  if (portEl) {
+  const stopEntEl = e.target.closest("[data-stop-entity-id]");
+  if (stopEntEl) {
     e.stopPropagation();
-    openEntity(portEl.getAttribute("data-stop-entity-id"));
+    openEntity(stopEntEl.getAttribute("data-stop-entity-id"));
+    return;
+  }
+  const actEl = e.target.closest("[data-action]");
+  if (actEl) {
+    const act = actEl.getAttribute("data-action");
+    if (act === "switch-tab") {
+      const df = actEl.getAttribute("data-device-filter");
+      if (df) deviceFilter = df;
+      switchTab(actEl.getAttribute("data-tab-target") || "checkup");
+    } else if (act === "close-drawer") {
+      closeDrawer(true);
+    } else if (act === "pop-drawer") {
+      popDrawer();
+    } else if (act === "rescan") {
+      triggerRescan(actEl.getAttribute("data-rescan-ip") || "");
+    } else if (act === "port-filter") {
+      setPortFilter(actEl.getAttribute("data-filter") || "all");
+    } else if (act === "device-filter") {
+      setDeviceFilter(actEl.getAttribute("data-filter") || "all");
+    } else if (act === "activity-filter") {
+      setActivityFilter(actEl.getAttribute("data-filter") || "all");
+    } else if (act === "show-splash") {
+      bypassInitialSplash = false;
+      renderActiveTab();
+    } else if (act === "bypass-splash") {
+      bypassInitialSplash = true;
+      renderActiveTab();
+    }
     return;
   }
   const entEl = e.target.closest("[data-entity-id]");
@@ -1706,12 +1828,25 @@ function isInitialScanActive() {
   if (!state || isStaticMode) return false;
   const hasBaseline = Boolean(state.last_full_scan_at && !String(state.last_full_scan_at).startsWith("0001-"));
   if (hasBaseline) return false;
-  return Boolean(state.scanning || state.scan_progress?.initial || (state.view?.census?.unassessed_count || 0) > 0);
+  return Boolean(state.scanning || (state.scan_progress && state.scan_progress.initial));
 }
 
 function renderScanBanner(initial) {
   const host = document.getElementById("scan-banner");
   if (!host) return;
+  if (state?.last_scan_error && !state?.scanning) {
+    host.innerHTML = `<div class="scan-banner" style="background:var(--crit-bg);border-color:var(--crit-bd);color:var(--crit)">
+      <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1">
+        <span class="sdot" style="background:var(--crit-solid);flex-shrink:0"></span>
+        <div style="min-width:0">
+          <strong>Network scan failed:</strong>
+          <span>${esc(state.last_scan_error)}</span>
+        </div>
+      </div>
+      ${isStaticMode ? "" : `<button class="btn sm" data-action="rescan">Retry now</button>`}
+    </div>`;
+    return;
+  }
   const sp = state?.scan_progress;
   if (!state?.scanning || !sp || (initial && !bypassInitialSplash)) {
     host.innerHTML = "";
@@ -1730,7 +1865,7 @@ function renderScanBanner(initial) {
     <div style="display:flex;align-items:center;gap:10px">
       <div class="scan-banner-bar"><div style="width:${pct}%"></div></div>
       <span class="mono" style="font-size:12px;font-weight:700;color:var(--blue)">${pct}%</span>
-      ${initial ? `<button class="btn sm" onclick="bypassInitialSplash=false; renderActiveTab()">Show progress</button>` : ""}
+      ${initial ? `<button class="btn sm" data-action="show-splash">Show progress</button>` : ""}
     </div>
   </div>`;
 }
@@ -1794,7 +1929,7 @@ function renderInitialSplash() {
       </div>
 
       <div class="init-foot">
-        <button class="btn sm ghost" onclick="bypassInitialSplash=true; renderActiveTab()">Peek at partial cables &amp; devices while scanning →</button>
+        <button class="btn sm ghost" data-action="bypass-splash">Peek at partial cables &amp; devices while scanning →</button>
       </div>
     </div>`;
 }
@@ -1803,9 +1938,11 @@ function renderHeader() {
   const vm = state.view || { census: {}, queue: [], entities: {} };
   const c = vm.census || {};
   const hosts = Object.values(vm.entities || {}).filter(e => e.kind === "host");
+  const skippedCount = hosts.filter(e => e.skipped).length;
+  const scannableCount = Math.max(0, hosts.length - skippedCount);
   const unassessed = c.unassessed_count || 0;
   const initial = isInitialScanActive();
-  const checking = Boolean(state.scanning || unassessed > 0);
+  const checking = Boolean(state.scanning || (state.scan_progress && state.scan_progress.initial));
   const sp = state.scan_progress;
 
   const pill = document.getElementById("status-pill");
@@ -1814,14 +1951,20 @@ function renderHeader() {
     pill.className = "status-pill";
     lbl.textContent = "Saved Snapshot · " + fmtTime(state.updated_at);
     document.getElementById("rescan-btn").style.display = "none";
+  } else if (sseDisconnected) {
+    pill.className = "status-pill";
+    lbl.textContent = sseSource ? "Reconnecting..." : "Offline (reconnecting...)";
   } else if (checking) {
     pill.className = "status-pill scanning";
     if (sp && sp.percent > 0) {
       lbl.textContent = `Scanning ${sp.percent}%…`;
     } else {
-      const done = Math.max(0, hosts.length - unassessed);
-      lbl.textContent = unassessed > 0 ? `Checking ${done}/${hosts.length}…` : "Checking network…";
+      const done = Math.max(0, scannableCount - unassessed);
+      lbl.textContent = unassessed > 0 ? `Checking ${done}/${scannableCount}…` : "Checking network…";
     }
+  } else if (state.last_scan_error) {
+    pill.className = "status-pill";
+    lbl.textContent = "Scan error";
   } else {
     pill.className = "status-pill live";
     lbl.textContent = "Live · " + fmtTime(state.updated_at);
@@ -1830,13 +1973,13 @@ function renderHeader() {
   const q = vm.queue || [];
   const exposedBMCCount = hosts.filter(e => e.is_bmc && e.state === "exposed").length;
   const exposedHostCount = hosts.filter(e => !e.is_bmc && e.state === "exposed").length;
-  const wanAlertCount = (vm.wan_flows || []).filter(f => !f.expected).length;
+  const wanAlertCount = (vm.wan_flows || []).filter(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown").length;
   const perimCount = q.filter(x => x.category === "perimeter").length;
   const ctrlCount = q.filter(x => x.category === "controller").length;
   const checkupTotal = exposedBMCCount + perimCount + wanAlertCount + exposedHostCount + ctrlCount;
   const checkupHasCrit = q.some(x => x.severity === "critical")
     || hosts.some(e => e.state === "exposed" && e.max_severity === "critical")
-    || (vm.wan_flows || []).some(f => !f.expected && f.severity === "critical");
+    || (vm.wan_flows || []).some(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown" && f.severity === "critical");
   const ckB = document.getElementById("nb-ck");
   if (initial && !bypassInitialSplash) {
     ckB.textContent = "…";
@@ -1886,14 +2029,18 @@ function renderCheckup() {
   const c = vm.census || {};
   const ents = Object.values(vm.entities || {});
   const hosts = ents.filter(e => e.kind === "host");
+  const skippedCount = hosts.filter(e => e.skipped).length;
+  const scannableCount = Math.max(0, hosts.length - skippedCount);
   const unassessed = c.unassessed_count || 0;
-  const checking = Boolean(state.scanning || unassessed > 0);
-  const assessedCount = Math.max(0, hosts.length - unassessed);
+  const checking = Boolean(state.scanning || (state.scan_progress && state.scan_progress.initial));
+  const assessedCount = Math.max(0, scannableCount - unassessed);
 
   const bmcHosts = hosts.filter(e => e.is_bmc);
   const exposedBMCs = bmcHosts.filter(e => e.state === "exposed");
   const exposedHosts = hosts.filter(e => e.state === "exposed" && !e.is_bmc);
-  const wanAlerts = (vm.wan_flows || []).filter(f => !f.expected);
+  const wanFlowsAll = vm.wan_flows || [];
+  const wanAlerts = wanFlowsAll.filter(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown");
+  const wanCoverageUnknown = wanFlowsAll.filter(f => f.kind === "coverage" || f.state === "unknown");
   const perimItems = (vm.queue || []).filter(x => x.category === "perimeter");
   const ctrlItems = (vm.queue || []).filter(x => x.category === "controller");
   const totalIssues = exposedBMCs.length + perimItems.length + wanAlerts.length + exposedHosts.length + ctrlItems.length;
@@ -1909,16 +2056,18 @@ function renderCheckup() {
   let ringSpin = "";
   let ringLabel = "✓";
   let heroTitle = "Your home network looks great";
-  let heroSub = `All ${hosts.length} devices and ${(vm.physical || []).length} network boxes checked out cleanly.`;
+  let heroSub = skippedCount
+    ? `All ${assessedCount} checked devices (${skippedCount} skipped) and ${(vm.physical || []).length} network boxes checked out cleanly.`
+    : `All ${hosts.length} devices and ${(vm.physical || []).length} network boxes checked out cleanly.`;
 
   if (checking && totalIssues === 0) {
-    const pct = hosts.length ? (assessedCount / hosts.length) : 0.25;
+    const pct = scannableCount ? (assessedCount / scannableCount) : 0.25;
     ringColor = "var(--blue)";
     ringOffset = C * (1 - Math.max(0.18, pct));
-    ringSpin = unassessed === hosts.length ? " spin" : "";
-    ringLabel = hosts.length ? `${Math.round(pct * 100)}%` : "…";
+    ringSpin = unassessed === scannableCount ? " spin" : "";
+    ringLabel = scannableCount ? `${Math.round(pct * 100)}%` : "…";
     heroTitle = "Checking your home network…";
-    heroSub = `Checked ${assessedCount} of ${hosts.length} devices so far. Results appear automatically as each device finishes; nothing is marked safe until checked.`;
+    heroSub = `Checked ${assessedCount} of ${scannableCount} devices so far${skippedCount ? ` (${skippedCount} skipped)` : ""}. Results appear automatically as each device finishes; nothing is marked safe until checked.`;
   } else if (totalIssues > 0) {
     ringColor = hasCrit ? "var(--crit-solid)" : "var(--warn-solid)";
     ringOffset = C * 0.22;
@@ -1934,14 +2083,46 @@ function renderCheckup() {
     if (ctrlItems.length) parts.push(`${ctrlItems.length} router setting${ctrlItems.length === 1 ? "" : "s"}`);
     heroSub = (checking ? `Still checking ${unassessed} device${unassessed === 1 ? "" : "s"} · Found so far: ` : "We found ")
       + parts.join(", ") + ". Click any item below for plain-English steps to fix it.";
+  } else if (wanCoverageUnknown.length > 0) {
+    ringColor = "var(--warn-solid)";
+    ringOffset = C * 0.25;
+    ringLabel = "?";
+    heroTitle = "Internet edge coverage is incomplete";
+    heroSub = "Some router firewall or port-forward feeds were unavailable from UniFi, so UniBlue cannot confirm the internet front door is locked.";
+  } else if (unassessed > 0) {
+    ringColor = "var(--warn-solid)";
+    ringOffset = C * 0.25;
+    ringLabel = "?";
+    heroTitle = "Network checkup incomplete";
+    heroSub = `${unassessed} of ${scannableCount} device${scannableCount === 1 ? "" : "s"} have not been assessed yet.`;
   }
 
   // 3 Clean Pillar Cards inside Hero
   const cableTone = perimItems.some(x => x.severity === "critical") ? "crit" : (perimItems.length ? "warn" : "ok");
   const devTone = exposedHosts.some(x => x.max_severity === "critical") || exposedBMCs.some(x => x.max_severity === "critical")
     ? "crit"
-    : ((exposedHosts.length + exposedBMCs.length) ? "warn" : (checking ? "blue" : "ok"));
-  const wanTone = wanAlerts.some(x => x.severity === "critical") ? "crit" : ((wanAlerts.length + ctrlItems.length) ? "warn" : "ok");
+    : ((exposedHosts.length + exposedBMCs.length) ? "warn" : ((checking || unassessed > 0) ? "blue" : "ok"));
+  const wanTone = wanAlerts.some(x => x.severity === "critical")
+    ? "crit"
+    : ((wanAlerts.length + ctrlItems.length + wanCoverageUnknown.length) ? "warn" : "ok");
+
+  let devPillarVal = `All ${hosts.length} look good`;
+  if (exposedHosts.length + exposedBMCs.length) {
+    devPillarVal = `${exposedHosts.length + exposedBMCs.length} need attention`;
+  } else if (checking) {
+    devPillarVal = `Checking ${assessedCount}/${scannableCount}…`;
+  } else if (unassessed > 0) {
+    devPillarVal = `${unassessed} unassessed`;
+  } else if (skippedCount > 0) {
+    devPillarVal = `${assessedCount} OK (${skippedCount} skipped)`;
+  }
+
+  let wanPillarVal = "Front door locked";
+  if (wanAlerts.length) {
+    wanPillarVal = `${wanAlerts.length} open door${wanAlerts.length === 1 ? "" : "s"} to review`;
+  } else if (wanCoverageUnknown.length) {
+    wanPillarVal = "Coverage unknown";
+  }
 
   let html = `
   <div class="hero">
@@ -1960,27 +2141,25 @@ function renderCheckup() {
     </div>
 
     <div class="hero-pillars">
-      <div class="pillar" onclick="switchTab('house')">
+      <div class="pillar" data-action="switch-tab" data-tab-target="house">
         <div class="pillar-ico ${cableTone}">${perimItems.length ? ICONS.unlock : ICONS.lock}</div>
         <div>
           <div class="pillar-lbl">House &amp; Outdoor Cables</div>
           <div class="pillar-val">${perimItems.length ? `${c.open_wall_gates || perimItems.length} need locking` : "All outdoor cables locked"}</div>
         </div>
       </div>
-      <div class="pillar" onclick="deviceFilter='${(exposedHosts.length + exposedBMCs.length) ? "issues" : "all"}'; switchTab('devices')">
+      <div class="pillar" data-action="switch-tab" data-tab-target="devices" data-device-filter="${(exposedHosts.length + exposedBMCs.length) ? "issues" : "all"}">
         <div class="pillar-ico ${devTone}">${ICONS.laptop}</div>
         <div>
           <div class="pillar-lbl">Devices &amp; Updates</div>
-          <div class="pillar-val">${(exposedHosts.length + exposedBMCs.length)
-            ? `${exposedHosts.length + exposedBMCs.length} need attention`
-            : (checking ? `Checking ${assessedCount}/${hosts.length}…` : `All ${hosts.length} look good`)}</div>
+          <div class="pillar-val">${esc(devPillarVal)}</div>
         </div>
       </div>
-      <div class="pillar" onclick="deviceFilter='wan'; switchTab('devices')">
+      <div class="pillar" data-action="switch-tab" data-tab-target="devices" data-device-filter="wan">
         <div class="pillar-ico ${wanTone}">${ICONS.globe}</div>
         <div>
           <div class="pillar-lbl">Internet Front Door</div>
-          <div class="pillar-val">${wanAlerts.length ? `${wanAlerts.length} open door${wanAlerts.length === 1 ? "" : "s"} to review` : "Front door locked"}</div>
+          <div class="pillar-val">${esc(wanPillarVal)}</div>
         </div>
       </div>
     </div>
@@ -2005,7 +2184,7 @@ function renderCheckup() {
     for (const bmc of bmcHosts) {
       const portEnt = bmc.port_id ? vm.entities[bmc.port_id] : null;
       const chips = (bmc.services || []).filter(s => s.exposed).slice(0, 3).map(s => `<span class="tag ${humanStateTone(s.severity)}">${esc(humanServiceChip(s))}</span>`).join("");
-      html += `<div class="story-item" onclick="openEntity('${esc(bmc.id)}')">
+      html += `<div class="story-item" data-entity-id="${esc(bmc.id)}">
         <div class="story-item-l">
           <div class="story-item-name">${esc(bmc.label)} <span class="tag ${humanStateTone(bmc)}">${esc(humanStateLabel(bmc))}</span></div>
           <div class="story-item-sub">On <strong>${esc(bmc.network_name || "main")}</strong> network${portEnt ? ` · Plugged into <strong>${esc(portEnt.label)}</strong>` : ""} · <span class="mono">${esc(bmc.ip)}</span></div>
@@ -2028,7 +2207,7 @@ function renderCheckup() {
             <div class="story-why">If someone unplugs an outdoor camera or switch cable, locking these ports stops them from plugging in a laptop and reaching your home network.</div>
           </div>
         </div>
-        <button class="btn sm" onclick="switchTab('house')">View House Map</button>
+        <button class="btn sm" data-action="switch-tab" data-tab-target="house">View House Map</button>
       </div>`;
     for (const item of perimItems) {
       const ent = vm.entities[item.subject_id];
@@ -2037,7 +2216,7 @@ function renderCheckup() {
         ? `${ent.label} → ${peers[0]}`
         : (ent ? ent.label : item.sentence);
       const topReason = ent?.reasons?.[0] ? humanReason(ent.reasons[0]).title : item.sentence;
-      html += `<div class="story-item" onclick="openEntity('${esc(item.subject_id)}')">
+      html += `<div class="story-item" data-entity-id="${esc(item.subject_id)}">
         <div class="story-item-l">
           <div class="story-item-name">${esc(headline)} <span class="tag ${humanStateTone(item.severity)}">${item.severity === "critical" ? "Urgent" : "Review"}</span></div>
           <div class="story-item-sub">${esc(topReason)}</div>
@@ -2048,7 +2227,7 @@ function renderCheckup() {
     html += `</div>`;
   }
 
-  // 3. Open Doors to the Internet (WAN)
+  // 3. Open Doors to the Internet (WAN) & Missing WAN Coverage
   if (wanAlerts.length) {
     const tone = wanAlerts.some(x => x.severity === "critical") ? "crit" : "warn";
     html += `<div class="story">
@@ -2063,12 +2242,36 @@ function renderCheckup() {
       </div>`;
     for (const f of wanAlerts) {
       const target = f.kind === "firewall" ? f.id : (f.target_id || vm.gateway_id);
-      html += `<div class="story-item" onclick="openEntity('${esc(target)}')">
+      html += `<div class="story-item" data-entity-id="${esc(target)}">
         <div class="story-item-l">
           <div class="story-item-name">${esc(f.rule_name)} <span class="tag ${humanStateTone(f.severity)}">${f.severity === "critical" ? "Urgent" : "Review"}</span></div>
           <div class="story-item-sub">Points to <strong>${esc(f.target_name || f.target_ip || "Router")}</strong> · <span class="mono">${esc(f.label)}</span></div>
         </div>
         <div class="story-item-r"><span class="go-arrow">Inspect →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  if (wanCoverageUnknown.length) {
+    html += `<div class="story">
+      <div class="story-hd">
+        <div class="story-hd-l">
+          <div class="story-ico warn">${ICONS.globe}</div>
+          <div>
+            <div class="story-title">Internet Edge Visibility Incomplete (${wanCoverageUnknown.length})</div>
+            <div class="story-why">The UniFi controller did not return all internet-edge policy feeds, so UniBlue cannot verify that inbound WAN access is locked down.</div>
+          </div>
+        </div>
+      </div>`;
+    for (const f of wanCoverageUnknown) {
+      const target = f.target_id || vm.gateway_id || "";
+      html += `<div class="story-item" ${target ? `data-entity-id="${esc(target)}"` : ""}>
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(f.rule_name)} <span class="tag unk">Unknown</span></div>
+          <div class="story-item-sub">${esc(f.label)}</div>
+        </div>
+        ${target ? `<div class="story-item-r"><span class="go-arrow">Inspect →</span></div>` : ""}
       </div>`;
     }
     html += `</div>`;
@@ -2086,7 +2289,7 @@ function renderCheckup() {
             <div class="story-why">Devices running software with known security bugs, or exposing older unprotected logins on your home network.</div>
           </div>
         </div>
-        <button class="btn sm" onclick="deviceFilter='issues'; switchTab('devices')">See All Devices</button>
+        <button class="btn sm" data-action="switch-tab" data-tab-target="devices" data-device-filter="issues">See All Devices</button>
       </div>`;
     const sorted = [...exposedHosts].sort((a, b) => (b.exact_cve_count || 0) - (a.exact_cve_count || 0));
     for (const h of sorted) {
@@ -2098,7 +2301,7 @@ function renderCheckup() {
       for (const s of (h.services || []).filter(x => x.exposed).slice(0, 2)) {
         tags.push(`<span class="tag ${humanStateTone(s.severity)}">${esc(humanServiceChip(s))}</span>`);
       }
-      html += `<div class="story-item" onclick="openEntity('${esc(h.id)}')">
+      html += `<div class="story-item" data-entity-id="${esc(h.id)}">
         <div class="story-item-l">
           <div class="story-item-name">${esc(h.label)}</div>
           <div class="story-item-sub">${esc(humanRole(h.role, false))} · On <strong>${esc(h.network_name || "main")}</strong>${portEnt ? ` · ${esc(portEnt.label)}` : (h.essid ? ` · Wi-Fi: ${esc(h.essid)}` : "")}</div>
@@ -2111,23 +2314,27 @@ function renderCheckup() {
 
   // 5. Router & Wi-Fi Quick Settings
   if (ctrlItems.length) {
+    const tone = ctrlItems.some(x => x.severity === "critical") ? "crit" : "warn";
     html += `<div class="story">
       <div class="story-hd">
         <div class="story-hd-l">
-          <div class="story-ico warn">${ICONS.sliders}</div>
+          <div class="story-ico ${tone}">${ICONS.sliders}</div>
           <div>
             <div class="story-title">Quick Router &amp; Wi-Fi Settings (${ctrlItems.length})</div>
-            <div class="story-why">Simple switches you can flip in your UniFi settings to close easy loopholes.</div>
+            <div class="story-why">Simple switches and firmware updates on your UniFi router, switches, and Wi-Fi to close easy loopholes.</div>
           </div>
         </div>
       </div>`;
     for (const item of ctrlItems) {
       const gw = vm.entities[item.subject_id];
-      const matchR = gw?.reasons?.find(r => r.ref === item.reason_ref);
+      const reasons = gw?.reasons || [];
+      const matchR = reasons.find(r => r.ref === item.reason_ref && item.sentence && item.sentence.endsWith(r.title))
+        || reasons.find(r => r.ref === item.reason_ref);
       const hr = matchR ? humanReason(matchR) : { title: item.sentence, why: "" };
-      html += `<div class="story-item" onclick="openEntity('${esc(item.subject_id)}')">
+      const sevTag = item.severity === "critical" ? `<span class="tag crit">Urgent</span>` : "";
+      html += `<div class="story-item" data-entity-id="${esc(item.subject_id)}">
         <div class="story-item-l">
-          <div class="story-item-name">${esc(hr.title)}</div>
+          <div class="story-item-name">${esc(hr.title)} ${sevTag}</div>
           ${hr.why ? `<div class="story-item-sub">${esc(hr.why)}</div>` : ""}
         </div>
         <div class="story-item-r"><span class="go-arrow">How to fix →</span></div>
@@ -2136,7 +2343,7 @@ function renderCheckup() {
     html += `</div>`;
   }
 
-  if (!totalIssues && !checking) {
+  if (!totalIssues && !checking && !wanCoverageUnknown.length && unassessed === 0) {
     html += `<div class="card"><div class="card-body" style="display:flex;align-items:center;gap:14px">
       <div class="pillar-ico ok">${ICONS.shieldOk}</div>
       <div>
@@ -2149,46 +2356,52 @@ function renderCheckup() {
   // Right Column: Plain-English Router Safety Checklist
   html += `</div><div>`;
   html += `<div class="section-kicker">Router Protection</div>`;
-  const s = state.report?.unifi_posture?.settings || {};
-  const h = state.report?.unifi_posture?.health || {};
-  const posture = state.report?.unifi_posture || {};
+  const rawSettings = state.report?.unifi_posture?.settings;
+  const hasSettings = rawSettings != null && typeof rawSettings === "object";
+  const s = hasSettings ? rawSettings : {};
+  const rawHealth = state.report?.unifi_posture?.health;
+  const hasHealth = rawHealth != null && typeof rawHealth === "object";
+  const h = hasHealth ? rawHealth : {};
+  const rawPosture = state.report?.unifi_posture;
+  const hasPosture = rawPosture != null && typeof rawPosture === "object";
+  const posture = hasPosture ? rawPosture : {};
 
   const checks = [
     {
       name: "Intrusion Shield",
       hint: "Blocks attacks automatically",
-      tone: (s.ips_mode === "ips" || s.ips_mode === "ids") ? "ok" : "warn",
-      val: s.ips_mode === "ips" ? "Blocking threats" : (s.ips_mode === "ids" ? "Alerting only" : "Turned off")
+      tone: !hasSettings ? "neutral" : ((s.ips_mode === "ips" || s.ips_mode === "ids") ? "ok" : "warn"),
+      val: !hasSettings ? "Unknown" : (s.ips_mode === "ips" ? "Blocking threats" : (s.ips_mode === "ids" ? "Alerting only" : "Turned off"))
     },
     {
       name: "Auto Port Opening",
       hint: "UPnP for apps & gadgets",
-      tone: s.upnp_enabled ? "warn" : "ok",
-      val: s.upnp_enabled ? "On (risky)" : "Off (safer)"
+      tone: !hasSettings ? "neutral" : (s.upnp_enabled ? "warn" : "ok"),
+      val: !hasSettings ? "Unknown" : (s.upnp_enabled ? "On (risky)" : "Off (safer)")
     },
     {
       name: "Fake Wi-Fi Watch",
       hint: "Checks for copycat networks",
-      tone: posture.evil_twin_count ? "crit" : "ok",
-      val: posture.evil_twin_count ? `${posture.evil_twin_count} suspicious!` : `All clear (${posture.neighbor_aps || 0} nearby)`
+      tone: !hasPosture ? "neutral" : (posture.evil_twin_count ? "crit" : "ok"),
+      val: !hasPosture ? "Unknown" : (posture.evil_twin_count ? `${posture.evil_twin_count} suspicious!` : `All clear (${posture.neighbor_aps || 0} nearby)`)
     },
     {
       name: "Router Admin Login",
       hint: "SSH password protection",
-      tone: (s.ssh_enabled && s.ssh_password_auth) ? "warn" : "ok",
-      val: s.ssh_enabled ? (s.ssh_password_auth ? "Password on" : "Key-only") : "Turned off"
+      tone: !hasSettings ? "neutral" : ((s.ssh_enabled && s.ssh_password_auth) ? "warn" : "ok"),
+      val: !hasSettings ? "Unknown" : (s.ssh_enabled ? (s.ssh_password_auth ? "Password on" : "Key-only") : "Turned off")
     },
     {
       name: "Encrypted DNS",
       hint: "Hides web lookups from ISP",
-      tone: (s.doh_state && s.doh_state !== "off") ? "ok" : "neutral",
-      val: (s.doh_state && s.doh_state !== "off") ? "On" : "Standard"
+      tone: !hasSettings ? "neutral" : ((s.doh_state && s.doh_state !== "off") ? "ok" : "neutral"),
+      val: !hasSettings ? "Unknown" : ((s.doh_state && s.doh_state !== "off") ? "On" : "Standard")
     },
     {
       name: "Intruder Trap",
       hint: "Decoy address catches scans",
-      tone: s.honeypot_enabled ? "ok" : "neutral",
-      val: s.honeypot_enabled ? `Active (${(s.honeypot_ips || []).length})` : "Off"
+      tone: !hasSettings ? "neutral" : (s.honeypot_enabled ? "ok" : "neutral"),
+      val: !hasSettings ? "Unknown" : (s.honeypot_enabled ? `Active (${(s.honeypot_ips || []).length})` : "Off")
     },
     {
       name: "Internet Line",
@@ -2200,14 +2413,14 @@ function renderCheckup() {
       name: "Remote VPN",
       hint: "People signed in remotely",
       tone: "neutral",
-      val: `${h.active_vpn_users || 0} connected`
+      val: hasHealth ? `${h.active_vpn_users || 0} connected` : "Unknown"
     }
   ];
 
   html += `<div class="card">
     <div class="card-hd">
       <div class="card-title">Safety Features</div>
-      ${vm.gateway_id ? `<button class="btn sm ghost" onclick="openEntity('${esc(vm.gateway_id)}')">Inspect Router →</button>` : ""}
+      ${vm.gateway_id ? `<button class="btn sm ghost" data-entity-id="${esc(vm.gateway_id)}">Inspect Router →</button>` : ""}
     </div>
     <div class="checklist">
       ${checks.map(ck => `<div class="chk-row">
@@ -2225,7 +2438,7 @@ function renderCheckup() {
 
   const notes = state.report?.posture_notes || [];
   if (notes.length) {
-    html += `<details class="tech" style="margin-top:0">
+    html += `<details class="tech" data-details-key="posture-notes" style="margin-top:0">
       <summary>Good to know (${notes.length} note${notes.length === 1 ? "" : "s"})</summary>
       <div class="tech-body">
         ${notes.slice(0, 8).map(n => `<div style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
@@ -2274,7 +2487,7 @@ function renderCheckup() {
   }
 
   html += `</div></div>`;
-  document.getElementById("view-checkup").innerHTML = html;
+  patchContainerHTML(document.getElementById("view-checkup"), html);
 }
 
 /* ============================================================================
@@ -2292,9 +2505,9 @@ function renderHouse() {
   let html = `
   <div class="bar">
     <div class="seg">
-      <button class="seg-b ${portFilter === "all" ? "active" : ""}" onclick="portFilter='all'; renderHouse()">All Sockets</button>
-      <button class="seg-b ${portFilter === "risk" ? "active" : ""}" onclick="portFilter='risk'; renderHouse()">Highlight Issues</button>
-      <button class="seg-b ${portFilter === "external" ? "active" : ""}" onclick="portFilter='external'; renderHouse()">Outdoor Cables</button>
+      <button class="seg-b ${portFilter === "all" ? "active" : ""}" data-action="port-filter" data-filter="all">All Sockets</button>
+      <button class="seg-b ${portFilter === "risk" ? "active" : ""}" data-action="port-filter" data-filter="risk">Highlight Issues</button>
+      <button class="seg-b ${portFilter === "external" ? "active" : ""}" data-action="port-filter" data-filter="external">Outdoor Cables</button>
     </div>
     <div class="legend">
       <span class="leg"><span class="sw up"></span>Plugged in</span>
@@ -2335,7 +2548,7 @@ function renderHouse() {
           const plainFact = pe?.tagged_policy === "all"
             ? "Carries all home networks"
             : (pe?.port_security ? `Locked to ${pe.native_vlan || "1 network"}` : `${pe?.native_vlan || "Network"} · no device lock`);
-          return `<div class="cable-pill ${tone} ${g.inferred ? "inferred" : ""}" onclick="openEntity('${esc(g.port_id)}')">
+          return `<div class="cable-pill ${tone} ${g.inferred ? "inferred" : ""}" data-entity-id="${esc(g.port_id)}">
             <span style="color:${isRisk ? "var(--" + (tone === "crit" ? "crit" : "warn") + ")" : "var(--ok)"}">${isRisk ? ICONS.unlock : ICONS.lock}</span>
             <div>
               <div style="font-weight:700;font-size:13.5px">${esc(g.switch_name)} #${g.port_idx} → ${esc(g.target_name)}</div>
@@ -2358,7 +2571,7 @@ function renderHouse() {
     </div>`;
   }
 
-  document.getElementById("view-house").innerHTML = html;
+  patchContainerHTML(document.getElementById("view-house"), html);
 }
 
 function renderHWCard(vm, row) {
@@ -2395,7 +2608,7 @@ function renderHWCard(vm, row) {
     const peers = peerNamesForPort(vm, pe);
     const who = peers.length ? peers.join(", ") : (pe.port_state === "disabled" ? "Turned off" : "Empty socket");
     const tip = `Socket #${pe.port_idx} · ${who}${pe.native_vlan ? " · Network: " + pe.native_vlan : ""}${pe.state !== "ok" ? " · Needs attention" : ""}`;
-    return `<div class="sock ${linkCls}${trunkCls}${vCls}${sel}${dim}" title="${esc(tip)}" onclick="event.stopPropagation(); openEntity('${esc(pe.id)}')">
+    return `<div class="sock ${linkCls}${trunkCls}${vCls}${sel}${dim}" title="${esc(tip)}" data-stop-entity-id="${esc(pe.id)}">
       <span class="sn">#${pe.port_idx}</span>
       <span class="sm">${esc(meta)}</span>
       ${pe.native_vlan ? `<span class="ubar" style="background:${vlanColor(pe.native_vlan)}"></span>` : ""}
@@ -2413,7 +2626,7 @@ function renderHWCard(vm, row) {
   }
 
   return `<div class="hw-card${depthCls}">
-    <div class="hw-hd" onclick="openEntity('${esc(row.device_id)}')">
+    <div class="hw-hd" data-entity-id="${esc(row.device_id)}">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <strong style="font-size:15px">${esc(row.name)}</strong>
         <span class="small">${esc(row.model)}</span>
@@ -2424,7 +2637,7 @@ function renderHWCard(vm, row) {
       </div>
       <div>
         ${row.parent_label
-          ? `<span class="tag click" onclick="event.stopPropagation(); openEntity('${esc(row.parent_port_id || row.parent_id)}')">↳ Plugged into ${esc(row.parent_label)}</span>`
+          ? `<span class="tag click" data-stop-entity-id="${esc(row.parent_port_id || row.parent_id)}">↳ Plugged into ${esc(row.parent_label)}</span>`
           : `<span class="tag neutral">Main Router</span>`}
       </div>
     </div>
@@ -2434,7 +2647,7 @@ function renderHWCard(vm, row) {
       ${riskPorts.slice(0, 6).map(p => {
         const peers = peerNamesForPort(vm, p);
         const lbl = peers.length ? `#${p.port_idx} (${peers[0]})` : `#${p.port_idx} (empty)`;
-        return `<span class="tag click ${p.state === "exposed" ? humanStateTone(p) : "warn"}" onclick="openEntity('${esc(p.id)}')">${esc(lbl)}</span>`;
+        return `<span class="tag click ${p.state === "exposed" ? humanStateTone(p) : "warn"}" data-entity-id="${esc(p.id)}">${esc(lbl)}</span>`;
       }).join("")}
       ${riskPorts.length > 6 ? `<span class="small">+${riskPorts.length - 6} more</span>` : ""}
     </div>` : ""}
@@ -2444,6 +2657,21 @@ function renderHWCard(vm, row) {
 /* ============================================================================
    TAB 3: DEVICES & WI-FI (Network Zones Explained Like Rooms)
    ========================================================================== */
+function wifiSecurityBadge(w) {
+  const sec = (w.security || "").toLowerCase().trim();
+  const mode = (w.wpa_mode || "").toLowerCase().trim();
+  if (sec === "open" || sec === "") return { label: "Open (no password)", tone: "crit" };
+  if (sec === "wep") return { label: "Legacy (WEP)", tone: "crit" };
+  if (mode === "wpa1") return { label: "Legacy (WPA1)", tone: "warn" };
+  if (mode === "wpa3" || w.wpa3_support) {
+    return { label: mode === "wpa3" ? "Modern (WPA3)" : "Modern (WPA2/WPA3)", tone: "ok" };
+  }
+  if (mode === "wpa2" || sec === "wpapsk" || sec === "wpaeap") {
+    return { label: sec === "wpaeap" ? "Enterprise (WPA2)" : "Standard (WPA2)", tone: "neutral" };
+  }
+  return { label: w.security || "Unknown", tone: "neutral" };
+}
+
 function renderDevices() {
   const vm = state.view;
   if (!vm) return;
@@ -2457,7 +2685,7 @@ function renderDevices() {
     if (deviceFilter === "bmc" && !ent.is_bmc) return false;
     if (deviceFilter === "cve" && !(ent.exact_cve_count > 0)) return false;
     if (deviceFilter === "wan" && !wanIPSet.has(ent.ip)) return false;
-    if (deviceFilter === "checking" && ent.state !== "unknown") return false;
+    if (deviceFilter === "checking" && (ent.state !== "unknown" || ent.skipped)) return false;
     if (deviceSearch) {
       const hay = [ent.label, ent.ip, ent.mac, ent.network_name, ent.role, humanRole(ent.role, ent.is_bmc), ent.vendor, (ent.services || []).map(s => s.label + " " + s.port).join(" "), (ent.reasons || []).map(r => r.ref + " " + r.title).join(" ")].join(" ").toLowerCase();
       if (!hay.includes(deviceSearch.toLowerCase())) return false;
@@ -2468,12 +2696,12 @@ function renderDevices() {
   let html = `
   <div class="bar">
     <div class="seg" style="flex-wrap:wrap">
-      <button class="seg-b ${deviceFilter === "all" ? "active" : ""}" onclick="deviceFilter='all'; renderDevices()">All (${totalHosts})</button>
-      <button class="seg-b ${deviceFilter === "issues" ? "active" : ""}" onclick="deviceFilter='issues'; renderDevices()">Needs attention</button>
-      ${c.bmc_count ? `<button class="seg-b ${deviceFilter === "bmc" ? "active" : ""}" onclick="deviceFilter='bmc'; renderDevices()">Hardware controls (${c.bmc_count})</button>` : ""}
-      ${c.exact_cve_hosts ? `<button class="seg-b ${deviceFilter === "cve" ? "active" : ""}" onclick="deviceFilter='cve'; renderDevices()">Security updates (${c.exact_cve_hosts})</button>` : ""}
-      <button class="seg-b ${deviceFilter === "wan" ? "active" : ""}" onclick="deviceFilter='wan'; renderDevices()">Open to internet</button>
-      ${c.unassessed_count ? `<button class="seg-b ${deviceFilter === "checking" ? "active" : ""}" onclick="deviceFilter='checking'; renderDevices()">Checking (${c.unassessed_count})</button>` : ""}
+      <button class="seg-b ${deviceFilter === "all" ? "active" : ""}" data-action="device-filter" data-filter="all">All (${totalHosts})</button>
+      <button class="seg-b ${deviceFilter === "issues" ? "active" : ""}" data-action="device-filter" data-filter="issues">Needs attention</button>
+      ${c.bmc_count ? `<button class="seg-b ${deviceFilter === "bmc" ? "active" : ""}" data-action="device-filter" data-filter="bmc">Hardware controls (${c.bmc_count})</button>` : ""}
+      ${c.exact_cve_hosts ? `<button class="seg-b ${deviceFilter === "cve" ? "active" : ""}" data-action="device-filter" data-filter="cve">Security updates (${c.exact_cve_hosts})</button>` : ""}
+      <button class="seg-b ${deviceFilter === "wan" ? "active" : ""}" data-action="device-filter" data-filter="wan">Open to internet</button>
+      ${c.unassessed_count ? `<button class="seg-b ${deviceFilter === "checking" ? "active" : ""}" data-action="device-filter" data-filter="checking">Checking (${c.unassessed_count})</button>` : ""}
     </div>
     <div class="search-box">
       <span class="muted">${ICONS.search}</span>
@@ -2539,17 +2767,21 @@ function renderDevices() {
       </div>
       <div class="wifi-grid">
         ${wlans.map(w => {
-          const enc = w.wpa3_support ? "Modern (WPA3)" : ((w.security || "").toLowerCase().includes("open") ? "Open (no password)" : "Standard (WPA2)");
-          const encTone = enc.includes("Open") ? "crit" : (w.wpa3_support ? "ok" : "neutral");
-          return `<div class="wifi-card">
+          const isDisabled = w.enabled === false;
+          const badge = wifiSecurityBadge(w);
+          const encTone = isDisabled ? "neutral" : badge.tone;
+          return `<div class="wifi-card"${isDisabled ? ` style="opacity:.65"` : ""}>
             <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
               <strong style="font-size:15px">${esc(w.name)}</strong>
-              ${w.is_guest ? `<span class="tag blue">Guest</span>` : ""}
+              <span style="display:inline-flex;gap:5px">
+                ${isDisabled ? `<span class="tag neutral">Disabled</span>` : ""}
+                ${w.is_guest ? `<span class="tag blue">Guest</span>` : ""}
+              </span>
             </div>
-            <div class="small" style="margin-bottom:10px">Connects to <strong>${esc(w.network_name || "Main")}</strong> network</div>
+            <div class="small" style="margin-bottom:10px">${isDisabled ? "Disabled SSID · " : ""}Connects to <strong>${esc(w.network_name || "Main")}</strong> network</div>
             <div class="pills">
-              <span class="tag ${encTone}">${esc(enc)}</span>
-              <span class="tag ${w.l2_isolation ? "ok" : "neutral"}">${w.l2_isolation ? "Devices isolated" : "Devices can talk"}</span>
+              <span class="tag ${encTone}">${esc(badge.label)}</span>
+              <span class="tag ${!isDisabled && w.l2_isolation ? "ok" : "neutral"}">${w.l2_isolation ? "Devices isolated" : "Devices can talk"}</span>
             </div>
           </div>`;
         }).join("")}
@@ -2567,7 +2799,7 @@ function renderDevices() {
       </div>`;
     for (const f of wanFlows) {
       const target = f.target_id || vm.gateway_id || "";
-      html += `<div class="story-item" onclick="openEntity('${esc(target)}')">
+      html += `<div class="story-item" ${target ? `data-entity-id="${esc(target)}"` : ""}>
         <div class="story-item-l">
           <div class="story-item-name">${esc(f.rule_name)} <span class="tag ${f.expected ? "neutral" : humanStateTone(f.severity)}">${f.expected ? "Normal P2P" : "Review"}</span></div>
           <div class="story-item-sub">Sends internet traffic to <strong>${esc(f.target_name || f.target_ip)}</strong> · <span class="mono">${esc(f.label)}</span></div>
@@ -2578,16 +2810,14 @@ function renderDevices() {
     html += `</div>`;
   }
 
-  document.getElementById("view-devices").innerHTML = html;
-  const sEl = document.getElementById("dev-search");
-  if (sEl) {
-    sEl.addEventListener("input", e => {
-      const pos = e.target.selectionStart;
-      deviceSearch = e.target.value;
-      renderDevices();
-      const again = document.getElementById("dev-search");
-      if (again) { again.focus(); again.setSelectionRange(pos, pos); }
-    });
+  if (patchContainerHTML(document.getElementById("view-devices"), html)) {
+    const sEl = document.getElementById("dev-search");
+    if (sEl) {
+      sEl.addEventListener("input", e => {
+        deviceSearch = e.target.value;
+        renderDevices();
+      });
+    }
   }
 }
 
@@ -2682,11 +2912,11 @@ function renderActivity() {
     if (e.ip && (e.kind === "host" || e.kind === "device")) entByIP[e.ip] = e.id;
   }
 
-  document.getElementById("view-activity").innerHTML = `
+  const actHTML = `
     <div class="bar">
       <div class="seg" style="flex-wrap:wrap">
         ${[["all", "Everything (" + logs.length + ")"], ["threats", "Security alerts"], ["ports", "Cables"], ["clients", "Devices & VPN"], ["admin", "Settings"]].map(([k, lbl]) =>
-          `<button class="seg-b ${activityFilter === k ? "active" : ""}" onclick="activityFilter='${k}'; renderActivity()">${lbl}</button>`
+          `<button class="seg-b ${activityFilter === k ? "active" : ""}" data-action="activity-filter" data-filter="${k}">${lbl}</button>`
         ).join("")}
       </div>
       <span class="small">Live updates + past 24 hours from your router</span>
@@ -2695,8 +2925,8 @@ function renderActivity() {
       ${filtered.length ? filtered.map(ev => {
         const target = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || (ev.dst_ip ? entByIP[ev.dst_ip] : "") || "";
         const ht = humanEventType(ev.type);
-        const click = target ? `clickable" onclick="openEntity('${esc(target)}')"` : `"`;
-        return `<div class="act-row ${click}>
+        const clickAttr = target ? ` class="act-row clickable" data-entity-id="${esc(target)}"` : ` class="act-row"`;
+        return `<div${clickAttr}>
           <div class="act-l">
             <span class="act-time mono">${fmtTime(ev.time)}</span>
             <span class="tag ${ht.tone}">${esc(ht.label)}</span>
@@ -2706,6 +2936,7 @@ function renderActivity() {
         </div>`;
       }).join("") : `<div class="empty">No matching activity yet.</div>`}
     </div>`;
+  patchContainerHTML(document.getElementById("view-activity"), actHTML);
 }
 
 /* ============================================================================
@@ -2723,6 +2954,9 @@ function plainSummaryForEntity(vm, ent) {
     return where + conn;
   }
   if (ent.kind === "host") {
+    if (ent.skipped && ent.state === "unknown") {
+      return `Active probing was skipped for <strong>${esc(ent.label)}</strong>${ent.skip_reason ? ` (${esc(ent.skip_reason)})` : ""}.`;
+    }
     if (ent.state === "unknown") {
       return `UniBlue hasn't finished checking <strong>${esc(ent.label)}</strong> yet. Once scanned, any open services or outdated software will appear right here.`;
     }
@@ -2809,19 +3043,20 @@ function renderDrawer() {
       : `<strong>${esc(ent.label)}</strong> has no open-port vulnerabilities, and your UniFi router blocked <strong>${hostAlerts.length} inbound intrusion attempt${hostAlerts.length === 1 ? "" : "s"} targeting this device</strong> in the last 24h.`)
     : plainSummaryForEntity(vm, ent);
 
-  document.getElementById("drawer-hd-content").innerHTML = `
+  const hdHTML = `
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-      ${drawerStack.length > 1 ? `<button class="btn sm" onclick="popDrawer()">← Back</button>` : ""}
+      ${drawerStack.length > 1 ? `<button class="btn sm" data-action="pop-drawer">← Back</button>` : ""}
       ${alertOnlyHost
         ? `<span class="tag ${hasOutboundAlert ? "crit" : "warn"}">Router alert (${hostAlerts.length})</span><span class="tag neutral">Services clean</span>`
         : `<span class="tag ${tone}">${esc(humanStateLabel(ent))}</span>`}
       ${!alertOnlyHost && hostAlerts.length ? `<span class="tag ${hasOutboundAlert ? "crit" : "warn"}">${hostAlerts.length} router alert${hostAlerts.length === 1 ? "" : "s"}</span>` : ""}
       ${ent.is_bmc ? `<span class="tag warn">Hardware Control</span>` : ""}
       ${ent.side === "outside" ? `<span class="tag neutral">Outside House</span>` : ""}
-      ${!isStaticMode && ent.kind === "host" && ent.ip ? `<button class="btn sm" onclick="triggerRescan('${esc(ent.ip)}')">Recheck</button>` : ""}
+      ${!isStaticMode && ent.kind === "host" && ent.ip ? `<button class="btn sm" data-action="rescan" data-rescan-ip="${esc(ent.ip)}">Recheck</button>` : ""}
     </div>
     <div style="font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.2">${esc(ent.label)}</div>
     <div class="small" style="margin-top:3px">${esc(ent.kind === "host" ? humanRole(ent.role, ent.is_bmc) : (ent.subtitle || ent.model || ""))}${ent.network_name ? ` · ${esc(ent.network_name)} network` : ""}${ent.ip ? ` · <span class="mono">${esc(ent.ip)}</span>` : ""}</div>`;
+  patchContainerHTML(document.getElementById("drawer-hd-content"), hdHTML);
 
   let b = `<div class="summary-box ${summaryTone}">${summaryText}</div>`;
 
@@ -2945,7 +3180,7 @@ function renderDrawer() {
   }
 
   // 4. Collapsible Technical Details
-  b += `<details class="tech">
+  b += `<details class="tech" data-details-key="entity-tech:${esc(ent.id)}">
     <summary>Technical details (IP, MAC, ports &amp; raw checks)</summary>
     <div class="tech-body">
       <div class="kv-grid">`;
@@ -2960,7 +3195,7 @@ function renderDrawer() {
     b += `<div class="kv"><div class="k">IP Address</div><div class="v mono">${esc(ent.ip || "-")}</div></div>
       <div class="kv"><div class="k">MAC Address</div><div class="v mono">${esc(ent.mac || "-")}</div></div>
       <div class="kv"><div class="k">Network / VLAN</div><div class="v">${esc(ent.network_name || "-")}</div></div>
-      <div class="kv"><div class="k">${ent.kind === "device" ? "Firmware" : "Last Checked"}</div><div class="v mono">${esc(ent.kind === "device" ? (ent.firmware || "-") : (ent.scanned_at ? fmtTime(ent.scanned_at) : "Not yet scanned"))}</div></div>`;
+      <div class="kv"><div class="k">${ent.kind === "device" ? "Firmware" : "Last Checked"}</div><div class="v mono">${esc(ent.kind === "device" ? (ent.firmware || "-") : (ent.scanned_at ? fmtTime(ent.scanned_at) : (ent.skipped ? (ent.state_label || "Skipped") : "Not yet scanned")))}</div></div>`;
   }
   b += `</div>`;
 
@@ -3014,7 +3249,7 @@ function renderDrawer() {
   }
 
   b += `</div></details>`;
-  document.getElementById("drawer-body").innerHTML = b;
+  patchContainerHTML(document.getElementById("drawer-body"), b);
 }
 
 function renderIsolationPanelDrawer(vm, filter) {
@@ -3047,13 +3282,13 @@ function renderIsolationPanelDrawer(vm, filter) {
     "same-vlan-mixed-peers": "Wired ↔ Wi-Fi Peers"
   };
 
-  document.getElementById("drawer-hd-content").innerHTML = `
+  patchContainerHTML(document.getElementById("drawer-hd-content"), `
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-      ${drawerStack.length > 1 ? `<button class="btn sm" onclick="popDrawer()">← Back</button>` : ""}
+      ${drawerStack.length > 1 ? `<button class="btn sm" data-action="pop-drawer">← Back</button>` : ""}
       <span class="tag blue">Isolation Policy Check</span>
     </div>
     <div style="font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.2">Network Isolation Boundaries</div>
-    <div class="small" style="margin-top:3px">Shows which network paths are blocked, approved, violating policy, or missing controller evidence.</div>`;
+    <div class="small" style="margin-top:3px">Shows which network paths are blocked, approved, violating policy, or missing controller evidence.</div>`);
 
   const filters = [
     { key: "all", label: `All (${allCells.length})` },
@@ -3068,7 +3303,7 @@ function renderIsolationPanelDrawer(vm, filter) {
 
   if (!cells.length) {
     b += `<div class="summary-box ok">No boundary checks match this filter.</div>`;
-    document.getElementById("drawer-body").innerHTML = b;
+    patchContainerHTML(document.getElementById("drawer-body"), b);
     return;
   }
 
@@ -3105,7 +3340,7 @@ function renderIsolationPanelDrawer(vm, filter) {
       ${hostID ? `<div style="margin-top:8px"><button class="btn sm ghost" data-entity-id="${esc(hostID)}">Inspect ${esc(dst)} →</button></div>` : ""}
     </div>`;
   }
-  document.getElementById("drawer-body").innerHTML = b;
+  patchContainerHTML(document.getElementById("drawer-body"), b);
 }
 
 function renderCoveragePanelDrawer(vm) {
@@ -3114,13 +3349,13 @@ function renderCoveragePanelDrawer(vm) {
   const byT = sc.by_transport || {};
   const byF = sc.by_address_family || {};
 
-  document.getElementById("drawer-hd-content").innerHTML = `
+  patchContainerHTML(document.getElementById("drawer-hd-content"), `
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-      ${drawerStack.length > 1 ? `<button class="btn sm" onclick="popDrawer()">← Back</button>` : ""}
+      ${drawerStack.length > 1 ? `<button class="btn sm" data-action="pop-drawer">← Back</button>` : ""}
       <span class="tag blue">Service Visibility</span>
     </div>
     <div style="font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.2">How Services Were Identified</div>
-    <div class="small" style="margin-top:3px">Separates wire-verified services from advertisements, encrypted TLS-only sockets, and external internet dependencies.</div>`;
+    <div class="small" style="margin-top:3px">Separates wire-verified services from advertisements, encrypted TLS-only sockets, and external internet dependencies.</div>`);
 
   let b = `<div class="summary-box blue">
     UniBlue inspected <strong>${sc.total_observed_endpoints || 0}</strong> unique local service endpoint${(sc.total_observed_endpoints || 0) === 1 ? "" : "s"} and tracked <strong>${sc.outbound_dependencies || 0}</strong> external internet dependenc${(sc.outbound_dependencies || 0) === 1 ? "y" : "ies"} separately.
@@ -3137,20 +3372,20 @@ function renderCoveragePanelDrawer(vm) {
     ${stateRows.map(([n, h, v, tone]) => `<div class="chk-row"><div class="chk-l"><span class="chk-dot ${tone}"></span><div><div class="chk-name">${esc(n)}</div><div class="chk-hint">${esc(h)}</div></div></div><div class="chk-val ${tone}">${v}</div></div>`).join("")}
   </div></div></div>`;
 
-  b += `<details class="tech"><summary>Technical breakdown (transports &amp; Nerva plugins)</summary><div class="tech-body"><div class="kv-grid">
+  b += `<details class="tech" data-details-key="coverage-tech"><summary>Technical breakdown (transports &amp; Nerva plugins)</summary><div class="tech-body"><div class="kv-grid">
     <div class="kv"><div class="k">TCP Endpoints</div><div class="v mono">${byT.tcp || 0}</div></div>
     <div class="kv"><div class="k">UDP Endpoints</div><div class="v mono">${byT.udp || 0}</div></div>
     <div class="kv"><div class="k">IPv4 / IPv6</div><div class="v mono">${byF.ipv4 || 0} / ${byF.ipv6 || 0}</div></div>
     <div class="kv"><div class="k">Pinned Recognizers</div><div class="v mono">${sc.pinned_nerva_tcp_capable || 0} TCP/TLS · ${sc.pinned_nerva_udp_only || 0} UDP</div></div>
   </div></div></details>`;
 
-  document.getElementById("drawer-body").innerHTML = b;
+  patchContainerHTML(document.getElementById("drawer-body"), b);
 }
 
 /* ============================================================================
    LIVE LOOP & OFFLINE SNAPSHOT BOOTSTRAP
    ============================================================================ */
-function renderActiveTab() {
+function renderActiveTab(progressOnly = false) {
   if (!state) return;
   const initial = isInitialScanActive();
   if (!initial) bypassInitialSplash = false;
@@ -3168,6 +3403,10 @@ function renderActiveTab() {
     return;
   }
 
+  // During scan_progress ticks when the user is interacting with a tab or drawer,
+  // header + scan banner already updated above; avoid rebuilding active views/drawer.
+  if (progressOnly) return;
+
   document.querySelectorAll("main > section.view:not(#view-initial)").forEach(s => s.classList.toggle("active", s.id === "view-" + activeTab));
   if (activeTab === "checkup") renderCheckup();
   else if (activeTab === "house") renderHouse();
@@ -3176,10 +3415,12 @@ function renderActiveTab() {
   if (drawerStack.length) renderDrawer();
 }
 
-async function fetchState() {
+let fetchQueuedProgressOnly = true;
+async function fetchState(progressOnly = false) {
   if (isStaticMode) return;
   if (fetchInFlight) {
     fetchQueued = true;
+    if (!progressOnly) fetchQueuedProgressOnly = false;
     return;
   }
   fetchInFlight = true;
@@ -3192,12 +3433,14 @@ async function fetchState() {
       applyHash();
       syncHash(false);
     }
-    renderActiveTab();
+    renderActiveTab(progressOnly);
   } finally {
     fetchInFlight = false;
     if (fetchQueued) {
+      const nextProgressOnly = fetchQueuedProgressOnly;
       fetchQueued = false;
-      fetchState();
+      fetchQueuedProgressOnly = true;
+      fetchState(nextProgressOnly);
     }
   }
 }
@@ -3205,8 +3448,34 @@ async function fetchState() {
 async function triggerRescan(ip) {
   if (isStaticMode) return;
   const url = ip ? ("/api/rescan?ip=" + encodeURIComponent(ip)) : "/api/rescan";
-  await fetch(url, {method: "POST"});
-  setTimeout(fetchState, 600);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "X-UniBlue-Request": "1" }
+    });
+    if (!resp.ok) {
+      let detail = `HTTP ${resp.status}`;
+      try {
+        const txt = (await resp.text()).trim();
+        if (txt) detail += ": " + txt.slice(0, 120);
+      } catch (_) {}
+      showToast({
+        type: "finding",
+        severity: "high",
+        time: new Date().toISOString(),
+        summary: `Rescan request failed (${detail})`
+      });
+      return;
+    }
+    setTimeout(fetchState, 600);
+  } catch (err) {
+    showToast({
+      type: "finding",
+      severity: "high",
+      time: new Date().toISOString(),
+      summary: `Rescan request failed: ${err?.message || "network error"}`
+    });
+  }
 }
 
 function resolveEventSubject(ev) {
@@ -3265,18 +3534,54 @@ function showToast(ev) {
   setTimeout(dismiss, ttl);
 }
 
+function scheduleSSEReconnect() {
+  if (isStaticMode || sseRetryTimer) return;
+  const delay = sseRetryMs;
+  sseRetryMs = Math.min(30000, sseRetryMs * 2);
+  sseRetryTimer = setTimeout(() => {
+    sseRetryTimer = null;
+    connectSSE();
+  }, delay);
+}
+
 function connectSSE() {
   if (isStaticMode) return;
+  if (sseSource) {
+    try { sseSource.close(); } catch (_) {}
+    sseSource = null;
+  }
   const es = new EventSource("/api/events");
+  sseSource = es;
   es.addEventListener("uniblue", (msg) => {
+    sseDisconnected = false;
+    sseRetryMs = 1000;
     let ev = null;
     try { ev = JSON.parse(msg.data); } catch (_) {}
-    fetchState().then(() => {
+    if (ev && ev.type === "scan_progress") {
+      fetchState(true);
+      return;
+    }
+    fetchState(false).then(() => {
       if (ev) showToast(ev);
     });
   });
-  es.onerror = () => { document.getElementById("status-lbl").textContent = "Reconnecting…"; };
-  es.onopen = () => fetchState();
+  es.onerror = () => {
+    sseDisconnected = true;
+    const pill = document.getElementById("status-pill");
+    const lbl = document.getElementById("status-lbl");
+    if (pill) pill.className = "status-pill";
+    if (lbl) lbl.textContent = es.readyState === EventSource.CLOSED ? "Offline (reconnecting...)" : "Reconnecting...";
+    if (es.readyState === EventSource.CLOSED) {
+      try { es.close(); } catch (_) {}
+      if (sseSource === es) sseSource = null;
+      scheduleSSEReconnect();
+    }
+  };
+  es.onopen = () => {
+    sseDisconnected = false;
+    sseRetryMs = 1000;
+    fetchState(false);
+  };
 }
 
 const staticEl = document.getElementById("uniblue-static-state");

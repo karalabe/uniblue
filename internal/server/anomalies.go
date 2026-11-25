@@ -46,7 +46,9 @@ type txSample struct {
 // physical tampering, behavioral anomalies, Evil-Twin APs, VPN/WAN transitions,
 // controller security logs, and security configuration drift.
 type anomalyTracker struct {
-	poeBaselineWatts map[string]float64 // devMAC|portIdx -> max observed PoE watts
+	poeBaselineWatts map[string]float64 // devMAC|portIdx -> observed PoE watts baseline
+	poeAlertedPorts  map[string]bool    // devMAC|portIdx -> already alerted for current swap
+	portMACBaseline  map[string]int     // devMAC|portIdx -> learned normal MAC count
 	knownHistory     map[string]unifi.HistoricalClient
 	clientTx         map[string]txSample // mac -> rolling tx baseline
 	seenLogIDs       map[string]struct{} // deduplicates v2 system-log events
@@ -55,13 +57,16 @@ type anomalyTracker struct {
 	lastVPNCount     int
 	lastWANIP        string
 	lastWANStatus    string
-	lastSecuritySig  string
+	lastSettingsSig  string
+	lastWLANSig      string
 	initialized      bool
 }
 
 func newAnomalyTracker() *anomalyTracker {
 	return &anomalyTracker{
 		poeBaselineWatts: make(map[string]float64),
+		poeAlertedPorts:  make(map[string]bool),
+		portMACBaseline:  make(map[string]int),
 		knownHistory:     make(map[string]unifi.HistoricalClient),
 		clientTx:         make(map[string]txSample),
 		seenLogIDs:       make(map[string]struct{}),
@@ -80,6 +85,9 @@ func (a *anomalyTracker) Seed(snap *unifi.Snapshot, ports map[string]portLiveSta
 		if p.PoEPowerWatts >= poeBaselineMinWatts {
 			a.poeBaselineWatts[pk] = p.PoEPowerWatts
 		}
+		if p.Up && p.MACTableCount > 0 {
+			a.portMACBaseline[pk] = p.MACTableCount
+		}
 	}
 	for _, hc := range snap.KnownClients {
 		a.knownHistory[hc.MAC] = hc
@@ -89,6 +97,15 @@ func (a *anomalyTracker) Seed(snap *unifi.Snapshot, ports map[string]portLiveSta
 		if cl.TxBytes > 0 {
 			a.clientTx[k] = txSample{Bytes: cl.TxBytes, At: now}
 		}
+		a.knownHistory[k] = unifi.HistoricalClient{
+			MAC:             k,
+			Name:            cl.Name,
+			Hostname:        cl.Hostname,
+			IsWired:         cl.IsWired,
+			FirstSeen:       cl.FirstSeen,
+			LastSeen:        now.Unix(),
+			LastNetworkName: cl.NetworkName,
+		}
 	}
 	for _, ev := range snap.RecentLogs {
 		a.seenLogIDs[ev.ID] = struct{}{}
@@ -97,9 +114,16 @@ func (a *anomalyTracker) Seed(snap *unifi.Snapshot, ports map[string]portLiveSta
 		a.lastWANIP = snap.Health.WANIP
 		a.lastWANStatus = snap.Health.WANStatus
 		a.lastVPNCount = snap.Health.ActiveVPNUsers
-		a.lastVPNKeys = indexVPNConnections(snap.Health.VPNConnections)
+		if snap.Visibility == nil || snap.Visibility.VPNAvailable || len(snap.Health.VPNConnections) > 0 {
+			a.lastVPNKeys = indexVPNConnections(snap.Health.VPNConnections)
+		}
 	}
-	a.lastSecuritySig = securityConfigSignature(snap.SecuritySettings, snap.WLANs)
+	if snap.SecuritySettings != nil {
+		a.lastSettingsSig = settingsOnlySignature(snap.SecuritySettings)
+	}
+	if snap.Visibility == nil || snap.Visibility.WLANsAvailable || len(snap.WLANs) > 0 {
+		a.lastWLANSig = wlansOnlySignature(snap.WLANs)
+	}
 	a.initialized = true
 }
 
@@ -110,10 +134,16 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 	var events []LiveEvent
 	for pk, curr := range currPorts {
 		prev, existed := prevPorts[pk]
-		if curr.PoEPowerWatts >= poeBaselineMinWatts && curr.PoEPowerWatts > a.poeBaselineWatts[pk] {
+		if curr.PoEPowerWatts >= poeBaselineMinWatts {
+			// Track active PoE draw smoothly and clear any prior cable-swap latch
+			// once a PoE device is drawing power again.
 			a.poeBaselineWatts[pk] = curr.PoEPowerWatts
+			delete(a.poeAlertedPorts, pk)
 		}
 		if !existed {
+			if curr.Up && curr.MACTableCount > a.portMACBaseline[pk] {
+				a.portMACBaseline[pk] = curr.MACTableCount
+			}
 			continue
 		}
 
@@ -123,10 +153,12 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 		// 1. PoE cable-swap / tamper detection:
 		// A port that previously powered a PoE device (>= 2W, e.g., outdoor camera)
 		// is now link UP while drawing < 0.5W (e.g., laptop/implant plugged into the
-		// camera cable, potentially spoofing the camera's MAC address).
+		// camera cable, potentially spoofing the camera's MAC address). Alert once
+		// per transition and then reset the PoE baseline so legitimately replacing
+		// a PoE camera with a non-PoE device does not alert forever.
 		baseW := a.poeBaselineWatts[pk]
 		wasDrawingPoE := prev.PoEPowerWatts >= poeBaselineMinWatts || (!prev.Up && curr.Up && baseW >= poeBaselineMinWatts)
-		if curr.Up && baseW >= poeBaselineMinWatts && curr.PoEPowerWatts <= poeDropMaxWatts && wasDrawingPoE {
+		if curr.Up && baseW >= poeBaselineMinWatts && curr.PoEPowerWatts <= poeDropMaxWatts && wasDrawingPoE && !a.poeAlertedPorts[pk] {
 			sev := "high"
 			if isExternal {
 				sev = "critical"
@@ -139,11 +171,16 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 				Summary: fmt.Sprintf("Possible physical cable swap on %s Port %d (zone=%s): link is UP with %.2fW PoE draw (baseline %.2fW; PoE device replaced by non-PoE host?)",
 					curr.DeviceName, curr.PortIdx, curr.Zone, curr.PoEPowerWatts, baseW),
 			})
+			a.poeAlertedPorts[pk] = true
+			delete(a.poeBaselineWatts, pk)
 		}
 
 		// 2. Inline hub / rogue mini-switch detection (MAC table surge):
-		// Non-uplink access port jumped from <= 1 learned MAC to >= 2 MACs.
-		if isAccess && curr.Up && prev.MACTableCount <= 1 && curr.MACTableCount >= 2 {
+		// Only alert when a non-uplink access port that was already UP (not a
+		// normal link-up repopulating a known mini-switch/IP phone) exceeds its
+		// learned baseline and jumps from <= 1 to >= 2 MACs.
+		learnedBase := a.portMACBaseline[pk]
+		if isAccess && curr.Up && prev.Up && !curr.HasUniFiPeer && prev.MACTableCount <= 1 && curr.MACTableCount >= 2 && learnedBase <= 1 {
 			sev := "high"
 			if isExternal {
 				sev = "critical"
@@ -156,6 +193,9 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 				Summary: fmt.Sprintf("MAC table jumped %d -> %d on %s Port %d (zone=%s): possible unauthorized mini-switch, travel router, or inline tap",
 					prev.MACTableCount, curr.MACTableCount, curr.DeviceName, curr.PortIdx, curr.Zone),
 			})
+		}
+		if curr.Up && curr.MACTableCount > a.portMACBaseline[pk] {
+			a.portMACBaseline[pk] = curr.MACTableCount
 		}
 
 		// 3. Spanning Tree (STP) loop blocking transition.
@@ -335,7 +375,7 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 		if _, match := ourSSIDs[strings.ToLower(rap.ESSID)]; !match {
 			continue
 		}
-		if isOwnedRadioBSSID(rap.BSSID, ownedMACs) {
+		if isOwnedRadioBSSID(rap, ownedMACs) {
 			continue
 		}
 		if _, alerted := a.seenEvilTwins[rap.BSSID]; !alerted {
@@ -376,64 +416,101 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			a.lastWANStatus = snap.Health.WANStatus
 		}
 
-		currVPN := indexVPNConnections(snap.Health.VPNConnections)
-		for k, vc := range currVPN {
-			if _, existed := a.lastVPNKeys[k]; !existed {
+		vpnAvailable := snap.Visibility == nil || snap.Visibility.VPNAvailable || len(snap.Health.VPNConnections) > 0
+		if vpnAvailable {
+			currVPN := indexVPNConnections(snap.Health.VPNConnections)
+			for k, vc := range currVPN {
+				if _, existed := a.lastVPNKeys[k]; !existed {
+					events = append(events, LiveEvent{
+						Type:     "vpn_connected",
+						Severity: "medium",
+						Host:     firstStr(vc.User, vc.Name, vc.LocalIP),
+						IP:       vc.RemoteIP,
+						Summary:  fmt.Sprintf("Remote VPN peer connected: %s (%s, remote=%s, local=%s)", firstStr(vc.User, vc.Name, "VPN user"), vc.Type, vc.RemoteIP, vc.LocalIP),
+					})
+				}
+			}
+			for k, vc := range a.lastVPNKeys {
+				if _, still := currVPN[k]; !still {
+					events = append(events, LiveEvent{
+						Type:     "vpn_disconnected",
+						Severity: "info",
+						Host:     firstStr(vc.User, vc.Name, vc.LocalIP),
+						IP:       vc.RemoteIP,
+						Summary:  fmt.Sprintf("Remote VPN peer disconnected: %s (%s)", firstStr(vc.User, vc.Name, "VPN user"), vc.Type),
+					})
+				}
+			}
+			// Fallback counter alert when UniFi reports remote_user_num_active without per-connection details.
+			if len(currVPN) == 0 && len(a.lastVPNKeys) == 0 && snap.Health.ActiveVPNUsers != a.lastVPNCount {
+				sev := "info"
+				verb := "disconnected"
+				if snap.Health.ActiveVPNUsers > a.lastVPNCount {
+					sev = "medium"
+					verb = "connected"
+				}
 				events = append(events, LiveEvent{
-					Type:     "vpn_connected",
-					Severity: "medium",
-					Host:     firstStr(vc.User, vc.Name, vc.LocalIP),
-					IP:       vc.RemoteIP,
-					Summary:  fmt.Sprintf("Remote VPN peer connected: %s (%s, remote=%s, local=%s)", firstStr(vc.User, vc.Name, "VPN user"), vc.Type, vc.RemoteIP, vc.LocalIP),
+					Type:     "vpn_session_changed",
+					Severity: sev,
+					Summary:  fmt.Sprintf("Active remote VPN users %s (%d -> %d)", verb, a.lastVPNCount, snap.Health.ActiveVPNUsers),
 				})
 			}
+			a.lastVPNKeys = currVPN
+			a.lastVPNCount = snap.Health.ActiveVPNUsers
 		}
-		for k, vc := range a.lastVPNKeys {
-			if _, still := currVPN[k]; !still {
-				events = append(events, LiveEvent{
-					Type:     "vpn_disconnected",
-					Severity: "info",
-					Host:     firstStr(vc.User, vc.Name, vc.LocalIP),
-					IP:       vc.RemoteIP,
-					Summary:  fmt.Sprintf("Remote VPN peer disconnected: %s (%s)", firstStr(vc.User, vc.Name, "VPN user"), vc.Type),
-				})
-			}
-		}
-		// Fallback counter alert when UniFi reports remote_user_num_active without per-connection details.
-		if len(currVPN) == 0 && len(a.lastVPNKeys) == 0 && snap.Health.ActiveVPNUsers != a.lastVPNCount {
-			sev := "info"
-			verb := "disconnected"
-			if snap.Health.ActiveVPNUsers > a.lastVPNCount {
-				sev = "medium"
-				verb = "connected"
-			}
-			events = append(events, LiveEvent{
-				Type:     "vpn_session_changed",
-				Severity: sev,
-				Summary:  fmt.Sprintf("Active remote VPN users %s (%d -> %d)", verb, a.lastVPNCount, snap.Health.ActiveVPNUsers),
-			})
-		}
-		a.lastVPNKeys = currVPN
-		a.lastVPNCount = snap.Health.ActiveVPNUsers
 	}
 
-	// 4. Detect controller security setting or Wi-Fi SSID configuration drift.
-	secSig := securityConfigSignature(snap.SecuritySettings, snap.WLANs)
-	if a.lastSecuritySig != "" && secSig != "" && secSig != a.lastSecuritySig {
+	// 4. Detect controller security setting or Wi-Fi SSID configuration drift,
+	// only comparing each feed when it was actually retrieved cleanly so a
+	// transient fetch failure never fires false config_drift alerts.
+	driftDetected := false
+	settingsAvail := snap.SecuritySettings != nil && (snap.Visibility == nil || snap.Visibility.SettingsAvailable || snap.SecuritySettings != nil)
+	if settingsAvail {
+		sig := settingsOnlySignature(snap.SecuritySettings)
+		if a.lastSettingsSig != "" && sig != a.lastSettingsSig {
+			driftDetected = true
+		}
+		a.lastSettingsSig = sig
+	}
+	wlansAvail := snap.Visibility == nil || snap.Visibility.WLANsAvailable || len(snap.WLANs) > 0
+	if wlansAvail {
+		sig := wlansOnlySignature(snap.WLANs)
+		if a.lastWLANSig != "" && sig != a.lastWLANSig {
+			driftDetected = true
+		}
+		a.lastWLANSig = sig
+	}
+	if driftDetected {
 		events = append(events, LiveEvent{
 			Type:     "config_drift",
 			Severity: "high",
 			Summary:  "UniFi site security settings or Wi-Fi SSID configuration changed; re-auditing posture",
 		})
 	}
-	if secSig != "" {
-		a.lastSecuritySig = secSig
-	}
 
-	// Refresh knownHistory map softly for future joins.
+	// Refresh knownHistory entries from both KnownClients and live active clients
+	// so long daemon uptimes never raise false 30-day dormant wakeups or repeated
+	// medium-swap alerts after a device legitimately switches wired <-> Wi-Fi.
+	nowUnix := time.Now().UTC().Unix()
 	for _, hc := range snap.KnownClients {
-		if _, exists := a.knownHistory[hc.MAC]; !exists {
+		if prev, exists := a.knownHistory[hc.MAC]; !exists || hc.LastSeen >= prev.LastSeen {
 			a.knownHistory[hc.MAC] = hc
+		}
+	}
+	for _, cl := range snap.Clients {
+		k := clientKey(cl)
+		ls := cl.LastSeen
+		if ls <= 0 {
+			ls = nowUnix
+		}
+		a.knownHistory[k] = unifi.HistoricalClient{
+			MAC:             k,
+			Name:            cl.Name,
+			Hostname:        cl.Hostname,
+			IsWired:         cl.IsWired,
+			FirstSeen:       cl.FirstSeen,
+			LastSeen:        ls,
+			LastNetworkName: cl.NetworkName,
 		}
 	}
 
@@ -451,14 +528,18 @@ func indexVPNConnections(list []unifi.VPNConnection) map[string]unifi.VPNConnect
 	return out
 }
 
-func securityConfigSignature(s *unifi.SiteSecuritySettings, wlans []unifi.WLANConfig) string {
-	var parts []string
-	if s != nil {
-		parts = append(parts, fmt.Sprintf("sec:%v|%v|%d|%v|%v|%s|%v|%s|%v",
-			s.SSHEnabled, s.SSHPasswordAuth, s.SSHKeyCount,
-			s.UPnPEnabled, s.UPnPNATPMPEnabled, s.IPSMode,
-			s.HoneypotEnabled, s.DoHState, s.TeleportEnabled))
+func settingsOnlySignature(s *unifi.SiteSecuritySettings) string {
+	if s == nil {
+		return ""
 	}
+	return fmt.Sprintf("sec:%v|%v|%d|%v|%v|%s|%v|%s|%v",
+		s.SSHEnabled, s.SSHPasswordAuth, s.SSHKeyCount,
+		s.UPnPEnabled, s.UPnPNATPMPEnabled, s.IPSMode,
+		s.HoneypotEnabled, s.DoHState, s.TeleportEnabled)
+}
+
+func wlansOnlySignature(wlans []unifi.WLANConfig) string {
+	parts := make([]string, 0, len(wlans))
 	for _, w := range wlans {
 		parts = append(parts, fmt.Sprintf("wlan:%s|%v|%s|%s|%v|%s|%v|%v|%s",
 			w.Name, w.Enabled, w.Security, w.WPAMode, w.WPA3Support, w.PMFMode, w.L2Isolation, w.IsGuest, w.NetworkName))
@@ -476,8 +557,16 @@ func isApplianceCategory(cat string) bool {
 	}
 }
 
-func isOwnedRadioBSSID(bssid string, ownedMACs map[string]struct{}) bool {
-	bParts := strings.Split(strings.ToLower(bssid), ":")
+func isOwnedRadioBSSID(rap unifi.RogueAP, ownedMACs map[string]struct{}) bool {
+	if rap.IsRogue {
+		return false
+	}
+	if ouiLow := strings.ToLower(strings.TrimSpace(rap.OUI)); ouiLow != "" &&
+		!strings.Contains(ouiLow, "ubiquiti") && !strings.Contains(ouiLow, "ubnt") {
+		return false
+	}
+	bssid := strings.ToLower(strings.TrimSpace(rap.BSSID))
+	bParts := strings.Split(bssid, ":")
 	if len(bParts) != 6 {
 		return false
 	}
@@ -487,7 +576,9 @@ func isOwnedRadioBSSID(bssid string, ownedMACs map[string]struct{}) bool {
 		}
 		oParts := strings.Split(om, ":")
 		if len(oParts) == 6 && bParts[1] == oParts[1] && bParts[2] == oParts[2] && bParts[3] == oParts[3] && bParts[4] == oParts[4] {
-			return true
+			if len(bParts[0]) == 2 && len(oParts[0]) == 2 && bParts[0][0] == oParts[0][0] {
+				return true
+			}
 		}
 	}
 	return false
