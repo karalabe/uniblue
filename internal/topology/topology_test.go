@@ -74,3 +74,42 @@ func TestBuildTopologyPlacement(t *testing.T) {
 		t.Fatalf("wan proxy placement = %q, want review", placements["192.168.1.30"])
 	}
 }
+
+// TestBuildGroupsUnassignedClientsIntoSingleVLAN verifies that multiple clients
+// without a resolvable NetworkName or NetworkID share a single "Unassigned"
+// VLAN group rather than creating one duplicate group per client.
+func TestBuildGroupsUnassignedClientsIntoSingleVLAN(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Site:           "default",
+		ControllerType: "classic",
+		Networks: []unifi.Network{
+			{ID: "n1", Name: "Default", VLAN: "1", Subnet: "192.168.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
+		},
+		Clients: []unifi.Client{
+			{IP: "192.168.1.10", MAC: "aa:bb:cc:00:00:01", Name: "known-host", NetworkID: "n1", NetworkName: "Default"},
+			{IP: "192.168.1.20", MAC: "aa:bb:cc:00:00:02", Name: "orphan-1"},
+			{IP: "192.168.1.21", MAC: "aa:bb:cc:00:00:03", Name: "orphan-2", NetworkName: "   "},
+			{IP: "192.168.1.22", MAC: "aa:bb:cc:00:00:04", Name: "orphan-3", NetworkID: "missing-net"},
+		},
+	}
+
+	model := Build(snap, nil, config.NetworkConfig{})
+	if len(model.VLANs) != 2 {
+		t.Fatalf("got %d VLAN groups (%+v), want 2 (Default + single Unassigned)", len(model.VLANs), model.VLANs)
+	}
+
+	unassignedGroups := 0
+	unassignedClients := 0
+	for _, vg := range model.VLANs {
+		if vg.Name == "Unassigned" {
+			unassignedGroups++
+			unassignedClients += len(vg.Clients)
+		}
+	}
+	if unassignedGroups != 1 {
+		t.Fatalf("got %d Unassigned VLAN groups, want 1", unassignedGroups)
+	}
+	if unassignedClients != 3 {
+		t.Fatalf("got %d clients in Unassigned VLAN group, want 3", unassignedClients)
+	}
+}

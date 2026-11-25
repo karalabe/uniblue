@@ -9,10 +9,13 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -277,16 +280,20 @@ func Default() *Config {
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
+	loadedFromFile := false
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if !(errors.Is(err, os.ErrNotExist) && os.Getenv("UNIBLUE_UNIFI_URL") != "") {
 			return nil, fmt.Errorf("read config %q: %w", path, err)
 		}
 	} else {
+		loadedFromFile = true
 		// Clear default ports before unmarshaling so we can tell whether the
 		// user explicitly overrode scan.ports vs. left it omitted.
 		cfg.Scan.Ports = nil
-		if err := yaml.Unmarshal(raw, cfg); err != nil {
+		dec := yaml.NewDecoder(bytes.NewReader(raw))
+		dec.KnownFields(true)
+		if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("parse config %q: %w", path, err)
 		}
 	}
@@ -338,6 +345,15 @@ func Load(path string) (*Config, error) {
 	if cfg.State.Path == "" {
 		cfg.State.Path = "uniblue-state.json"
 	}
+	if !filepath.IsAbs(cfg.State.Path) {
+		if loadedFromFile {
+			if cfgDir := filepath.Dir(path); cfgDir != "" && cfgDir != "." {
+				cfg.State.Path = filepath.Join(cfgDir, cfg.State.Path)
+			}
+		} else if cwd, err := os.Getwd(); err == nil && cwd == string(filepath.Separator) {
+			cfg.State.Path = defaultFallbackStatePath(cfg.State.Path)
+		}
+	}
 	if cfg.Notify.Format == "" {
 		cfg.Notify.Format = "json"
 	}
@@ -345,10 +361,85 @@ func Load(path string) (*Config, error) {
 		cfg.Notify.MinSeverity = "medium"
 	}
 
+	// Canonicalize configured MAC addresses (supporting dash, dot, and bare hex forms)
+	// so comparisons against UniFi colon-form MACs always match reliably.
+	for i, dev := range cfg.Network.ExternalDevices {
+		if mac, ok := ParseCanonicalMAC(dev); ok {
+			cfg.Network.ExternalDevices[i] = mac
+		}
+	}
+	for i := range cfg.Network.PhysicalPorts {
+		if mac, ok := ParseCanonicalMAC(cfg.Network.PhysicalPorts[i].Device); ok {
+			cfg.Network.PhysicalPorts[i].Device = mac
+		}
+		for j, m := range cfg.Network.PhysicalPorts[i].AllowedMACs {
+			cfg.Network.PhysicalPorts[i].AllowedMACs[j] = CanonicalMAC(m)
+		}
+	}
+	for i := range cfg.Network.BridgeInventories {
+		if mac, ok := ParseCanonicalMAC(cfg.Network.BridgeInventories[i].ParentMAC); ok {
+			cfg.Network.BridgeInventories[i].ParentMAC = mac
+		}
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// ParseCanonicalMAC parses a 48-bit MAC address in colon, dash, Cisco dot, or
+// bare 12-hex-digit form and returns lowercase colon-separated aa:bb:cc:dd:ee:ff.
+func ParseCanonicalMAC(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", false
+	}
+	var hexBuf [12]byte
+	n := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ':' || c == '-' || c == '.' {
+			continue
+		}
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+			c += 'a' - 'A'
+		default:
+			return "", false
+		}
+		if n >= 12 {
+			return "", false
+		}
+		hexBuf[n] = c
+		n++
+	}
+	if n != 12 {
+		return "", false
+	}
+	return fmt.Sprintf("%s:%s:%s:%s:%s:%s",
+		hexBuf[0:2], hexBuf[2:4], hexBuf[4:6], hexBuf[6:8], hexBuf[8:10], hexBuf[10:12]), true
+}
+
+// CanonicalMAC returns the canonical lowercase colon-separated MAC when raw is
+// a valid 48-bit MAC, or trimmed lowercase raw otherwise.
+func CanonicalMAC(raw string) string {
+	if mac, ok := ParseCanonicalMAC(raw); ok {
+		return mac
+	}
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func defaultFallbackStatePath(baseName string) string {
+	if stateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME")); stateHome != "" {
+		return filepath.Join(stateHome, "uniblue", baseName)
+	}
+	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+		return filepath.Join(cacheDir, "uniblue", baseName)
+	}
+	return baseName
 }
 
 // Validate checks that required fields are present and well-formed before any
@@ -373,6 +464,12 @@ func (c *Config) Validate() error {
 	case "json", "discord", "slack", "ntfy":
 	default:
 		return fmt.Errorf("config: unsupported notify.format %q (want json, discord, slack, or ntfy)", c.Notify.Format)
+	}
+	if wh := strings.TrimSpace(c.Notify.WebhookURL); wh != "" {
+		whURL, err := url.Parse(wh)
+		if err != nil || (whURL.Scheme != "http" && whURL.Scheme != "https") || whURL.Host == "" {
+			return fmt.Errorf("config: notify.webhook_url %q must be a valid http(s) URL", c.Notify.WebhookURL)
+		}
 	}
 	for _, pr := range c.Network.PhysicalPorts {
 		if strings.TrimSpace(pr.Device) == "" || pr.Port < 1 {

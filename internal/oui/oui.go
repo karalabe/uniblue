@@ -41,18 +41,19 @@ const (
 // registrySource describes one official IEEE CSV registry endpoint and its
 // expected assignment prefix length in hex nibbles.
 type registrySource struct {
-	Name    string
-	URL     string
-	Nibbles int
+	Name       string
+	URL        string
+	Nibbles    int
+	MinEntries int
 }
 
 // defaultSources lists the four official public IEEE MAC assignment registries,
 // covering 24-bit (MA-L), 28-bit (MA-M), and 36-bit (MA-S / IAB) vendor blocks.
 var defaultSources = []registrySource{
-	{Name: "MA-L", URL: "https://standards-oui.ieee.org/oui/oui.csv", Nibbles: 6},
-	{Name: "MA-M", URL: "https://standards-oui.ieee.org/oui28/mam.csv", Nibbles: 7},
-	{Name: "MA-S", URL: "https://standards-oui.ieee.org/oui36/oui36.csv", Nibbles: 9},
-	{Name: "IAB", URL: "https://standards-oui.ieee.org/iab/iab.csv", Nibbles: 9},
+	{Name: "MA-L", URL: "https://standards-oui.ieee.org/oui/oui.csv", Nibbles: 6, MinEntries: 1000},
+	{Name: "MA-M", URL: "https://standards-oui.ieee.org/oui28/mam.csv", Nibbles: 7, MinEntries: 100},
+	{Name: "MA-S", URL: "https://standards-oui.ieee.org/oui36/oui36.csv", Nibbles: 9, MinEntries: 100},
+	{Name: "IAB", URL: "https://standards-oui.ieee.org/iab/iab.csv", Nibbles: 9, MinEntries: 100},
 }
 
 // builtinVirtualOUIs maps well-known virtualization and container MAC prefixes
@@ -256,6 +257,9 @@ func (d *DB) Sync(ctx context.Context, progress func(string)) (*Meta, error) {
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("sync ieee oui registries: %w", errors.Join(errs...))
 	}
+	if len(merged) == 0 {
+		return nil, fmt.Errorf("sync ieee oui registries: fetched zero valid OUI entries")
+	}
 
 	// Write compiled table sorted deterministically for reproducible gzip output.
 	keys := make([]string, 0, len(merged))
@@ -342,18 +346,33 @@ func (d *DB) fetchCSV(ctx context.Context, src registrySource) (map[string]strin
 	reader.FieldsPerRecord = -1
 	reader.LazyQuotes = true
 
-	// Skip CSV header row ("Registry,Assignment,Organization Name,Organization Address").
-	if _, err := reader.Read(); err != nil {
+	// Read and validate the IEEE CSV header row ("Registry,Assignment,Organization Name,Organization Address")
+	// so HTML captive portals or malformed 200 responses cannot overwrite a valid database.
+	header, err := reader.Read()
+	if err != nil {
 		return nil, fmt.Errorf("read csv header: %w", err)
+	}
+	if !isValidIEEEHeader(header) {
+		return nil, fmt.Errorf("unexpected csv header from %s", src.URL)
 	}
 
 	out := make(map[string]string)
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("read csv body: %w", err)
+		}
 		rec, err := reader.Read()
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		if err != nil || len(rec) < 3 {
+		if err != nil {
+			var parseErr *csv.ParseError
+			if errors.As(err, &parseErr) {
+				continue
+			}
+			return nil, fmt.Errorf("read csv body: %w", err)
+		}
+		if len(rec) < 3 {
 			continue
 		}
 		assignment := normalizeHex(rec[1])
@@ -367,7 +386,24 @@ func (d *DB) fetchCSV(ctx context.Context, src registrySource) (map[string]strin
 			out[pfx] = org
 		}
 	}
+	if src.MinEntries > 0 && len(out) < src.MinEntries {
+		return nil, fmt.Errorf("too few entries in %s CSV: got %d, want at least %d", src.Name, len(out), src.MinEntries)
+	}
 	return out, nil
+}
+
+// isValidIEEEHeader checks whether a CSV header row matches the official IEEE
+// OUI schema ("Registry,Assignment,Organization Name,...").
+func isValidIEEEHeader(header []string) bool {
+	if len(header) < 3 {
+		return false
+	}
+	col0 := strings.TrimSpace(strings.TrimPrefix(header[0], "\ufeff"))
+	col1 := strings.TrimSpace(header[1])
+	col2 := strings.ToLower(strings.TrimSpace(header[2]))
+	return strings.EqualFold(col0, "registry") &&
+		strings.EqualFold(col1, "assignment") &&
+		strings.Contains(col2, "organization")
 }
 
 // Lookup resolves a MAC address using longest-prefix matching across 36-bit

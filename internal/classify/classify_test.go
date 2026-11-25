@@ -181,3 +181,94 @@ func TestClassifyPreservesHardwareIdentityOverServicesAndWAN(t *testing.T) {
 		t.Fatalf("Backup host classified as %+v, want Backup Server", pbs)
 	}
 }
+
+// TestClassifyHostnameBoundariesAndPersonalPrecedence verifies that whole-token
+// hostname matching and personal-device rule precedence prevent names like
+// "Camerons-iPhone", "Campbell-Laptop", "Jonass-iPhone", and "Panasonic-TV"
+// from being misclassified as cameras or NAS servers while preserving true
+// camera, NAS, and Proxmox hostname matches.
+func TestClassifyHostnameBoundariesAndPersonalPrecedence(t *testing.T) {
+	c, err := Load(classifydata.BuiltinFS, oui.New(t.TempDir()))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		client    unifi.Client
+		wantCat   Category
+		forbidCat Category
+	}{
+		{
+			name:    "Camerons-iPhone with private MAC is personal not camera",
+			client:  unifi.Client{IP: "192.0.2.10", MAC: "02:aa:bb:00:00:10", Hostname: "Camerons-iPhone", IsWired: false},
+			wantCat: CategoryPersonal,
+		},
+		{
+			name:    "Campbell-Laptop is personal not camera",
+			client:  unifi.Client{IP: "192.0.2.11", MAC: "00:11:22:00:00:11", Hostname: "Campbell-Laptop", IsWired: false},
+			wantCat: CategoryPersonal,
+		},
+		{
+			name:    "Jonass-iPhone is personal not NAS",
+			client:  unifi.Client{IP: "192.0.2.12", MAC: "02:aa:bb:00:00:12", Hostname: "Jonass-iPhone", IsWired: false},
+			wantCat: CategoryPersonal,
+		},
+		{
+			name:      "Panasonic-TV is media not NAS",
+			client:    unifi.Client{IP: "192.0.2.13", MAC: "00:11:22:00:00:13", Hostname: "Panasonic-TV", IsWired: true},
+			wantCat:   CategoryMedia,
+			forbidCat: CategoryServer,
+		},
+		{
+			name:      "Cameron-Host does not match cam token",
+			client:    unifi.Client{IP: "192.0.2.14", MAC: "00:11:22:00:00:14", Hostname: "Cameron-Host", IsWired: true},
+			wantCat:   CategoryUnknown,
+			forbidCat: CategoryCamera,
+		},
+		{
+			name:      "Jonas-Box does not match nas token",
+			client:    unifi.Client{IP: "192.0.2.15", MAC: "00:11:22:00:00:15", Hostname: "Jonas-Box", IsWired: true},
+			wantCat:   CategoryUnknown,
+			forbidCat: CategoryServer,
+		},
+		{
+			name:      "appvendor-box does not match pve token",
+			client:    unifi.Client{IP: "192.0.2.16", MAC: "00:11:22:00:00:16", Hostname: "appvendor-box", IsWired: true},
+			wantCat:   CategoryUnknown,
+			forbidCat: CategoryServer,
+		},
+		{
+			name:    "front-cam01 matches camera",
+			client:  unifi.Client{IP: "192.0.2.20", MAC: "00:11:22:00:00:20", Hostname: "front-cam01", IsWired: true},
+			wantCat: CategoryCamera,
+		},
+		{
+			name:    "g4-doorbell matches camera",
+			client:  unifi.Client{IP: "192.0.2.21", MAC: "00:11:22:00:00:21", Hostname: "g4-doorbell", IsWired: true},
+			wantCat: CategoryCamera,
+		},
+		{
+			name:    "home-nas01 matches server",
+			client:  unifi.Client{IP: "192.0.2.22", MAC: "00:11:22:00:00:22", Hostname: "home-nas01", IsWired: true},
+			wantCat: CategoryServer,
+		},
+		{
+			name:    "pve01 matches server",
+			client:  unifi.Client{IP: "192.0.2.23", MAC: "00:11:22:00:00:23", Hostname: "pve01", IsWired: true},
+			wantCat: CategoryServer,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := c.ClassifyClient(tc.client, nil, false)
+			if tc.forbidCat != "" && got.Category == tc.forbidCat {
+				t.Fatalf("got forbidden category %q (role=%q, signals=%v)", got.Category, got.Role, got.Signals)
+			}
+			if got.Category != tc.wantCat {
+				t.Fatalf("got category %q (role=%q, signals=%v), want %q", got.Category, got.Role, got.Signals, tc.wantCat)
+			}
+		})
+	}
+}

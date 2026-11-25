@@ -298,20 +298,20 @@ func Build(snap *unifi.Snapshot, classes map[string]classify.Result, netCfg conf
 				idx = i
 			}
 		}
-		if idx < 0 && cl.NetworkName != "" {
-			if i, ok := vlanIdxByKey[strings.ToLower(strings.TrimSpace(cl.NetworkName))]; ok {
-				idx = i
-			}
-		}
 		if idx < 0 {
-			// Fallback bucket if a client's network wasn't returned by the controller.
-			name := cl.NetworkName
+			name := strings.TrimSpace(cl.NetworkName)
 			if name == "" {
 				name = "Unassigned"
 			}
-			idx = len(m.VLANs)
-			vlanIdxByKey[strings.ToLower(name)] = idx
-			m.VLANs = append(m.VLANs, VLANGroup{Name: name, ZoneName: "Internal"})
+			key := strings.ToLower(name)
+			if i, ok := vlanIdxByKey[key]; ok {
+				idx = i
+			} else {
+				// Fallback bucket if a client's network wasn't returned by the controller.
+				idx = len(m.VLANs)
+				vlanIdxByKey[key] = idx
+				m.VLANs = append(m.VLANs, VLANGroup{Name: name, ZoneName: "Internal"})
+			}
 		}
 
 		key := cl.IP

@@ -73,9 +73,16 @@ hostname_rules:
     role: Out-of-Band BMC / IPMI
     regex: "(?i)(^|[-_.\\s])(ipmi|idrac|ilo|ikvm|bmc|mgmt[-_]?console|management console)($|[-_.\\s])"
 
+  # Evaluate personal workstation/mobile hostnames before generic camera/NAS
+  # patterns so names like "Camerons-iPhone" or "Jonass-iPhone" are never
+  # misclassified as appliances.
+  - category: personal
+    role: Mobile / Workstation
+    regex: "(?i)(^|[-_.\\s])(iphone|ipad|macbook|imac|mac[-_\\s]|pixel|galaxy|oneplus|android|thinkpad|surface|(desktop|laptop)($|[-_.\\s0-9]))"
+
   - category: camera
     role: IP Camera / Doorbell
-    regex: "(?i)(^|[-_.\\s])(cam|camera|doorbell|chime|nvr|protect|g3|g4|g5)[-_0-9a-z]*($|[-_.\\s])"
+    regex: "(?i)(^|[-_.\\s])(ipcam[0-9]*|cam[0-9]*|camera[0-9]*|doorbell[0-9]*|chime[0-9]*|unvr[0-9]*|nvr[0-9]*|protect|g[345])($|[-_.\\s])"
 
   - category: printer
     role: 3D Printer
@@ -87,7 +94,7 @@ hostname_rules:
 
   - category: media
     role: Media / Streaming Device
-    regex: "(?i)(chromecast|apple[-_\\s]?tv|fire[-_\\s]?tv|roku|shield|bravia|webos|lg[-_]?tv|samsung[-_]?tv|sonos|marantz|denon|avr[-_]?[0-9]|playstation|ps[45]|xbox)"
+    regex: "(?i)(chromecast|apple[-_\\s]?tv|fire[-_\\s]?tv|roku|shield|bravia|webos|lg[-_]?tv|samsung[-_]?tv|panasonic[-_]?tv|sonos|marantz|denon|avr[-_]?[0-9]|playstation|ps[45]|xbox)"
 
   - category: iot
     role: Smart Home Hub
@@ -103,8 +110,4 @@ hostname_rules:
 
   - category: server
     role: Server / NAS / Hypervisor
-    regex: "(?i)(truenas|freenas|unraid|proxmox|pve|synology|diskstation|qnap|esxi|nas|hypervisor)"
-
-  - category: personal
-    role: Mobile / Workstation
-    regex: "(?i)(^|[-_.\\s])(iphone|ipad|macbook|imac|mac[-_\\s]|pixel|galaxy|oneplus|android|thinkpad|surface|desktop-|laptop-)"
+    regex: "(?i)(^|[-_.\\s])(truenas|freenas|unraid|proxmox|pve|synology|diskstation|qnap|esxi|nas|hypervisor)[0-9]*($|[-_.\\s])"
