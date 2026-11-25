@@ -17,6 +17,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,6 +62,10 @@ type Finding struct {
 	// Transport records the L4 transport ("tcp" or "udp") associated with Port.
 	Transport string `json:"transport,omitempty"`
 
+	// ObservedIPs identifies the target addresses supporting this finding.
+	// An empty list means unresolved. Older records omit the field entirely.
+	ObservedIPs []string `json:"observed_ips,omitzero"`
+
 	// BaseSeverity is the check's intrinsic severity before UniFi topology scoring.
 	BaseSeverity Severity `json:"base_severity"`
 
@@ -80,6 +86,18 @@ type Finding struct {
 
 	// Remediation provides practical guidance and suggested UniFi actions.
 	Remediation Remediation `json:"remediation"`
+}
+
+// EndpointIPs returns the addresses eligible for correlation with a WAN forward.
+// Legacy records can be attributed only when the client has one possible address.
+func (f Finding) EndpointIPs() []string {
+	if f.ObservedIPs != nil {
+		return f.ObservedIPs
+	}
+	if ips := f.Client.AllIPs(); len(ips) == 1 {
+		return ips
+	}
+	return nil
 }
 
 // Key returns a stable deduplication key identifying this finding across scans.
@@ -295,22 +313,24 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 				for _, supID := range chk.Supersedes {
 					superseded[fmt.Sprintf("%s|%d", supID, port)] = struct{}{}
 				}
-				transport := resolveFindingTransport(chk, hp, port)
-				findings = append(findings, Finding{
-					CheckID:           chk.ID,
-					Title:             chk.Title,
-					CVE:               chk.CVE,
-					Category:          chk.Category,
-					ClaimKind:         chk.Claim,
-					Property:          chk.Property,
-					Transport:         transport,
-					BaseSeverity:      chk.Severity,
-					EffectiveSeverity: chk.Severity,
-					Client:            hp.Client,
-					Port:              port,
-					Evidence:          evidence,
-					Remediation:       chk.Remediation,
-				})
+				for _, ep := range findingEndpoints(chk, hp, port) {
+					findings = append(findings, Finding{
+						CheckID:           chk.ID,
+						Title:             chk.Title,
+						CVE:               chk.CVE,
+						Category:          chk.Category,
+						ClaimKind:         chk.Claim,
+						Property:          chk.Property,
+						Transport:         ep.transport,
+						ObservedIPs:       ep.ips,
+						BaseSeverity:      chk.Severity,
+						EffectiveSeverity: chk.Severity,
+						Client:            hp.Client,
+						Port:              port,
+						Evidence:          evidence,
+						Remediation:       chk.Remediation,
+					})
+				}
 			}
 		}
 	}
@@ -697,36 +717,107 @@ func (r *Runner) executeProbeProfile(ctx context.Context, chk *Check, hp probe.H
 	}
 }
 
-// resolveFindingTransport preserves the actual observed transport (e.g., UDP for
-// passive BACnet or TCP for ONVIF XAddr HTTP) before falling back to check default.
-func resolveFindingTransport(chk *Check, hp probe.HostProfile, port int) string {
-	if chk.Probe.Type == "observe" {
-		if port > 0 {
-			for _, svc := range hp.Services {
-				if svc.Port == port && strings.TrimSpace(svc.Transport) != "" {
-					return strings.ToLower(strings.TrimSpace(svc.Transport))
-				}
+type findingEndpoint struct {
+	transport string
+	ips       []string
+}
+
+// observationIPs intersects explicit target addresses and family with the
+// client inventory. Family alone identifies a target only if exactly one
+// client address qualifies.
+func observationIPs(cl unifi.Client, family string, targets []string) []string {
+	family = strings.ToLower(strings.TrimSpace(family))
+	ips := []string{}
+	for _, raw := range cl.AllIPs() {
+		addr, err := netip.ParseAddr(raw)
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		if (family == "ipv4" && !addr.Is4()) || (family == "ipv6" && !addr.Is6()) {
+			continue
+		}
+		if len(targets) > 0 && !slices.ContainsFunc(targets, func(target string) bool {
+			a, err := netip.ParseAddr(target)
+			return err == nil && a.Unmap() == addr
+		}) {
+			continue
+		}
+		if !slices.Contains(ips, addr.String()) {
+			ips = append(ips, addr.String())
+		}
+	}
+	if len(targets) == 0 && len(ips) != 1 {
+		return []string{}
+	}
+	return ips
+}
+
+func findingEndpoints(chk *Check, hp probe.HostProfile, port int) []findingEndpoint {
+	if chk.Probe.Type != "observe" {
+		return []findingEndpoint{{chk.DefaultTransport(), []string{hp.EffectiveProbeIP()}}}
+	}
+	byTransport := make(map[string][]string)
+	add := func(transport, family string, targets []string) {
+		if transport == "" {
+			transport = chk.DefaultTransport()
+		}
+		transport = strings.ToLower(transport)
+		// Keep an explicitly empty observation when the address is unresolved.
+		ips := byTransport[transport]
+		if ips == nil {
+			ips = []string{}
+		}
+		for _, ip := range observationIPs(hp.Client, family, targets) {
+			if !slices.Contains(ips, ip) {
+				ips = append(ips, ip)
 			}
-			for _, md := range hp.MDNSServices {
-				if !md.Withdrawn && md.Port == port && strings.TrimSpace(md.Transport) != "" {
-					return strings.ToLower(strings.TrimSpace(md.Transport))
-				}
+		}
+		byTransport[transport] = ips
+	}
+	for _, md := range hp.MDNSServices {
+		if md.Port == port && matchesMDNSService(chk, md) {
+			targets := md.TargetIPs
+			if !md.Reflected && md.ResponderIP != "" && len(targets) == 0 {
+				targets = []string{md.ResponderIP}
 			}
-			for _, u := range hp.UPnPDevices {
-				if u.Port == port {
-					return "tcp"
-				}
-			}
-			for _, w := range hp.WSDiscovery {
-				for _, wp := range w.Ports {
-					if wp == port {
-						return "tcp"
-					}
-				}
+			add(md.Transport, md.AddressFamily, targets)
+		}
+	}
+	for _, svc := range hp.Services {
+		if svc.Port == port && slices.ContainsFunc(chk.Preconditions.ServiceProtoAny, func(want string) bool {
+			return strings.EqualFold(want, svc.Protocol)
+		}) {
+			add(svc.Transport, svc.AddressFamily, nil)
+		}
+	}
+	if chk.compiled.upnpDevice != nil || chk.compiled.upnpService != nil {
+		for _, dev := range hp.UPnPDevices {
+			if dev.Port == port && matchesUPnPDevice(chk, dev) {
+				add("tcp", dev.AddressFamily, nil)
 			}
 		}
 	}
-	return chk.DefaultTransport()
+	if chk.compiled.wsType != nil {
+		for _, rec := range hp.WSDiscovery {
+			if slices.Contains(rec.Ports, port) && matchesWSRecord(chk, rec) {
+				add("tcp", rec.AddressFamily, nil)
+			}
+		}
+	}
+	if len(byTransport) == 0 {
+		ips := []string{}
+		if hp.HasPort(port) && (len(chk.Preconditions.PortsAny) > 0 || len(chk.Preconditions.PortsAll) > 0) {
+			ips = observationIPs(hp.Client, "", []string{hp.EffectiveProbeIP()})
+		}
+		byTransport[chk.DefaultTransport()] = ips
+	}
+	var endpoints []findingEndpoint
+	for transport, ips := range byTransport {
+		endpoints = append(endpoints, findingEndpoint{transport, ips})
+	}
+	sort.Slice(endpoints, func(i, j int) bool { return endpoints[i].transport < endpoints[j].transport })
+	return endpoints
 }
 
 // probeTCP confirms that ip:port accepts a TCP connection and optionally

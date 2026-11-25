@@ -1411,7 +1411,7 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 			continue
 		}
 		svc.TargetIPs = ips
-		svc.AddressFamily = classifyIPFamily(ips)
+		svc.AddressFamily = IPFamily(ips)
 
 		hasResponder := func(ip string) bool {
 			if len(inst.responderIPs) == 0 {
@@ -1528,14 +1528,15 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 	return res
 }
 
-func classifyIPFamily(ips []string) string {
+// IPFamily reports ipv4, ipv6, dual, or an empty string for an unknown family.
+func IPFamily(ips []string) string {
 	hasV4, hasV6 := false, false
 	for _, s := range ips {
-		ip := net.ParseIP(s)
-		if ip == nil {
+		ip, err := netip.ParseAddr(s)
+		if err != nil {
 			continue
 		}
-		if ip.To4() != nil {
+		if ip.Unmap().Is4() {
 			hasV4 = true
 		} else {
 			hasV6 = true
@@ -2364,7 +2365,7 @@ func fetchSSDPDescriptionsWithSubnets(ctx context.Context, httpClient *http.Clie
 			continue
 		}
 		for _, h := range list {
-			out[ip] = append(out[ip], UPnPDevice{ST: h.st, Server: h.server})
+			out[ip] = append(out[ip], UPnPDevice{ST: h.st, Server: h.server, AddressFamily: ipFamilyOf(ip)})
 		}
 	}
 	isProtectedRawPrint := func(ip string, port int) bool {
@@ -2395,7 +2396,7 @@ func fetchSSDPDescriptionsWithSubnets(ctx context.Context, httpClient *http.Clie
 		}
 		if !ok {
 			mu.Lock()
-			out[h.ip] = append(out[h.ip], UPnPDevice{ST: mergedST, Server: h.server, ServiceTypes: stServices})
+			out[h.ip] = append(out[h.ip], UPnPDevice{ST: mergedST, Server: h.server, ServiceTypes: stServices, AddressFamily: ipFamilyOf(h.ip)})
 			mu.Unlock()
 			continue
 		}
@@ -2404,7 +2405,7 @@ func fetchSSDPDescriptionsWithSubnets(ctx context.Context, httpClient *http.Clie
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			dev := UPnPDevice{ST: mergedST, Server: h.server, Port: port, ServiceTypes: stServices}
+			dev := UPnPDevice{ST: mergedST, Server: h.server, Port: port, ServiceTypes: stServices, AddressFamily: ipFamilyOf(h.ip)}
 			if httpClient != nil && !isProtectedRawPrint(h.ip, port) {
 				fetchUPnPXML(ctx, httpClient, safeURL, &dev)
 			}
@@ -2608,6 +2609,7 @@ func discoverWSD(ctx context.Context) map[string][]WSDiscoveryRecord {
 		}
 		if rec, ok := parseWSDProbeMatch(buf[:n], ip); ok {
 			seenIP[ip] = struct{}{}
+			rec.AddressFamily = ipFamilyOf(ip)
 			out[ip] = append(out[ip], rec)
 		}
 	}

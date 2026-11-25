@@ -213,8 +213,8 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	// metadata when generating posture findings.
 	clientsByIP := make(map[string]unifi.Client, len(snap.Clients))
 	for _, cl := range snap.Clients {
-		if cl.IP != "" {
-			clientsByIP[cl.IP] = cl
+		for _, ip := range cl.AllIPs() {
+			clientsByIP[canonicalIsolationIP(ip)] = cl
 		}
 	}
 
@@ -222,7 +222,8 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	forwardsByIP := make(map[string][]unifi.PortForward)
 	for _, pf := range snap.PortForwards {
 		if pf.Enabled && pf.FwdIP != "" {
-			forwardsByIP[pf.FwdIP] = append(forwardsByIP[pf.FwdIP], pf)
+			ip := canonicalIsolationIP(pf.FwdIP)
+			forwardsByIP[ip] = append(forwardsByIP[ip], pf)
 		}
 	}
 
@@ -230,7 +231,11 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 
 	scored := make([]checks.Finding, 0, len(rawFindings)+len(snap.PortForwards))
 	for _, f := range rawFindings {
-		f = scoreFinding(f, forwardsByIP[f.Client.IP], trustedSet, isolatedSet)
+		var forwards []unifi.PortForward
+		for _, ip := range f.EndpointIPs() {
+			forwards = append(forwards, forwardsByIP[canonicalIsolationIP(ip)]...)
+		}
+		f = scoreFinding(f, forwards, trustedSet, isolatedSet)
 		scored = append(scored, f)
 	}
 
@@ -242,7 +247,7 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		if !pf.Enabled {
 			continue
 		}
-		cl, known := clientsByIP[pf.FwdIP]
+		cl, known := clientsByIP[canonicalIsolationIP(pf.FwdIP)]
 		if !known {
 			cl = unifi.Client{IP: pf.FwdIP, Name: pf.Name}
 			if net, ok := lookupNetworkByIP(snap, pf.FwdIP); ok {

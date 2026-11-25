@@ -7,11 +7,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	embedded "github.com/karalabe/uniblue/checks"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
@@ -1324,4 +1326,88 @@ func TestDualStackIPv4PortForwardDoesNotMarkIPv6ServiceWAN(t *testing.T) {
 			t.Fatalf("expected IPv6 HTTPS to remain vlan-only (not wan), got %+v", byFam["ipv6"])
 		}
 	})
+}
+
+func TestDualStackHomeKitFindingDashboardRowFollowsObservedEndpoint(t *testing.T) {
+	all, err := checks.LoadFromFS(embedded.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hap *checks.Check
+	for _, chk := range all {
+		if chk.ID == "UB-2026-0022" {
+			hap = chk
+			break
+		}
+	}
+	if hap == nil {
+		t.Fatal("missing UB-2026-0022 HomeKit check")
+	}
+
+	cl := unifi.Client{
+		Name:        "dual-stack accessory",
+		IP:          "192.0.2.10",
+		IPv6:        []string{"2001:db8::10"},
+		MAC:         "00:00:5e:00:53:10",
+		NetworkName: "Lab",
+	}
+	snap := &unifi.Snapshot{
+		Site:    "default",
+		Clients: []unifi.Client{cl},
+		PortForwards: []unifi.PortForward{
+			{Name: "IPv4-only web", Enabled: true, Proto: "tcp", DstPort: "8080", FwdPort: "8080", FwdIP: cl.IP},
+		},
+	}
+
+	for _, fam := range []string{"ipv6", "ipv4"} {
+		t.Run(fam, func(t *testing.T) {
+			addr := cl.IP
+			if fam == "ipv6" {
+				addr = cl.IPv6[0]
+			}
+			hp := probe.HostProfile{
+				Client: cl,
+				MDNSServices: []probe.MDNSService{{
+					Type: "_hap._tcp", TXT: []string{"sf=1"}, Port: 8080,
+					Transport: "tcp", AddressFamily: fam, TargetIPs: []string{addr}, ResponderIP: addr,
+				}},
+			}
+			raw := checks.NewRunner([]*checks.Check{hap}, 1).RunHost(context.Background(), hp)
+			report := risk.Evaluate(snap, raw, config.NetworkConfig{})
+			topo := topology.Build(snap, nil, config.NetworkConfig{})
+			pm := BuildPresentationModel(snap, report, topo, []ClientView{{Client: cl}}, nil, nil, []probe.HostProfile{hp})
+
+			var ent *Entity
+			for _, cand := range pm.Entities {
+				if cand.MAC == cl.MAC {
+					ent = cand
+					break
+				}
+			}
+			if ent == nil {
+				t.Fatalf("missing entity for %s", cl.MAC)
+			}
+
+			var matched *ServiceView
+			for i := range ent.Services {
+				s := &ent.Services[i]
+				if s.Port == 8080 && s.AddressFamily == fam {
+					matched = s
+					break
+				}
+			}
+			if matched == nil {
+				t.Fatalf("expected dashboard row for %s TCP/8080, got %+v", fam, ent.Services)
+			}
+			if fam == "ipv6" {
+				if matched.Reachable != "lan" || matched.Severity != hap.Severity.String() {
+					t.Fatalf("IPv6-only HomeKit dashboard row must keep base severity %q on lan, got %+v", hap.Severity, *matched)
+				}
+			} else {
+				if matched.Reachable != "wan" || !matched.Exposed || matched.Severity != "critical" {
+					t.Fatalf("IPv4 HomeKit dashboard row must be WAN-escalated critical, got %+v", *matched)
+				}
+			}
+		})
+	}
 }

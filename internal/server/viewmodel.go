@@ -1353,8 +1353,8 @@ func BuildPresentationModel(
 					Source:      "probe",
 					Port:        f.Port,
 				})
-				// Mark matching service as exposed (or add UDP service like IPMI 623 / SNMP 161).
-				markServiceExposed(he, f)
+				// Mark matching service as exposed (or add observed/UDP service like HomeKit, IPMI 623, SNMP 161).
+				markServiceExposed(he, f, lookupWANForIPs(f.EndpointIPs()), netIsolated[strings.ToLower(he.NetworkName)], isSnapshotWANBehindCGNAT(snap))
 			}
 		}
 	}
@@ -2444,8 +2444,12 @@ func isSnapshotWANBehindCGNAT(snap *unifi.Snapshot) bool {
 
 func findMatchingServiceIndex(services []ServiceView, f checks.Finding) int {
 	proto := f.EffectiveTransport()
+	family := probe.IPFamily(f.EndpointIPs())
 	var matches []int
 	for i := range services {
+		if (family == "ipv4" || family == "ipv6") && services[i].AddressFamily != "" && services[i].AddressFamily != family {
+			continue
+		}
 		if services[i].Port == f.Port && strings.EqualFold(services[i].Proto, proto) {
 			matches = append(matches, i)
 		}
@@ -2511,17 +2515,18 @@ func recordObservedService(ent *Entity, f checks.Finding) {
 		reach = "advertised"
 	}
 	ent.Services = append(ent.Services, ServiceView{
-		Port:      f.Port,
-		Proto:     proto,
-		Name:      commonPortLabel(f.Port),
-		Reachable: reach,
-		State:     obsState,
-		Exposed:   false,
-		Label:     compactCheckChip(f),
+		Port:          f.Port,
+		Proto:         proto,
+		AddressFamily: probe.IPFamily(f.EndpointIPs()),
+		Name:          commonPortLabel(f.Port),
+		Reachable:     reach,
+		State:         obsState,
+		Exposed:       false,
+		Label:         compactCheckChip(f),
 	})
 }
 
-func markServiceExposed(ent *Entity, f checks.Finding) {
+func markServiceExposed(ent *Entity, f checks.Finding, endpointWAN []risk.ExposureAssessment, vlanIsolated, behindCGNAT bool) {
 	if f.Port <= 0 {
 		return
 	}
@@ -2536,14 +2541,43 @@ func markServiceExposed(ent *Entity, f checks.Finding) {
 		}
 		return
 	}
+	reach := "lan"
+	if vlanIsolated {
+		reach = "vlan-only"
+	}
+	srcRestricted := false
+	matchedWAN := false
+	allRestricted := true
+	for _, a := range endpointWAN {
+		if !a.Forward.ExposesEndpoint(f.Port, proto) {
+			continue
+		}
+		matchedWAN = true
+		if !a.Forward.IsSourceRestricted() {
+			allRestricted = false
+		}
+	}
+	if matchedWAN {
+		srcRestricted = allRestricted
+		switch {
+		case behindCGNAT:
+			reach = "wan-cgnat"
+		case allRestricted:
+			reach = "wan-restricted"
+		default:
+			reach = "wan"
+		}
+	}
 	ent.Services = append(ent.Services, ServiceView{
-		Port:      f.Port,
-		Proto:     proto,
-		Name:      commonPortLabel(f.Port),
-		Reachable: "lan",
-		Exposed:   true,
-		Severity:  newSev,
-		Label:     compactCheckChip(f),
+		Port:             f.Port,
+		Proto:            proto,
+		AddressFamily:    probe.IPFamily(f.EndpointIPs()),
+		Name:             commonPortLabel(f.Port),
+		Reachable:        reach,
+		SourceRestricted: srcRestricted,
+		Exposed:          true,
+		Severity:         newSev,
+		Label:            compactCheckChip(f),
 	})
 }
 

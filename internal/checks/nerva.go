@@ -33,8 +33,10 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 		if prop == "" {
 			continue
 		}
-		key := fmt.Sprintf("%s|%d|%s|%s", f.Client.PrimaryIP(), f.Port, f.EffectiveTransport(), prop)
-		coveredByExisting[key] = struct{}{}
+		for _, ip := range f.EndpointIPs() {
+			key := fmt.Sprintf("%s|%d|%s|%s", ip, f.Port, f.EffectiveTransport(), prop)
+			coveredByExisting[key] = struct{}{}
+		}
 	}
 
 	// Track the highest-severity Nerva finding per dedup key so weaker findings
@@ -51,9 +53,18 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 				transport = "tcp"
 			}
 
+			var targets []string
+			if hp.ProbeIP != "" {
+				targets = []string{hp.ProbeIP}
+			}
+			ips := observationIPs(hp.Client, svc.AddressFamily, targets)
+			endpoint := hp.Client.PrimaryIP() + "|" + svc.AddressFamily + "|unknown"
+			if len(ips) == 1 {
+				endpoint = ips[0]
+			}
 			for _, sf := range svc.Findings {
 				prop := nervaFindingProperty(sf.ID)
-				key := fmt.Sprintf("%s|%d|%s|%s", hp.Client.PrimaryIP(), svc.Port, transport, prop)
+				key := fmt.Sprintf("%s|%d|%s|%s", endpoint, svc.Port, transport, prop)
 				if _, ok := coveredByExisting[key]; ok {
 					continue
 				}
@@ -75,6 +86,7 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 					ClaimKind:         nervaClaimKind(sf.ID),
 					Property:          prop,
 					Transport:         transport,
+					ObservedIPs:       ips,
 					BaseSeverity:      sev,
 					EffectiveSeverity: sev,
 					Client:            hp.Client,

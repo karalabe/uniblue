@@ -452,9 +452,7 @@ func EvaluateIsolation(
 			continue
 		}
 		fnLow := strings.ToLower(strings.TrimSpace(ap.Function))
-		if strings.Contains(fnLow, "bmc") || strings.Contains(fnLow, "print") || strings.Contains(fnLow, "ipp") {
-			continue
-		}
+		dedicatedWorkflow := strings.Contains(fnLow, "bmc") || strings.Contains(fnLow, "print") || strings.Contains(fnLow, "ipp")
 		proto := strings.ToLower(strings.TrimSpace(ap.Transport))
 		if proto == "" {
 			proto = "tcp"
@@ -512,16 +510,22 @@ func EvaluateIsolation(
 				}
 			}
 		}
+		missingRole := len(targets) == 0 && ap.DestIP == "" && strings.TrimSpace(ap.DestRole) != ""
+		if dedicatedWorkflow && !missingRole {
+			continue
+		}
 		if len(targets) == 0 && ap.DestZone != "" {
 			for _, n := range snap.Networks {
 				if strings.EqualFold(n.ZoneName, ap.DestZone) || strings.EqualFold(n.Name, ap.DestZone) {
 					targets = append(targets, approvedTarget{net: n})
-					break
+					if !missingRole {
+						break
+					}
 				}
 			}
 		}
-		if len(targets) == 0 {
-			continue
+		if missingRole && len(targets) == 0 {
+			targets = append(targets, approvedTarget{})
 		}
 		fams := []string{"ipv4"}
 		switch strings.ToLower(strings.TrimSpace(ap.IPVersion)) {
@@ -538,6 +542,17 @@ func EvaluateIsolation(
 			for _, srcNet := range srcNets {
 				srcZone := strings.TrimSpace(srcNet.ZoneName)
 				for _, fam := range fams {
+					if missingRole {
+						addCell(IsolationCell{
+							SourceZone: srcZone, SourceNetwork: srcNet.Name,
+							DestZone: dstZone, DestNetwork: dstNet.Name, DestFunction: funcLabel,
+							Transport: proto, Port: ap.Port, IPFamily: fam, Expected: "allow",
+							Effective: "unknown", Verdict: IsolationUnknown,
+							MissingInput:   fmt.Sprintf("No inventory device matched destination role %q.", ap.DestRole),
+							RecommendedFix: "Identify the destination device or supply its address to verify this workflow.",
+						})
+						continue
+					}
 					if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, dstClient) {
 						continue
 					}
@@ -1686,6 +1701,12 @@ func matchesProtocol(ruleProto, queryProto string) bool {
 	}
 	if (rp == "tcp_udp" || rp == "tcp/udp") && (qp == "tcp" || qp == "udp") {
 		return true
+	}
+	if rp == "ipv6-icmp" {
+		rp = "icmpv6"
+	}
+	if qp == "ipv6-icmp" {
+		qp = "icmpv6"
 	}
 	return rp == qp
 }
@@ -3044,12 +3065,15 @@ func evaluateTransitBoundary(
 		return firstCell
 	}
 
-	// Collect protocols to verify: always TCP and UDP, plus any explicit
-	// protocol referenced by an enabled ALLOW rule (e.g., ICMP).
+	// Partition on every named selector, including blocks. All remaining IP
+	// protocols match the same selectors (wildcards and complements).
 	protos := []string{"tcp", "udp"}
 	seenProto := map[string]struct{}{"tcp": {}, "udp": {}}
 	addProto := func(raw string) {
 		p := strings.ToLower(strings.TrimSpace(raw))
+		if p == "ipv6-icmp" {
+			p = "icmpv6"
+		}
 		if p == "" || p == "all" || p == "any" || p == "tcp_udp" || p == "tcp/udp" {
 			return
 		}
@@ -3071,17 +3095,33 @@ func evaluateTransitBoundary(
 			return i < j
 		})
 		for _, acl := range sortedACLs {
-			if acl.Enabled && strings.EqualFold(acl.Action, "ALLOW") && matchesIPFamily(acl.IPVersion, fam) {
+			if acl.Enabled && matchesIPFamily(acl.IPVersion, fam) {
 				addProto(acl.Protocol)
 			}
 		}
 	} else {
 		for _, pol := range sortedPolicies {
-			if pol.Enabled && strings.EqualFold(pol.Action, "ALLOW") && matchesIPFamily(pol.IPVersion, fam) {
+			if pol.Enabled && matchesIPFamily(pol.IPVersion, fam) {
 				addProto(pol.Protocol)
 			}
 		}
 	}
+
+	icmp := "icmp"
+	if fam == "ipv6" {
+		icmp = "icmpv6"
+	}
+	// Prefer a concrete witness for the remaining class. If all these names
+	// already occur, a permitted residual class can only establish uncertainty.
+	const unnamedProtocol = "<unlisted IP protocol>"
+	representative := unnamedProtocol
+	for _, name := range []string{icmp, "gre", "esp", "ah", "sctp"} {
+		if _, named := seenProto[name]; !named {
+			representative = name
+			break
+		}
+	}
+	protos = append(protos, representative)
 
 	srcNetPfx, hasSrcNetPfx := networkPrefixForFamily(srcNet, fam)
 	dstNetPfx, hasDstNetPfx := networkPrefixForFamily(dstNet, fam)
@@ -3127,7 +3167,7 @@ func evaluateTransitBoundary(
 				// later shadowed ALLOW rules skip already-blocked port ranges
 				// without quadratic scanning, unless an earlier rule was
 				// indeterminate (scheduled/unsupported) and must stay observable.
-				if !sawIndeterminateRule &&
+				if !sawIndeterminateRule && (pr == "tcp" || pr == "udp" || dstEP.AnyPort) &&
 					endpointUnconditionallyMatchesNetwork(srcEP, srcZone, srcNet, true) &&
 					endpointUnconditionallyMatchesNetwork(dstEP, dstZone, dstNet, false) {
 					if ivs, ok := endpointPortIntervals(dstEP); ok {
@@ -3390,6 +3430,12 @@ func evaluateTransitBoundary(
 							goto nextProto
 						}
 						if viol, ok := evalOne(pr, p, sc.ip, sc.mac, dc.ip, dc.mac, true); ok {
+							if pr == unnamedProtocol {
+								viol.Transport = ""
+								viol.Effective = "unknown"
+								viol.Verdict = IsolationUnknown
+								viol.MissingInput = "Cannot certify isolation for IP protocols outside the named selectors."
+							}
 							return viol
 						}
 					}
