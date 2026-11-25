@@ -176,11 +176,13 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 		}
 
 		// 2. Inline hub / rogue mini-switch detection (MAC table surge):
-		// Only alert when a non-uplink access port that was already UP (not a
-		// normal link-up repopulating a known mini-switch/IP phone) exceeds its
-		// learned baseline and jumps from <= 1 to >= 2 MACs.
+		// Alert when a non-uplink access port exceeds its learned normal
+		// single-MAC baseline and jumps from <= 1 to >= 2 MACs, including
+		// across an observed link-down (unplug -> insert inline hub -> replug).
+		// Legitimate multi-MAC ports (unmanaged switches, IP phones) are
+		// already suppressed by their learned portMACBaseline >= 2.
 		learnedBase := a.portMACBaseline[pk]
-		if isAccess && curr.Up && prev.Up && !curr.HasUniFiPeer && prev.MACTableCount <= 1 && curr.MACTableCount >= 2 && learnedBase <= 1 {
+		if isAccess && curr.Up && !curr.HasUniFiPeer && prev.MACTableCount <= 1 && curr.MACTableCount >= 2 && learnedBase <= 1 {
 			sev := "high"
 			if isExternal {
 				sev = "critical"
@@ -364,8 +366,13 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 	}
 	ownedMACs := make(map[string]struct{}, len(snap.Devices))
 	for _, d := range snap.Devices {
-		if d.MAC != "" {
-			ownedMACs[strings.ToLower(d.MAC)] = struct{}{}
+		if m := strings.ToLower(strings.TrimSpace(d.MAC)); m != "" {
+			ownedMACs[m] = struct{}{}
+		}
+		for _, b := range d.BSSIDs {
+			if bm := strings.ToLower(strings.TrimSpace(b)); bm != "" {
+				ownedMACs[bm] = struct{}{}
+			}
 		}
 	}
 	for _, rap := range snap.RogueAPs {
@@ -416,8 +423,8 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			a.lastWANStatus = snap.Health.WANStatus
 		}
 
-		vpnAvailable := snap.Visibility == nil || snap.Visibility.VPNAvailable || len(snap.Health.VPNConnections) > 0
-		if vpnAvailable {
+		vpnDetailAvailable := snap.Visibility == nil || snap.Visibility.VPNAvailable || len(snap.Health.VPNConnections) > 0
+		if vpnDetailAvailable {
 			currVPN := indexVPNConnections(snap.Health.VPNConnections)
 			for k, vc := range currVPN {
 				if _, existed := a.lastVPNKeys[k]; !existed {
@@ -457,6 +464,24 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			}
 			a.lastVPNKeys = currVPN
 			a.lastVPNCount = snap.Health.ActiveVPNUsers
+		} else if len(a.lastVPNKeys) == 0 {
+			// Controllers without the v2 vpn/connections endpoint still expose
+			// stat/health remote_user_num_active; keep the counter fallback active
+			// whenever we have no v2 per-connection baseline to protect from flaps.
+			if snap.Health.ActiveVPNUsers != a.lastVPNCount {
+				sev := "info"
+				verb := "disconnected"
+				if snap.Health.ActiveVPNUsers > a.lastVPNCount {
+					sev = "medium"
+					verb = "connected"
+				}
+				events = append(events, LiveEvent{
+					Type:     "vpn_session_changed",
+					Severity: sev,
+					Summary:  fmt.Sprintf("Active remote VPN users %s (%d -> %d)", verb, a.lastVPNCount, snap.Health.ActiveVPNUsers),
+				})
+			}
+			a.lastVPNCount = snap.Health.ActiveVPNUsers
 		}
 	}
 
@@ -464,7 +489,7 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 	// only comparing each feed when it was actually retrieved cleanly so a
 	// transient fetch failure never fires false config_drift alerts.
 	driftDetected := false
-	settingsAvail := snap.SecuritySettings != nil && (snap.Visibility == nil || snap.Visibility.SettingsAvailable || snap.SecuritySettings != nil)
+	settingsAvail := snap.SecuritySettings != nil && (snap.Visibility == nil || snap.Visibility.SettingsAvailable)
 	if settingsAvail {
 		sig := settingsOnlySignature(snap.SecuritySettings)
 		if a.lastSettingsSig != "" && sig != a.lastSettingsSig {
@@ -472,7 +497,7 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 		}
 		a.lastSettingsSig = sig
 	}
-	wlansAvail := snap.Visibility == nil || snap.Visibility.WLANsAvailable || len(snap.WLANs) > 0
+	wlansAvail := snap.Visibility == nil || snap.Visibility.WLANsAvailable
 	if wlansAvail {
 		sig := wlansOnlySignature(snap.WLANs)
 		if a.lastWLANSig != "" && sig != a.lastWLANSig {
@@ -566,22 +591,11 @@ func isOwnedRadioBSSID(rap unifi.RogueAP, ownedMACs map[string]struct{}) bool {
 		return false
 	}
 	bssid := strings.ToLower(strings.TrimSpace(rap.BSSID))
-	bParts := strings.Split(bssid, ":")
-	if len(bParts) != 6 {
+	if bssid == "" {
 		return false
 	}
-	for om := range ownedMACs {
-		if om == bssid {
-			return true
-		}
-		oParts := strings.Split(om, ":")
-		if len(oParts) == 6 && bParts[1] == oParts[1] && bParts[2] == oParts[2] && bParts[3] == oParts[3] && bParts[4] == oParts[4] {
-			if len(bParts[0]) == 2 && len(oParts[0]) == 2 && bParts[0][0] == oParts[0][0] {
-				return true
-			}
-		}
-	}
-	return false
+	_, exact := ownedMACs[bssid]
+	return exact
 }
 
 func firstStr(vals ...string) string {

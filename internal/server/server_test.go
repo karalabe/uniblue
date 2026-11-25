@@ -81,7 +81,7 @@ func TestHTTPHandlers(t *testing.T) {
 	// GET / serves the self-contained dashboard HTML.
 	t.Run("index", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET / status = %d, want 200", rec.Code)
 		}
@@ -96,7 +96,7 @@ func TestHTTPHandlers(t *testing.T) {
 	// Unknown root subpaths return 404.
 	t.Run("not_found", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/does-not-exist", nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/does-not-exist", nil))
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("GET /does-not-exist status = %d, want 404", rec.Code)
 		}
@@ -106,7 +106,7 @@ func TestHTTPHandlers(t *testing.T) {
 	for _, path := range []string{"/assets/logo-light.svg", "/assets/logo-dark.svg"} {
 		t.Run("asset_"+path, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+path, nil))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("GET %s status = %d, want 200", path, rec.Code)
 			}
@@ -122,7 +122,7 @@ func TestHTTPHandlers(t *testing.T) {
 	// GET /api/state returns the live StateSnapshot JSON.
 	t.Run("state", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/api/state", nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET /api/state status = %d, want 200", rec.Code)
 		}
@@ -151,7 +151,7 @@ func TestHTTPHandlers(t *testing.T) {
 	t.Run("rescan", func(t *testing.T) {
 		// Full rescan
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/rescan", nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan", nil))
 		if rec.Code != http.StatusAccepted {
 			t.Fatalf("POST /api/rescan status = %d, want 202", rec.Code)
 		}
@@ -163,7 +163,7 @@ func TestHTTPHandlers(t *testing.T) {
 
 		// Known host rescan
 		recHost := httptest.NewRecorder()
-		h.ServeHTTP(recHost, httptest.NewRequest(http.MethodPost, "/api/rescan?ip=192.0.2.10", nil))
+		h.ServeHTTP(recHost, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan?ip=192.0.2.10", nil))
 		if recHost.Code != http.StatusAccepted {
 			t.Fatalf("POST /api/rescan?ip=192.0.2.10 status = %d, want 202", recHost.Code)
 		}
@@ -178,7 +178,7 @@ func TestHTTPHandlers(t *testing.T) {
 
 		// Unknown host rescan returns 404
 		recUnknown := httptest.NewRecorder()
-		h.ServeHTTP(recUnknown, httptest.NewRequest(http.MethodPost, "/api/rescan?ip=192.0.2.99", nil))
+		h.ServeHTTP(recUnknown, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/rescan?ip=192.0.2.99", nil))
 		if recUnknown.Code != http.StatusNotFound {
 			t.Fatalf("POST /api/rescan unknown IP status = %d, want 404", recUnknown.Code)
 		}

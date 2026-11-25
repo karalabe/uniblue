@@ -68,8 +68,12 @@ type Options struct {
 	// SkipCVE disables local NVD+KEV correlation even when a cache exists.
 	SkipCVE bool
 
-	// APIToken optionally requires Authorization: Bearer <token> on /api/* endpoints.
+	// APIToken optionally requires Authorization: Bearer <token> or session cookie on /api/* endpoints.
 	APIToken string
+
+	// AllowedHosts optionally whitelists additional reverse-proxy Host / Origin
+	// values (merged with UNIBLUE_ALLOWED_HOSTS).
+	AllowedHosts []string
 
 	// Logger receives structured daemon logs.
 	Logger *slog.Logger
@@ -262,6 +266,18 @@ const (
 	hostRescanQueueFull
 )
 
+type pendingWebhook struct {
+	site        string
+	diff        risk.Diff
+	attempts    int
+	nextAttempt time.Time
+}
+
+const (
+	maxPendingWebhooks = 64
+	maxWebhookRetries  = 5
+)
+
 // Engine coordinates UniFi event ingestion, targeted single-host live checks,
 // periodic full reconciliation, webhook alerting, and SSE broadcasting.
 type Engine struct {
@@ -286,12 +302,19 @@ type Engine struct {
 	// never apply an older snapshot on top of a newer one.
 	pollMu sync.Mutex
 
-	// recomputeMu serializes read-diff-notify-save-publish so concurrent scans
+	// recomputeMu serializes read-diff-save-publish so concurrent scans
 	// never double-alert, roll back dashboard state, or race on state.json.
 	recomputeMu sync.Mutex
 
 	// fullScanMu serializes full scans executed on their own goroutine.
 	fullScanMu sync.Mutex
+
+	// webhookMu guards the asynchronous webhook delivery & retry queue so slow
+	// or failing webhook endpoints never stall recomputeMu or pollDelta.
+	webhookMu        sync.Mutex
+	pendingWebhooks  []pendingWebhook
+	webhookRunning   bool
+	webhookRetryBase time.Duration
 
 	// mu protects the live state maps and the published StateSnapshot.
 	mu               sync.RWMutex
@@ -764,6 +787,11 @@ func (e *Engine) pollDelta(ctx context.Context) {
 // (even while UniFi still caches them), publishing the refreshed StateSnapshot
 // before broadcasting SSE events, and returning any hosts queued for rescanning.
 func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, now time.Time) []hostScanTask {
+	e.mu.RLock()
+	prevSnapHint := e.snap
+	e.mu.RUnlock()
+	preserveUnavailableTelemetry(prevSnapHint, snap)
+
 	currPorts := snapshotPortStates(snap, e.cfg.Network)
 	snap.Clients = filterOfflineWiredClients(snap.Clients, currPorts)
 
@@ -786,17 +814,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 
 	e.mu.Lock()
 	prevSnap := e.snap
-	// Preserve last-known settings/WLANs across transient telemetry fetch errors
-	// so temporary 500s do not make settings-derived findings vanish and re-alert.
-	if prevSnap != nil && snap.Visibility != nil {
-		if !snap.Visibility.SettingsAvailable && snap.SecuritySettings == nil && prevSnap.SecuritySettings != nil {
-			cp := *prevSnap.SecuritySettings
-			snap.SecuritySettings = &cp
-		}
-		if !snap.Visibility.WLANsAvailable && len(snap.WLANs) == 0 && len(prevSnap.WLANs) > 0 {
-			snap.WLANs = append([]unifi.WLANConfig(nil), prevSnap.WLANs...)
-		}
-	}
+	preserveUnavailableTelemetry(prevSnap, snap)
 	prevClients := make(map[string]unifi.Client)
 	if prevSnap != nil {
 		for _, cl := range prevSnap.Clients {
@@ -1007,7 +1025,8 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 					Summary:   fmt.Sprintf("Physical link DOWN on %s Port %d (%s, zone=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone),
 				})
 			}
-			if prev.Enabled != curr.Enabled || prev.NativeVLAN != curr.NativeVLAN || prev.TaggedPolicy != curr.TaggedPolicy || prev.PortSecurity != curr.PortSecurity {
+			portProfilesOK := snap.Visibility == nil || snap.Visibility.PortProfilesAvailable
+			if portProfilesOK && (prev.Enabled != curr.Enabled || prev.NativeVLAN != curr.NativeVLAN || prev.TaggedPolicy != curr.TaggedPolicy || prev.PortSecurity != curr.PortSecurity) {
 				changed = true
 				sev := "medium"
 				if isSensitive {
@@ -1086,10 +1105,10 @@ func (e *Engine) hostScanWorker(ctx context.Context) {
 // host and updates the live state snapshot immediately.
 func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	cl := task.client
-	if cl.IP == "" {
+	if cl.PrimaryIP() == "" {
 		return
 	}
-	if _, skip := e.cfg.Network.ExcludedSet()[cl.IP]; skip {
+	if isClientExcluded(cl, e.cfg.Network.ExcludedSet()) {
 		return
 	}
 
@@ -1099,8 +1118,12 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	e.mu.RLock()
 	hints := e.snap.PortHintsByIP()
 	sitePrefixes := snapshotSubnets(e.snap)
+	cacheTTL := e.opts.ReconcileInterval
+	if cacheTTL <= 0 {
+		cacheTTL = 30 * time.Minute
+	}
 	var cachedDisc *probe.LANDiscovery
-	if e.lastDiscovery != nil && time.Since(e.lastDiscoveryAt) < 10*time.Minute {
+	if e.lastDiscovery != nil && time.Since(e.lastDiscoveryAt) < cacheTTL {
 		cachedDisc = e.lastDiscovery
 	}
 	e.mu.RUnlock()
@@ -1112,6 +1135,14 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	}
 	fp.SetHostPortHints(checks.PlanHostPorts([]unifi.Client{cl}, e.checkList, hints))
 	profiles := fp.FingerprintAll(ctx, []unifi.Client{cl})
+	if cachedDisc == nil {
+		if disc := fp.Discovery(); disc != nil {
+			e.mu.Lock()
+			e.lastDiscovery = disc
+			e.lastDiscoveryAt = time.Now().UTC()
+			e.mu.Unlock()
+		}
+	}
 	if len(profiles) == 0 {
 		return
 	}
@@ -1231,6 +1262,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 
 	e.mu.RLock()
 	startGen := e.deltaGen
+	prevSnapHint := e.snap
 	e.mu.RUnlock()
 
 	e.logger.Info("starting full scan", "reason", reason)
@@ -1239,6 +1271,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		e.setScanProgress(nil)
 		return err
 	}
+	preserveUnavailableTelemetry(prevSnapHint, snap)
 	currPorts := snapshotPortStates(snap, e.cfg.Network)
 	snap.Clients = filterOfflineWiredClients(snap.Clients, currPorts)
 	totalClients := len(snap.Clients)
@@ -1334,15 +1367,18 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		Initial:   isInitial,
 	})
 
+	var scanExtraEvents []LiveEvent
 	e.mu.Lock()
-	if e.deltaGen == startGen || e.snap == nil {
-		// No live delta arrived while the full scan ran; adopt the full snapshot cleanly.
+	adopted := e.deltaGen == startGen || e.snap == nil
+	if adopted {
+		// No live delta arrived while the full scan ran; preserve any telemetry
+		// feeds that transiently failed and adopt the full snapshot cleanly.
+		preserveUnavailableTelemetry(e.snap, snap)
 		e.snap = snap
 		e.lastFwdSig = portForwardSignature(snap.PortForwards)
 		e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
 		e.sigsInitialized = true
 		e.lastPorts = currPorts
-		e.missingClients = make(map[string]missingClient)
 	}
 	// Merge scanned host profiles/findings carefully: keep only hosts still active
 	// at the same IP/network, and never overwrite a fresher per-host rescan that
@@ -1350,6 +1386,37 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	activeByKey := make(map[string]unifi.Client, len(e.snap.Clients))
 	for _, cl := range e.snap.Clients {
 		activeByKey[clientKey(cl)] = cl
+	}
+	if adopted {
+		// Evict any departed clients (including Wi-Fi clients that were in
+		// leave-grace) that are no longer in the adopted snapshot so ghost
+		// profiles and findings never linger until rejoin.
+		for k, mc := range e.missingClients {
+			delete(e.missingClients, k)
+			if _, stillActive := activeByKey[k]; !stillActive {
+				delete(e.profilesByMAC, k)
+				delete(e.findingsByMAC, k)
+				scanExtraEvents = append(scanExtraEvents, LiveEvent{
+					Type:      "client_left",
+					Severity:  "info",
+					Host:      mc.client.DisplayName(),
+					IP:        mc.client.IP,
+					SubjectID: hostEntityID(mc.client),
+					Summary:   fmt.Sprintf("%s left %s (%s)", mc.client.DisplayName(), fallbackVLAN(mc.client.NetworkName), mc.client.IP),
+				})
+			}
+		}
+		for k := range e.profilesByMAC {
+			if _, stillActive := activeByKey[k]; !stillActive {
+				delete(e.profilesByMAC, k)
+				delete(e.findingsByMAC, k)
+			}
+		}
+		for k := range e.findingsByMAC {
+			if _, stillActive := activeByKey[k]; !stillActive {
+				delete(e.findingsByMAC, k)
+			}
+		}
 	}
 	for _, hp := range profiles {
 		k := clientKey(hp.Client)
@@ -1374,7 +1441,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 
 	// Keep scanProgress in the "evaluating" state until recomputeAndPublish
 	// atomically publishes LastFullScanAt and clears scanProgress together.
-	e.recomputeAndPublish(ctx, true, nil)
+	e.recomputeAndPublish(ctx, true, scanExtraEvents)
 
 	snapView := e.Snapshot()
 	e.emit(LiveEvent{
@@ -1479,16 +1546,13 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	}
 
 	excludedSet := e.cfg.Network.ExcludedSet()
+	sitePrefixes := snapshotSubnets(snap)
 	clientViews := make([]ClientView, 0, len(snap.Clients))
 	for _, cl := range snap.Clients {
 		k := clientKey(cl)
-		clsKey := cl.PrimaryIP()
-		if clsKey == "" {
-			clsKey = cl.MAC
-		}
 		cv := ClientView{
 			Client:      cl,
-			Class:       classes[clsKey],
+			Class:       lookupClientClass(classes, cl),
 			MaxSeverity: "clean",
 		}
 		if hp, ok := profileByKey[k]; ok {
@@ -1497,7 +1561,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 				ts := hp.ScannedAt
 				cv.LastScannedAt = &ts
 			}
-		} else if reason := clientSkipReason(cl, excludedSet); reason != "" {
+		} else if reason := clientSkipReason(cl, excludedSet, sitePrefixes); reason != "" {
 			cv.Skipped = true
 			cv.SkipReason = reason
 		}
@@ -1523,12 +1587,14 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	// Diff against previous baseline for webhook alerting and live finding events
 	// ONLY after the initial baseline probe has completed, so restarting `serve`
 	// never wipes existing host findings from uniblue-state.json or fires a storm
-	// of false "new" alerts.
+	// of false "new" alerts. Advance the in-memory and on-disk baseline immediately
+	// and dispatch external webhooks asynchronously so a slow or failing webhook
+	// never stalls recomputeMu/pollDelta or re-emits finding_new infinitely.
 	postEvents := append([]LiveEvent(nil), extraEvents...)
 	nextState := prevRisk
+	var webhookToSend *pendingWebhook
 	if baselineReady {
 		diff := risk.ComputeDiff(prevRisk, snap, report, e.cfg.Network)
-		webhookFailed := false
 		if prevRisk != nil {
 			for _, nf := range diff.NewFindings {
 				postEvents = append(postEvents, LiveEvent{
@@ -1541,18 +1607,13 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 				})
 			}
 			if diff.HasAlerts(e.minNotify) && e.notifier != nil {
-				if err := e.notifier.Send(ctx, snap.Site, diff); err != nil {
-					webhookFailed = true
-					e.logger.Error("webhook notification failed; preserving previous baseline for retry", "err", err)
-				}
+				webhookToSend = &pendingWebhook{site: snap.Site, diff: diff}
 			}
 		}
-		if !webhookFailed {
-			nextState = risk.BuildStateWithPrev(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
-			if e.cfg != nil && e.cfg.State.Path != "" {
-				if err := risk.SaveState(e.cfg.State.Path, nextState); err != nil {
-					e.logger.Error("failed to persist state baseline", "path", e.cfg.State.Path, "err", err)
-				}
+		nextState = risk.BuildStateWithPrev(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
+		if e.cfg != nil && e.cfg.State.Path != "" {
+			if err := risk.SaveState(e.cfg.State.Path, nextState); err != nil {
+				e.logger.Error("failed to persist state baseline", "path", e.cfg.State.Path, "err", err)
 			}
 		}
 	}
@@ -1595,6 +1656,158 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		e.emitLocked(ev)
 	}
 	e.mu.Unlock()
+
+	if webhookToSend != nil {
+		e.enqueueWebhook(ctx, *webhookToSend)
+	}
+}
+
+func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
+	e.webhookMu.Lock()
+	if len(e.pendingWebhooks) >= maxPendingWebhooks {
+		// Drop the oldest queued notification under sustained outage so memory stays bounded.
+		e.pendingWebhooks = e.pendingWebhooks[1:]
+	}
+	e.pendingWebhooks = append(e.pendingWebhooks, item)
+	if !e.webhookRunning {
+		e.webhookRunning = true
+		go e.drainWebhooks(ctx)
+	}
+	e.webhookMu.Unlock()
+}
+
+func (e *Engine) drainWebhooks(ctx context.Context) {
+	baseDelay := e.webhookRetryBase
+	if baseDelay <= 0 {
+		baseDelay = 5 * time.Second
+	}
+	for {
+		e.webhookMu.Lock()
+		if len(e.pendingWebhooks) == 0 {
+			e.webhookRunning = false
+			e.webhookMu.Unlock()
+			return
+		}
+		item := e.pendingWebhooks[0]
+		e.webhookMu.Unlock()
+
+		if wait := time.Until(item.nextAttempt); wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				e.webhookMu.Lock()
+				e.webhookRunning = false
+				e.webhookMu.Unlock()
+				return
+			case <-timer.C:
+			}
+		}
+		if ctx.Err() != nil {
+			e.webhookMu.Lock()
+			e.webhookRunning = false
+			e.webhookMu.Unlock()
+			return
+		}
+
+		err := e.notifier.Send(ctx, item.site, item.diff)
+		e.webhookMu.Lock()
+		if err == nil {
+			if len(e.pendingWebhooks) > 0 {
+				e.pendingWebhooks = e.pendingWebhooks[1:]
+			}
+			e.webhookMu.Unlock()
+			continue
+		}
+		item.attempts++
+		if item.attempts >= maxWebhookRetries {
+			e.logger.Error("webhook notification failed after retries; dropping alert batch", "attempts", item.attempts, "err", err)
+			if len(e.pendingWebhooks) > 0 {
+				e.pendingWebhooks = e.pendingWebhooks[1:]
+			}
+			e.webhookMu.Unlock()
+			continue
+		}
+		delay := baseDelay << (item.attempts - 1)
+		if delay > 5*time.Minute {
+			delay = 5 * time.Minute
+		}
+		item.nextAttempt = time.Now().Add(delay)
+		if len(e.pendingWebhooks) > 0 {
+			e.pendingWebhooks[0] = item
+		}
+		e.logger.Error("webhook notification failed; scheduling async retry", "attempt", item.attempts, "retry_in", delay, "err", err)
+		e.webhookMu.Unlock()
+	}
+}
+
+// preserveUnavailableTelemetry carries forward last-known SecuritySettings,
+// WLANs, and switch port profile configuration across transient controller
+// telemetry fetch failures so temporary errors do not drop findings or fire
+// false drift / port_config_changed alerts.
+func preserveUnavailableTelemetry(prevSnap, nextSnap *unifi.Snapshot) {
+	if prevSnap == nil || nextSnap == nil || nextSnap.Visibility == nil {
+		return
+	}
+	if !nextSnap.Visibility.SettingsAvailable && nextSnap.SecuritySettings == nil && prevSnap.SecuritySettings != nil {
+		cp := *prevSnap.SecuritySettings
+		nextSnap.SecuritySettings = &cp
+	}
+	if !nextSnap.Visibility.WLANsAvailable && len(nextSnap.WLANs) == 0 && len(prevSnap.WLANs) > 0 {
+		nextSnap.WLANs = append([]unifi.WLANConfig(nil), prevSnap.WLANs...)
+	}
+	if !nextSnap.Visibility.PortProfilesAvailable && len(prevSnap.Devices) > 0 && len(nextSnap.Devices) > 0 {
+		prevPorts := make(map[string]unifi.SwitchPort)
+		for _, d := range prevSnap.Devices {
+			dmac := strings.ToLower(strings.TrimSpace(d.MAC))
+			for _, p := range d.Ports {
+				prevPorts[portKey(dmac, p.PortIdx)] = p
+			}
+		}
+		for di := range nextSnap.Devices {
+			dmac := strings.ToLower(strings.TrimSpace(nextSnap.Devices[di].MAC))
+			for pi := range nextSnap.Devices[di].Ports {
+				p := &nextSnap.Devices[di].Ports[pi]
+				if old, ok := prevPorts[portKey(dmac, p.PortIdx)]; ok {
+					p.Enabled = old.Enabled
+					p.OpMode = old.OpMode
+					p.Forward = old.Forward
+					p.TaggedVLANMgmt = old.TaggedVLANMgmt
+					p.NativeNetworkID = old.NativeNetworkID
+					p.NativeNetworkName = old.NativeNetworkName
+					p.PoEMode = old.PoEMode
+					p.PortSecurityEnabled = old.PortSecurityEnabled
+					p.PortSecurityMACs = append([]string(nil), old.PortSecurityMACs...)
+					p.Isolation = old.Isolation
+				}
+			}
+		}
+	}
+}
+
+func lookupClientClass(classes map[string]classify.Result, cl unifi.Client) classify.Result {
+	if len(classes) == 0 {
+		return classify.Result{}
+	}
+	if cl.IP != "" {
+		if r, ok := classes[cl.IP]; ok && r.Category != "" {
+			return r
+		}
+	}
+	if pip := cl.PrimaryIP(); pip != "" {
+		if r, ok := classes[pip]; ok && r.Category != "" {
+			return r
+		}
+	}
+	if cl.MAC != "" {
+		if r, ok := classes[cl.MAC]; ok && r.Category != "" {
+			return r
+		}
+		if r, ok := classes[strings.ToLower(cl.MAC)]; ok && r.Category != "" {
+			return r
+		}
+	}
+	return classify.Result{}
 }
 
 // emit records ev in the recent history buffer and fans it out to all SSE clients.
@@ -1714,14 +1927,75 @@ func snapshotSubnets(snap *unifi.Snapshot) []netip.Prefix {
 	return out
 }
 
-func clientSkipReason(cl unifi.Client, excluded map[string]struct{}) string {
-	for _, ip := range cl.AllIPs() {
-		if _, skip := excluded[ip]; skip {
-			return "Excluded via network.exclude_ips"
+var cgnatProbePrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+func canonicalIPSet(raw map[string]struct{}) map[string]struct{} {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(raw)*2)
+	for k := range raw {
+		trimmed := strings.TrimSpace(k)
+		if trimmed == "" {
+			continue
+		}
+		out[trimmed] = struct{}{}
+		if addr, err := netip.ParseAddr(trimmed); err == nil {
+			out[addr.Unmap().String()] = struct{}{}
 		}
 	}
-	if cl.PrimaryIP() == "" {
+	return out
+}
+
+func isClientExcluded(cl unifi.Client, excluded map[string]struct{}) bool {
+	if len(excluded) == 0 {
+		return false
+	}
+	canon := canonicalIPSet(excluded)
+	for _, rawIP := range cl.AllIPs() {
+		ip := strings.TrimSpace(rawIP)
+		if ip == "" {
+			continue
+		}
+		if _, skip := canon[ip]; skip {
+			return true
+		}
+		if addr, err := netip.ParseAddr(ip); err == nil {
+			if _, skip := canon[addr.Unmap().String()]; skip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isAllowedClientProbeIP(rawIP string, allowedSubnets []netip.Prefix) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(rawIP))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	if addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback() || cgnatProbePrefix.Contains(addr) {
+		return true
+	}
+	for _, pfx := range allowedSubnets {
+		if pfx.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func clientSkipReason(cl unifi.Client, excluded map[string]struct{}, allowedSubnets []netip.Prefix) string {
+	if isClientExcluded(cl, excluded) {
+		return "Excluded via network.exclude_ips"
+	}
+	primary := strings.TrimSpace(cl.PrimaryIP())
+	if primary == "" {
 		return "No IP address reported by UniFi"
+	}
+	if !isAllowedClientProbeIP(primary, allowedSubnets) {
+		return "Public or out-of-subnet IP address (active probing skipped)"
 	}
 	return ""
 }

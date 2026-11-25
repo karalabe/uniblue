@@ -21,8 +21,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
-// TestSkippedHostAndZeroScannedAt verifies findings #42 and #139: skipped hosts
-// carry Skipped/SkipReason and an Excluded/Skipped label without counting in
+// TestSkippedHostAndZeroScannedAt verifies that skipped hosts carry
+// Skipped/SkipReason and an Excluded/Skipped label without counting in
 // Census.UnassessedCount, while a non-nil zero LastScannedAt still counts as
 // unassessed.
 func TestSkippedHostAndZeroScannedAt(t *testing.T) {
@@ -63,8 +63,8 @@ func TestSkippedHostAndZeroScannedAt(t *testing.T) {
 	}
 }
 
-// TestUniFiDeviceFirmwareCVEsAttached verifies finding #44: exact and potential
-// CVEs matched against UniFi gateway/switch/AP firmware attach to dev:<mac>
+// TestUniFiDeviceFirmwareCVEsAttached verifies that exact and potential CVEs
+// matched against UniFi gateway/switch/AP firmware attach to dev:<mac>
 // entities, raise exposed reasons, enter the queue, and count in ExactCVEHosts.
 func TestUniFiDeviceFirmwareCVEsAttached(t *testing.T) {
 	snap := &unifi.Snapshot{
@@ -109,10 +109,11 @@ func TestUniFiDeviceFirmwareCVEsAttached(t *testing.T) {
 	}
 }
 
-// TestUnauthorizedMACPortFindingResolutionAndFallback verifies finding #45:
+// TestUnauthorizedMACPortFindingResolutionAndFallback verifies that
 // UB-UNIFI-PORT-UNAUTHORIZED-MAC resolves the switch port via SwitchMAC/Property
-// or peer lists, attaches to both the switch port and intruding host, and falls
-// back instead of silently dropping when the port entity is absent.
+// or peer lists, attaches to both the switch port and intruding host without
+// double-counting queue items or Census.ExposedCount, and falls back instead of
+// silently dropping when the port entity is absent.
 func TestUnauthorizedMACPortFindingResolutionAndFallback(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -180,15 +181,31 @@ func TestUnauthorizedMACPortFindingResolutionAndFallback(t *testing.T) {
 	if hostEnt == nil || hostEnt.State != VerdictExposed || hostEnt.MaxSeverity != "critical" {
 		t.Fatalf("expected intruding host entity to be Exposed/critical, got %+v", hostEnt)
 	}
+	if len(hostEnt.Reasons) != 1 || !hostEnt.Reasons[0].Secondary {
+		t.Fatalf("expected secondary reason on host when primary port owns finding, got %+v", hostEnt.Reasons)
+	}
+	unauthQueueItems := 0
+	for _, q := range pm.Queue {
+		if q.ReasonRef == "UB-UNIFI-PORT-UNAUTHORIZED-MAC" {
+			unauthQueueItems++
+		}
+	}
+	if unauthQueueItems != 1 {
+		t.Fatalf("expected exactly 1 queue item for UB-UNIFI-PORT-UNAUTHORIZED-MAC, got %d: %+v", unauthQueueItems, pm.Queue)
+	}
 	gwEnt := pm.Entities["dev:aa:00:00:00:00:01"]
 	if gwEnt == nil || gwEnt.State != VerdictExposed {
 		t.Fatalf("expected unattached port finding to fall back to gateway, got %+v", gwEnt)
 	}
+	// Two findings total (unauthorized MAC on port + STP fallback on gateway) -> ExposedCount == 2, not 3.
+	if pm.Census.ExposedCount != 2 {
+		t.Fatalf("expected Census.ExposedCount=2 (no port+host double count), got %d", pm.Census.ExposedCount)
+	}
 }
 
-// TestUnscannedHostWithPlacementReviewStaysUnknown verifies finding #46: an
-// unscanned host with heuristic Review reasons (such as VLAN placement advice)
-// remains VerdictUnknown, preserves its review reasons, and still counts in
+// TestUnscannedHostWithPlacementReviewStaysUnknown verifies that an unscanned
+// host with heuristic Review reasons (such as VLAN placement advice) remains
+// VerdictUnknown, preserves its review reasons, and still counts in
 // Census.UnassessedCount.
 func TestUnscannedHostWithPlacementReviewStaysUnknown(t *testing.T) {
 	snap := &unifi.Snapshot{
@@ -233,9 +250,9 @@ func TestUnscannedHostWithPlacementReviewStaysUnknown(t *testing.T) {
 	}
 }
 
-// TestUnassignedNetworkHostsAppearInLogicalLanes verifies finding #47: hosts
-// with empty or unresolved NetworkName appear inside the Unassigned logical
-// lane instead of vanishing from Devices & Wi-Fi.
+// TestUnassignedNetworkHostsAppearInLogicalLanes verifies that hosts with empty
+// or unresolved NetworkName appear inside the Unassigned logical lane instead
+// of vanishing from Devices & Wi-Fi.
 func TestUnassignedNetworkHostsAppearInLogicalLanes(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -272,9 +289,9 @@ func TestUnassignedNetworkHostsAppearInLogicalLanes(t *testing.T) {
 	}
 }
 
-// TestHostScopedUniFiFindingsAttachToHostNotGateway verifies finding #48:
-// host-scoped UB-UNIFI-* findings (rogue wired AP, public admin tunnel/proxy,
-// dynamic NAT mapping) attach to the concrete host entity instead of the gateway.
+// TestHostScopedUniFiFindingsAttachToHostNotGateway verifies that host-scoped
+// UB-UNIFI-* findings (rogue wired AP, public admin tunnel/proxy, dynamic NAT
+// mapping) attach to the concrete host entity instead of the gateway.
 func TestHostScopedUniFiFindingsAttachToHostNotGateway(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -324,8 +341,8 @@ func TestHostScopedUniFiFindingsAttachToHostNotGateway(t *testing.T) {
 	}
 }
 
-// TestMultipleGatewayReasonsEmitSeparateQueueItems verifies finding #49: each
-// distinct exposed gateway/controller reason emits its own controller queue item.
+// TestMultipleGatewayReasonsEmitSeparateQueueItems verifies that each distinct
+// exposed gateway/controller reason emits its own controller queue item.
 func TestMultipleGatewayReasonsEmitSeparateQueueItems(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
@@ -354,9 +371,9 @@ func TestMultipleGatewayReasonsEmitSeparateQueueItems(t *testing.T) {
 	}
 }
 
-// TestMissingWANTelemetryEmitsUnknownCoverageFlow verifies findings #51 and #56:
-// missing firewall-policy or port-forward feeds emit an Unknown coverage WANFlow
-// and prevent PresentationModel.Headline from reporting "All clear".
+// TestMissingWANTelemetryEmitsUnknownCoverageFlow verifies that missing
+// firewall-policy and port-forward feeds emit an Unknown coverage WANFlow and
+// report the exact missing feed count in PresentationModel.Headline.
 func TestMissingWANTelemetryEmitsUnknownCoverageFlow(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
@@ -380,13 +397,14 @@ func TestMissingWANTelemetryEmitsUnknownCoverageFlow(t *testing.T) {
 	if !foundCov {
 		t.Fatalf("expected Unknown coverage WANFlow when firewall/port-forward feeds are missing, got %+v", pm.WANFlows)
 	}
-	if strings.HasPrefix(pm.Headline, "All clear") {
-		t.Fatalf("headline must not claim All clear when WAN telemetry is missing: %q", pm.Headline)
+	if pm.Headline != "Coverage incomplete: 2 WAN telemetry feeds unavailable." {
+		t.Fatalf("expected exact 2 missing WAN telemetry feeds headline, got %q", pm.Headline)
 	}
 }
 
-// TestWidePortRangeForwardMarksServiceWAN verifies finding #52: a port-range
-// forward wider than 64 ports still labels matching open ports as "wan".
+// TestWidePortRangeForwardMarksServiceWAN verifies that a port-range forward
+// wider than 64 ports marks matching open TCP ports as "wan" and adds a concise
+// UDP range chip when no concrete UDP service inside a wide UDP forward was observed.
 func TestWidePortRangeForwardMarksServiceWAN(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -411,19 +429,40 @@ func TestWidePortRangeForwardMarksServiceWAN(t *testing.T) {
 				Client:   snap.Clients[0],
 				Severity: checks.SeverityCritical,
 			},
+			{
+				Forward: unifi.PortForward{
+					ID: "pf-udp-wide", Name: "RTP UDP Range", Enabled: true, Proto: "udp",
+					DstPort: "10000-20000", FwdIP: "192.168.1.10", FwdPort: "10000-20000", Src: "any",
+				},
+				Client:   snap.Clients[0],
+				Severity: checks.SeverityHigh,
+			},
 		},
 	}
 
 	pm := BuildPresentationModel(snap, report, nil, clientViews, nil, nil, nil)
 	ent := pm.Entities["host:55:55:55:55:55:10"]
-	if ent == nil || len(ent.Services) == 0 || ent.Services[0].Reachable != "wan" {
-		t.Fatalf("expected port 8080 behind 8000-9000 forward to be reachable=wan, got %+v", ent)
+	if ent == nil || len(ent.Services) != 2 {
+		t.Fatalf("expected TCP 8080 + wide UDP range chip (2 services), got %+v", ent)
+	}
+	var sawTCP, sawWideUDP bool
+	for _, svc := range ent.Services {
+		if svc.Port == 8080 && svc.Proto == "tcp" && svc.Reachable == "wan" {
+			sawTCP = true
+		}
+		if svc.Proto == "udp" && svc.Reachable == "wan" && svc.Label == "UDP :10000-20000" {
+			sawWideUDP = true
+		}
+	}
+	if !sawTCP || !sawWideUDP {
+		t.Fatalf("expected wan TCP :8080 and wan UDP :10000-20000 chips, got %+v", ent.Services)
 	}
 }
 
-// TestFirewallPolicyWANFlowRoutingAndHostResolution verifies finding #55:
+// TestFirewallPolicyWANFlowRoutingAndHostResolution verifies that
 // UB-UNIFI-FW-ISO-LEAK does not appear in WANFlows, while UB-UNIFI-FW-WAN-LAN
-// sets TargetIP and resolves TargetID to the concrete IPv4/IPv6 host entity.
+// sets TargetIP, resolves TargetID to the concrete IPv4/IPv6 host entity, and
+// does not double-count the finding across two queue items or Census.ExposedCount.
 func TestFirewallPolicyWANFlowRoutingAndHostResolution(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -467,9 +506,21 @@ func TestFirewallPolicyWANFlowRoutingAndHostResolution(t *testing.T) {
 	if laptop == nil || laptop.State != VerdictExposed {
 		t.Fatalf("expected IPv6-pinholed host to be Exposed, got %+v", laptop)
 	}
+	if len(laptop.Reasons) != 1 || !laptop.Reasons[0].Secondary {
+		t.Fatalf("expected secondary reason on host for WAN-LAN rule already represented in WANFlows, got %+v", laptop.Reasons)
+	}
+	wanQueueItems := 0
+	for _, q := range pm.Queue {
+		if q.ReasonRef == "UB-UNIFI-FW-WAN-LAN" {
+			wanQueueItems++
+		}
+	}
+	if wanQueueItems != 1 {
+		t.Fatalf("expected exactly 1 queue item for UB-UNIFI-FW-WAN-LAN, got %d: %+v", wanQueueItems, pm.Queue)
+	}
 }
 
-// TestHeadlineNotAllClearWhenUnassessedOrUnexpectedWAN verifies finding #56:
+// TestHeadlineNotAllClearWhenUnassessedOrUnexpectedWAN verifies that
 // PresentationModel.Headline never says "All clear" when hosts are unassessed
 // or when an unexpected WAN port forward is present.
 func TestHeadlineNotAllClearWhenUnassessedOrUnexpectedWAN(t *testing.T) {
@@ -503,8 +554,8 @@ func TestHeadlineNotAllClearWhenUnassessedOrUnexpectedWAN(t *testing.T) {
 	}
 }
 
-// TestPlacementLookupFallsBackToMACForIPv6OnlyHost verifies finding #57: a host
-// without an IPv4 address still receives its placement review via placementByMAC.
+// TestPlacementLookupFallsBackToMACForIPv6OnlyHost verifies that a host without
+// an IPv4 address still receives its placement review via placementByMAC.
 func TestPlacementLookupFallsBackToMACForIPv6OnlyHost(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -534,9 +585,10 @@ func TestPlacementLookupFallsBackToMACForIPv6OnlyHost(t *testing.T) {
 	}
 }
 
-// TestUnusedPortsCountedOnceWithoutDoubleCounting verifies finding #58: ports
+// TestUnusedPortsCountedOnceWithoutDoubleCounting verifies that indoor ports
 // zoned "unused" are aggregated once per switch without creating duplicate
-// per-port queue items or mislabeling indoor unused ports as external.
+// per-port queue items or mislabeling indoor unused ports as external even when
+// the upstream risk finding title contains "External".
 func TestUnusedPortsCountedOnceWithoutDoubleCounting(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
@@ -559,7 +611,7 @@ func TestUnusedPortsCountedOnceWithoutDoubleCounting(t *testing.T) {
 		Findings: []checks.Finding{
 			{
 				CheckID:           "UB-UNIFI-PORT-EXT-UNUSED-OPEN",
-				Title:             "Unused Switch Ports Left Enabled (Closet Switch: 2 port(s))",
+				Title:             "Unused External Switch Ports Left Enabled (Closet Switch: 2 port(s))",
 				EffectiveSeverity: checks.SeverityHigh,
 				Client:            unifi.Client{MAC: "aa:00:00:00:00:05", IP: "192.168.1.5", Name: "Closet Switch"},
 				Port:              5,
@@ -572,19 +624,22 @@ func TestUnusedPortsCountedOnceWithoutDoubleCounting(t *testing.T) {
 	for _, q := range pm.Queue {
 		if q.Category == "perimeter" {
 			perimItems++
-			if strings.Contains(q.Sentence, "unused external ports") {
-				t.Fatalf("indoor unused-only switch should not say unused external ports: %q", q.Sentence)
+			if strings.Contains(strings.ToLower(q.Sentence), "external") {
+				t.Fatalf("indoor unused-only switch must not say external in queue sentence: %q", q.Sentence)
 			}
 		}
 	}
 	if perimItems != 1 {
 		t.Fatalf("expected exactly 1 perimeter queue item for 2 unused ports, got %d: %+v", perimItems, pm.Queue)
 	}
+	if pm.Census.ExposedCount != 1 {
+		t.Fatalf("expected Census.ExposedCount=1 for single switch unused-ports rollup, got %d", pm.Census.ExposedCount)
+	}
 }
 
-// TestQueueSentenceReportsActualCheckFindingCount verifies finding #59: when a
-// host has both exact CVEs and check findings, the queue sentence reports the
-// real check-finding count rather than hard-coded "0 check findings".
+// TestQueueSentenceReportsActualCheckFindingCount verifies that when a host has
+// both exact CVEs and check findings, the queue sentence reports the real
+// check-finding count rather than hard-coded "0 check findings".
 func TestQueueSentenceReportsActualCheckFindingCount(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -619,8 +674,8 @@ func TestQueueSentenceReportsActualCheckFindingCount(t *testing.T) {
 	}
 }
 
-// TestUDPForwardServiceChipsAreDeterministicallySorted verifies finding #60:
-// UDP forward service chips are appended in sorted port order across rebuilds.
+// TestUDPForwardServiceChipsAreDeterministicallySorted verifies that UDP
+// forward service chips are appended in sorted port order across rebuilds.
 func TestUDPForwardServiceChipsAreDeterministicallySorted(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -656,9 +711,8 @@ func TestUDPForwardServiceChipsAreDeterministicallySorted(t *testing.T) {
 	}
 }
 
-// TestServiceChipKeepsHighestSeverityLabel verifies finding #61: a later
-// lower-severity finding on the same port never overwrites the higher-severity
-// service chip label.
+// TestServiceChipKeepsHighestSeverityLabel verifies that a later lower-severity
+// finding on the same port never overwrites the higher-severity service chip label.
 func TestServiceChipKeepsHighestSeverityLabel(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -688,8 +742,8 @@ func TestServiceChipKeepsHighestSeverityLabel(t *testing.T) {
 	}
 }
 
-// TestNetIsolatedHonorsTopologyIsolatedVLANs verifies finding #69: corporate
-// VLANs marked isolated via network.isolated_vlans or custom isolated zones in
+// TestNetIsolatedHonorsTopologyIsolatedVLANs verifies that corporate VLANs
+// marked isolated via network.isolated_vlans or custom isolated zones in
 // topology.Model label host services as "vlan-only" rather than "lan".
 func TestNetIsolatedHonorsTopologyIsolatedVLANs(t *testing.T) {
 	now := time.Now().UTC()
@@ -714,12 +768,14 @@ func TestNetIsolatedHonorsTopologyIsolatedVLANs(t *testing.T) {
 	}
 }
 
-// TestDashboardHTMLReviewFixes verifies UI/JS regressions for findings #42, #43,
-// #49, #50, #51, #53, #54, #62, #63, #64, #65, #66, #67, and #68 in index.html.
-func TestDashboardHTMLReviewFixes(t *testing.T) {
+// TestDashboardHTMLInvariants verifies UI/JS invariants in index.html including
+// auth sign-in flow, initial splash gating, progress-tick view transitions,
+// indoor vs outdoor port separation, reason_ref matching, Devices CVE filter
+// accuracy, safe hash decoding, zero inline handlers, and typography rules.
+func TestDashboardHTMLInvariants(t *testing.T) {
 	html := string(dashboardHTML)
 
-	// #42: checking must derive from state.scanning / scan_progress.initial, not unassessed > 0.
+	// Checking indicator must derive from state.scanning / scan_progress.initial, not unassessed > 0.
 	if strings.Contains(html, "Boolean(state.scanning || unassessed > 0)") {
 		t.Fatal("index.html must not derive checking from unassessed > 0")
 	}
@@ -727,22 +783,49 @@ func TestDashboardHTMLReviewFixes(t *testing.T) {
 		t.Fatal("index.html must derive checking from state.scanning || scan_progress.initial")
 	}
 
-	// #43: Safety Features must handle absent/null settings as Unknown rather than green Off.
+	// Initial splash must only activate when scan_progress.initial is true (not on targeted rescans).
+	if !strings.Contains(html, "function isInitialScanActive() {\n  if (!state || isStaticMode) return false;\n  const hasBaseline = Boolean(state.last_full_scan_at && !String(state.last_full_scan_at).startsWith(\"0001-\"));\n  if (hasBaseline) return false;\n  return Boolean(state.scan_progress && state.scan_progress.initial);\n}") {
+		t.Fatal("isInitialScanActive must gate strictly on scan_progress.initial")
+	}
+
+	// Safety Features must handle absent/null settings as Unknown rather than green Off.
 	if !strings.Contains(html, "const hasSettings = rawSettings != null") || !strings.Contains(html, `!hasSettings ? "Unknown"`) {
 		t.Fatal("index.html must render Unknown when unifi_posture.settings is absent/null")
 	}
 
-	// #50: DOM patching must preserve focus/selection and <details> state and skip scan_progress tab rebuilds.
-	if !strings.Contains(html, "function patchContainerHTML(") || !strings.Contains(html, "if (progressOnly) return;") {
-		t.Fatal("index.html must preserve focus/details state and skip view rebuilds on scan_progress ticks")
+	// DOM patching must preserve focus/details state, skip scan_progress tab rebuilds
+	// while a tab view is already active, and render when exiting the initial splash.
+	if !strings.Contains(html, "function patchContainerHTML(") || !strings.Contains(html, "if (progressOnly && !hadSplash && hasActiveView) return;") {
+		t.Fatal("index.html must preserve focus/details state and render full view when transitioning out of splash")
 	}
 
-	// #51: Unknown WAN coverage must not display Front door locked.
+	// Token sign-in overlay must post to /api/auth on HTTP 401.
+	for _, needle := range []string{`id="auth-overlay"`, `id="auth-form"`, `fetch("/api/auth"`, `r.status === 401`} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("index.html missing API token auth flow marker %q", needle)
+		}
+	}
+
+	// Devices tab Security updates filter must count host entities with CVEs.
+	if !strings.Contains(html, "const hostCVECount = allHosts.filter(e => e.exact_cve_count > 0).length;") ||
+		!strings.Contains(html, "Security updates (${hostCVECount})") {
+		t.Fatal("index.html must count host entities for Devices tab Security updates filter")
+	}
+
+	// Indoor switch port alerts must stay separate from outdoor cable alerts,
+	// match reasons by reason_ref, and exclude secondary reasons from hero host counts.
+	for _, needle := range []string{"Indoor Switch Port Alerts", "function matchQueueReason(", "function hasPrimaryExposedReason(", "Unused indoor switch ports are still active"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("index.html missing indoor/dedupe/reason_ref marker %q", needle)
+		}
+	}
+
+	// Unknown WAN coverage must not display Front door locked.
 	if !strings.Contains(html, `"Coverage unknown"`) || !strings.Contains(html, "wanCoverageUnknown") {
 		t.Fatal("index.html must handle unknown WAN coverage without claiming Front door locked")
 	}
 
-	// #53: Splash must not appear when no scan runs, and last_scan_error must show Retry now banner.
+	// Splash must not appear when no scan runs, and last_scan_error must show Retry now banner.
 	if strings.Contains(html, "|| (state.view?.census?.unassessed_count || 0) > 0") {
 		t.Fatal("isInitialScanActive must not lock splash on unassessed_count when no scan runs")
 	}
@@ -750,19 +833,19 @@ func TestDashboardHTMLReviewFixes(t *testing.T) {
 		t.Fatal("index.html must display last_scan_error with a Retry now button")
 	}
 
-	// #54: Wi-Fi security badges must handle WEP, open, WPA1, WPA3, and disabled SSIDs.
+	// Wi-Fi security badges must handle WEP, open, WPA1, WPA3, and disabled SSIDs.
 	for _, needle := range []string{"function wifiSecurityBadge(", `"Legacy (WEP)"`, `"Legacy (WPA1)"`, "w.enabled === false", ">Disabled<"} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("index.html missing Wi-Fi security fix marker %q", needle)
+			t.Fatalf("index.html missing Wi-Fi security marker %q", needle)
 		}
 	}
 
-	// #62: fmtTime must include date for static exports or non-today timestamps.
+	// fmtTime must include date for static exports or non-today timestamps.
 	if !strings.Contains(html, "isStaticMode || !sameDay") || !strings.Contains(html, "toLocaleDateString") {
 		t.Fatal("fmtTime must include date for static snapshots and non-today timestamps")
 	}
 
-	// #63: Friendly reason keys must match Go CheckIDs.
+	// Friendly reason keys must match Go CheckIDs.
 	if strings.Contains(html, `"UB-UNIFI-UPNP":`) || strings.Contains(html, `"UB-UNIFI-PORT-EXT-OPEN":`) {
 		t.Fatal("index.html still contains mismatched UB-UNIFI-UPNP or UB-UNIFI-PORT-EXT-OPEN keys")
 	}
@@ -770,19 +853,19 @@ func TestDashboardHTMLReviewFixes(t *testing.T) {
 		t.Fatal("index.html missing UB-UNIFI-UPNP-ENABLED or UB-UNIFI-PORT-EXT-UNRESTRICTED keys")
 	}
 
-	// #64: Filter changes must call syncHash(false) (history.replaceState).
+	// Filter changes must call syncHash(false) (history.replaceState).
 	for _, fn := range []string{"function setPortFilter(", "function setDeviceFilter(", "function setActivityFilter("} {
 		if !strings.Contains(html, fn) {
 			t.Fatalf("index.html missing filter history helper %q", fn)
 		}
 	}
 
-	// #65: decodeURIComponent in hash parsing must be wrapped in try/catch.
+	// decodeURIComponent in hash parsing must be wrapped in try/catch.
 	if !strings.Contains(html, "try {\n      ent = decodeURIComponent(") {
 		t.Fatal("index.html must wrap decodeURIComponent in try/catch when parsing location.hash")
 	}
 
-	// #66: Zero inline onclick= handlers; use delegated data-entity-id / data-action listeners.
+	// Zero inline onclick= handlers; use delegated data-entity-id / data-action listeners.
 	if strings.Contains(html, "onclick=") {
 		t.Fatal("index.html must not contain inline onclick= handlers")
 	}
@@ -790,14 +873,14 @@ func TestDashboardHTMLReviewFixes(t *testing.T) {
 		t.Fatal("index.html missing delegated data-action / data-entity-id click handler")
 	}
 
-	// #67: triggerRescan must send X-UniBlue-Request, check resp.ok, and surface errors via toast.
+	// triggerRescan must send X-UniBlue-Request, check resp.ok, and surface errors via toast.
 	for _, needle := range []string{`"X-UniBlue-Request": "1"`, "if (!resp.ok)", "Rescan request failed"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("triggerRescan missing %q", needle)
 		}
 	}
 
-	// #68: SSE EventSource error handler must recreate on CLOSED with backoff and track sseDisconnected.
+	// SSE EventSource error handler must recreate on CLOSED with backoff and track sseDisconnected.
 	for _, needle := range []string{"EventSource.CLOSED", "scheduleSSEReconnect()", "sseDisconnected"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("SSE reconnect handler missing %q", needle)

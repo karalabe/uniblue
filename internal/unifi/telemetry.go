@@ -117,16 +117,18 @@ type rawAdminActivityEntry struct {
 // siteTelemetry bundles best-effort security posture & event data fetched
 // concurrently alongside core topology.
 type siteTelemetry struct {
-	wlans      []rawWLAN
-	wlansOK    bool
-	rogueAPs   []rawRogueAP
-	settings   *SiteSecuritySettings
-	settingsOK bool
-	health     *SystemHealth
-	vpnOK      bool
-	knownUsers []rawHistoricalUser
-	recentLogs []ControllerLogEvent
-	portConfs  []rawPortConf
+	wlans        []rawWLAN
+	wlansOK      bool
+	rogueAPs     []rawRogueAP
+	settings     *SiteSecuritySettings
+	settingsOK   bool
+	health       *SystemHealth
+	vpnOK        bool
+	knownUsers   []rawHistoricalUser
+	recentLogs   []ControllerLogEvent
+	portConfs    []rawPortConf
+	portConfsOK  bool
+	portConfsErr error
 }
 
 // fetchSiteTelemetry concurrently retrieves Wi-Fi configs, neighboring rogue APs,
@@ -147,6 +149,11 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 		health *SystemHealth
 		vpnOK  bool
 	}
+	type portConfRes struct {
+		items []rawPortConf
+		ok    bool
+		err   error
+	}
 	var (
 		wlanCh     = make(chan wlanRes, 1)
 		rogueCh    = make(chan []rawRogueAP, 1)
@@ -154,7 +161,7 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 		healthCh   = make(chan healthRes, 1)
 		usersCh    = make(chan []rawHistoricalUser, 1)
 		logsCh     = make(chan []ControllerLogEvent, 1)
-		portConfCh = make(chan []rawPortConf, 1)
+		portConfCh = make(chan portConfRes, 1)
 	)
 	apiPrefix, site := c.sessionPrefixAndSite()
 
@@ -245,10 +252,11 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	go func() {
 		var env apiEnvelope[rawPortConf]
 		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/portconf", site), &env); err == nil {
-			portConfCh <- env.Data
+			portConfCh <- portConfRes{items: env.Data, ok: true}
 			return
+		} else {
+			portConfCh <- portConfRes{err: err}
 		}
-		portConfCh <- nil
 	}()
 	go func() {
 		logs, _ := c.FetchRecentLogs(ctx, time.Now().UTC().Add(-24*time.Hour))
@@ -258,17 +266,20 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	wr := <-wlanCh
 	sr := <-settingCh
 	hr := <-healthCh
+	pcr := <-portConfCh
 	return siteTelemetry{
-		wlans:      wr.items,
-		wlansOK:    wr.ok,
-		rogueAPs:   <-rogueCh,
-		settings:   sr.settings,
-		settingsOK: sr.ok,
-		health:     hr.health,
-		vpnOK:      hr.vpnOK,
-		knownUsers: <-usersCh,
-		recentLogs: <-logsCh,
-		portConfs:  <-portConfCh,
+		wlans:        wr.items,
+		wlansOK:      wr.ok,
+		rogueAPs:     <-rogueCh,
+		settings:     sr.settings,
+		settingsOK:   sr.ok,
+		health:       hr.health,
+		vpnOK:        hr.vpnOK,
+		knownUsers:   <-usersCh,
+		recentLogs:   <-logsCh,
+		portConfs:    pcr.items,
+		portConfsOK:  pcr.ok,
+		portConfsErr: pcr.err,
 	}
 }
 
@@ -405,32 +416,57 @@ func stableHashID(s string) string {
 
 // postJSON performs a read-only query POST (used by UniFi v2 system-log endpoints)
 // and decodes its JSON response into dst, transparently re-logging in once if
-// the cookie session expired.
+// the cookie session expired and retrying once on transient 429/5xx bursts.
 func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any, dst any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
+	var lastErr error
 	relogged := false
 	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 		epoch := c.currentAuthEpoch()
 		err := c.postJSONOnce(ctx, fullPath, raw, dst)
 		if err == nil {
+			c.clearPathUnauthorized(fullPath)
 			return nil
 		}
-		if !relogged && c.canRelogin() && isSessionExpiredError(err) {
+		lastErr = err
+		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorizedAtEpoch(fullPath, epoch) {
 			relogged = true
-			if loginErr := c.relogin(ctx, epoch); loginErr == nil {
-				continue
+			if loginErr := c.relogin(ctx, epoch); loginErr != nil {
+				return fmt.Errorf("re-authentication failed: %w (after %w)", loginErr, err)
 			}
+			// Retry immediately with the fresh session without consuming the transient retry slot.
+			retryErr := c.postJSONOnce(ctx, fullPath, raw, dst)
+			if retryErr == nil {
+				c.clearPathUnauthorized(fullPath)
+				return nil
+			}
+			if isSessionExpiredError(retryErr) {
+				c.markPathUnauthorized(fullPath, c.currentAuthEpoch())
+			}
+			lastErr = retryErr
+		}
+		var apiErr *apiEnvelopeError
+		if errors.As(lastErr, &apiErr) {
+			return lastErr
 		}
 		var httpErr *httpStatusError
-		if errors.As(err, &httpErr) && (httpErr.status == http.StatusTooManyRequests || httpErr.status >= 500) && attempt == 0 {
-			continue
+		if errors.As(lastErr, &httpErr) && httpErr.status != http.StatusTooManyRequests && httpErr.status < 500 {
+			return lastErr
 		}
-		return err
 	}
-	return nil
+	return lastErr
 }
 
 func (c *Controller) postJSONOnce(ctx context.Context, fullPath string, raw []byte, dst any) error {
@@ -462,7 +498,7 @@ func (c *Controller) postJSONOnce(ctx context.Context, fullPath string, raw []by
 		return fmt.Errorf("read %s: %w", fullPath, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &httpStatusError{path: fullPath, status: resp.StatusCode}
+		return &httpStatusError{path: fullPath, status: resp.StatusCode, apiMsg: extractAPIErrorMsg(body)}
 	}
 	if err := checkAPIEnvelopeError(fullPath, body); err != nil {
 		return err

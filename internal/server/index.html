@@ -1064,6 +1064,52 @@
   .scan-banner-bar { width: 160px; height: 7px; border-radius: 999px; background: var(--surface); border: 1px solid var(--blue-bd); overflow: hidden; flex-shrink: 0; }
   .scan-banner-bar > div { height: 100%; background: var(--blue); transition: width .35s ease; }
   .nav-pills.locked { opacity: .45; pointer-events: none; }
+  .auth-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(15, 23, 42, .56);
+    backdrop-filter: blur(4px);
+  }
+  .auth-overlay.open { display: flex; }
+  .auth-card {
+    width: 100%;
+    max-width: 400px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    box-shadow: var(--shadow-lg);
+  }
+  .auth-card h2 { margin: 0 0 6px; font-size: 18px; font-weight: 800; }
+  .auth-card p { margin: 0 0 16px; font-size: 13px; color: var(--text-2); line-height: 1.5; }
+  .auth-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin-bottom: 12px;
+  }
+  .auth-err {
+    display: none;
+    margin-bottom: 12px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--crit-bg);
+    border: 1px solid var(--crit-bd);
+    color: var(--crit);
+    font-size: 12.5px;
+  }
+  .auth-err.show { display: block; }
 </style>
 </head>
 <body>
@@ -1126,6 +1172,20 @@
 
 <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
+<div id="auth-overlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+  <div class="auth-card">
+    <h2 id="auth-title">Sign in to UniBlue</h2>
+    <p>This dashboard is protected by an API token (<span class="mono">UNIBLUE_API_TOKEN</span>). Enter your token to establish an HttpOnly session cookie.</p>
+    <form id="auth-form">
+      <div id="auth-err" class="auth-err"></div>
+      <input id="auth-token-input" class="auth-input" type="password" autocomplete="current-password" placeholder="API token" required>
+      <div style="display:flex;justify-content:flex-end;gap:8px">
+        <button id="auth-submit" class="btn primary" type="submit">Sign in</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <footer>
   <div class="ft-inner" id="app-footer">
     <span><strong>UniBlue</strong> · Home &amp; UniFi network security checkup</span>
@@ -1151,6 +1211,7 @@ let sseSource = null;
 let sseRetryMs = 1000;
 let sseRetryTimer = null;
 let sseDisconnected = false;
+let authRequired = false;
 
 /* ============================================================================
    CRISP INLINE SVG ICONS (No external dependencies, works offline)
@@ -1352,8 +1413,34 @@ function humanServiceChip(svc) {
   return svc.label || ("Port " + svc.port);
 }
 
-function humanReason(r) {
+function isOutdoorEntity(ent, r) {
+  if (ent) {
+    if (ent.side === "outside") return true;
+    if (ent.kind === "port") {
+      return ent.port_zone === "external" || ent.port_zone === "external_uplink";
+    }
+    if (ent.kind === "device" && state?.view?.entities) {
+      for (const other of Object.values(state.view.entities)) {
+        if (other.kind === "port" && other.device_id === ent.id && other.port_zone === "external" && other.port_state === "inactive_enabled") {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+  if (r && r.title && r.title.toLowerCase().includes("external")) return true;
+  return false;
+}
+
+function humanReason(r, ent) {
   const ref = r.ref || "";
+  if (ref === "UB-UNIFI-PORT-EXT-UNUSED-OPEN" && !isOutdoorEntity(ent, r)) {
+    return {
+      title: "Unused indoor switch ports are still active",
+      why: "Unused sockets on this indoor switch are left enabled. Disabling unused ports stops someone from plugging into an empty jack.",
+      fix: r.remediation || "In UniFi → Ports, select each unused port on this switch and set its Operation to 'Disabled'."
+    };
+  }
   const map = {
     "UB-0019": {
       title: "Hardware remote-control port (IPMI) is reachable",
@@ -1828,7 +1915,40 @@ function isInitialScanActive() {
   if (!state || isStaticMode) return false;
   const hasBaseline = Boolean(state.last_full_scan_at && !String(state.last_full_scan_at).startsWith("0001-"));
   if (hasBaseline) return false;
-  return Boolean(state.scanning || (state.scan_progress && state.scan_progress.initial));
+  return Boolean(state.scan_progress && state.scan_progress.initial);
+}
+
+function hasPrimaryExposedReason(ent) {
+  if (!ent || ent.state !== "exposed") return false;
+  const exposedReasons = (ent.reasons || []).filter(r => r.state === "exposed");
+  if (!exposedReasons.length) return true;
+  return exposedReasons.some(r => !r.secondary);
+}
+
+function isOutdoorPerimeterItem(vm, item) {
+  const ent = vm?.entities?.[item.subject_id];
+  if (!ent) return true;
+  if (ent.kind === "port") {
+    return ent.side === "outside" || ent.port_zone === "external" || ent.port_zone === "external_uplink";
+  }
+  if (ent.kind === "device") {
+    if (ent.side === "outside") return true;
+    for (const other of Object.values(vm.entities || {})) {
+      if (other.kind === "port" && other.device_id === ent.id && other.port_zone === "external" && other.port_state === "inactive_enabled") {
+        return true;
+      }
+    }
+    return false;
+  }
+  return ent.side === "outside";
+}
+
+function matchQueueReason(ent, item) {
+  const reasons = ent?.reasons || [];
+  return reasons.find(r => r.ref === item.reason_ref && item.sentence && item.sentence.includes(r.title))
+    || reasons.find(r => r.ref === item.reason_ref)
+    || reasons[0]
+    || null;
 }
 
 function renderScanBanner(initial) {
@@ -1971,14 +2091,14 @@ function renderHeader() {
   }
 
   const q = vm.queue || [];
-  const exposedBMCCount = hosts.filter(e => e.is_bmc && e.state === "exposed").length;
-  const exposedHostCount = hosts.filter(e => !e.is_bmc && e.state === "exposed").length;
+  const exposedBMCCount = hosts.filter(e => e.is_bmc && hasPrimaryExposedReason(e)).length;
+  const exposedHostCount = hosts.filter(e => !e.is_bmc && hasPrimaryExposedReason(e)).length;
   const wanAlertCount = (vm.wan_flows || []).filter(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown").length;
   const perimCount = q.filter(x => x.category === "perimeter").length;
   const ctrlCount = q.filter(x => x.category === "controller").length;
   const checkupTotal = exposedBMCCount + perimCount + wanAlertCount + exposedHostCount + ctrlCount;
   const checkupHasCrit = q.some(x => x.severity === "critical")
-    || hosts.some(e => e.state === "exposed" && e.max_severity === "critical")
+    || hosts.some(e => hasPrimaryExposedReason(e) && e.max_severity === "critical")
     || (vm.wan_flows || []).some(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown" && f.severity === "critical");
   const ckB = document.getElementById("nb-ck");
   if (initial && !bypassInitialSplash) {
@@ -2036,12 +2156,14 @@ function renderCheckup() {
   const assessedCount = Math.max(0, scannableCount - unassessed);
 
   const bmcHosts = hosts.filter(e => e.is_bmc);
-  const exposedBMCs = bmcHosts.filter(e => e.state === "exposed");
-  const exposedHosts = hosts.filter(e => e.state === "exposed" && !e.is_bmc);
+  const exposedBMCs = bmcHosts.filter(e => hasPrimaryExposedReason(e));
+  const exposedHosts = hosts.filter(e => !e.is_bmc && hasPrimaryExposedReason(e));
   const wanFlowsAll = vm.wan_flows || [];
   const wanAlerts = wanFlowsAll.filter(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown");
   const wanCoverageUnknown = wanFlowsAll.filter(f => f.kind === "coverage" || f.state === "unknown");
   const perimItems = (vm.queue || []).filter(x => x.category === "perimeter");
+  const outdoorPerimItems = perimItems.filter(x => isOutdoorPerimeterItem(vm, x));
+  const indoorPortItems = perimItems.filter(x => !isOutdoorPerimeterItem(vm, x));
   const ctrlItems = (vm.queue || []).filter(x => x.category === "controller");
   const totalIssues = exposedBMCs.length + perimItems.length + wanAlerts.length + exposedHosts.length + ctrlItems.length;
   const hasCrit = (vm.queue || []).some(x => x.severity === "critical")
@@ -2077,7 +2199,8 @@ function renderCheckup() {
       : `${totalIssues} things worth tightening up`;
     const parts = [];
     if (exposedBMCs.length) parts.push(`${exposedBMCs.length} server hardware control panel${exposedBMCs.length === 1 ? "" : "s"}`);
-    if (perimItems.length) parts.push(`${perimItems.length} outdoor cable alert${perimItems.length === 1 ? "" : "s"}`);
+    if (outdoorPerimItems.length) parts.push(`${outdoorPerimItems.length} outdoor cable alert${outdoorPerimItems.length === 1 ? "" : "s"}`);
+    if (indoorPortItems.length) parts.push(`${indoorPortItems.length} switch port alert${indoorPortItems.length === 1 ? "" : "s"}`);
     if (wanAlerts.length) parts.push(`${wanAlerts.length} open internet door${wanAlerts.length === 1 ? "" : "s"}`);
     if (exposedHosts.length) parts.push(`${exposedHosts.length} device${exposedHosts.length === 1 ? "" : "s"} needing updates or fixes`);
     if (ctrlItems.length) parts.push(`${ctrlItems.length} router setting${ctrlItems.length === 1 ? "" : "s"}`);
@@ -2145,7 +2268,7 @@ function renderCheckup() {
         <div class="pillar-ico ${cableTone}">${perimItems.length ? ICONS.unlock : ICONS.lock}</div>
         <div>
           <div class="pillar-lbl">House &amp; Outdoor Cables</div>
-          <div class="pillar-val">${perimItems.length ? `${c.open_wall_gates || perimItems.length} need locking` : "All outdoor cables locked"}</div>
+          <div class="pillar-val">${outdoorPerimItems.length ? `${c.open_wall_gates || outdoorPerimItems.length} need locking` : (indoorPortItems.length ? `${indoorPortItems.length} switch port alert${indoorPortItems.length === 1 ? "" : "s"}` : "All outdoor cables locked")}</div>
         </div>
       </div>
       <div class="pillar" data-action="switch-tab" data-tab-target="devices" data-device-filter="${(exposedHosts.length + exposedBMCs.length) ? "issues" : "all"}">
@@ -2196,32 +2319,66 @@ function renderCheckup() {
   }
 
   // 2. Outdoor Cables & Switches
-  if (perimItems.length) {
-    const tone = perimItems.some(x => x.severity === "critical") ? "crit" : "warn";
+  if (outdoorPerimItems.length) {
+    const tone = outdoorPerimItems.some(x => x.severity === "critical") ? "crit" : "warn";
     html += `<div class="story">
       <div class="story-hd">
         <div class="story-hd-l">
           <div class="story-ico ${tone}">${ICONS.unlock}</div>
           <div>
-            <div class="story-title">Cables Going Outside Your House (${perimItems.length})</div>
+            <div class="story-title">Cables Going Outside Your House (${outdoorPerimItems.length})</div>
             <div class="story-why">If someone unplugs an outdoor camera or switch cable, locking these ports stops them from plugging in a laptop and reaching your home network.</div>
           </div>
         </div>
         <button class="btn sm" data-action="switch-tab" data-tab-target="house">View House Map</button>
       </div>`;
-    for (const item of perimItems) {
+    for (const item of outdoorPerimItems) {
       const ent = vm.entities[item.subject_id];
       const peers = ent ? peerNamesForPort(vm, ent) : [];
       const headline = ent?.kind === "port" && peers.length
         ? `${ent.label} → ${peers[0]}`
         : (ent ? ent.label : item.sentence);
-      const topReason = ent?.reasons?.[0] ? humanReason(ent.reasons[0]).title : item.sentence;
+      const matchR = matchQueueReason(ent, item);
+      const topReason = matchR ? humanReason(matchR, ent).title : item.sentence;
       html += `<div class="story-item" data-entity-id="${esc(item.subject_id)}">
         <div class="story-item-l">
           <div class="story-item-name">${esc(headline)} <span class="tag ${humanStateTone(item.severity)}">${item.severity === "critical" ? "Urgent" : "Review"}</span></div>
           <div class="story-item-sub">${esc(topReason)}</div>
         </div>
         <div class="story-item-r"><span class="go-arrow">How to lock →</span></div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // 2b. Indoor Switch Port Alerts (unused indoor ports, restricted desk jacks, STP blocks)
+  if (indoorPortItems.length) {
+    const tone = indoorPortItems.some(x => x.severity === "critical") ? "crit" : "warn";
+    html += `<div class="story">
+      <div class="story-hd">
+        <div class="story-hd-l">
+          <div class="story-ico ${tone}">${ICONS.plug}</div>
+          <div>
+            <div class="story-title">Indoor Switch Port Alerts (${indoorPortItems.length})</div>
+            <div class="story-why">Unused indoor switch ports or restricted desk jacks need attention so unauthorized hardware cannot connect.</div>
+          </div>
+        </div>
+        <button class="btn sm" data-action="switch-tab" data-tab-target="house">View House Map</button>
+      </div>`;
+    for (const item of indoorPortItems) {
+      const ent = vm.entities[item.subject_id];
+      const peers = ent ? peerNamesForPort(vm, ent) : [];
+      const headline = ent?.kind === "port" && peers.length
+        ? `${ent.label} → ${peers[0]}`
+        : (ent ? ent.label : item.sentence);
+      const matchR = matchQueueReason(ent, item);
+      const topReason = matchR ? humanReason(matchR, ent).title : item.sentence;
+      html += `<div class="story-item" data-entity-id="${esc(item.subject_id)}">
+        <div class="story-item-l">
+          <div class="story-item-name">${esc(headline)} <span class="tag ${humanStateTone(item.severity)}">${item.severity === "critical" ? "Urgent" : "Review"}</span></div>
+          <div class="story-item-sub">${esc(topReason)}</div>
+        </div>
+        <div class="story-item-r"><span class="go-arrow">Inspect →</span></div>
       </div>`;
     }
     html += `</div>`;
@@ -2330,7 +2487,7 @@ function renderCheckup() {
       const reasons = gw?.reasons || [];
       const matchR = reasons.find(r => r.ref === item.reason_ref && item.sentence && item.sentence.endsWith(r.title))
         || reasons.find(r => r.ref === item.reason_ref);
-      const hr = matchR ? humanReason(matchR) : { title: item.sentence, why: "" };
+      const hr = matchR ? humanReason(matchR, gw) : { title: item.sentence, why: "" };
       const sevTag = item.severity === "critical" ? `<span class="tag crit">Urgent</span>` : "";
       html += `<div class="story-item" data-entity-id="${esc(item.subject_id)}">
         <div class="story-item-l">
@@ -2677,7 +2834,9 @@ function renderDevices() {
   if (!vm) return;
   const c = vm.census || {};
   const wanIPSet = new Set((vm.wan_flows || []).map(f => f.target_ip).filter(Boolean));
-  const totalHosts = Object.values(vm.entities || {}).filter(e => e.kind === "host").length;
+  const allHosts = Object.values(vm.entities || {}).filter(e => e.kind === "host");
+  const totalHosts = allHosts.length;
+  const hostCVECount = allHosts.filter(e => e.exact_cve_count > 0).length;
 
   const matchHost = (ent) => {
     if (!ent) return false;
@@ -2699,7 +2858,7 @@ function renderDevices() {
       <button class="seg-b ${deviceFilter === "all" ? "active" : ""}" data-action="device-filter" data-filter="all">All (${totalHosts})</button>
       <button class="seg-b ${deviceFilter === "issues" ? "active" : ""}" data-action="device-filter" data-filter="issues">Needs attention</button>
       ${c.bmc_count ? `<button class="seg-b ${deviceFilter === "bmc" ? "active" : ""}" data-action="device-filter" data-filter="bmc">Hardware controls (${c.bmc_count})</button>` : ""}
-      ${c.exact_cve_hosts ? `<button class="seg-b ${deviceFilter === "cve" ? "active" : ""}" data-action="device-filter" data-filter="cve">Security updates (${c.exact_cve_hosts})</button>` : ""}
+      ${hostCVECount ? `<button class="seg-b ${deviceFilter === "cve" ? "active" : ""}" data-action="device-filter" data-filter="cve">Security updates (${hostCVECount})</button>` : ""}
       <button class="seg-b ${deviceFilter === "wan" ? "active" : ""}" data-action="device-filter" data-filter="wan">Open to internet</button>
       ${c.unassessed_count ? `<button class="seg-b ${deviceFilter === "checking" ? "active" : ""}" data-action="device-filter" data-filter="checking">Checking (${c.unassessed_count})</button>` : ""}
     </div>
@@ -3115,7 +3274,7 @@ function renderDrawer() {
   if (nonCVE.length) {
     b += `<div class="dsec"><div class="dsec-t">What Needs Attention (${nonCVE.length})</div>`;
     for (const r of nonCVE) {
-      const hr = humanReason(r);
+      const hr = humanReason(r, ent);
       const rTone = r.state === "exposed" ? humanStateTone(r.severity) : "warn";
       const portTag = r.port ? ` (port ${r.port})` : "";
       const titleWithPort = hr.title.includes(String(r.port || "")) ? hr.title : (hr.title + portTag);
@@ -3393,6 +3552,8 @@ function renderActiveTab(progressOnly = false) {
   renderScanBanner(initial);
 
   const initSec = document.getElementById("view-initial");
+  const hadSplash = Boolean(initSec && initSec.classList.contains("active"));
+  const hasActiveView = Boolean(document.querySelector("main > section.view.active:not(#view-initial)"));
   const showSplash = initial && !bypassInitialSplash;
   const navPills = document.querySelector(".nav-pills");
   if (navPills) navPills.classList.toggle("locked", showSplash);
@@ -3403,9 +3564,11 @@ function renderActiveTab(progressOnly = false) {
     return;
   }
 
-  // During scan_progress ticks when the user is interacting with a tab or drawer,
-  // header + scan banner already updated above; avoid rebuilding active views/drawer.
-  if (progressOnly) return;
+  // During scan_progress ticks when a tab view is already visible, header + scan
+  // banner already updated above; avoid rebuilding active views/drawer. When
+  // transitioning out of the initial splash (or when no tab view is active),
+  // perform a full render so the dashboard never flashes blank.
+  if (progressOnly && !hadSplash && hasActiveView) return;
 
   document.querySelectorAll("main > section.view:not(#view-initial)").forEach(s => s.classList.toggle("active", s.id === "view-" + activeTab));
   if (activeTab === "checkup") renderCheckup();
@@ -3413,6 +3576,85 @@ function renderActiveTab(progressOnly = false) {
   else if (activeTab === "devices") renderDevices();
   else if (activeTab === "activity") renderActivity();
   if (drawerStack.length) renderDrawer();
+}
+
+function showAuthOverlay(errMsg) {
+  authRequired = true;
+  if (sseRetryTimer) {
+    clearTimeout(sseRetryTimer);
+    sseRetryTimer = null;
+  }
+  if (sseSource) {
+    try { sseSource.close(); } catch (_) {}
+    sseSource = null;
+  }
+  const ov = document.getElementById("auth-overlay");
+  const errEl = document.getElementById("auth-err");
+  if (errEl) {
+    if (errMsg) {
+      errEl.textContent = errMsg;
+      errEl.classList.add("show");
+    } else {
+      errEl.textContent = "";
+      errEl.classList.remove("show");
+    }
+  }
+  if (ov) {
+    ov.classList.add("open");
+    const inp = document.getElementById("auth-token-input");
+    if (inp) inp.focus();
+  }
+  const pill = document.getElementById("status-pill");
+  const lbl = document.getElementById("status-lbl");
+  if (pill) pill.className = "status-pill";
+  if (lbl) lbl.textContent = "Sign in required";
+}
+
+function hideAuthOverlay() {
+  authRequired = false;
+  const ov = document.getElementById("auth-overlay");
+  if (ov) ov.classList.remove("open");
+  const errEl = document.getElementById("auth-err");
+  if (errEl) {
+    errEl.textContent = "";
+    errEl.classList.remove("show");
+  }
+}
+
+const authForm = document.getElementById("auth-form");
+if (authForm) {
+  authForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const inp = document.getElementById("auth-token-input");
+    const btn = document.getElementById("auth-submit");
+    const token = (inp?.value || "").trim();
+    if (!token) return;
+    if (btn) btn.disabled = true;
+    try {
+      const resp = await fetch("/api/auth", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-UniBlue-Request": "1"
+        },
+        body: JSON.stringify({ token })
+      });
+      if (!resp.ok) {
+        showAuthOverlay("Invalid API token. Check UNIBLUE_API_TOKEN and try again.");
+        return;
+      }
+      if (inp) inp.value = "";
+      hideAuthOverlay();
+      sseDisconnected = false;
+      sseRetryMs = 1000;
+      await fetchState(false);
+      connectSSE();
+    } catch (err) {
+      showAuthOverlay("Sign-in request failed: " + (err?.message || "network error"));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
 }
 
 let fetchQueuedProgressOnly = true;
@@ -3426,7 +3668,12 @@ async function fetchState(progressOnly = false) {
   fetchInFlight = true;
   try {
     const r = await fetch("/api/state", {cache: "no-store"});
+    if (r.status === 401) {
+      showAuthOverlay("");
+      return;
+    }
     if (!r.ok) return;
+    if (authRequired) hideAuthOverlay();
     state = await r.json();
     if (!initialHashApplied) {
       initialHashApplied = true;
@@ -3453,6 +3700,10 @@ async function triggerRescan(ip) {
       method: "POST",
       headers: { "X-UniBlue-Request": "1" }
     });
+    if (resp.status === 401) {
+      showAuthOverlay("Session expired. Enter your API token to continue.");
+      return;
+    }
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`;
       try {
@@ -3535,7 +3786,7 @@ function showToast(ev) {
 }
 
 function scheduleSSEReconnect() {
-  if (isStaticMode || sseRetryTimer) return;
+  if (isStaticMode || authRequired || sseRetryTimer) return;
   const delay = sseRetryMs;
   sseRetryMs = Math.min(30000, sseRetryMs * 2);
   sseRetryTimer = setTimeout(() => {
@@ -3545,7 +3796,7 @@ function scheduleSSEReconnect() {
 }
 
 function connectSSE() {
-  if (isStaticMode) return;
+  if (isStaticMode || authRequired) return;
   if (sseSource) {
     try { sseSource.close(); } catch (_) {}
     sseSource = null;

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +52,7 @@ type Reason struct {
 	Remediation string       `json:"remediation,omitempty"`
 	Source      string       `json:"source"` // "probe" | "lldp" | "config" | "name-heuristic" | "nvd-cve" | "unifi-policy"
 	Port        int          `json:"port,omitempty"`
+	Secondary   bool         `json:"secondary,omitempty"`
 }
 
 // ServiceView represents one discovered network service on a host along with
@@ -964,11 +966,19 @@ func BuildPresentationModel(
 			if f.CheckID == "UB-UNIFI-PORT-EXT-UNUSED-OPEN" {
 				// Attach to each unused external/restricted port on this switch and the switch device itself.
 				attached := false
+				de, hasSwitchEnt := pm.Entities[devEntityID(swMAC)]
+				hasExternalUnused := hasSwitchEnt && de.Side == "outside"
 				if sw, ok := swByMAC[swMAC]; ok {
+					if sw.ExternalDevice {
+						hasExternalUnused = true
+					}
 					for _, sp := range sw.Ports {
 						if (sp.Zone == "external" || sp.Zone == "unused") && sp.State == "inactive_enabled" {
+							if sp.Zone == "external" {
+								hasExternalUnused = true
+							}
 							if pe, ok := pm.Entities[portEntityID(swMAC, sp.PortIdx)]; ok {
-								title := "Unused port left enabled"
+								title := "Unused indoor port left enabled"
 								if sp.Zone == "external" || sw.ExternalDevice {
 									title = "Unused external port left enabled"
 								}
@@ -985,23 +995,26 @@ func BuildPresentationModel(
 									Remediation: f.Remediation.Summary,
 									Source:      "unifi-port",
 									Port:        sp.PortIdx,
+									Secondary:   hasSwitchEnt,
 								})
 								attached = true
 							}
 						}
 					}
 				}
-				if de, ok := pm.Entities[devEntityID(swMAC)]; ok {
-					expected := "Unused ports disabled"
-					if de.Side == "outside" {
+				if hasSwitchEnt {
+					expected := "Unused indoor ports disabled"
+					title := strings.ReplaceAll(f.Title, "Unused External Switch Ports", "Unused Indoor Switch Ports")
+					if hasExternalUnused {
 						expected = "Unused external ports disabled"
+						title = f.Title
 					}
 					de.Reasons = append(de.Reasons, Reason{
 						ID:          fid,
 						State:       VerdictExposed,
 						Kind:        "policy",
 						Ref:         f.CheckID,
-						Title:       f.Title,
+						Title:       title,
 						Severity:    sev,
 						Expected:    expected,
 						Observed:    f.Evidence,
@@ -1060,7 +1073,9 @@ func BuildPresentationModel(
 					})
 					attached = true
 				}
-				// Also attach unauthorized-MAC findings to the intruding host when present.
+				// Also attach unauthorized-MAC findings to the intruding host when present,
+				// marking it secondary when the port entity already owns the primary finding
+				// so one finding is never double-counted in the fix-next queue or hero.
 				if f.CheckID == "UB-UNIFI-PORT-UNAUTHORIZED-MAC" ||
 					(f.Client.SwitchMAC != "" && !strings.EqualFold(f.Client.MAC, swMAC)) {
 					if hid := lookupHostID(f.Client); hid != "" {
@@ -1078,6 +1093,7 @@ func BuildPresentationModel(
 								Remediation: f.Remediation.Summary,
 								Source:      "unifi-port",
 								Port:        portIdx,
+								Secondary:   attached,
 							})
 							attached = true
 						}
@@ -1166,6 +1182,7 @@ func BuildPresentationModel(
 							Remediation: f.Remediation.Summary,
 							Source:      "unifi-policy",
 							Port:        f.Port,
+							Secondary:   true,
 						})
 					}
 				}
@@ -1367,6 +1384,7 @@ func BuildPresentationModel(
 			Severity:   a.Severity.String(),
 		})
 	}
+	missingWANFeeds := 0
 	if vis := snap.Visibility; vis != nil {
 		missingFW := !vis.GatewayPoliciesAvailable
 		missingPF := !vis.PortForwardsAvailable && len(snap.PortForwards) == 0
@@ -1387,6 +1405,7 @@ func BuildPresentationModel(
 			if missingPF {
 				missing = append(missing, "port forwards")
 			}
+			missingWANFeeds = len(missing)
 			pm.WANFlows = append(pm.WANFlows, WANFlow{
 				ID:         "wan-coverage:missing",
 				Kind:       "coverage",
@@ -1468,7 +1487,9 @@ func BuildPresentationModel(
 			}
 			switch ent.State {
 			case VerdictExposed:
-				pm.Census.ExposedCount++
+				if hasPrimaryExposedReason(ent) {
+					pm.Census.ExposedCount++
+				}
 			case VerdictReview:
 				pm.Census.ReviewCount++
 			case VerdictUnknown:
@@ -1481,7 +1502,9 @@ func BuildPresentationModel(
 				pm.Census.ExactCVEHosts++
 			}
 			if ent.State == VerdictExposed {
-				pm.Census.ExposedCount++
+				if hasPrimaryExposedReason(ent) {
+					pm.Census.ExposedCount++
+				}
 			} else if ent.State == VerdictReview {
 				pm.Census.ReviewCount++
 			}
@@ -1498,10 +1521,17 @@ func BuildPresentationModel(
 			unexpectedWAN++
 		}
 	}
+	if missingWANFeeds > unknownWAN {
+		unknownWAN = missingWANFeeds
+	}
 	if len(pm.Queue) == 0 {
 		switch {
 		case unexpectedWAN > 0:
-			pm.Headline = fmt.Sprintf("%d unexpected WAN exposure%s require review.", unexpectedWAN, pluralS(unexpectedWAN))
+			verb := "require"
+			if unexpectedWAN == 1 {
+				verb = "requires"
+			}
+			pm.Headline = fmt.Sprintf("%d unexpected WAN exposure%s %s review.", unexpectedWAN, pluralS(unexpectedWAN), verb)
 		case unknownWAN > 0:
 			pm.Headline = fmt.Sprintf("Coverage incomplete: %d WAN telemetry feed%s unavailable.", unknownWAN, pluralS(unknownWAN))
 		case pm.Census.UnassessedCount > 0:
@@ -1516,6 +1546,34 @@ func BuildPresentationModel(
 	}
 
 	return pm
+}
+
+func hasPrimaryExposedReason(ent *Entity) bool {
+	if ent == nil || ent.State != VerdictExposed {
+		return false
+	}
+	hasAnyExposed := false
+	for _, r := range ent.Reasons {
+		if r.State == VerdictExposed {
+			hasAnyExposed = true
+			if !r.Secondary {
+				return true
+			}
+		}
+	}
+	return !hasAnyExposed
+}
+
+func primaryExposedReason(ent *Entity) (Reason, bool) {
+	if ent == nil {
+		return Reason{}, false
+	}
+	for _, r := range ent.Reasons {
+		if r.State == VerdictExposed && !r.Secondary {
+			return r, true
+		}
+	}
+	return Reason{}, false
 }
 
 func finalizeEntityVerdict(ent *Entity) {
@@ -1630,12 +1688,14 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 							}
 						}
 					}
-					phrase := "unused ports"
+					phrase := "unused indoor ports"
+					title := strings.ReplaceAll(r.Title, "Unused External Switch Ports", "Unused Indoor Switch Ports")
 					if hasExternal {
 						phrase = "unused external ports"
+						title = r.Title
 					}
 					items = append(items, QueueItem{
-						Sentence:  fmt.Sprintf("%s has %s left open (%s)", ent.Label, phrase, r.Title),
+						Sentence:  fmt.Sprintf("%s has %s left open (%s)", ent.Label, phrase, title),
 						Category:  "perimeter",
 						Severity:  r.Severity,
 						State:     ent.State,
@@ -1669,7 +1729,11 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 			continue
 		}
 
-		top := ent.Reasons[0]
+		top, hasPrimary := primaryExposedReason(ent)
+		if !hasPrimary {
+			// Skip secondary copies already represented on their primary port/rule entity.
+			continue
+		}
 		cat := "service"
 		sentence := fmt.Sprintf("%s: %s", ent.Label, top.Title)
 		related := []string{ent.ID}
@@ -2031,6 +2095,13 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			m[port] = wanPortInfo{restricted: restricted}
 		}
 	}
+	type wideUDPForward struct {
+		fwd        unifi.PortForward
+		spec       string
+		startPort  int
+		restricted bool
+	}
+	var wideUDPForwards []wideUDPForward
 	for _, a := range wan {
 		if !a.Forward.Enabled {
 			continue
@@ -2038,8 +2109,17 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		if a.Forward.MatchesTransport("udp") {
 			ports := a.Forward.ExpandFwdPorts(64)
 			restricted := a.Forward.IsSourceRestricted()
-			for _, p := range ports {
-				recordWAN(wanUDPPorts, p, restricted)
+			if len(ports) > 0 {
+				for _, p := range ports {
+					recordWAN(wanUDPPorts, p, restricted)
+				}
+			} else if spec := strings.TrimSpace(firstStr(a.Forward.FwdPort, a.Forward.DstPort)); spec != "" {
+				wideUDPForwards = append(wideUDPForwards, wideUDPForward{
+					fwd:        a.Forward,
+					spec:       spec,
+					startPort:  firstPortInSpec(spec),
+					restricted: restricted,
+				})
 			}
 		}
 	}
@@ -2172,7 +2252,62 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(name), p),
 		})
 	}
+	// Surface wide UDP port-forward ranges (>64 ports) as a concise range chip
+	// whenever no concrete UDP service inside that forward was observed on the host.
+	if len(wideUDPForwards) > 0 {
+		sort.Slice(wideUDPForwards, func(i, j int) bool {
+			if wideUDPForwards[i].startPort != wideUDPForwards[j].startPort {
+				return wideUDPForwards[i].startPort < wideUDPForwards[j].startPort
+			}
+			return wideUDPForwards[i].spec < wideUDPForwards[j].spec
+		})
+		seenWide := make(map[string]bool)
+		for _, wf := range wideUDPForwards {
+			if seenWide[wf.spec] {
+				continue
+			}
+			seenWide[wf.spec] = true
+			coveredByObserved := false
+			for _, svc := range hp.Services {
+				if svc.Port > 0 && wf.fwd.ExposesEndpoint(svc.Port, firstStr(strings.ToLower(strings.TrimSpace(svc.Transport)), "tcp")) {
+					coveredByObserved = true
+					break
+				}
+			}
+			if coveredByObserved {
+				continue
+			}
+			out = append(out, ServiceView{
+				Port:             wf.startPort,
+				Proto:            "udp",
+				Name:             "udp",
+				Reachable:        wanReachLabel(wanPortInfo{restricted: wf.restricted}),
+				State:            "configured-forward",
+				SourceRestricted: wf.restricted,
+				Label:            fmt.Sprintf("UDP :%s", wf.spec),
+			})
+		}
+	}
 	return out
+}
+
+func firstPortInSpec(spec string) int {
+	for _, token := range strings.Split(spec, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if startStr, _, ok := strings.Cut(token, "-"); ok {
+			if p, err := strconv.Atoi(strings.TrimSpace(startStr)); err == nil && p > 0 {
+				return p
+			}
+			continue
+		}
+		if p, err := strconv.Atoi(token); err == nil && p > 0 {
+			return p
+		}
+	}
+	return 0
 }
 
 func isSnapshotWANBehindCGNAT(snap *unifi.Snapshot) bool {

@@ -45,7 +45,7 @@ func TestNewDemoEngineBuildsCompletePresentationModel(t *testing.T) {
 	h := eng.Handler()
 	for _, route := range []string{"/", "/api/state", "/assets/logo-light.svg", "/assets/favicon.svg", "/favicon.ico"} {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, route, nil))
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080"+route, nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET %s = %d, want 200", route, rec.Code)
 		}

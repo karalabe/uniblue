@@ -122,6 +122,7 @@ type SiteVisibility struct {
 	SettingsAvailable        bool     `json:"settings_available" yaml:"settings_available"`
 	VPNAvailable             bool     `json:"vpn_available" yaml:"vpn_available"`
 	PortForwardsAvailable    bool     `json:"port_forwards_available" yaml:"port_forwards_available"`
+	PortProfilesAvailable    bool     `json:"port_profiles_available" yaml:"port_profiles_available"`
 	DHCPAvailable            bool     `json:"dhcp_available" yaml:"dhcp_available"`
 	MDNSReflectorKnown       bool     `json:"mdns_reflector_known" yaml:"mdns_reflector_known"`
 	MissingFeeds             []string `json:"missing_feeds,omitempty" yaml:"missing_feeds,omitempty"`
@@ -421,6 +422,10 @@ type Device struct {
 	// Ports holds the physical Ethernet/SFP port table (merged with port_overrides)
 	// for UniFi switches, gateways, and In-Wall APs.
 	Ports []SwitchPort `json:"ports,omitempty"`
+
+	// BSSIDs holds the exact wireless radio BSSIDs advertised by this UniFi AP
+	// (extracted from stat/device vap_table) for exact evil-twin matching.
+	BSSIDs []string `json:"bssids,omitempty"`
 }
 
 // SwitchPort describes one physical Ethernet or SFP port on a UniFi switch,
@@ -1008,6 +1013,9 @@ type rawDevice struct {
 	} `json:"uplink"`
 	PortTable     []rawPort `json:"port_table"`
 	PortOverrides []rawPort `json:"port_overrides"`
+	VAPTable      []struct {
+		BSSID string `json:"bssid"`
+	} `json:"vap_table"`
 }
 
 // flexSTPCount unmarshals UniFi's stp_state_change_count, which modern switch

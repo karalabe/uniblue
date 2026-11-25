@@ -9,8 +9,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +28,8 @@ import (
 
 	"github.com/karalabe/uniblue/docs"
 )
+
+const sessionCookieName = "uniblue_session"
 
 // Serve starts the HTTP server for the built-in web UI, JSON API, live SVG
 // topology endpoint, and SSE event stream, shutting down gracefully when ctx is
@@ -77,10 +82,11 @@ func (e *Engine) Serve(ctx context.Context) error {
 
 // Handler builds the HTTP router for UniBlue's live dashboard and APIs wrapped
 // with Host (DNS-rebinding), Origin/Sec-Fetch-Site (CSRF), and optional Bearer
-// token protection.
+// token / HttpOnly session cookie protection.
 func (e *Engine) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", e.handleIndex)
+	mux.HandleFunc("POST /api/auth", e.handleAuth)
 	mux.HandleFunc("GET /api/state", e.handleState)
 	mux.HandleFunc("GET /api/events", e.handleEventsSSE)
 	mux.HandleFunc("POST /api/rescan", e.handleRescan)
@@ -98,6 +104,29 @@ func (e *Engine) effectiveAPIToken() string {
 	return strings.TrimSpace(os.Getenv("UNIBLUE_API_TOKEN"))
 }
 
+func (e *Engine) effectiveAllowedHosts() []string {
+	var out []string
+	for _, h := range e.opts.AllowedHosts {
+		if t := strings.TrimSpace(h); t != "" {
+			out = append(out, t)
+		}
+	}
+	if env := strings.TrimSpace(os.Getenv("UNIBLUE_ALLOWED_HOSTS")); env != "" {
+		for _, part := range strings.Split(env, ",") {
+			if t := strings.TrimSpace(part); t != "" {
+				out = append(out, t)
+			}
+		}
+	}
+	return out
+}
+
+func sessionCookieValue(apiToken string) string {
+	mac := hmac.New(sha256.New, []byte(apiToken))
+	_, _ = mac.Write([]byte("uniblue-web-session-v1"))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func isLoopbackListenAddr(addr string) bool {
 	if strings.TrimSpace(addr) == "" {
 		return false
@@ -110,12 +139,80 @@ func isLoopbackListenAddr(addr string) bool {
 }
 
 func isLoopbackHostName(host string) bool {
-	h := strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+	h := strings.ToLower(strings.TrimSuffix(strings.Trim(strings.TrimSpace(host), "[]"), "."))
 	if h == "localhost" || h == "127.0.0.1" || h == "::1" {
 		return true
 	}
 	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
 		return true
+	}
+	return false
+}
+
+// isAllowedLANHostName reports whether host is a literal IP address, localhost,
+// a local LAN suffix (.local, .lan, .home, .internal, .home.arpa), or a
+// single-label hostname, preventing external DNS-rebinding domains on non-loopback
+// listeners.
+func isAllowedLANHostName(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(strings.Trim(strings.TrimSpace(host), "[]"), "."))
+	if h == "" {
+		return false
+	}
+	if isLoopbackHostName(h) {
+		return true
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	if strings.HasSuffix(h, ".localhost") ||
+		strings.HasSuffix(h, ".local") ||
+		strings.HasSuffix(h, ".lan") ||
+		strings.HasSuffix(h, ".home") ||
+		strings.HasSuffix(h, ".internal") ||
+		strings.HasSuffix(h, ".home.arpa") {
+		return true
+	}
+	if !strings.Contains(h, ".") {
+		for i := 0; i < len(h); i++ {
+			c := h[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return false
+			}
+		}
+		return h[0] != '-' && h[len(h)-1] != '-'
+	}
+	return false
+}
+
+func matchesAllowedHost(hostHeader string, allowed []string) bool {
+	raw := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostHeader), "."))
+	if raw == "" || len(allowed) == 0 {
+		return false
+	}
+	reqHost := strings.ToLower(strings.TrimSuffix(requestHostName(raw), "."))
+	for _, entry := range allowed {
+		e := strings.ToLower(strings.TrimSpace(entry))
+		if e == "" {
+			continue
+		}
+		if strings.Contains(e, "://") {
+			if u, err := url.Parse(e); err == nil && u.Host != "" {
+				e = strings.ToLower(u.Host)
+			}
+		}
+		e = strings.TrimSuffix(strings.TrimSuffix(e, "/"), ".")
+		if e == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(e); err == nil {
+			if raw == e {
+				return true
+			}
+			continue
+		}
+		if reqHost == strings.Trim(e, "[]") {
+			return true
+		}
 	}
 	return false
 }
@@ -131,22 +228,52 @@ func requestHostName(hostHeader string) string {
 	return strings.Trim(h, "[]")
 }
 
-// protectHTTP rejects DNS-rebinding Host headers on loopback listeners, blocks
+func hasValidAPIAuth(r *http.Request, tok string) bool {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "Bearer "
+	if strings.HasPrefix(auth, prefix) {
+		cand := strings.TrimSpace(auth[len(prefix):])
+		if subtle.ConstantTimeCompare([]byte(cand), []byte(tok)) == 1 {
+			return true
+		}
+	}
+	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
+		want := sessionCookieValue(tok)
+		if subtle.ConstantTimeCompare([]byte(ck.Value), []byte(want)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// protectHTTP rejects DNS-rebinding Host headers on both loopback and LAN
+// listeners (honoring UNIBLUE_ALLOWED_HOSTS for reverse proxies), blocks
 // cross-origin / cross-site browser requests (especially POST /api/rescan CSRF),
-// and enforces Bearer token authentication on /api/* when UNIBLUE_API_TOKEN is set.
+// and enforces Bearer token or HttpOnly session cookie auth on /api/* when
+// UNIBLUE_API_TOKEN is set.
 func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 	loopbackOnly := isLoopbackListenAddr(e.opts.ListenAddr)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if loopbackOnly && r.Host != "" && !isLoopbackHostName(requestHostName(r.Host)) {
-			http.Error(w, "forbidden host header", http.StatusForbidden)
-			return
+		allowedHosts := e.effectiveAllowedHosts()
+		if r.Host != "" && !matchesAllowedHost(r.Host, allowedHosts) {
+			hostName := requestHostName(r.Host)
+			if loopbackOnly {
+				if !isLoopbackHostName(hostName) {
+					http.Error(w, "forbidden host header", http.StatusForbidden)
+					return
+				}
+			} else if !isAllowedLANHostName(hostName) {
+				http.Error(w, "forbidden host header", http.StatusForbidden)
+				return
+			}
 		}
 
 		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
 		if isAPI || (r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions) {
 			if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
 				parsedOrigin, err := url.Parse(origin)
-				if err != nil || !strings.EqualFold(parsedOrigin.Host, r.Host) {
+				if err != nil || parsedOrigin.Host == "" ||
+					(!strings.EqualFold(parsedOrigin.Host, r.Host) && !matchesAllowedHost(parsedOrigin.Host, allowedHosts)) {
 					http.Error(w, "forbidden cross-origin request", http.StatusForbidden)
 					return
 				}
@@ -157,12 +284,9 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 			}
 		}
 
-		if isAPI {
+		if isAPI && !(r.Method == http.MethodPost && r.URL.Path == "/api/auth") {
 			if tok := e.effectiveAPIToken(); tok != "" {
-				auth := strings.TrimSpace(r.Header.Get("Authorization"))
-				const prefix = "Bearer "
-				if !strings.HasPrefix(auth, prefix) ||
-					subtle.ConstantTimeCompare([]byte(strings.TrimSpace(auth[len(prefix):])), []byte(tok)) != 1 {
+				if !hasValidAPIAuth(r, tok) {
 					w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
 					http.Error(w, "unauthorized", http.StatusUnauthorized)
 					return
@@ -172,6 +296,48 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	tok := e.effectiveAPIToken()
+	if tok == "" {
+		_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": true, "required": false})
+		return
+	}
+
+	var cand string
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "Bearer "
+	if strings.HasPrefix(auth, prefix) {
+		cand = strings.TrimSpace(auth[len(prefix):])
+	}
+	if cand == "" && r.Body != nil {
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err == nil {
+			cand = strings.TrimSpace(body.Token)
+		}
+	}
+	if cand == "" || subtle.ConstantTimeCompare([]byte(cand), []byte(tok)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    sessionCookieValue(tok),
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
+		MaxAge:   30 * 24 * 3600,
+	})
+	_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": true, "required": true})
 }
 
 // RenderStaticHTML renders a self-contained, offline interactive HTML snapshot

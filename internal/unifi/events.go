@@ -51,6 +51,7 @@ func (c *Controller) SubscribeEvents(ctx context.Context, out chan<- Event) erro
 	ct := c.controllerType
 	apiPrefix := c.apiPrefix
 	site := c.site
+	seenEpoch := c.authEpoch
 	c.authMu.RUnlock()
 
 	if c.apiKey != "" || (ct != controllerUniFiOS && ct != controllerClassic) {
@@ -140,14 +141,23 @@ func (c *Controller) SubscribeEvents(ctx context.Context, out chan<- Event) erro
 		return fmt.Errorf("read websocket upgrade response: %w", err)
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		// Session cookie expired; trigger a single-flight re-login so the next
-		// redial immediately succeeds with fresh credentials.
-		_ = c.relogin(ctx, c.currentAuthEpoch())
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		// Only attempt a single-flight re-login when the rejection is not an
+		// explicit permission error and we have not already re-authenticated
+		// for a prior WebSocket rejection without a successful handshake.
+		if !isPermissionDeniedMsg(extractAPIErrorMsg(body)) && c.canRelogin() && c.shouldReloginWS(seenEpoch) {
+			if err := c.relogin(ctx, seenEpoch); err == nil {
+				c.markWSReloginEpoch(c.currentAuthEpoch())
+			}
+		}
 		return fmt.Errorf("websocket upgrade rejected: HTTP %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		_ = resp.Body.Close()
 		return fmt.Errorf("websocket upgrade rejected: HTTP %d", resp.StatusCode)
 	}
+	c.clearWSReloginEpoch()
 	_ = conn.SetDeadline(time.Time{})
 
 	var fragBuf []byte

@@ -55,6 +55,11 @@ const (
 	// maxControllerBodyBytes caps JSON payloads read from the controller so a
 	// misconfigured URL cannot exhaust memory.
 	maxControllerBodyBytes = 16 << 20
+
+	// defaultAuthFailCooldown prevents concurrent or repeated 401 responses from
+	// hammering the controller login endpoint when credentials were revoked or
+	// changed while running.
+	defaultAuthFailCooldown = 30 * time.Second
 )
 
 // Controller is a read-only client for a single UniFi controller or gateway.
@@ -81,15 +86,30 @@ type Controller struct {
 	// httpClient carries TLS configuration, timeouts, and the session cookie jar.
 	httpClient *http.Client
 
-	// authMu guards apiPrefix, controllerType, site, siteID, csrfToken, and authEpoch.
+	// authMu guards apiPrefix, controllerType, site, siteID, csrfToken, authEpoch,
+	// wsReloginEpoch, and unauthPaths.
 	authMu sync.RWMutex
 
-	// loginMu serializes Login/relogin calls so concurrent 401s re-authenticate once.
-	loginMu sync.Mutex
+	// loginMu serializes Login/relogin calls so concurrent 401s re-authenticate once
+	// and failed re-logins share a cooldown window.
+	loginMu               sync.Mutex
+	authFailCooldown      time.Duration
+	authFailCooldownUntil time.Time
+	lastLoginErr          error
 
 	// authEpoch increments on every completed Login so single-flight relogin callers
 	// know whether another goroutine already refreshed the session.
 	authEpoch uint64
+
+	// wsReloginEpoch records the authEpoch produced after a WebSocket upgrade
+	// rejection triggered re-login so persistent 401/403 rejections do not create
+	// a new console session on every redial.
+	wsReloginEpoch uint64
+
+	// unauthPaths maps REST paths that still returned 401 immediately after a
+	// fresh re-login to the authEpoch at which they failed, suppressing repeated
+	// re-logins on every poll for role-restricted endpoints.
+	unauthPaths map[string]uint64
 
 	// apiPrefix is "/proxy/network" for UniFi OS consoles or "" for classic
 	// controllers, discovered automatically during Login.
@@ -189,13 +209,77 @@ func (c *Controller) canRelogin() bool {
 	return c.apiKey == "" && c.username != "" && c.password != ""
 }
 
+func (c *Controller) authFailCooldownDuration() time.Duration {
+	if c.authFailCooldown > 0 {
+		return c.authFailCooldown
+	}
+	return defaultAuthFailCooldown
+}
+
+func (c *Controller) shouldReloginWS(seenEpoch uint64) bool {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	if c.wsReloginEpoch != 0 && c.wsReloginEpoch == seenEpoch {
+		return false
+	}
+	return true
+}
+
+func (c *Controller) markWSReloginEpoch(epoch uint64) {
+	c.authMu.Lock()
+	c.wsReloginEpoch = epoch
+	c.authMu.Unlock()
+}
+
+func (c *Controller) clearWSReloginEpoch() {
+	c.authMu.Lock()
+	c.wsReloginEpoch = 0
+	c.authMu.Unlock()
+}
+
+func (c *Controller) isPathUnauthorizedAtEpoch(path string, epoch uint64) bool {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	if len(c.unauthPaths) == 0 {
+		return false
+	}
+	failedEpoch, ok := c.unauthPaths[path]
+	return ok && failedEpoch == epoch
+}
+
+func (c *Controller) markPathUnauthorized(path string, epoch uint64) {
+	c.authMu.Lock()
+	if c.unauthPaths == nil {
+		c.unauthPaths = make(map[string]uint64)
+	}
+	c.unauthPaths[path] = epoch
+	c.authMu.Unlock()
+}
+
+func (c *Controller) clearPathUnauthorized(path string) {
+	c.authMu.Lock()
+	delete(c.unauthPaths, path)
+	c.authMu.Unlock()
+}
+
 func (c *Controller) relogin(ctx context.Context, seenEpoch uint64) error {
 	c.loginMu.Lock()
 	defer c.loginMu.Unlock()
 	if c.currentAuthEpoch() != seenEpoch {
 		return nil
 	}
-	return c.loginLocked(ctx)
+	now := time.Now()
+	if !c.authFailCooldownUntil.IsZero() && now.Before(c.authFailCooldownUntil) && c.lastLoginErr != nil {
+		return c.lastLoginErr
+	}
+	if err := c.loginLocked(ctx); err != nil {
+		c.lastLoginErr = err
+		c.authFailCooldownUntil = time.Now().Add(c.authFailCooldownDuration())
+		return err
+	}
+	c.lastLoginErr = nil
+	c.authFailCooldownUntil = time.Time{}
+	return nil
 }
 
 // Login authenticates against the controller and auto-detects the appropriate
@@ -207,7 +291,12 @@ func (c *Controller) relogin(ctx context.Context, seenEpoch uint64) error {
 func (c *Controller) Login(ctx context.Context) error {
 	c.loginMu.Lock()
 	defer c.loginMu.Unlock()
-	return c.loginLocked(ctx)
+	if err := c.loginLocked(ctx); err != nil {
+		return err
+	}
+	c.lastLoginErr = nil
+	c.authFailCooldownUntil = time.Time{}
+	return nil
 }
 
 func (c *Controller) loginLocked(ctx context.Context) error {
@@ -215,9 +304,24 @@ func (c *Controller) loginLocked(ctx context.Context) error {
 		return c.loginWithAPIKey(ctx)
 	}
 
+	knownType := c.currentControllerType()
+	if knownType == controllerClassic {
+		if _, classicErr := c.postLogin(ctx, "/api/login"); classicErr != nil {
+			return fmt.Errorf("classic unifi login failed: %w", classicErr)
+		}
+		c.authMu.Lock()
+		c.apiPrefix = ""
+		c.controllerType = controllerClassic
+		c.authEpoch++
+		c.authMu.Unlock()
+		return nil
+	}
+
 	// Attempt UniFi OS authentication first (UDM Pro / Cloud Gateway / modern
-	// Cloud Key). A 404 (or 400/401/405 on self-hosted Network apps that do not
-	// serve /api/auth/login) falls back to classic /api/login.
+	// Cloud Key). On initial detection, a 404 (or 400/401/405 on self-hosted
+	// Network apps that do not serve /api/auth/login) falls back to /api/login.
+	// Once UniFi OS has already been detected, avoid hammering /api/login on a
+	// 401 credential failure.
 	status, uosErr := c.postLogin(ctx, "/api/auth/login")
 	if uosErr == nil {
 		c.authMu.Lock()
@@ -228,6 +332,9 @@ func (c *Controller) loginLocked(ctx context.Context) error {
 		return nil
 	}
 	if status == http.StatusTooManyRequests || status >= 500 || status == 0 {
+		return fmt.Errorf("unifi-os login failed: %w", uosErr)
+	}
+	if knownType == controllerUniFiOS && status != http.StatusNotFound && status != http.StatusMethodNotAllowed {
 		return fmt.Errorf("unifi-os login failed: %w", uosErr)
 	}
 
@@ -744,6 +851,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 				dev.UplinkPort = ld.Uplink.UplinkRemotePort
 			}
 			dev.Ports = convertSwitchPorts(ld, netByID, portConfByID, defaultNetName)
+			dev.BSSIDs = extractDeviceBSSIDs(ld)
 		}
 		devices = append(devices, dev)
 	}
@@ -776,6 +884,13 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	if !telem.settingsOK {
 		missingFeeds = append(missingFeeds, "security-settings (unavailable)")
 	}
+	if !telem.portConfsOK {
+		reason := "unavailable"
+		if telem.portConfsErr != nil {
+			reason = shortFetchErr(telem.portConfsErr)
+		}
+		missingFeeds = append(missingFeeds, fmt.Sprintf("port-profiles (%s)", reason))
+	}
 	missingFeeds = append(missingFeeds, "switch-acls (not exposed by controller API)")
 
 	return &Snapshot{
@@ -806,6 +921,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			SettingsAvailable:        telem.settingsOK,
 			VPNAvailable:             telem.vpnOK,
 			PortForwardsAvailable:    fr.err == nil,
+			PortProfilesAvailable:    telem.portConfsOK,
 			DHCPAvailable:            hasDHCP,
 			MDNSReflectorKnown:       hasMDNS,
 			MissingFeeds:             missingFeeds,
@@ -982,6 +1098,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			Version:    rd.Version,
 			Upgradable: rd.Upgradable,
 			Ports:      convertSwitchPorts(rd, netByID, portConfByID, defaultNetName),
+			BSSIDs:     extractDeviceBSSIDs(rd),
 		}
 		if rd.Uplink != nil {
 			dev.UplinkMAC = strings.ToLower(strings.TrimSpace(rd.Uplink.UplinkMAC))
@@ -1002,6 +1119,13 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	}
 	if !telem.settingsOK {
 		missingFeeds = append(missingFeeds, "security-settings (unavailable)")
+	}
+	if !telem.portConfsOK {
+		reason := "unavailable"
+		if telem.portConfsErr != nil {
+			reason = shortFetchErr(telem.portConfsErr)
+		}
+		missingFeeds = append(missingFeeds, fmt.Sprintf("port-profiles (%s)", reason))
 	}
 	return &Snapshot{
 		CollectedAt:      time.Now().UTC(),
@@ -1029,6 +1153,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			SettingsAvailable:        telem.settingsOK,
 			VPNAvailable:             telem.vpnOK,
 			PortForwardsAvailable:    fr.err == nil,
+			PortProfilesAvailable:    telem.portConfsOK,
 			DHCPAvailable:            hasDHCP,
 			MDNSReflectorKnown:       hasMDNS,
 			MissingFeeds:             missingFeeds,
@@ -1068,28 +1193,58 @@ func clientByteCounters(isWired bool, tx, rx, wiredTx, wiredRx int64) (int64, in
 	return wiredTx, wiredRx
 }
 
+// extractDeviceBSSIDs returns sorted, deduplicated lowercase radio BSSIDs from
+// a legacy stat/device record's vap_table.
+func extractDeviceBSSIDs(rd rawDevice) []string {
+	if len(rd.VAPTable) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(rd.VAPTable))
+	out := make([]string, 0, len(rd.VAPTable))
+	for _, vap := range rd.VAPTable {
+		b := strings.ToLower(strings.TrimSpace(vap.BSSID))
+		if b == "" {
+			continue
+		}
+		if _, dup := seen[b]; dup {
+			continue
+		}
+		seen[b] = struct{}{}
+		out = append(out, b)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // inferDeviceTypeFromModel maps a UniFi device model code to a normalized
-// controller device type ("udm", "ugw", "usw", "uap", "uck") when legacy
+// controller device type ("udm", "uxg", "ugw", "usw", "uap", "uck") when legacy
 // stat/device telemetry is absent, instead of misusing device state ("online").
 func inferDeviceTypeFromModel(model string) string {
 	m := strings.ToUpper(strings.TrimSpace(model))
+	compact := strings.NewReplacer("-", "", "_", "", " ", "").Replace(m)
 	switch {
 	case m == "":
 		return ""
-	case strings.HasPrefix(m, "UDM"), strings.HasPrefix(m, "UDR"), strings.HasPrefix(m, "UDW"),
-		strings.HasPrefix(m, "UCG"), strings.HasPrefix(m, "EFG"):
+	case strings.HasPrefix(compact, "UXG"):
+		return "uxg"
+	case strings.HasPrefix(compact, "UDM"), strings.HasPrefix(compact, "UDR"), strings.HasPrefix(compact, "UDW"),
+		strings.HasPrefix(compact, "UCG"), strings.HasPrefix(compact, "EFG"),
+		compact == "UX" || strings.HasPrefix(compact, "UX7") || strings.HasPrefix(m, "UX-"),
+		strings.Contains(compact, "DREAMMACHINE"), strings.Contains(compact, "DREAMROUTER"),
+		strings.Contains(compact, "DREAMWALL"), strings.Contains(compact, "CLOUDGATEWAY"),
+		strings.Contains(compact, "UNIFIEXPRESS"):
 		return "udm"
-	case strings.HasPrefix(m, "UXG"), strings.HasPrefix(m, "USG"), m == "UX" || strings.HasPrefix(m, "UX-"):
+	case strings.HasPrefix(compact, "USG"), strings.HasPrefix(compact, "UGW"):
 		return "ugw"
-	case strings.HasPrefix(m, "USW"), strings.HasPrefix(m, "USL"), strings.HasPrefix(m, "USC"),
-		strings.HasPrefix(m, "US8"), strings.HasPrefix(m, "US16"), strings.HasPrefix(m, "US24"),
-		strings.HasPrefix(m, "US48"), strings.HasPrefix(m, "US-"):
+	case strings.HasPrefix(compact, "USW"), strings.HasPrefix(compact, "USL"), strings.HasPrefix(compact, "USC"),
+		strings.HasPrefix(compact, "US8"), strings.HasPrefix(compact, "US16"), strings.HasPrefix(compact, "US24"),
+		strings.HasPrefix(compact, "US48"), strings.HasPrefix(m, "US-"), strings.Contains(compact, "SWITCH"):
 		return "usw"
-	case strings.HasPrefix(m, "UAP"), strings.HasPrefix(m, "UAL"), strings.HasPrefix(m, "U6"),
-		strings.HasPrefix(m, "U7"), strings.HasPrefix(m, "UWB"), strings.HasPrefix(m, "UDB"),
-		strings.HasPrefix(m, "UK"), strings.HasPrefix(m, "AC"):
+	case strings.HasPrefix(compact, "UAP"), strings.HasPrefix(compact, "UAL"), strings.HasPrefix(compact, "U6"),
+		strings.HasPrefix(compact, "U7"), strings.HasPrefix(compact, "UWB"), strings.HasPrefix(compact, "UDB"),
+		strings.HasPrefix(compact, "UK"), strings.HasPrefix(compact, "AC"):
 		return "uap"
-	case strings.HasPrefix(m, "UCK"), strings.HasPrefix(m, "UNVR"):
+	case strings.HasPrefix(compact, "UCK"), strings.HasPrefix(compact, "UNVR"), strings.Contains(compact, "CLOUDKEY"):
 		return "uck"
 	default:
 		return ""
@@ -1224,32 +1379,39 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 				rp.Isolation = ov.Isolation
 			}
 		}
-		// Apply referenced switch port profile defaults when setting_preference is
-		// not "manual" (or when individual port fields were omitted).
-		if rp.PortConfID != "" && !strings.EqualFold(strings.TrimSpace(rp.SettingPreference), "manual") {
+		// Apply referenced switch port profile settings when setting_preference is
+		// not "manual". When setting_preference is explicitly "auto", the assigned
+		// profile takes precedence over any stale per-port fields.
+		pref := strings.ToLower(strings.TrimSpace(rp.SettingPreference))
+		if rp.PortConfID != "" && pref != "manual" {
 			if pc, ok := portConfByID[rp.PortConfID]; ok {
-				if rp.OpMode == "" && pc.OpMode != "" {
+				profileWins := pref == "auto"
+				if (profileWins || rp.OpMode == "") && pc.OpMode != "" {
 					rp.OpMode = pc.OpMode
 				}
-				if rp.Forward == "" && pc.Forward != "" {
+				if (profileWins || rp.Forward == "") && pc.Forward != "" {
 					rp.Forward = pc.Forward
 				}
-				if rp.TaggedVLANMgmt == "" && pc.TaggedVLANMgmt != "" {
+				if pc.TaggedVLANMgmt != "" && (profileWins || rp.TaggedVLANMgmt == "") {
 					rp.TaggedVLANMgmt = pc.TaggedVLANMgmt
+				} else if profileWins && pc.Forward != "" {
+					// Clear any stale per-port tagged_vlan_mgmt so the profile's
+					// forward setting ("native", "customize", "disabled") governs.
+					rp.TaggedVLANMgmt = ""
 				}
-				if rp.NativeNetworkConfID == "" && pc.NativeNetworkConfID != "" {
+				if (profileWins || rp.NativeNetworkConfID == "") && pc.NativeNetworkConfID != "" {
 					rp.NativeNetworkConfID = pc.NativeNetworkConfID
 				}
-				if rp.PoEMode == "" && pc.PoEMode != "" {
+				if (profileWins || rp.PoEMode == "") && pc.PoEMode != "" {
 					rp.PoEMode = pc.PoEMode
 				}
-				if rp.PortSecurityEnabled == nil && pc.PortSecurityEnabled != nil {
+				if (profileWins || rp.PortSecurityEnabled == nil) && pc.PortSecurityEnabled != nil {
 					rp.PortSecurityEnabled = pc.PortSecurityEnabled
 				}
-				if len(rp.PortSecurityMACs) == 0 && len(pc.PortSecurityMACs) > 0 {
+				if (profileWins || len(rp.PortSecurityMACs) == 0) && len(pc.PortSecurityMACs) > 0 {
 					rp.PortSecurityMACs = pc.PortSecurityMACs
 				}
-				if rp.Isolation == nil && pc.Isolation != nil {
+				if (profileWins || rp.Isolation == nil) && pc.Isolation != nil {
 					rp.Isolation = pc.Isolation
 				}
 			}
@@ -1483,6 +1645,10 @@ func shortFetchErr(err error) string {
 	if errors.As(err, &httpErr) {
 		return fmt.Sprintf("HTTP %d", httpErr.status)
 	}
+	var apiErr *apiEnvelopeError
+	if errors.As(err, &apiErr) && apiErr.msg != "" {
+		return apiErr.msg
+	}
 	return "request failed"
 }
 
@@ -1688,15 +1854,35 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 		}
 	}
 	// If the controller supplied a non-empty trafficFilter type (e.g., REGION,
-	// DOMAIN, APP, OBJECT_GROUP) that we did not decode into IP/Network/MAC/Port,
-	// mark it unsupported so the evaluator yields "unknown" rather than treating
-	// it as AnyTarget=true.
+	// DOMAIN, APPLICATION, OBJECT_GROUP) that is not modeled by the decoded
+	// IP/Network/MAC/Port sub-filters, always mark it unsupported even when a
+	// sibling portFilter was also present so a narrowed BLOCK never shadows
+	// later ALLOW rules.
 	tfType := strings.ToUpper(strings.TrimSpace(tf.Type))
-	if !recognized && out.UnsupportedSelector == "" && tfType != "" && tfType != "ANY" && tfType != "ALL" {
-		out.AnyTarget = false
-		out.UnsupportedSelector = fmt.Sprintf("traffic filter type %q", tf.Type)
+	if out.UnsupportedSelector == "" && tfType != "" && tfType != "ANY" && tfType != "ALL" {
+		if !trafficFilterTypeDecoded(tfType, tf.IPAddressFilter != nil, tf.NetworkFilter != nil, tf.MACAddressFilter != nil, tf.PortFilter != nil) || !recognized {
+			out.AnyTarget = false
+			out.UnsupportedSelector = fmt.Sprintf("traffic filter type %q", tf.Type)
+		}
 	}
 	return out
+}
+
+func trafficFilterTypeDecoded(tfType string, hasIP, hasNet, hasMAC, hasPort bool) bool {
+	switch tfType {
+	case "", "ANY", "ALL":
+		return true
+	case "PORT", "PORTS", "PORT_FILTER":
+		return hasPort
+	case "IP_ADDRESS", "IP", "IP_ADDRESSES", "IP_RANGE", "SUBNET":
+		return hasIP
+	case "NETWORK", "NETWORKS":
+		return hasNet
+	case "MAC_ADDRESS", "MAC", "MAC_ADDRESSES":
+		return hasMAC
+	default:
+		return false
+	}
 }
 
 // parsePolicyPortSpec decodes a port specification string ("443", "80,443",
@@ -1877,15 +2063,20 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 	return legacyNets
 }
 
-// httpStatusError preserves the HTTP status code on failed controller requests
-// so callers can distinguish missing endpoints (404) from auth errors (401/403).
+// httpStatusError preserves the HTTP status code and optional controller error
+// message on failed requests so callers can distinguish missing endpoints (404),
+// session expiry (401), and explicit permission errors (NoPermission).
 type httpStatusError struct {
 	path   string
 	status int
+	apiMsg string
 }
 
 // Error formats a concise description of the non-2xx HTTP status.
 func (e *httpStatusError) Error() string {
+	if e.apiMsg != "" {
+		return fmt.Sprintf("GET %s returned HTTP %d (%s)", e.path, e.status, e.apiMsg)
+	}
 	return fmt.Sprintf("GET %s returned HTTP %d", e.path, e.status)
 }
 
@@ -1901,6 +2092,41 @@ func (e *apiEnvelopeError) Error() string {
 		return fmt.Sprintf("API %s returned error: %s", e.path, e.msg)
 	}
 	return fmt.Sprintf("API %s returned meta.rc=error", e.path)
+}
+
+func extractAPIErrorMsg(body []byte) string {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Meta *struct {
+			Msg string `json:"msg"`
+		} `json:"meta"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		if parsed.Meta != nil && strings.TrimSpace(parsed.Meta.Msg) != "" {
+			return strings.TrimSpace(parsed.Meta.Msg)
+		}
+		if msg := firstNonEmpty(parsed.Code, parsed.Message, parsed.Error); msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+func isPermissionDeniedMsg(msg string) bool {
+	low := strings.ToLower(strings.TrimSpace(msg))
+	if low == "" {
+		return false
+	}
+	return strings.Contains(low, "nopermission") ||
+		strings.Contains(low, "forbidden") ||
+		strings.Contains(low, "permission denied") ||
+		strings.Contains(low, "access denied") ||
+		strings.Contains(low, "insufficient")
 }
 
 func checkAPIEnvelopeError(path string, body []byte) error {
@@ -1921,6 +2147,9 @@ func checkAPIEnvelopeError(path string, body []byte) error {
 func isSessionExpiredError(err error) bool {
 	var httpErr *httpStatusError
 	if errors.As(err, &httpErr) && httpErr.status == http.StatusUnauthorized {
+		if isPermissionDeniedMsg(httpErr.apiMsg) {
+			return false
+		}
 		return true
 	}
 	var apiErr *apiEnvelopeError
@@ -1950,20 +2179,25 @@ func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) erro
 		epoch := c.currentAuthEpoch()
 		err := c.getJSONOnce(ctx, fullPath, dst)
 		if err == nil {
+			c.clearPathUnauthorized(fullPath)
 			return nil
 		}
 		lastErr = err
-		if !relogged && c.canRelogin() && isSessionExpiredError(err) {
+		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorizedAtEpoch(fullPath, epoch) {
 			relogged = true
-			if loginErr := c.relogin(ctx, epoch); loginErr == nil {
-				// Retry immediately with the fresh session without consuming the transient retry slot.
-				if retryErr := c.getJSONOnce(ctx, fullPath, dst); retryErr == nil {
-					return nil
-				} else {
-					lastErr = retryErr
-				}
+			if loginErr := c.relogin(ctx, epoch); loginErr != nil {
+				return fmt.Errorf("re-authentication failed: %w (after %w)", loginErr, err)
 			}
-			return lastErr
+			// Retry immediately with the fresh session without consuming the transient retry slot.
+			retryErr := c.getJSONOnce(ctx, fullPath, dst)
+			if retryErr == nil {
+				c.clearPathUnauthorized(fullPath)
+				return nil
+			}
+			if isSessionExpiredError(retryErr) {
+				c.markPathUnauthorized(fullPath, c.currentAuthEpoch())
+			}
+			lastErr = retryErr
 		}
 		var apiErr *apiEnvelopeError
 		if errors.As(lastErr, &apiErr) {
@@ -2006,7 +2240,7 @@ func (c *Controller) getJSONOnce(ctx context.Context, fullPath string, dst any) 
 		return fmt.Errorf("read %s: %w", fullPath, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &httpStatusError{path: fullPath, status: resp.StatusCode}
+		return &httpStatusError{path: fullPath, status: resp.StatusCode, apiMsg: extractAPIErrorMsg(body)}
 	}
 	if err := checkAPIEnvelopeError(fullPath, body); err != nil {
 		return err
