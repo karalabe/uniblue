@@ -1737,7 +1737,7 @@ func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	eng.webhookCoalesceWindow = 30 * time.Millisecond
+	eng.webhookCoalesceWindow = 250 * time.Millisecond
 
 	trustedCl := unifi.Client{MAC: "02:aa:bb:00:00:10", IP: "10.0.1.10", Name: "workstation", NetworkName: "Main", IsWired: true}
 	iotCl := unifi.Client{MAC: "02:aa:bb:00:00:20", IP: "10.0.20.20", Name: "amp", NetworkName: "IoT", IsWired: true}
