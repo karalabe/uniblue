@@ -1245,3 +1245,68 @@ func TestSnapshotSitePreservesConfiguredDisplayName(t *testing.T) {
 		t.Fatalf("Snapshot.Site = %q, want Office", snap.Site)
 	}
 }
+
+// TestFetchRecentLogsInterpolatesAdminTemplateParameters verifies that UniFi
+// admin-activity log messages interpolate numeric, string, and object parameter
+// values and strip any remaining unpopulated {PLACEHOLDER} tokens cleanly.
+func TestFetchRecentLogsInterpolatesAdminTemplateParameters(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/proxy/network/v2/api/site/default/system-log/all", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	mux.HandleFunc("/proxy/network/v2/api/site/default/system-log/admin-activity", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[
+			{
+				"id":"adm-1",
+				"timestamp":1770000002000,
+				"key":"ADMIN_SETTINGS_CHANGED",
+				"ip":"10.0.0.5",
+				"platform":"web",
+				"message":"{ADMIN} made {COUNT} changes to {OBJECT} {SECTION} settings",
+				"admin":{"name":"Alice"},
+				"parameters":{"COUNT":3,"OBJECT":{"name":"UDM Pro"},"SECTION":"Firewall"}
+			},
+			{
+				"id":"adm-2",
+				"timestamp":1770000001000,
+				"key":"ADMIN_SETTINGS_CHANGED",
+				"ip":"10.0.0.5",
+				"platform":"web",
+				"message":"{ADMIN} made {COUNT} changes to {OBJECT} {SECTION} settings",
+				"admin":{"name":"Bob"},
+				"parameters":{"SECTION":"Network"}
+			}
+		]}`))
+	})
+
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	ctrl, err := New(config.UniFiConfig{
+		URL:                srv.URL,
+		Site:               "default",
+		Username:           "viewer",
+		Password:           "secret",
+		InsecureSkipVerify: true,
+		Timeout:            5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := ctrl.FetchRecentLogs(context.Background(), time.Unix(1770000000, 0).UTC())
+	if err != nil {
+		t.Fatalf("FetchRecentLogs: %v", err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("expected 2 admin log events, got %d (%+v)", len(logs), logs)
+	}
+	if logs[0].Message != "Alice made 3 changes to UDM Pro Firewall settings" {
+		t.Fatalf("unexpected interpolated admin message: %q", logs[0].Message)
+	}
+	if logs[1].Message != "Bob made changes to Network settings" || strings.Contains(logs[1].Message, "{") {
+		t.Fatalf("unexpected fallback admin message with missing params: %q", logs[1].Message)
+	}
+}

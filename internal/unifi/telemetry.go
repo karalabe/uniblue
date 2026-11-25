@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -103,13 +105,24 @@ type rawSystemLogEntry struct {
 
 // rawAdminActivityEntry maps one item from POST /v2/api/site/<site>/system-log/admin-activity.
 type rawAdminActivityEntry struct {
-	ID        string `json:"id"`
-	Timestamp int64  `json:"timestamp"`
-	Key       string `json:"key"`
-	IP        string `json:"ip"`
-	Platform  string `json:"platform"`
-	Message   string `json:"message"`
-	Admin     *struct {
+	ID         string                     `json:"id"`
+	Timestamp  int64                      `json:"timestamp"`
+	Key        string                     `json:"key"`
+	IP         string                     `json:"ip"`
+	Platform   string                     `json:"platform"`
+	Message    string                     `json:"message"`
+	MessageRaw string                     `json:"message_raw"`
+	Parameters map[string]json.RawMessage `json:"parameters"`
+	Count      int                        `json:"count"`
+	Object     string                     `json:"object"`
+	Section    string                     `json:"section"`
+	Changes    []json.RawMessage          `json:"changes"`
+	Target     *struct {
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		Section string `json:"section"`
+	} `json:"target"`
+	Admin *struct {
 		Name string `json:"name"`
 	} `json:"admin"`
 }
@@ -372,12 +385,46 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		if entry.Admin != nil && strings.TrimSpace(entry.Admin.Name) != "" {
 			adminName = strings.TrimSpace(entry.Admin.Name)
 		}
-		params := map[string]string{
-			"ADMIN":    adminName,
-			"IP":       entry.IP,
-			"PLATFORM": entry.Platform,
+		params := extractLogParams(entry.Parameters)
+		if params == nil {
+			params = make(map[string]string, 8)
 		}
-		msg := interpolateLogTemplate(entry.Message, params)
+		if params["ADMIN"] == "" {
+			params["ADMIN"] = adminName
+		}
+		if params["IP"] == "" && entry.IP != "" {
+			params["IP"] = entry.IP
+		}
+		if params["PLATFORM"] == "" && entry.Platform != "" {
+			params["PLATFORM"] = entry.Platform
+		}
+		if params["COUNT"] == "" {
+			if entry.Count > 0 {
+				params["COUNT"] = strconv.Itoa(entry.Count)
+			} else if len(entry.Changes) > 0 {
+				params["COUNT"] = strconv.Itoa(len(entry.Changes))
+			}
+		}
+		if params["OBJECT"] == "" {
+			obj := strings.TrimSpace(entry.Object)
+			if obj == "" && entry.Target != nil {
+				obj = firstNonEmpty(entry.Target.Name, entry.Target.Type)
+			}
+			if obj != "" {
+				params["OBJECT"] = obj
+			}
+		}
+		if params["SECTION"] == "" {
+			sec := strings.TrimSpace(entry.Section)
+			if sec == "" && entry.Target != nil {
+				sec = strings.TrimSpace(entry.Target.Section)
+			}
+			if sec != "" {
+				params["SECTION"] = sec
+			}
+		}
+		rawMsg := firstNonEmpty(entry.Message, entry.MessageRaw)
+		msg := interpolateLogTemplate(rawMsg, params)
 		if msg == "" {
 			msg = fmt.Sprintf("%s (%s) via %s from %s", adminName, entry.Key, entry.Platform, entry.IP)
 		}
@@ -658,42 +705,88 @@ func isSecurityRelevantLog(e rawSystemLogEntry) bool {
 	return sev == "HIGH" || sev == "VERY_HIGH" || sev == "CRITICAL"
 }
 
+var unresolvedLogPlaceholderPattern = regexp.MustCompile(`\{[A-Z][A-Z0-9_]*\}`)
+
 func extractLogParams(raw map[string]json.RawMessage) map[string]string {
 	if len(raw) == 0 {
 		return nil
 	}
 	out := make(map[string]string, len(raw))
 	for k, v := range raw {
-		var s string
-		if err := json.Unmarshal(v, &s); err == nil && s != "" {
-			out[k] = s
+		val := decodeLogParamValue(v)
+		if val == "" {
 			continue
 		}
-		var obj struct {
-			Name string `json:"name"`
-			ID   string `json:"id"`
-			IP   string `json:"ip"`
-		}
-		if err := json.Unmarshal(v, &obj); err == nil {
-			if val := firstNonEmpty(obj.Name, obj.IP, obj.ID); val != "" {
-				out[k] = val
-			}
+		out[k] = val
+		if up := strings.ToUpper(k); up != k && out[up] == "" {
+			out[up] = val
 		}
 	}
 	return out
 }
 
+func decodeLogParamValue(v json.RawMessage) string {
+	trimmed := bytes.TrimSpace(v)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	var num json.Number
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	if err := dec.Decode(&num); err == nil && num.String() != "" {
+		return num.String()
+	}
+	var b bool
+	if err := json.Unmarshal(trimmed, &b); err == nil {
+		return strconv.FormatBool(b)
+	}
+	var obj struct {
+		Name     string          `json:"name"`
+		Value    json.RawMessage `json:"value"`
+		Label    string          `json:"label"`
+		Title    string          `json:"title"`
+		IP       string          `json:"ip"`
+		Hostname string          `json:"hostname"`
+		MAC      string          `json:"mac"`
+		Section  string          `json:"section"`
+		Object   string          `json:"object"`
+		ID       string          `json:"id"`
+	}
+	if err := json.Unmarshal(trimmed, &obj); err == nil {
+		valStr := ""
+		if len(obj.Value) > 0 {
+			valStr = decodeLogParamValue(obj.Value)
+		}
+		return firstNonEmpty(obj.Name, valStr, obj.Label, obj.Title, obj.IP, obj.Hostname, obj.MAC, obj.Section, obj.Object, obj.ID)
+	}
+	return ""
+}
+
 func interpolateLogTemplate(tmpl string, params map[string]string) string {
-	if tmpl == "" || len(params) == 0 {
-		return tmpl
+	if tmpl == "" {
+		return ""
 	}
 	out := tmpl
 	for k, v := range params {
 		if v != "" {
 			out = strings.ReplaceAll(out, "{"+k+"}", v)
+			if up := strings.ToUpper(k); up != k {
+				out = strings.ReplaceAll(out, "{"+up+"}", v)
+			}
 		}
 	}
-	return out
+	// Strip any remaining unpopulated UniFi template placeholders (such as
+	// {COUNT}, {OBJECT}, {SECTION}) and normalize spacing so raw braces never
+	// appear in dashboard activity entries.
+	if unresolvedLogPlaceholderPattern.MatchString(out) {
+		out = unresolvedLogPlaceholderPattern.ReplaceAllString(out, "")
+		out = strings.Join(strings.Fields(out), " ")
+	}
+	return strings.TrimSpace(out)
 }
 
 func normalizeLogSeverity(rawSev, category, event string) string {
