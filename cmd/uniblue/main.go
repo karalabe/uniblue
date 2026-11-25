@@ -1724,6 +1724,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	listen := fs.String("listen", "127.0.0.1:8080", "HTTP listen address for the built-in web UI")
 	poll := fs.Duration("poll", 5*time.Second, "UniFi topology delta poll interval (when WebSocket is unavailable)")
 	reconcile := fs.Duration("reconcile", 30*time.Minute, "periodic full LAN reconciliation interval")
+	cveRefresh := fs.Duration("cve-refresh", 1*time.Hour, "background NVD+KEV CVE cache sync and refresh interval (0 to disable auto-sync)")
 	noCVE := fs.Bool("no-cve", false, "skip local CVE cache correlation even if synced")
 	demo := fs.Bool("demo", false, "serve built-in offline demo network (no UniFi controller needed)")
 	if err := fs.Parse(args); err != nil {
@@ -1748,11 +1749,12 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
 	eng, err := server.NewEngine(cfg, checkList, scanPorts, server.Options{
-		ListenAddr:        *listen,
-		PollInterval:      *poll,
-		ReconcileInterval: *reconcile,
-		SkipCVE:           *noCVE,
-		Logger:            logger,
+		ListenAddr:         *listen,
+		PollInterval:       *poll,
+		ReconcileInterval:  *reconcile,
+		SkipCVE:            *noCVE,
+		CVERefreshInterval: *cveRefresh,
+		Logger:             logger,
 	})
 	if err != nil {
 		return err

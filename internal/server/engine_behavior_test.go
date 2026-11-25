@@ -7,10 +7,13 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,6 +24,7 @@ import (
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
+	"github.com/karalabe/uniblue/internal/cve"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -700,4 +704,280 @@ func TestClientSkipReasonAndIPv6ClassLookup(t *testing.T) {
 	if got := lookupClientClass(classes, v6BMC); got.Category != classify.CategoryBMC {
 		t.Fatalf("expected IPv6-only BMC classification via MAC fallback, got %+v", got)
 	}
+}
+
+// TestHTTPAuthBruteForceLockout verifies per-IP lockout throttling on repeated
+// bad dashboard/API token attempts without penalizing cookie-less initial loads.
+func TestHTTPAuthBruteForceLockout(t *testing.T) {
+	eng := NewDemoEngineForTest(t)
+	eng.opts.ListenAddr = "0.0.0.0:8080"
+	eng.opts.APIToken = "super-secret-token"
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	eng.authLimiter.nowFn = func() time.Time { return now }
+	h := eng.Handler()
+
+	// Unauthenticated GET /api/state without Authorization header never locks out.
+	for i := 0; i < 8; i++ {
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+		req.RemoteAddr = "10.0.0.50:40000"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401 for unauthenticated page check, got %d", i+1, rec.Code)
+		}
+	}
+
+	// 4 bad POST /api/auth attempts return 401; the 5th triggers 429 lockout.
+	for i := 1; i <= authMaxFailedAttempts; i++ {
+		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"wrong"}`))
+		req.RemoteAddr = "10.0.0.50:40001"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		want := http.StatusUnauthorized
+		if i == authMaxFailedAttempts {
+			want = http.StatusTooManyRequests
+		}
+		if rec.Code != want {
+			t.Fatalf("bad login %d: expected %d, got %d", i, want, rec.Code)
+		}
+		if want == http.StatusTooManyRequests && rec.Header().Get("Retry-After") == "" {
+			t.Fatal("expected Retry-After header on 429 lockout response")
+		}
+	}
+
+	// Even the valid token is rejected while locked out (including IPv4-mapped form).
+	for _, remote := range []string{"10.0.0.50:55555", "[::ffff:10.0.0.50]:55556"} {
+		req := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"super-secret-token"}`))
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("remote %s while locked out: expected 429, got %d", remote, rec.Code)
+		}
+	}
+
+	// Another IP is unaffected and can authenticate normally.
+	reqOther := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"super-secret-token"}`))
+	reqOther.RemoteAddr = "10.0.0.51:12345"
+	recOther := httptest.NewRecorder()
+	h.ServeHTTP(recOther, reqOther)
+	if recOther.Code != http.StatusOK {
+		t.Fatalf("different IP expected 200, got %d", recOther.Code)
+	}
+
+	// After lockout expires, valid auth succeeds and resets state.
+	now = now.Add(authLockoutDuration + time.Second)
+	reqUnlock := httptest.NewRequest(http.MethodPost, "http://192.168.1.10:8080/api/auth", strings.NewReader(`{"token":"super-secret-token"}`))
+	reqUnlock.RemoteAddr = "10.0.0.50:60000"
+	recUnlock := httptest.NewRecorder()
+	h.ServeHTTP(recUnlock, reqUnlock)
+	if recUnlock.Code != http.StatusOK {
+		t.Fatalf("after lockout expiry expected 200, got %d", recUnlock.Code)
+	}
+
+	// Bad Bearer tokens on /api/state also count toward lockout, and a valid
+	// Bearer token before the threshold resets the counter.
+	for i := 0; i < authMaxFailedAttempts-1; i++ {
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+		req.RemoteAddr = "10.0.0.52:1000"
+		req.Header.Set("Authorization", "Bearer bad-guess")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("bad bearer %d: expected 401, got %d", i+1, rec.Code)
+		}
+	}
+	reqGood := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+	reqGood.RemoteAddr = "10.0.0.52:1001"
+	reqGood.Header.Set("Authorization", "Bearer super-secret-token")
+	recGood := httptest.NewRecorder()
+	h.ServeHTTP(recGood, reqGood)
+	if recGood.Code != http.StatusOK {
+		t.Fatalf("valid bearer before threshold expected 200, got %d", recGood.Code)
+	}
+	// One more bad attempt must be 401 (counter was reset), not 429.
+	reqAfterReset := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+	reqAfterReset.RemoteAddr = "10.0.0.52:1002"
+	reqAfterReset.Header.Set("Authorization", "Bearer bad-again")
+	recAfterReset := httptest.NewRecorder()
+	h.ServeHTTP(recAfterReset, reqAfterReset)
+	if recAfterReset.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after reset, got %d", recAfterReset.Code)
+	}
+
+	// Forged session cookies also count toward lockout and are cleared on rejection.
+	for i := 1; i <= authMaxFailedAttempts; i++ {
+		req := httptest.NewRequest(http.MethodGet, "http://192.168.1.10:8080/api/state", nil)
+		req.RemoteAddr = "10.0.0.53:1000"
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "forged-cookie"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		want := http.StatusUnauthorized
+		if i == authMaxFailedAttempts {
+			want = http.StatusTooManyRequests
+		}
+		if rec.Code != want {
+			t.Fatalf("forged cookie %d: expected %d, got %d", i, want, rec.Code)
+		}
+	}
+}
+
+// TestBackgroundCVESyncAutoLoadsAndSkipsUnchanged verifies that cveSyncLoop
+// populates an initially empty CVE cache, publishes exact CVE matches without
+// restart, stays quiet when feeds are unchanged, and re-correlates when new
+// CVEs arrive.
+func TestBackgroundCVESyncAutoLoadsAndSkipsUnchanged(t *testing.T) {
+	eng := NewDemoEngineForTest(t)
+	cacheDir := t.TempDir()
+	eng.cfg.CVE.CacheDir = cacheDir
+	eng.cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	eng.opts.CVERefreshInterval = 20 * time.Millisecond
+	eng.mu.Lock()
+	eng.cveCache = nil
+	eng.cveIdent = nil
+	amp := unifi.Client{MAC: "aa:bb:cc:dd:ee:01", Name: "LivingRoomAmp", IP: "10.0.30.50", NetworkName: "IoT"}
+	eng.snap.Clients = append(eng.snap.Clients, amp)
+	eng.profilesByMAC[clientKey(amp)] = probe.HostProfile{
+		Client:    amp,
+		OpenPorts: []int{80},
+		HTTP: map[int]probe.HTTPBanner{
+			80: {Server: "nginx/1.26.3"},
+		},
+		ScannedAt: time.Now().UTC(),
+	}
+	eng.mu.Unlock()
+
+	writeShard := func(recs []cve.Record, stats *cve.CacheStats) error {
+		vendorsDir := filepath.Join(cacheDir, "vendors")
+		if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+			return err
+		}
+		f, err := os.Create(filepath.Join(vendorsDir, "f5.json.gz"))
+		if err != nil {
+			return err
+		}
+		gz := gzip.NewWriter(f)
+		if err := json.NewEncoder(gz).Encode(recs); err != nil {
+			_ = gz.Close()
+			_ = f.Close()
+			return err
+		}
+		if err := gz.Close(); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		rawStats, err := json.Marshal(stats)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(cacheDir, "stats.json"), rawStats, 0o644)
+	}
+
+	t1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 6, 1, 11, 0, 0, 0, time.UTC)
+	rec1 := cve.Record{
+		ID:       "CVE-2026-99991",
+		Severity: checks.SeverityHigh,
+		CVSS:     7.5,
+		Matches: []cve.CPEMatch{{
+			Part: "a", Vendor: "f5", Product: "nginx",
+			StartIncl: "1.26.0", EndExcl: "1.26.4",
+		}},
+	}
+	rec2 := cve.Record{
+		ID:       "CVE-2026-99992",
+		Severity: checks.SeverityCritical,
+		CVSS:     9.8,
+		Matches: []cve.CPEMatch{{
+			Part: "a", Vendor: "f5", Product: "nginx",
+			StartIncl: "1.26.0", EndExcl: "1.26.4",
+		}},
+	}
+	stats1 := &cve.CacheStats{
+		SyncedAt: t1, TotalCVEs: 1, IndexedCPECVEs: 1, VendorCount: 1,
+		KEVSHA: "kev-v1", YearSHAs: map[string]string{"2026": "sha-v1"},
+	}
+	stats2 := &cve.CacheStats{
+		SyncedAt: t2, TotalCVEs: 2, IndexedCPECVEs: 2, VendorCount: 1,
+		KEVSHA: "kev-v1", YearSHAs: map[string]string{"2026": "sha-v2"},
+	}
+
+	var calls atomic.Int32
+	step2Done := make(chan struct{})
+	step3Done := make(chan struct{})
+	eng.cveSyncFn = func(_ context.Context, _ *cve.Cache) (*cve.CacheStats, error) {
+		switch calls.Add(1) {
+		case 1:
+			if err := writeShard([]cve.Record{rec1}, stats1); err != nil {
+				return nil, err
+			}
+			return stats1, nil
+		case 2:
+			close(step2Done)
+			return stats1, nil
+		case 3:
+			if err := writeShard([]cve.Record{rec1, rec2}, stats2); err != nil {
+				return nil, err
+			}
+			close(step3Done)
+			return stats2, nil
+		default:
+			return stats2, nil
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		eng.cveSyncLoop(ctx)
+	}()
+
+	// Wait until step 2 (unchanged tick) completes.
+	select {
+	case <-step2Done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for second CVE sync check")
+	}
+	// Give the loop a moment to process step 2 without emitting a second event.
+	time.Sleep(15 * time.Millisecond)
+
+	// Wait until step 3 (updated feed) triggers and publishes.
+	select {
+	case <-step3Done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for third CVE sync check")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := eng.Snapshot()
+		if snap.CVELoaded {
+			for _, ex := range snap.ExactCVEs {
+				if ex.Product.HostName == "LivingRoomAmp" && ex.TotalCVEs == 2 {
+					cancel()
+					<-done
+					syncedEvents := 0
+					for _, ev := range snap.Events {
+						if ev.Type == "cve_synced" {
+							syncedEvents++
+						}
+					}
+					if syncedEvents != 2 {
+						t.Fatalf("expected exactly 2 cve_synced events (initial load + changed feed, skipping unchanged tick), got %d", syncedEvents)
+					}
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	t.Fatalf("expected nginx ExactCVEs with TotalCount=2 after background sync, got CVELoaded=%v ExactCVEs=%+v",
+		eng.Snapshot().CVELoaded, eng.Snapshot().ExactCVEs)
 }

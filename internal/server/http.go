@@ -21,15 +21,165 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/karalabe/uniblue/docs"
 )
 
-const sessionCookieName = "uniblue_session"
+const (
+	sessionCookieName = "uniblue_session"
+
+	authMaxFailedAttempts  = 5
+	authFailureWindow      = 15 * time.Minute
+	authLockoutDuration    = 15 * time.Minute
+	authMaxLockoutDuration = 1 * time.Hour
+	authMaxTrackedClients  = 1024
+)
+
+type authAttemptState struct {
+	failures    int
+	lockouts    int
+	windowStart time.Time
+	lockedUntil time.Time
+	lastSeen    time.Time
+}
+
+// authFailureLimiter tracks failed dashboard/API authentication attempts per
+// remote IP and temporarily locks out clients after repeated invalid tokens.
+type authFailureLimiter struct {
+	mu      sync.Mutex
+	clients map[string]authAttemptState
+	nowFn   func() time.Time
+}
+
+func (l *authFailureLimiter) now() time.Time {
+	if l.nowFn != nil {
+		return l.nowFn()
+	}
+	return time.Now()
+}
+
+func (l *authFailureLimiter) checkLocked(ip string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.clients == nil {
+		return false, 0
+	}
+	st, ok := l.clients[ip]
+	if !ok {
+		return false, 0
+	}
+	now := l.now()
+	if now.Before(st.lockedUntil) {
+		return true, st.lockedUntil.Sub(now)
+	}
+	return false, 0
+}
+
+func (l *authFailureLimiter) recordFailure(ip string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.clients == nil {
+		l.clients = make(map[string]authAttemptState)
+	}
+	now := l.now()
+	st, ok := l.clients[ip]
+	if ok {
+		if now.Before(st.lockedUntil) {
+			return true, st.lockedUntil.Sub(now)
+		}
+		if st.windowStart.IsZero() || now.Sub(st.windowStart) > authFailureWindow {
+			st.failures = 0
+			st.windowStart = now
+		}
+	} else {
+		if len(l.clients) >= authMaxTrackedClients {
+			l.evictStaleLocked(now)
+		}
+		st.windowStart = now
+	}
+	st.failures++
+	st.lastSeen = now
+	if st.failures >= authMaxFailedAttempts {
+		st.lockouts++
+		dur := authLockoutDuration << min(st.lockouts-1, 4)
+		if dur > authMaxLockoutDuration {
+			dur = authMaxLockoutDuration
+		}
+		st.lockedUntil = now.Add(dur)
+		st.failures = 0
+		l.clients[ip] = st
+		return true, dur
+	}
+	l.clients[ip] = st
+	return false, 0
+}
+
+func (l *authFailureLimiter) reset(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.clients != nil {
+		delete(l.clients, ip)
+	}
+}
+
+func (l *authFailureLimiter) evictStaleLocked(now time.Time) {
+	for k, st := range l.clients {
+		if !now.Before(st.lockedUntil) && now.Sub(st.lastSeen) > authFailureWindow {
+			delete(l.clients, k)
+		}
+	}
+	if len(l.clients) < authMaxTrackedClients {
+		return
+	}
+	var oldestKey string
+	var oldestTime time.Time
+	for k, st := range l.clients {
+		if oldestKey == "" || st.lastSeen.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = st.lastSeen
+		}
+	}
+	if oldestKey != "" {
+		delete(l.clients, oldestKey)
+	}
+}
+
+func clientRemoteIP(r *http.Request) string {
+	raw := strings.TrimSpace(r.RemoteAddr)
+	if raw == "" {
+		return "unknown"
+	}
+	host := raw
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Unmap().String()
+	}
+	return host
+}
+
+func writeAuthLockedResponse(w http.ResponseWriter, retryAfter time.Duration) {
+	secs := int(retryAfter.Round(time.Second).Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error": "too many failed authentication attempts; try again later",
+	})
+}
 
 // Serve starts the HTTP server for the built-in web UI, JSON API, live SVG
 // topology endpoint, and SSE event stream, shutting down gracefully when ctx is
@@ -286,11 +436,42 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 
 		if isAPI && !(r.Method == http.MethodPost && r.URL.Path == "/api/auth") {
 			if tok := e.effectiveAPIToken(); tok != "" {
+				ip := clientRemoteIP(r)
+				if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
+					writeAuthLockedResponse(w, retryAfter)
+					return
+				}
 				if !hasValidAPIAuth(r, tok) {
+					// Count failed attempts only when the client actually sent
+					// an invalid credential (Bearer token or session cookie), so
+					// unauthenticated initial page loads prompting for login
+					// never trigger a lockout. Clear stale/invalid cookies so
+					// browsers with a rotated token do not keep resending them.
+					hasBearer := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
+					ck, ckErr := r.Cookie(sessionCookieName)
+					hasBadCookie := ckErr == nil && ck.Value != ""
+					if hasBadCookie {
+						http.SetCookie(w, &http.Cookie{
+							Name:     sessionCookieName,
+							Value:    "",
+							Path:     "/",
+							HttpOnly: true,
+							SameSite: http.SameSiteStrictMode,
+							Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
+							MaxAge:   -1,
+						})
+					}
+					if hasBearer || hasBadCookie {
+						if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
+							writeAuthLockedResponse(w, retryAfter)
+							return
+						}
+					}
 					w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
 					http.Error(w, "unauthorized", http.StatusUnauthorized)
 					return
 				}
+				e.authLimiter.reset(ip)
 			}
 		}
 
@@ -304,6 +485,12 @@ func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
 	tok := e.effectiveAPIToken()
 	if tok == "" {
 		_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": true, "required": false})
+		return
+	}
+
+	ip := clientRemoteIP(r)
+	if locked, retryAfter := e.authLimiter.checkLocked(ip); locked {
+		writeAuthLockedResponse(w, retryAfter)
 		return
 	}
 
@@ -322,11 +509,17 @@ func (e *Engine) handleAuth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if cand == "" || subtle.ConstantTimeCompare([]byte(cand), []byte(tok)) != 1 {
+		if locked, retryAfter := e.authLimiter.recordFailure(ip); locked {
+			writeAuthLockedResponse(w, retryAfter)
+			return
+		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="uniblue"`)
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
 		return
 	}
+
+	e.authLimiter.reset(ip)
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,

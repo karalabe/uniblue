@@ -68,6 +68,11 @@ type Options struct {
 	// SkipCVE disables local NVD+KEV correlation even when a cache exists.
 	SkipCVE bool
 
+	// CVERefreshInterval sets how often Start automatically downloads/refreshes
+	// the local NVD+KEV cache in the background (when > 0 and SkipCVE is false).
+	// When 0, only an already-present local cache is loaded without network sync.
+	CVERefreshInterval time.Duration
+
 	// APIToken optionally requires Authorization: Bearer <token> or session cookie on /api/* endpoints.
 	APIToken string
 
@@ -316,6 +321,12 @@ type Engine struct {
 	webhookRunning   bool
 	webhookRetryBase time.Duration
 
+	// authLimiter throttles repeated failed API/dashboard auth attempts per IP.
+	authLimiter authFailureLimiter
+
+	// cveSyncFn optionally overrides cve.Cache.Sync in tests.
+	cveSyncFn func(ctx context.Context, cache *cve.Cache) (*cve.CacheStats, error)
+
 	// mu protects the live state maps and the published StateSnapshot.
 	mu               sync.RWMutex
 	snap             *unifi.Snapshot
@@ -483,7 +494,129 @@ func (e *Engine) Start(ctx context.Context) error {
 	})
 	e.queueFullRescan("initial baseline")
 	go e.pollAndReconcileLoop(ctx)
+	if !e.opts.SkipCVE && e.opts.CVERefreshInterval > 0 {
+		go e.cveSyncLoop(ctx)
+	}
 	return nil
+}
+
+// cveSyncLoop keeps the local offline NVD+KEV cache populated and fresh in the
+// background so long-running deployments (including Docker/Unraid) get CVE
+// matching automatically without manual `uniblue cve sync` runs or restarts.
+func (e *Engine) cveSyncLoop(ctx context.Context) {
+	interval := e.opts.CVERefreshInterval
+	if interval <= 0 {
+		return
+	}
+	cache := cve.NewCache(e.cfg.CVE.CacheDir)
+
+	initialDelay := time.Duration(0)
+	if st, err := cache.Stats(); err == nil && st.VendorCount > 0 && !st.SyncedAt.IsZero() {
+		if age := time.Since(st.SyncedAt); age < interval {
+			initialDelay = interval - age
+		}
+	}
+
+	retryBackoff := 2 * time.Minute
+	const maxRetryBackoff = 30 * time.Minute
+
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		syncFn := e.cveSyncFn
+		if syncFn == nil {
+			syncFn = func(sctx context.Context, c *cve.Cache) (*cve.CacheStats, error) {
+				return c.Sync(sctx, cve.SyncOptions{})
+			}
+		}
+
+		prevStats, _ := cache.Stats()
+		e.mu.RLock()
+		alreadyLoaded := e.cveCache != nil && e.cveIdent != nil
+		e.mu.RUnlock()
+
+		if !alreadyLoaded {
+			e.logger.Info("syncing local NVD + CISA KEV CVE cache", "dir", e.cfg.CVE.CacheDir)
+		} else {
+			e.logger.Debug("checking local NVD + CISA KEV CVE cache for updates", "dir", e.cfg.CVE.CacheDir)
+		}
+		stats, err := syncFn(ctx, cache)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			e.logger.Warn("background CVE cache sync failed; will retry", "err", err, "retry_in", retryBackoff)
+			timer.Reset(retryBackoff)
+			retryBackoff *= 2
+			if retryBackoff > maxRetryBackoff {
+				retryBackoff = maxRetryBackoff
+			}
+			continue
+		}
+
+		retryBackoff = 2 * time.Minute
+		if alreadyLoaded && !cveStatsChanged(prevStats, stats) {
+			e.logger.Debug("local CVE cache already up to date")
+			timer.Reset(interval)
+			continue
+		}
+
+		ident, err := cve.LoadFingerprinter(fingerprints.BuiltinFS)
+		if err != nil {
+			e.logger.Warn("failed to load CVE fingerprinter after sync", "err", err)
+			timer.Reset(interval)
+			continue
+		}
+
+		e.mu.Lock()
+		e.cveCache = cache
+		e.cveIdent = ident
+		e.mu.Unlock()
+
+		var totalCVEs, vendors, kevs int
+		if stats != nil {
+			totalCVEs = stats.TotalCVEs
+			vendors = stats.VendorCount
+			kevs = stats.KEVCount
+		}
+		e.logger.Info("local CVE cache ready", "cves", totalCVEs, "vendors", vendors, "kev", kevs)
+		e.recomputeAndPublish(ctx, false, []LiveEvent{{
+			Type:     "cve_synced",
+			Severity: "info",
+			Summary:  fmt.Sprintf("CVE cache updated (%d CVEs across %d vendors, %d KEV)", totalCVEs, vendors, kevs),
+		}})
+		timer.Reset(interval)
+	}
+}
+
+func cveStatsChanged(prev, cur *cve.CacheStats) bool {
+	if prev == nil || cur == nil {
+		return prev != cur
+	}
+	if prev.TotalCVEs != cur.TotalCVEs ||
+		prev.IndexedCPECVEs != cur.IndexedCPECVEs ||
+		prev.VendorCount != cur.VendorCount ||
+		prev.KEVCount != cur.KEVCount ||
+		prev.KEVSHA != cur.KEVSHA ||
+		!prev.SyncedAt.Equal(cur.SyncedAt) {
+		return true
+	}
+	if len(prev.YearSHAs) != len(cur.YearSHAs) {
+		return true
+	}
+	for k, v := range prev.YearSHAs {
+		if cur.YearSHAs[k] != v {
+			return true
+		}
+	}
+	return false
 }
 
 // Snapshot returns a thread-safe copy of the latest StateSnapshot for HTTP handlers.
@@ -1495,6 +1628,8 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	}
 	prevRisk := e.prevRiskState
 	baselineReady := e.baselineComplete || isFullScan
+	cveCache := e.cveCache
+	cveIdent := e.cveIdent
 	e.mu.RUnlock()
 
 	sort.Slice(profiles, func(i, j int) bool {
@@ -1508,10 +1643,10 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 
 	var exactCVEs, potentialCVEs []cve.ProductSummary
 	cveLoaded := false
-	if e.cveCache != nil && e.cveIdent != nil {
+	if cveCache != nil && cveIdent != nil {
 		cveLoaded = true
-		products := e.cveIdent.Identify(snap, profiles)
-		if matches, err := e.cveCache.MatchProducts(products, cve.MatchOptions{
+		products := cveIdent.Identify(snap, profiles)
+		if matches, err := cveCache.MatchProducts(products, cve.MatchOptions{
 			MinSeverity:          checks.SeverityHigh,
 			PotentialMaxAgeYears: 2,
 		}); err == nil {

@@ -3640,7 +3640,13 @@ if (authForm) {
         body: JSON.stringify({ token })
       });
       if (!resp.ok) {
-        showAuthOverlay("Invalid API token. Check UNIBLUE_API_TOKEN and try again.");
+        if (resp.status === 429) {
+          const retrySecs = parseInt(resp.headers.get("Retry-After") || "0", 10);
+          const waitText = retrySecs >= 60 ? `${Math.ceil(retrySecs / 60)} minutes` : "a few minutes";
+          showAuthOverlay(`Too many failed attempts. Please wait ${waitText} and try again.`);
+        } else {
+          showAuthOverlay("Invalid API token. Check UNIBLUE_API_TOKEN and try again.");
+        }
         return;
       }
       if (inp) inp.value = "";
