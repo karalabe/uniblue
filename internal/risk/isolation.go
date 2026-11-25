@@ -160,11 +160,23 @@ func EvaluateIsolation(
 	var untrustedNets []unifi.Network
 	var trustedNets []unifi.Network
 	var mgmtNets []unifi.Network
+	var containmentNets []unifi.Network
+	// Always include VLANs explicitly named in containment policy lists even if
+	// they currently reside in the Internal zone without UniFi network isolation.
+	var explicitTargets []string
+	for _, group := range [][]string{intent.IoTVLANs, intent.NoInternetVLANs, intent.StrictInboundVLANs, intent.RequireSameVLANIsolation} {
+		explicitTargets = append(explicitTargets, group...)
+	}
+	explicit := toLowerSet(explicitTargets)
 	for _, n := range snap.Networks {
 		p := strings.ToLower(strings.TrimSpace(n.Purpose))
 		z := strings.ToLower(strings.TrimSpace(n.ZoneName))
 		if p == "wan" || p == "wan2" || p == "remote-user-vpn" || z == "external" || z == "vpn" || z == "gateway" {
 			continue
+		}
+		targeted := isNetworkInSet(n.Name, explicit) || (n.VLAN != "" && isNetworkInSet(n.VLAN, explicit))
+		if targeted {
+			containmentNets = append(containmentNets, n)
 		}
 		if isManagementNetwork(n, intent) {
 			mgmtNets = append(mgmtNets, n)
@@ -173,6 +185,9 @@ func EvaluateIsolation(
 		if isNetworkInSet(n.Name, isolatedSet) || isGuestNetwork(n, intent) || isCameraNetwork(n, intent) ||
 			(intendedIsoZones[z] && !isNetworkInSet(n.Name, trustedSet)) {
 			untrustedNets = append(untrustedNets, n)
+			if !targeted {
+				containmentNets = append(containmentNets, n)
+			}
 		} else if isNetworkInSet(n.Name, trustedSet) {
 			trustedNets = append(trustedNets, n)
 		}
@@ -757,19 +772,12 @@ func EvaluateIsolation(
 		}
 	}
 
-	// 4. Evaluate Same-VLAN L2 Peer Isolation (Same-AP Wi-Fi, Cross-AP Wi-Fi, Wired, Mixed).
-	sameVLANCells, sameVLANFindings := evaluateSameVLANPeerIsolation(snap, intent, switchACLStatus, switchACLReason, isolatedSet)
-	for _, c := range sameVLANCells {
-		addCell(c)
-	}
-	findings = append(findings, sameVLANFindings...)
-
-	// 5. Evaluate 4-axis Network Containment (Peers, LAN Egress, Internet Egress,
-	// LAN Inbound) and smart Guest/IoT/Camera archetypes for every isolated VLAN.
+	// Evaluate 4-axis network containment (Peers, LAN Egress, Internet Egress,
+	// and LAN Inbound) for every isolated or explicitly targeted VLAN.
 	containment, contCells, contFindings, contNotes := evaluateNetworkContainment(
-		snap, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason,
-		switchACLStatus, switchACLReason, gwName, gwIP,
-		untrustedNets, trustedNets, matrix.Cells,
+		snap, rawFindings, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason,
+		switchACLStatus, switchACLReason, gwName,
+		containmentNets, trustedNets, matrix.Cells,
 	)
 	matrix.Containment = containment
 	for _, c := range contCells {
@@ -1217,384 +1225,6 @@ func evaluateSwitchACLs(acls []unifi.SwitchACL, switchMAC string, q pathQuery) p
 		return policyDecision{action: "deny", ruleID: acl.ID, ruleName: acl.Name, reason: "matched switch ACL BLOCK"}
 	}
 	return policyDecision{action: "allow", ruleName: "Switch L2/L3 Default", reason: "default switch forwarding without explicit deny ACL"}
-}
-
-func evaluateSameVLANPeerIsolation(
-	snap *unifi.Snapshot,
-	intent config.IsolationIntent,
-	switchACLStatus, switchACLReason string,
-	isolatedSet map[string]struct{},
-) ([]IsolationCell, []checks.Finding) {
-	var cells []IsolationCell
-	var findings []checks.Finding
-	reqSet := toLowerSet(intent.RequireSameVLANIsolation)
-
-	wlansByNet := make(map[string][]unifi.WLANConfig)
-	for _, w := range snap.WLANs {
-		if w.Enabled && w.NetworkName != "" {
-			wlansByNet[strings.ToLower(w.NetworkName)] = append(wlansByNet[strings.ToLower(w.NetworkName)], w)
-		}
-	}
-
-	portIso := make(map[string]bool)
-	portMACCount := make(map[string]int)
-	for _, d := range snap.Devices {
-		dm := strings.ToLower(d.MAC)
-		for _, p := range d.Ports {
-			k := fmt.Sprintf("%s|%d", dm, p.PortIdx)
-			portIso[k] = p.Isolation
-			portMACCount[k] = p.MACTableCount
-		}
-	}
-
-	for _, n := range snap.Networks {
-		nLow := strings.ToLower(n.Name)
-		_, explicitReq := reqSet[nLow]
-		_, isIso := isolatedSet[nLow]
-		if !explicitReq && !isIso && !isGuestNetwork(n, intent) {
-			continue
-		}
-		zoneLabel := firstNonEmptyStr(n.ZoneName, n.Name)
-
-		var wiredClients []unifi.Client
-		apSet := make(map[string]int)
-		wiredSwitches := make(map[string]struct{})
-		for _, cl := range snap.Clients {
-			if !strings.EqualFold(cl.NetworkName, n.Name) {
-				continue
-			}
-			if cl.IsWired {
-				wiredClients = append(wiredClients, cl)
-				if cl.SwitchMAC != "" {
-					wiredSwitches[strings.ToLower(cl.SwitchMAC)] = struct{}{}
-				}
-			} else if cl.APMAC != "" {
-				apSet[strings.ToLower(cl.APMAC)]++
-			}
-		}
-
-		// Same-AP and Cross-AP Wi-Fi paths.
-		for _, w := range wlansByNet[nLow] {
-			if w.L2Isolation {
-				cells = append(cells, IsolationCell{
-					SourceZone:     zoneLabel,
-					SourceNetwork:  n.Name,
-					DestZone:       zoneLabel,
-					DestNetwork:    n.Name,
-					DestFunction:   "same-vlan-wifi-peers",
-					Transport:      "all",
-					IPFamily:       "ipv4",
-					PathKind:       "same-ap-wifi",
-					Enforcer:       fmt.Sprintf("UniFi AP (SSID %q L2 Isolation)", w.Name),
-					Expected:       "deny",
-					Effective:      "deny",
-					Verdict:        IsolationBlockedOK,
-					DecisiveReason: "WLAN client device isolation blocks peer-to-peer traffic on the same AP",
-				})
-			} else if explicitReq {
-				c := IsolationCell{
-					SourceZone:     zoneLabel,
-					SourceNetwork:  n.Name,
-					DestZone:       zoneLabel,
-					DestNetwork:    n.Name,
-					DestFunction:   "same-vlan-wifi-peers",
-					Transport:      "all",
-					IPFamily:       "ipv4",
-					PathKind:       "same-ap-wifi",
-					Enforcer:       fmt.Sprintf("UniFi AP (SSID %q)", w.Name),
-					Expected:       "deny",
-					Effective:      "allow",
-					Verdict:        IsolationViolation,
-					DecisiveReason: "WLAN l2_isolation is disabled",
-					RecommendedFix: fmt.Sprintf("Enable Client Device Isolation on SSID %q.", w.Name),
-				}
-				cells = append(cells, c)
-				findings = append(findings, checks.Finding{
-					CheckID:           "UB-UNIFI-ISO-SAME-VLAN",
-					Title:             fmt.Sprintf("Same-AP Wi-Fi Client Isolation Disabled on %s (%s)", n.Name, w.Name),
-					Category:          "isolation-policy",
-					ClaimKind:         checks.ClaimConfiguredAccess,
-					Property:          "isolation-same-ap-" + strings.ToLower(w.Name),
-					BaseSeverity:      checks.SeverityMedium,
-					EffectiveSeverity: checks.SeverityMedium,
-					Client:            unifi.Client{MAC: "wlan:" + w.ID, Name: w.Name, NetworkName: n.Name},
-					Evidence:          fmt.Sprintf("SSID %q on %s has l2_isolation=false while same-VLAN isolation is required", w.Name, n.Name),
-					Remediation: checks.Remediation{
-						Summary:      c.RecommendedFix,
-						UniFiActions: []string{"enable_wlan_l2_isolation"},
-					},
-				})
-			}
-
-			// Cross-AP Wi-Fi requires switch port isolation or switch ACL beyond AP-local isolation.
-			if len(apSet) >= 2 && (explicitReq || w.IsGuest) {
-				if switchACLStatus != "complete" {
-					cells = append(cells, IsolationCell{
-						SourceZone:     zoneLabel,
-						SourceNetwork:  n.Name,
-						DestZone:       zoneLabel,
-						DestNetwork:    n.Name,
-						DestFunction:   "cross-ap-wifi-peers",
-						Transport:      "all",
-						IPFamily:       "ipv4",
-						PathKind:       "cross-ap-wifi",
-						Enforcer:       "UniFi Switch (ACL / Port Isolation)",
-						Expected:       "deny",
-						Effective:      "unknown",
-						Verdict:        IsolationUnknown,
-						MissingInput:   fmt.Sprintf("Clients span %d APs on %s and %s; AP-only isolation does not verify cross-AP switching.", len(apSet), n.Name, switchACLReason),
-						RecommendedFix: "Verify switch ACLs or AP uplink port isolation on switches serving this isolated VLAN.",
-					})
-				} else {
-					dec := evaluateSwitchACLs(snap.SwitchACLs, "", pathQuery{
-						srcZone:    zoneLabel,
-						srcNetID:   n.ID,
-						srcNetName: n.Name,
-						dstZone:    zoneLabel,
-						dstNetID:   n.ID,
-						dstNetName: n.Name,
-						proto:      "all",
-						ipFamily:   "ipv4",
-						state:      "new",
-					})
-					c := IsolationCell{
-						SourceZone:    zoneLabel,
-						SourceNetwork: n.Name,
-						DestZone:      zoneLabel,
-						DestNetwork:   n.Name,
-						DestFunction:  "cross-ap-wifi-peers",
-						Transport:     "all",
-						IPFamily:      "ipv4",
-						PathKind:      "cross-ap-wifi",
-						Enforcer:      "UniFi Switch (L2 Switch ACL)",
-						Expected:      "deny",
-					}
-					applyDecisionToCell(&c, dec)
-					if c.Verdict == IsolationViolation {
-						c.RecommendedFix = fmt.Sprintf("Add a switch ACL blocking intra-VLAN peer traffic on %s or isolate AP switch ports.", n.Name)
-						findings = append(findings, checks.Finding{
-							CheckID:           "UB-UNIFI-ISO-SAME-VLAN",
-							Title:             fmt.Sprintf("Cross-AP Wi-Fi Peer Traffic Permitted on %s", n.Name),
-							Category:          "isolation-policy",
-							ClaimKind:         checks.ClaimConfiguredAccess,
-							Property:          "isolation-cross-ap-" + nLow,
-							BaseSeverity:      checks.SeverityMedium,
-							EffectiveSeverity: checks.SeverityMedium,
-							Client:            unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
-							Evidence:          fmt.Sprintf("clients span %d APs on %s and switch ACLs do not block intra-VLAN peer traffic (%s)", len(apSet), n.Name, c.DecisiveRuleName),
-							Remediation: checks.Remediation{
-								Summary:      c.RecommendedFix,
-								UniFiActions: []string{"add_switch_l2_isolation_acl"},
-							},
-						})
-					}
-					cells = append(cells, c)
-				}
-			}
-		}
-
-		// Wired same-VLAN peer isolation (gateway never sees local L2 switching).
-		// Port isolation alone guarantees L2 peer isolation ONLY when all wired
-		// clients sit on a single switch, on distinct isolated ports, with at
-		// most 1 MAC per port (ruling out cross-switch uplinks and unmanaged
-		// downstream switches behind an isolated port).
-		if len(wiredClients) >= 2 || (explicitReq && len(wiredClients) >= 1) {
-			allPortsIsolated := len(wiredClients) > 0 && len(wiredSwitches) == 1
-			seenPort := make(map[string]struct{}, len(wiredClients))
-			if allPortsIsolated {
-				for _, wc := range wiredClients {
-					if wc.SwitchMAC == "" || wc.SwitchPort <= 0 {
-						allPortsIsolated = false
-						break
-					}
-					pk := fmt.Sprintf("%s|%d", strings.ToLower(wc.SwitchMAC), wc.SwitchPort)
-					if !portIso[pk] || portMACCount[pk] > 1 {
-						allPortsIsolated = false
-						break
-					}
-					if _, dup := seenPort[pk]; dup {
-						allPortsIsolated = false
-						break
-					}
-					seenPort[pk] = struct{}{}
-				}
-			}
-			if allPortsIsolated {
-				cells = append(cells, IsolationCell{
-					SourceZone:     zoneLabel,
-					SourceNetwork:  n.Name,
-					DestZone:       zoneLabel,
-					DestNetwork:    n.Name,
-					DestFunction:   "same-vlan-wired-peers",
-					Transport:      "all",
-					IPFamily:       "ipv4",
-					PathKind:       "wired-same-vlan",
-					Enforcer:       "UniFi Switch (L2 Port Isolation)",
-					Expected:       "deny",
-					Effective:      "deny",
-					Verdict:        IsolationBlockedOK,
-					DecisiveReason: "all wired clients sit on distinct isolated ports on one switch",
-				})
-			} else if explicitReq {
-				if switchACLStatus != "complete" {
-					cells = append(cells, IsolationCell{
-						SourceZone:     zoneLabel,
-						SourceNetwork:  n.Name,
-						DestZone:       zoneLabel,
-						DestNetwork:    n.Name,
-						DestFunction:   "same-vlan-wired-peers",
-						Transport:      "all",
-						IPFamily:       "ipv4",
-						PathKind:       "wired-same-vlan",
-						Enforcer:       "UniFi Switch (ACL)",
-						Expected:       "deny",
-						Effective:      "unknown",
-						Verdict:        IsolationUnknown,
-						MissingInput:   fmt.Sprintf("Switch ACL unavailable (%s); gateway firewall cannot filter same-VLAN wired switching on %s (multi-switch or shared-port L2 traffic is not isolated by port flags alone).", switchACLReason, n.Name),
-						RecommendedFix: fmt.Sprintf("Enable switch port isolation on distinct single-switch ports or provide switch ACL data for %s.", n.Name),
-					})
-				} else {
-					sortedSwitches := make([]string, 0, len(wiredSwitches))
-					for m := range wiredSwitches {
-						sortedSwitches = append(sortedSwitches, m)
-					}
-					sort.Strings(sortedSwitches)
-					if len(sortedSwitches) == 0 {
-						sortedSwitches = []string{""}
-					}
-					// Evaluate ACLs across every switch carrying wired clients on this VLAN;
-					// worst verdict wins (allow > unknown > deny) deterministically.
-					var worstDec policyDecision
-					worstSW := ""
-					for idxSW, swMAC := range sortedSwitches {
-						dec := evaluateSwitchACLs(snap.SwitchACLs, swMAC, pathQuery{
-							srcZone:    zoneLabel,
-							srcNetID:   n.ID,
-							srcNetName: n.Name,
-							dstZone:    zoneLabel,
-							dstNetID:   n.ID,
-							dstNetName: n.Name,
-							proto:      "all",
-							ipFamily:   "ipv4",
-							state:      "new",
-						})
-						if idxSW == 0 ||
-							dec.action == "allow" ||
-							(dec.action == "unknown" && worstDec.action != "allow") {
-							worstDec = dec
-							worstSW = swMAC
-						}
-						if worstDec.action == "allow" {
-							break
-						}
-					}
-					enforcer := "UniFi Switch (L2 Switch ACL)"
-					if worstSW != "" {
-						enforcer = deviceNameByMAC(snap, worstSW) + " (L2 Switch ACL)"
-					}
-					c := IsolationCell{
-						SourceZone:    zoneLabel,
-						SourceNetwork: n.Name,
-						DestZone:      zoneLabel,
-						DestNetwork:   n.Name,
-						DestFunction:  "same-vlan-wired-peers",
-						Transport:     "all",
-						IPFamily:      "ipv4",
-						PathKind:      "wired-same-vlan",
-						Enforcer:      enforcer,
-						Expected:      "deny",
-					}
-					applyDecisionToCell(&c, worstDec)
-					if c.Verdict == IsolationViolation {
-						c.RecommendedFix = fmt.Sprintf("Enable switch port isolation on wired %s ports or add a switch L2 deny ACL.", n.Name)
-						findings = append(findings, checks.Finding{
-							CheckID:           "UB-UNIFI-ISO-SAME-VLAN",
-							Title:             fmt.Sprintf("Same-VLAN Wired Peer Traffic Permitted on %s", n.Name),
-							Category:          "isolation-policy",
-							ClaimKind:         checks.ClaimConfiguredAccess,
-							Property:          "isolation-wired-" + nLow,
-							BaseSeverity:      checks.SeverityMedium,
-							EffectiveSeverity: checks.SeverityMedium,
-							Client:            unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
-							Evidence:          fmt.Sprintf("wired clients on %s lack port isolation and switch ACLs permit intra-VLAN traffic (%s)", n.Name, c.DecisiveRuleName),
-							Remediation: checks.Remediation{
-								Summary:      c.RecommendedFix,
-								UniFiActions: []string{"enable_switch_port_isolation"},
-							},
-						})
-					}
-					cells = append(cells, c)
-				}
-			}
-		}
-
-		// Mixed wired <-> Wi-Fi peers on the same isolated VLAN.
-		if explicitReq && len(wiredClients) >= 1 && len(apSet) >= 1 {
-			if switchACLStatus != "complete" {
-				cells = append(cells, IsolationCell{
-					SourceZone:     zoneLabel,
-					SourceNetwork:  n.Name,
-					DestZone:       zoneLabel,
-					DestNetwork:    n.Name,
-					DestFunction:   "same-vlan-mixed-peers",
-					Transport:      "all",
-					IPFamily:       "ipv4",
-					PathKind:       "mixed-same-vlan",
-					Enforcer:       "UniFi Switch (ACL / Port Isolation)",
-					Expected:       "deny",
-					Effective:      "unknown",
-					Verdict:        IsolationUnknown,
-					MissingInput:   fmt.Sprintf("Both wired and wireless clients share %s and %s; AP isolation alone does not isolate wired-to-Wi-Fi traffic.", n.Name, switchACLReason),
-					RecommendedFix: fmt.Sprintf("Isolate switch ports or apply a switch L2 ACL on %s.", n.Name),
-				})
-			} else {
-				dec := evaluateSwitchACLs(snap.SwitchACLs, "", pathQuery{
-					srcZone:    zoneLabel,
-					srcNetID:   n.ID,
-					srcNetName: n.Name,
-					dstZone:    zoneLabel,
-					dstNetID:   n.ID,
-					dstNetName: n.Name,
-					proto:      "all",
-					ipFamily:   "ipv4",
-					state:      "new",
-				})
-				c := IsolationCell{
-					SourceZone:    zoneLabel,
-					SourceNetwork: n.Name,
-					DestZone:      zoneLabel,
-					DestNetwork:   n.Name,
-					DestFunction:  "same-vlan-mixed-peers",
-					Transport:     "all",
-					IPFamily:      "ipv4",
-					PathKind:      "mixed-same-vlan",
-					Enforcer:      "UniFi Switch (L2 Switch ACL)",
-					Expected:      "deny",
-				}
-				applyDecisionToCell(&c, dec)
-				if c.Verdict == IsolationViolation {
-					c.RecommendedFix = fmt.Sprintf("Isolate wired switch ports and AP uplinks or add a switch L2 deny ACL on %s.", n.Name)
-					findings = append(findings, checks.Finding{
-						CheckID:           "UB-UNIFI-ISO-SAME-VLAN",
-						Title:             fmt.Sprintf("Same-VLAN Wired-to-Wi-Fi Peer Traffic Permitted on %s", n.Name),
-						Category:          "isolation-policy",
-						ClaimKind:         checks.ClaimConfiguredAccess,
-						Property:          "isolation-mixed-" + nLow,
-						BaseSeverity:      checks.SeverityMedium,
-						EffectiveSeverity: checks.SeverityMedium,
-						Client:            unifi.Client{MAC: "vlan:" + n.ID, Name: n.Name, NetworkName: n.Name},
-						Evidence:          fmt.Sprintf("wired and Wi-Fi clients on %s can communicate via switch (%s)", n.Name, c.DecisiveRuleName),
-						Remediation: checks.Remediation{
-							Summary:      c.RecommendedFix,
-							UniFiActions: []string{"add_switch_l2_isolation_acl"},
-						},
-					})
-				}
-				cells = append(cells, c)
-			}
-		}
-	}
-	return cells, findings
 }
 
 type triMatch int
@@ -3180,9 +2810,86 @@ func evaluateTransitBoundary(
 	srcNet, dstNet unifi.Network,
 	srcZone, dstZone, fam string,
 ) IsolationCell {
+	return evaluateBoundary(snap, rawFindings, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason, switchACLStatus, switchACLReason, gwName, srcNet, dstNet, srcZone, dstZone, fam, "deny", nil)
+}
+
+// peerEndpoints constrains a same-VLAN boundary evaluation to two concrete
+// attached clients. Leaving a side empty keeps that side network-wide (for
+// example, traffic behind a wireless AP or a lone wired client on the VLAN).
+type peerEndpoints struct {
+	src unifi.Client
+	dst unifi.Client
+}
+
+// peerAddresses extracts every IP address of client c matching fam ("ipv4" or
+// "ipv6"), preserving secondary IPv6 aliases alongside the primary IPv4 address.
+func peerAddresses(c unifi.Client, fam string) []string {
+	var out []string
+	for _, raw := range append(append([]string(nil), c.IPv6...), c.IP) {
+		if ip, err := netip.ParseAddr(raw); err == nil && (fam == "ipv4") == ip.Unmap().Is4() {
+			out = append(out, ip.Unmap().String())
+		}
+	}
+	return out
+}
+
+// evaluateBoundary searches the full address, port, MAC, and protocol domain
+// between srcNet and dstNet for a counterexample to expected ("deny" or
+// "allow"). Invoking it for both expectations distinguishes a mixed/restricted
+// policy from an unconditional allow or deny while preserving exact first-match
+// rule ordering.
+func evaluateBoundary(
+	snap *unifi.Snapshot,
+	rawFindings []checks.Finding,
+	sortedPolicies []unifi.FirewallPolicy,
+	intent config.IsolationIntent,
+	gwPoliciesAvailable bool,
+	gwMissingReason, switchACLStatus, switchACLReason, gwName string,
+	srcNet, dstNet unifi.Network,
+	srcZone, dstZone, fam, expected string,
+	peers *peerEndpoints,
+) IsolationCell {
 	srcIPSample := sampleNetworkIPForFamily(srcNet, snap, fam)
 	dstIPSample := sampleNetworkIPForFamily(dstNet, snap, fam)
 
+	var fixedSrc, fixedDst []string
+	var fixedSrcMAC, fixedDstMAC string
+	if peers != nil {
+		fixedSrc = peerAddresses(peers.src, fam)
+		fixedDst = peerAddresses(peers.dst, fam)
+		fixedSrcMAC, fixedDstMAC = peers.src.MAC, peers.dst.MAC
+		if len(fixedSrc) > 0 {
+			srcIPSample = fixedSrc[0]
+		}
+		if len(fixedDst) > 0 {
+			dstIPSample = fixedDst[0]
+		}
+	}
+	// Exclude non-public, bogon, and local site subnets when searching the
+	// External zone so internet-egress witnesses always target public space.
+	var externalExclusions []string
+	var excludedPrefixes []netip.Prefix
+	if dstZone == "External" {
+		externalExclusions = []string{
+			"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+			"169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "192.0.2.0/24",
+			"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32",
+			"3fff::/20", "224.0.0.0/4", "240.0.0.0/4", "::/96", "::ffff:0:0/96",
+			"fc00::/7", "fe80::/10", "ff00::/8",
+		}
+		for _, local := range snap.Networks {
+			externalExclusions = append(externalExclusions, local.Subnet, local.IPv6Subnet)
+		}
+		for _, raw := range externalExclusions {
+			if prefix, err := netip.ParsePrefix(raw); err == nil {
+				excludedPrefixes = append(excludedPrefixes, prefix)
+			}
+		}
+		dstIPSample = "1.1.1.1"
+		if fam == "ipv6" {
+			dstIPSample = "2606:4700:4700::1111"
+		}
+	}
 	baseDstIP := func(proto string, port int) string {
 		if approvedIPs, _ := approvedHostIPsFor(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, proto, port, fam); len(approvedIPs) > 0 {
 			if outside := sampleIPOutsideSelectors(dstNet, snap, fam, approvedIPs); outside != "" {
@@ -3193,33 +2900,46 @@ func evaluateTransitBoundary(
 	}
 
 	type evalKey struct {
-		proto  string
-		port   int
-		srcIP  string
-		srcMAC string
-		dstIP  string
-		dstMAC string
+		proto   string
+		port    int
+		srcPort int
+		srcIP   string
+		srcMAC  string
+		dstIP   string
+		dstMAC  string
 	}
 	evaluated := make(map[evalKey]struct{})
 	var firstCell IsolationCell
 	hasFirst := false
 	var unknownCell *IsolationCell
 
-	evalOne := func(proto string, port int, srcIP, srcMAC, dstIP, dstMAC string, allowSkipApproved bool) (IsolationCell, bool) {
+	evalOne := func(proto string, port, srcPort int, srcIP, srcMAC, dstIP, dstMAC string, allowSkipApproved bool) (IsolationCell, bool) {
+		if len(externalExclusions) > 0 {
+			ip, err := netip.ParseAddr(dstIP)
+			if err != nil {
+				return IsolationCell{}, false
+			}
+			for _, prefix := range excludedPrefixes {
+				if prefix.Contains(ip) {
+					return IsolationCell{}, false
+				}
+			}
+		}
 		k := evalKey{
-			proto:  proto,
-			port:   port,
-			srcIP:  strings.TrimSpace(srcIP),
-			srcMAC: strings.ToLower(strings.TrimSpace(srcMAC)),
-			dstIP:  strings.TrimSpace(dstIP),
-			dstMAC: strings.ToLower(strings.TrimSpace(dstMAC)),
+			proto:   proto,
+			port:    port,
+			srcPort: srcPort,
+			srcIP:   strings.TrimSpace(srcIP),
+			srcMAC:  strings.ToLower(strings.TrimSpace(srcMAC)),
+			dstIP:   strings.TrimSpace(dstIP),
+			dstMAC:  strings.ToLower(strings.TrimSpace(dstMAC)),
 		}
 		if _, dup := evaluated[k]; dup {
 			return IsolationCell{}, false
 		}
 		evaluated[k] = struct{}{}
 
-		if allowSkipApproved && isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
+		if expected == "deny" && allowSkipApproved && isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
 			return IsolationCell{}, false
 		}
 		cell := evaluateRoutedPath(
@@ -3230,6 +2950,7 @@ func evaluateTransitBoundary(
 				srcNetID:   srcNet.ID,
 				srcNetName: srcNet.Name,
 				srcIP:      k.srcIP,
+				srcPort:    k.srcPort,
 				srcMAC:     k.srcMAC,
 				dstZone:    dstZone,
 				dstNetID:   dstNet.ID,
@@ -3240,10 +2961,10 @@ func evaluateTransitBoundary(
 				port:       k.port,
 				ipFamily:   fam,
 				state:      "new",
-			}, dstNet.Name, "trusted-lan-transit", "deny",
+			}, dstNet.Name, "trusted-lan-transit", expected,
 		)
-		if cell.Verdict == IsolationViolation {
-			if isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
+		if cell.Verdict == IsolationViolation || cell.Verdict == IsolationBrokenDependency {
+			if expected == "deny" && isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
 				return IsolationCell{}, false
 			}
 			return cell, true
@@ -3262,13 +2983,13 @@ func evaluateTransitBoundary(
 	// Run baseline TCP 443 and UDP 53 probes first so missing telemetry,
 	// unresolved zones, or wide allow rules fail fast and firstCell captures the
 	// decisive baseline block rule.
-	if viol, ok := evalOne("tcp", 443, srcIPSample, "", baseDstIP("tcp", 443), "", false); ok {
+	if viol, ok := evalOne("tcp", 443, 49152, srcIPSample, fixedSrcMAC, baseDstIP("tcp", 443), fixedDstMAC, false); ok {
 		return viol
 	}
 	if !gwPoliciesAvailable && firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC) == "" {
 		return firstCell
 	}
-	if viol, ok := evalOne("udp", 53, srcIPSample, "", baseDstIP("udp", 53), "", true); ok {
+	if viol, ok := evalOne("udp", 53, 49152, srcIPSample, fixedSrcMAC, baseDstIP("udp", 53), fixedDstMAC, true); ok {
 		return viol
 	}
 
@@ -3349,6 +3070,9 @@ func evaluateTransitBoundary(
 		strings.EqualFold(strings.TrimSpace(srcZone), strings.TrimSpace(dstZone)) ||
 		strings.EqualFold(strings.TrimSpace(srcZone), "internal")
 
+	if expected == "allow" {
+		defaultAllows = !defaultAllows
+	}
 	incompleteCoverage := false
 	totalRuleEvals := 0
 
@@ -3356,10 +3080,19 @@ func evaluateTransitBoundary(
 		var allowRules []boundaryRule
 		var srcPosSelectors, srcNegSelectors []string
 		var dstPosSelectors, dstNegSelectors []string
-		var dstPorts []int
+		var srcPorts, dstPorts []int
+		var srcRanges []unifi.PortRange
 		var dstPortRanges []unifi.PortRange
-		var uncondBlockedRaw []portInterval
+		var pendingIntervals []portInterval
 		var uncondBlockedMerged []portInterval
+		// Many consecutive deny rules can precede the first allow. Merge
+		// their intervals once when the ordered search actually needs them.
+		mergePending := func() {
+			if len(pendingIntervals) > 0 {
+				uncondBlockedMerged = mergePortIntervals(append(uncondBlockedMerged, pendingIntervals...))
+				pendingIntervals = pendingIntervals[:0]
+			}
+		}
 		sawIndeterminateRule := false
 		srcMACSet := make(map[string]struct{})
 		dstMACSet := make(map[string]struct{})
@@ -3371,11 +3104,19 @@ func evaluateTransitBoundary(
 		}
 
 		recordRuleEndpoints := func(allow bool, srcEP, dstEP unifi.PolicyEndpoint, indeterminate bool) {
+			if expected == "allow" {
+				allow = !allow
+			}
 			if indeterminate {
 				sawIndeterminateRule = true
 			}
 			if !endpointMatchesNetworkSelector(srcEP, srcNet) || !endpointMatchesNetworkSelector(dstEP, dstNet) {
 				return
+			}
+			srcPorts = append(srcPorts, srcEP.Ports...)
+			srcRanges = append(srcRanges, srcEP.PortRanges...)
+			if indeterminate {
+				allow = true
 			}
 			if !allow {
 				// Record unconditional whole-network BLOCK port intervals so
@@ -3386,13 +3127,18 @@ func evaluateTransitBoundary(
 					endpointUnconditionallyMatchesNetwork(srcEP, srcZone, srcNet, true) &&
 					endpointUnconditionallyMatchesNetwork(dstEP, dstZone, dstNet, false) {
 					if ivs, ok := endpointPortIntervals(dstEP); ok {
-						uncondBlockedRaw = append(uncondBlockedRaw, ivs...)
-						uncondBlockedMerged = mergePortIntervals(uncondBlockedRaw)
+						if isFullPortBlock(ivs) {
+							uncondBlockedMerged = ivs
+							pendingIntervals = pendingIntervals[:0]
+						} else if !isFullPortBlock(uncondBlockedMerged) {
+							pendingIntervals = append(pendingIntervals, ivs...)
+						}
 						return
 					}
 					sawIndeterminateRule = true
 				}
 			} else {
+				mergePending()
 				// Skip an ALLOW rule completely shadowed on every port by
 				// earlier unconditional whole-network BLOCK rules.
 				if !sawIndeterminateRule && isFullPortBlock(uncondBlockedMerged) {
@@ -3490,6 +3236,7 @@ func evaluateTransitBoundary(
 			}
 		}
 
+		mergePending()
 		if defaultAllows && (sawIndeterminateRule || !isFullPortBlock(uncondBlockedMerged)) {
 			anyEP := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
 			var priorCopy []portInterval
@@ -3519,7 +3266,7 @@ func evaluateTransitBoundary(
 		}
 
 		srcIntervals := partitionIPIntervals(srcNet, snap, fam, srcPosSelectors, srcNegSelectors, nil)
-		dstIntervals := partitionIPIntervals(dstNet, snap, fam, dstPosSelectors, dstNegSelectors, approvedIPs)
+		dstIntervals := partitionIPIntervals(dstNet, snap, fam, append(dstPosSelectors, externalExclusions...), dstNegSelectors, approvedIPs)
 
 		var srcReps []string
 		for _, iv := range srcIntervals {
@@ -3575,6 +3322,25 @@ func evaluateTransitBoundary(
 			dstMACs = []string{""}
 		}
 
+		if len(fixedSrc) > 0 {
+			srcReps = fixedSrc
+		}
+		if len(fixedDst) > 0 {
+			dstReps = fixedDst
+		}
+		if fixedSrcMAC != "" {
+			srcMACs = []string{fixedSrcMAC}
+		}
+		if fixedDstMAC != "" {
+			dstMACs = []string{fixedDstMAC}
+		}
+		sourcePorts := []int{0}
+		if pr == "tcp" || pr == "udp" {
+			sourcePorts = nil
+			for _, iv := range partitionPortIntervals(srcPorts, srcRanges) {
+				sourcePorts = append(sourcePorts, representativePortInInterval(iv))
+			}
+		}
 		var portReps []int
 		if pr == "tcp" || pr == "udp" {
 			for _, iv := range partitionPortIntervals(dstPorts, dstPortRanges) {
@@ -3639,19 +3405,21 @@ func evaluateTransitBoundary(
 			for _, sc := range matchSrc {
 				for _, dc := range matchDst {
 					for _, p := range matchPorts {
-						totalRuleEvals++
-						if totalRuleEvals > maxExactBoundaryEvals {
-							incompleteCoverage = true
-							goto nextProto
-						}
-						if viol, ok := evalOne(pr, p, sc.ip, sc.mac, dc.ip, dc.mac, true); ok {
-							if pr == unnamedProtocol {
-								viol.Transport = ""
-								viol.Effective = "unknown"
-								viol.Verdict = IsolationUnknown
-								viol.MissingInput = "Cannot certify isolation for IP protocols outside the named selectors."
+						for _, sport := range sourcePorts {
+							totalRuleEvals++
+							if totalRuleEvals > maxExactBoundaryEvals {
+								incompleteCoverage = true
+								goto nextProto
 							}
-							return viol
+							if viol, ok := evalOne(pr, p, sport, sc.ip, sc.mac, dc.ip, dc.mac, true); ok {
+								if pr == unnamedProtocol {
+									viol.Transport = ""
+									viol.Effective = "unknown"
+									viol.Verdict = IsolationUnknown
+									viol.MissingInput = "Cannot certify isolation for IP protocols outside the named selectors."
+								}
+								return viol
+							}
 						}
 					}
 				}

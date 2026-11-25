@@ -82,42 +82,42 @@ type ServiceView struct {
 //	rule:<id>
 //	wlan:<name>
 type Entity struct {
-	ID            string               `json:"id"`
-	Kind          string               `json:"kind"` // "device" | "port" | "network" | "host" | "rule" | "wlan"
-	Label         string               `json:"label"`
-	Subtitle      string               `json:"subtitle,omitempty"`
-	Role          string               `json:"role,omitempty"`        // "gateway"|"switch"|"ap"|"bmc"|"camera"|"server"|"iot"|...
-	Side          string               `json:"side,omitempty"`        // "inside"|"outside"|"unknown"
-	ZoneSource    string               `json:"zone_source,omitempty"` // "config"|"auto"|"parent_link"|"default"
-	Weight        int                  `json:"weight"`
-	State         VerdictState         `json:"state"`
-	MaxSeverity   string               `json:"max_severity"`
-	StateLabel    string               `json:"state_label"`
-	Reasons       []Reason             `json:"reasons,omitempty"`
-	PinNumber     int                  `json:"pin_number,omitempty"`
-	ScannedAt     *time.Time           `json:"scanned_at,omitempty"`
-	Skipped       bool                 `json:"skipped,omitempty"`
-	SkipReason    string               `json:"skip_reason,omitempty"`
-	DeviceID      string               `json:"device_id,omitempty"`
-	PortID        string               `json:"port_id,omitempty"`
-	NetworkID     string               `json:"network_id,omitempty"`
-	NetworkName   string               `json:"network_name,omitempty"`
-	APID          string               `json:"ap_id,omitempty"`
-	ESSID         string               `json:"essid,omitempty"`
-	IP            string               `json:"ip,omitempty"`
-	IPv6          []string             `json:"ipv6,omitempty"`
-	MAC           string               `json:"mac,omitempty"`
-	Vendor        string               `json:"vendor,omitempty"`
-	Model         string               `json:"model,omitempty"`
-	Firmware      string               `json:"firmware,omitempty"`
-	IsWired       bool                 `json:"is_wired,omitempty"`
-	IsBMC         bool                 `json:"is_bmc,omitempty"`
-	ExactCVECount int                  `json:"exact_cve_count,omitempty"`
-	PotCVECount   int                  `json:"pot_cve_count,omitempty"`
+	ID               string               `json:"id"`
+	Kind             string               `json:"kind"` // "device" | "port" | "network" | "host" | "rule" | "wlan"
+	Label            string               `json:"label"`
+	Subtitle         string               `json:"subtitle,omitempty"`
+	Role             string               `json:"role,omitempty"`        // "gateway"|"switch"|"ap"|"bmc"|"camera"|"server"|"iot"|...
+	Side             string               `json:"side,omitempty"`        // "inside"|"outside"|"unknown"
+	ZoneSource       string               `json:"zone_source,omitempty"` // "config"|"auto"|"parent_link"|"default"
+	Weight           int                  `json:"weight"`
+	State            VerdictState         `json:"state"`
+	MaxSeverity      string               `json:"max_severity"`
+	StateLabel       string               `json:"state_label"`
+	Reasons          []Reason             `json:"reasons,omitempty"`
+	PinNumber        int                  `json:"pin_number,omitempty"`
+	ScannedAt        *time.Time           `json:"scanned_at,omitempty"`
+	Skipped          bool                 `json:"skipped,omitempty"`
+	SkipReason       string               `json:"skip_reason,omitempty"`
+	DeviceID         string               `json:"device_id,omitempty"`
+	PortID           string               `json:"port_id,omitempty"`
+	NetworkID        string               `json:"network_id,omitempty"`
+	NetworkName      string               `json:"network_name,omitempty"`
+	APID             string               `json:"ap_id,omitempty"`
+	ESSID            string               `json:"essid,omitempty"`
+	IP               string               `json:"ip,omitempty"`
+	IPv6             []string             `json:"ipv6,omitempty"`
+	MAC              string               `json:"mac,omitempty"`
+	Vendor           string               `json:"vendor,omitempty"`
+	Model            string               `json:"model,omitempty"`
+	Firmware         string               `json:"firmware,omitempty"`
+	IsWired          bool                 `json:"is_wired,omitempty"`
+	IsBMC            bool                 `json:"is_bmc,omitempty"`
+	ExactCVECount    int                  `json:"exact_cve_count,omitempty"`
+	PotCVECount      int                  `json:"pot_cve_count,omitempty"`
 	Services         []ServiceView        `json:"services,omitempty"`
 	ConnectOnlyPorts []int                `json:"connect_only_ports,omitempty"`
 	ExactCVEs        []cve.ProductSummary `json:"exact_cves,omitempty"`
-	PotentialCVEs []cve.ProductSummary `json:"potential_cves,omitempty"`
+	PotentialCVEs    []cve.ProductSummary `json:"potential_cves,omitempty"`
 
 	// Bridge-to-child and outbound dependency metadata.
 	ParentID              string                     `json:"parent_id,omitempty"`
@@ -127,19 +127,21 @@ type Entity struct {
 	OutboundDependencies  []probe.OutboundDependency `json:"outbound_dependencies,omitempty"`
 
 	// Port telemetry (Kind == "port")
-	PortIdx       int      `json:"port_idx,omitempty"`
-	PortZone      string   `json:"port_zone,omitempty"`
-	PortState     string   `json:"port_state,omitempty"`
-	Speed         int      `json:"speed,omitempty"`
-	Media         string   `json:"media,omitempty"`
-	PoEEnabled    bool     `json:"poe_enabled,omitempty"`
-	PoEPower      string   `json:"poe_power,omitempty"`
-	NativeVLAN    string   `json:"native_vlan,omitempty"`
-	TaggedPolicy  string   `json:"tagged_policy,omitempty"`
-	PortSecurity  bool     `json:"port_security,omitempty"`
-	MACTableCount int      `json:"mac_table_count,omitempty"`
-	STPState      string   `json:"stp_state,omitempty"`
-	PeerIDs       []string `json:"peer_ids,omitempty"`
+	PortIdx              int      `json:"port_idx,omitempty"`
+	PortZone             string   `json:"port_zone,omitempty"`
+	PortState            string   `json:"port_state,omitempty"`
+	Speed                int      `json:"speed,omitempty"`
+	Media                string   `json:"media,omitempty"`
+	PoEEnabled           bool     `json:"poe_enabled,omitempty"`
+	PoEPower             string   `json:"poe_power,omitempty"`
+	NativeVLAN           string   `json:"native_vlan,omitempty"`
+	TaggedPolicy         string   `json:"tagged_policy,omitempty"`
+	PortSecurity         bool     `json:"port_security,omitempty"`
+	PortIsolation        bool     `json:"port_isolation,omitempty"`
+	PortIsolationUnknown bool     `json:"port_isolation_unknown,omitempty"`
+	MACTableCount        int      `json:"mac_table_count,omitempty"`
+	STPState             string   `json:"stp_state,omitempty"`
+	PeerIDs              []string `json:"peer_ids,omitempty"`
 }
 
 // QueueItem is one ranked entry in the Fix-Next rail. Queue[0] drives the
@@ -212,18 +214,18 @@ type PhysicalRow struct {
 
 // LogicalLane represents one VLAN lane inside the Logical Zones lens.
 type LogicalLane struct {
-	NetworkID      string       `json:"network_id"`
-	Name           string       `json:"name"`
-	VLAN           string       `json:"vlan,omitempty"`
-	Subnet         string       `json:"subnet,omitempty"`
-	ZoneName       string       `json:"zone_name"`
-	Isolated       bool         `json:"isolated"`
-	ValveState     VerdictState `json:"valve_state"`
-	ValveReason    string       `json:"valve_reason,omitempty"`
-	BMCIDs         []string     `json:"bmc_ids,omitempty"`
-	PinnedHostIDs  []string     `json:"pinned_host_ids,omitempty"`
-	CleanHostIDs   []string     `json:"clean_host_ids,omitempty"`
-	UnknownHostIDs []string     `json:"unknown_host_ids,omitempty"`
+	NetworkID      string                   `json:"network_id"`
+	Name           string                   `json:"name"`
+	VLAN           string                   `json:"vlan,omitempty"`
+	Subnet         string                   `json:"subnet,omitempty"`
+	ZoneName       string                   `json:"zone_name"`
+	Isolated       bool                     `json:"isolated"`
+	ValveState     VerdictState             `json:"valve_state"`
+	ValveReason    string                   `json:"valve_reason,omitempty"`
+	BMCIDs         []string                 `json:"bmc_ids,omitempty"`
+	PinnedHostIDs  []string                 `json:"pinned_host_ids,omitempty"`
+	CleanHostIDs   []string                 `json:"clean_host_ids,omitempty"`
+	UnknownHostIDs []string                 `json:"unknown_host_ids,omitempty"`
 	TotalHosts     int                      `json:"total_hosts"`
 	MigrationHint  string                   `json:"migration_hint,omitempty"`
 	Containment    *risk.NetworkContainment `json:"containment,omitempty"`
@@ -855,34 +857,36 @@ func BuildPresentationModel(
 				weight = 3
 			}
 			ent := &Entity{
-				ID:            pid,
-				Kind:          "port",
-				Label:         fmt.Sprintf("%s #%d", sw.Name, p.PortIdx),
-				Subtitle:      firstStr(p.Label, p.Name),
-				Role:          p.Zone,
-				Side:          side,
-				ZoneSource:    p.ZoneSource,
-				Weight:        weight,
-				State:         VerdictOK,
-				MaxSeverity:   "ok",
-				StateLabel:    "Matches policy",
-				DeviceID:      swID,
-				PortID:        pid,
-				NetworkID:     netEntByName[strings.ToLower(p.NativeVLAN)],
-				NetworkName:   p.NativeVLAN,
-				PortIdx:       p.PortIdx,
-				PortZone:      p.Zone,
-				PortState:     p.State,
-				Speed:         p.Speed,
-				Media:         p.Media,
-				PoEEnabled:    p.PoEEnabled,
-				PoEPower:      p.PoEPower,
-				NativeVLAN:    p.NativeVLAN,
-				TaggedPolicy:  p.TaggedPolicy,
-				PortSecurity:  p.PortSecurity,
-				MACTableCount: p.MACTableCount,
-				STPState:      p.STPState,
-				PeerIDs:       peerIDs,
+				ID:                   pid,
+				Kind:                 "port",
+				Label:                fmt.Sprintf("%s #%d", sw.Name, p.PortIdx),
+				Subtitle:             firstStr(p.Label, p.Name),
+				Role:                 p.Zone,
+				Side:                 side,
+				ZoneSource:           p.ZoneSource,
+				Weight:               weight,
+				State:                VerdictOK,
+				MaxSeverity:          "ok",
+				StateLabel:           "Matches policy",
+				DeviceID:             swID,
+				PortID:               pid,
+				NetworkID:            netEntByName[strings.ToLower(p.NativeVLAN)],
+				NetworkName:          p.NativeVLAN,
+				PortIdx:              p.PortIdx,
+				PortZone:             p.Zone,
+				PortState:            p.State,
+				Speed:                p.Speed,
+				Media:                p.Media,
+				PoEEnabled:           p.PoEEnabled,
+				PoEPower:             p.PoEPower,
+				NativeVLAN:           p.NativeVLAN,
+				TaggedPolicy:         p.TaggedPolicy,
+				PortSecurity:         p.PortSecurity,
+				PortIsolation:        p.Isolation,
+				PortIsolationUnknown: p.IsolationUnknown,
+				MACTableCount:        p.MACTableCount,
+				STPState:             p.STPState,
+				PeerIDs:              peerIDs,
 			}
 
 			// Add subtle Review reason for indoor active trunk access ports or inferred external drops.
@@ -1318,33 +1322,52 @@ func BuildPresentationModel(
 			}
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-ISO-"):
-			// Effective isolation policy violations attach to their target host
-			// (e.g. BMC or Printer) or owning network entity (vlan:/iso: findings)
-			// when known, falling back to Gateway.
-			target := pm.Entities[lookupHostID(f.Client)]
+			// Attach effective isolation violations to their resolved subject
+			// (owning network entity for vlan:/iso: findings, or target host
+			// such as a BMC/Printer), falling back to the Gateway.
+			target := pm.Entities[findingSubjectEntityID(f, snap)]
 			if target == nil {
-				if subID := findingSubjectEntityID(f, snap); subID != "" {
-					target = pm.Entities[subID]
-				}
+				target = pm.Entities[lookupHostID(f.Client)]
 			}
 			if target == nil {
 				target = pm.Entities[pm.GatewayID]
 			}
 			if target != nil {
-				target.Reasons = append(target.Reasons, Reason{
+				expected := "Deny unapproved access"
+				if f.CheckID == "UB-UNIFI-ISO-SAME-VLAN" {
+					expected = "Block traffic between VLAN peers"
+				}
+				reason := Reason{
 					ID:          fid,
 					State:       VerdictExposed,
 					Kind:        "policy",
 					Ref:         f.CheckID,
 					Title:       f.Title,
 					Severity:    sev,
-					Expected:    "Deny untrusted cross-zone path",
+					Expected:    expected,
 					Observed:    f.Evidence,
 					Evidence:    f.Evidence,
 					Remediation: f.Remediation.Summary,
 					Source:      "unifi-isolation",
 					Port:        f.Port,
-				})
+				}
+				target.Reasons = append(target.Reasons, reason)
+				// Keep one primary fix-queue item on the VLAN while surfacing the
+				// same peer-isolation evidence on each affected client and switch port.
+				reason.Secondary = true
+				seen := map[string]bool{target.ID: true}
+				for _, mac := range f.AffectedClientMACs {
+					host := pm.Entities[hostIDByMAC[strings.ToLower(mac)]]
+					if host == nil {
+						continue
+					}
+					for _, id := range []string{host.ID, host.PortID} {
+						if entity := pm.Entities[id]; entity != nil && !seen[id] {
+							entity.Reasons = append(entity.Reasons, reason)
+							seen[id] = true
+						}
+					}
+				}
 			}
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-"):
@@ -1479,6 +1502,36 @@ func BuildPresentationModel(
 		}
 	}
 
+	// Surface missing same-VLAN peer evidence as a Review reason on the network
+	// entity so incomplete telemetry is never presented as verified isolation.
+	if report.Isolation != nil {
+		missing := make(map[string]string)
+		for _, c := range report.Isolation.Cells {
+			if c.Verdict == risk.IsolationUnknown && c.SourceNetwork == c.DestNetwork {
+				if _, seen := missing[c.SourceNetwork]; !seen {
+					missing[c.SourceNetwork] = c.MissingInput
+				}
+			}
+		}
+		for _, n := range report.Isolation.Containment {
+			detail := missing[n.NetworkName]
+			if detail == "" && n.Peers.State == "unknown" {
+				detail = n.Peers.Detail
+			}
+			if ent := pm.Entities[netEntByName[strings.ToLower(n.NetworkName)]]; ent != nil && detail != "" {
+				ent.Reasons = append(ent.Reasons, Reason{
+					ID:          "peer-coverage:" + ent.ID,
+					Kind:        "coverage",
+					State:       VerdictReview,
+					Severity:    "unknown",
+					Title:       "Peer isolation unverified",
+					Evidence:    detail,
+					Remediation: "Verify switch and wireless attachment data for this network.",
+					Source:      "unifi-isolation",
+				})
+			}
+		}
+	}
 	// 6. Finalize verdict state and label for every entity.
 	for _, ent := range pm.Entities {
 		if ent.Kind == "child" {
@@ -2090,6 +2143,10 @@ func buildLogicalLanes(
 		if nc, ok := containmentByNet[key]; ok {
 			cp := nc
 			lane.Containment = &cp
+			if network := entities[id]; network != nil {
+				lane.ValveState = network.State
+			}
+			lane.ValveReason = nc.Peers.Detail
 		}
 		hosts := hostsByNet[key]
 		sort.Slice(hosts, func(i, j int) bool {

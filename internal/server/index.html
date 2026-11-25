@@ -1148,6 +1148,7 @@
         <svg class="icon" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
         Scan
       </button>
+      <span id="logout-error" role="status"></span>
       <button id="logout-btn" class="btn sm ghost" type="button" style="display:none" title="Sign out of dashboard session">Sign out</button>
     </div>
   </div>
@@ -2936,18 +2937,17 @@ function renderDevices() {
     const archLabel = cont && cont.archetype && cont.archetype !== "isolated"
       ? ({ guest: "Guest", iot: "IoT", camera: "Cameras" }[cont.archetype] || cont.archetype)
       : "";
-    const zoneExplain = lane.isolated
-      ? (cont && cont.internet_egress && (cont.internet_egress.state === "blocked" || cont.internet_egress.state === "restricted")
-          ? "Offline isolated network: devices here are separated from your main home devices and restricted from the internet."
-          : "Private isolated network: devices here are separated from your main home devices.")
-      : "Shared home network: devices here can talk freely to each other.";
-
+    const peerState = cont?.peers?.state;
+    const peerIssue = ["open", "partial", "unknown"].includes(peerState);
+    const zoneExplain = peerIssue ? cont.peers.detail
+      : (lane.isolated ? "Inter-network isolation configured." : "Shared network.");
     const axisChip = (label, axis, openIsOK) => {
       if (!axis || !axis.state) return "";
       const st = axis.state;
       let tone = "neutral";
-      if (st === "isolated" || st === "blocked" || st === "restricted" || (openIsOK && st === "open")) tone = "ok";
-      else if (st === "partial") tone = "warn";
+      if (axis.violation) tone = "crit";
+      else if (st === "isolated" || st === "blocked" || st === "restricted" || (openIsOK && st === "open")) tone = "ok";
+      else if (st === "unknown" || st === "partial") tone = "warn";
       else if (st === "open") tone = "warn";
       return `<span class="tag ${tone}" title="${esc(axis.detail || "")}">${esc(label)}: ${esc(st)}</span>`;
     };
@@ -2967,8 +2967,9 @@ function renderDevices() {
         <div>
           <div class="zone-title">
             <span>${esc(lane.name)}</span>
-            ${lane.isolated
-              ? `<span class="tag ok">${ICONS.lock} Isolated</span>`
+            ${peerIssue
+              ? `<span class="tag warn">${peerState === "unknown" ? "Peer isolation unverified" : "Peer isolation needs attention"}</span>`
+              : lane.isolated ? `<span class="tag neutral">${ICONS.lock} Network isolation configured</span>`
               : `<span class="tag blue">${ICONS.house} Shared</span>`}
             ${archLabel ? `<span class="tag neutral" title="${esc(cont.archetype_reason || "")}">${esc(archLabel)}</span>` : ""}
             ${lane.vlan ? `<span class="small mono">VLAN ${esc(lane.vlan)}</span>` : ""}
@@ -2983,7 +2984,7 @@ function renderDevices() {
       </div>`;
 
     if (lane.migration_hint && deviceFilter === "all" && !deviceSearch) {
-      html += `<div class="zone-tip">💡 Tip: Moving smart-home gadgets with warnings from your main network into <strong>${esc(lane.name)}</strong> keeps them safely separated.</div>`;
+      html += `<div class="zone-tip">💡 Tip: Moving smart-home gadgets with warnings from your main network into <strong>${esc(lane.name)}</strong> can reduce their access once containment is verified.</div>`;
     }
 
     if (bmcs.length) {
@@ -3475,6 +3476,7 @@ function renderDrawer() {
       <div class="kv"><div class="k">Native VLAN</div><div class="v">${esc(ent.native_vlan || "-")}</div></div>
       <div class="kv"><div class="k">Tagged VLANs</div><div class="v mono">${esc(ent.tagged_policy || "-")}</div></div>
       <div class="kv"><div class="k">MAC Security</div><div class="v">${ent.port_security ? "Enabled" : "Off"} (${ent.mac_table_count || 0} MACs)</div></div>
+      <div class="kv"><div class="k">Port Isolation</div><div class="v">${ent.port_isolation_unknown ? "Unknown" : (ent.port_isolation ? "Enabled" : "Off")}</div></div>
       <div class="kv"><div class="k">PoE Power</div><div class="v mono">${ent.poe_enabled ? "⚡ " + esc(ent.poe_power || "ON") + "W" : "Off"}</div></div>
       <div class="kv"><div class="k">STP State</div><div class="v mono">${esc(ent.stp_state || "-")}</div></div>`;
   } else {
@@ -3768,15 +3770,21 @@ const logoutBtn = document.getElementById("logout-btn");
 if (logoutBtn) {
   logoutBtn.addEventListener("click", async () => {
     logoutBtn.disabled = true;
+    const status = document.getElementById("logout-error");
+    status.textContent = "";
     try {
-      await fetch("/api/v1/session", {
+      const response = await fetch("/api/v1/session", {
         method: "DELETE",
         headers: { "X-UniBlue-Request": "1" }
       });
-    } catch (_) {}
-    updateLogoutControl(false);
-    logoutBtn.disabled = false;
-    showAuthOverlay("");
+      if (!response.ok) throw new Error();
+      updateLogoutControl(false);
+      showAuthOverlay("");
+    } catch (_) {
+      status.textContent = "Sign-out failed. Try again.";
+    } finally {
+      logoutBtn.disabled = false;
+    }
   });
 }
 

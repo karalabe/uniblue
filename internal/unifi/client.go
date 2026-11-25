@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/netip"
@@ -824,8 +825,37 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		}
 		networks = append(networks, n)
 
-		if pfx, err := parseNetworkPrefix(subnet); err == nil {
-			subnets = append(subnets, subnetEntry{prefix: pfx, net: n})
+		for _, raw := range []string{subnet, n.IPv6Subnet} {
+			if pfx, err := parseNetworkPrefix(raw); err == nil {
+				subnets = append(subnets, subnetEntry{prefix: pfx, net: n})
+			}
+		}
+	}
+
+	// Prefer the attachment reported by the controller. Fall back to the
+	// longest matching local prefix for clients missing attachment metadata.
+	assignNetwork := func(cl *Client, lc rawClient) {
+		for _, n := range networks {
+			if n.ID != "" && n.ID == lc.NetworkID || lc.Network != "" && strings.EqualFold(n.Name, lc.Network) {
+				cl.NetworkID, cl.NetworkName, cl.VLAN = n.ID, n.Name, n.VLAN
+				return
+			}
+		}
+		for _, raw := range append([]string{cl.IP}, cl.IPv6...) {
+			addr, err := netip.ParseAddr(raw)
+			if err != nil {
+				continue
+			}
+			best := -1
+			for _, se := range subnets {
+				if se.prefix.Contains(addr) && se.prefix.Bits() > best {
+					best = se.prefix.Bits()
+					cl.NetworkID, cl.NetworkName, cl.VLAN = se.net.ID, se.net.Name, se.net.VLAN
+				}
+			}
+			if best >= 0 {
+				return
+			}
 		}
 	}
 
@@ -889,6 +919,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			if len(lc.IPv6Addresses) > 0 {
 				cl.IPv6 = dedupeIPs(append(cl.IPv6, lc.IPv6Addresses...))
 			}
+			cl.IsWired = cl.IsWired || lc.IsWired
 			cl.ESSID = strings.TrimSpace(lc.ESSID)
 			cl.SwitchMAC = strings.ToLower(strings.TrimSpace(lc.SwMAC))
 			cl.SwitchPort = lc.SwPort
@@ -902,19 +933,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 				cl.Name = alias
 			}
 		}
-		if addr, err := netip.ParseAddr(cl.IP); err == nil {
-			// Pick the most specific matching CIDR (longest prefix) in case
-			// overlapping subnets exist.
-			bestBits := -1
-			for _, se := range subnets {
-				if se.prefix.Contains(addr) && se.prefix.Bits() > bestBits {
-					bestBits = se.prefix.Bits()
-					cl.NetworkID = se.net.ID
-					cl.NetworkName = se.net.Name
-					cl.VLAN = se.net.VLAN
-				}
-			}
-		}
+		assignNetwork(&cl, legacyClientByMAC[mac])
 		clients = append(clients, cl)
 	}
 	// Merge any active clients visible in legacy stat/sta that Integration v1
@@ -946,17 +965,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			FirstSeen:  lc.FirstSeen,
 			LastSeen:   lc.LastSeen,
 		}
-		if addr, err := netip.ParseAddr(cl.IP); err == nil {
-			bestBits := -1
-			for _, se := range subnets {
-				if se.prefix.Contains(addr) && se.prefix.Bits() > bestBits {
-					bestBits = se.prefix.Bits()
-					cl.NetworkID = se.net.ID
-					cl.NetworkName = se.net.Name
-					cl.VLAN = se.net.VLAN
-				}
-			}
-		}
+		assignNetwork(&cl, lc)
 		clients = append(clients, cl)
 	}
 
@@ -1061,6 +1070,14 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		switchACLs = convertIntegrationACLs(ar.items, devMACByID)
 		switchACLCov = &SwitchACLCoverage{Status: "complete"}
 		switchACLsAvailable = true
+		for _, acl := range switchACLs {
+			if acl.Enabled && (acl.Source.UnsupportedSelector != "" || acl.Destination.UnsupportedSelector != "") {
+				switchACLCov.Status = "partial"
+				switchACLCov.Reason = fmt.Sprintf("cannot fully resolve switch ACL %q", acl.Name)
+				missingFeeds = append(missingFeeds, "switch-acls ("+switchACLCov.Reason+")")
+				break
+			}
+		}
 	} else {
 		switchACLCov.Reason = shortFetchErr(ar.err)
 		missingFeeds = append(missingFeeds, fmt.Sprintf("switch-acls (%s)", shortFetchErr(ar.err)))
@@ -1557,8 +1574,9 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 		// profile takes precedence over any stale per-port fields.
 		pref := strings.ToLower(strings.TrimSpace(rp.SettingPreference))
 		profileManaged := rp.PortConfID != "" && pref != "manual"
+		pc, profileFound := portConfByID[rp.PortConfID]
 		if profileManaged {
-			if pc, ok := portConfByID[rp.PortConfID]; ok {
+			if profileFound {
 				profileWins := pref == "auto"
 				if (profileWins || rp.OpMode == "") && pc.OpMode != "" {
 					rp.OpMode = pc.OpMode
@@ -1585,7 +1603,7 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 				if (profileWins || len(rp.PortSecurityMACs) == 0) && len(pc.PortSecurityMACs) > 0 {
 					rp.PortSecurityMACs = pc.PortSecurityMACs
 				}
-				if (profileWins || rp.Isolation == nil) && pc.Isolation != nil {
+				if profileWins || rp.Isolation == nil {
 					rp.Isolation = pc.Isolation
 				}
 			}
@@ -1668,6 +1686,7 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			PortSecurityEnabled: psec,
 			PortSecurityMACs:    psecMACs,
 			Isolation:           iso,
+			IsolationUnknown:    profileManaged && !profileFound,
 			MACTableCount:       rp.MACTableCount,
 			STPState:            strings.ToLower(strings.TrimSpace(rp.STPState)),
 			STPStateChanges:     int(rp.STPStateChangeCount),
@@ -1981,13 +2000,35 @@ func convertIntegrationACLs(raw []integrationACLRule, devMACByID map[string]stri
 				proto = hasOther
 			}
 		}
+		source := convertACLEndpoint(rr.SourceFilter)
+		validFamily := ipVer == "ipv4" || ipVer == "ipv6" || ipVer == "both"
+		validAction := strings.EqualFold(rr.Action, "ALLOW") ||
+			strings.EqualFold(rr.Action, "BLOCK") ||
+			strings.EqualFold(rr.Action, "DROP") ||
+			strings.EqualFold(rr.Action, "REJECT")
+		if !validFamily || !validAction {
+			source.UnsupportedSelector = "unsupported ACL family or action"
+		}
+		for _, protocol := range rr.ProtocolFilter {
+			if !strings.EqualFold(protocol, "tcp") && !strings.EqualFold(protocol, "udp") {
+				source.UnsupportedSelector = "unsupported ACL protocol filter"
+			}
+		}
 		var devMACs []string
 		if rr.EnforcingDeviceFilter != nil {
-			for _, did := range rr.EnforcingDeviceFilter.DeviceIDs {
+			// A device-scoped ACL must never degrade silently into a site-wide
+			// rule when a referenced device ID cannot be resolved to a MAC.
+			filter := rr.EnforcingDeviceFilter
+			if len(filter.DeviceIDs) == 0 || (filter.Type != "DEVICES" && filter.Type != "DEVICE_IDS") {
+				source.UnsupportedSelector = "unresolved enforcing device filter"
+			}
+			for _, did := range filter.DeviceIDs {
 				if m, ok := devMACByID[did]; ok && m != "" {
 					devMACs = append(devMACs, m)
-				} else if strings.Contains(did, ":") {
+				} else if _, err := net.ParseMAC(did); err == nil {
 					devMACs = append(devMACs, strings.ToLower(strings.TrimSpace(did)))
+				} else {
+					source.UnsupportedSelector = "unresolved enforcing device"
 				}
 			}
 		}
@@ -2008,7 +2049,7 @@ func convertIntegrationACLs(raw []integrationACLRule, devMACByID map[string]stri
 			Action:      strings.ToUpper(strings.TrimSpace(rr.Action)),
 			IPVersion:   ipVer,
 			Protocol:    proto,
-			Source:      convertACLEndpoint(rr.SourceFilter),
+			Source:      source,
 			Destination: convertACLEndpoint(rr.DestinationFilter),
 			DeviceMACs:  devMACs,
 			NetworkIDs:  netIDs,
@@ -2017,6 +2058,10 @@ func convertIntegrationACLs(raw []integrationACLRule, devMACByID map[string]stri
 	return out
 }
 
+// convertACLEndpoint normalizes one Integration v1 switch ACL endpoint filter
+// into a PolicyEndpoint, marking UnsupportedSelector whenever the controller
+// uses an unrecognized filter type, empty port filter, non-exact MAC prefix
+// mask, negated compound target+port selector, or malformed address/MAC.
 func convertACLEndpoint(ep *integrationACLEndpoint) PolicyEndpoint {
 	out := PolicyEndpoint{
 		AnyTarget: true,
@@ -2031,7 +2076,8 @@ func convertACLEndpoint(ep *integrationACLEndpoint) PolicyEndpoint {
 			out.NetworkIDs = append(out.NetworkIDs, id)
 		}
 	}
-	for _, ip := range append(append([]string(nil), ep.IPAddresses...), ep.IPs...) {
+	addresses := append(append([]string(nil), ep.IPAddressesOrSubnets...), ep.IPAddresses...)
+	for _, ip := range append(addresses, ep.IPs...) {
 		if ip = strings.TrimSpace(ip); ip != "" {
 			out.IPs = append(out.IPs, ip)
 		}
@@ -2041,9 +2087,11 @@ func convertACLEndpoint(ep *integrationACLEndpoint) PolicyEndpoint {
 			out.MACs = append(out.MACs, mac)
 		}
 	}
-	for _, p := range ep.Ports {
+	for _, p := range append(append([]int(nil), ep.Ports...), ep.PortFilter...) {
 		if p > 0 && p <= 65535 {
 			out.Ports = append(out.Ports, p)
+		} else {
+			out.UnsupportedSelector = "invalid switch ACL port"
 		}
 	}
 	epType := strings.ToUpper(strings.TrimSpace(ep.Type))
@@ -2077,6 +2125,42 @@ func convertACLEndpoint(ep *integrationACLEndpoint) PolicyEndpoint {
 	}
 	if len(out.Ports) > 0 || len(out.PortRanges) > 0 {
 		out.AnyPort = false
+	}
+	// Reject empty PORTS/portFilter selectors and non-exact MAC prefix masks
+	// (PrefixLength != 48), which cannot be evaluated as exact host MACs.
+	emptyPorts := epType == "PORTS" && out.AnyPort
+	emptyPortFilter := ep.PortFilter != nil && len(ep.PortFilter) == 0
+	nonExactMACPrefix := ep.PrefixLength != nil && *ep.PrefixLength != 48
+	if emptyPorts || emptyPortFilter || nonExactMACPrefix {
+		out.UnsupportedSelector = "unsupported or empty switch ACL filter"
+	}
+	switch epType {
+	case "ANY", "ALL", "PORTS", "NETWORK", "NETWORKS", "IP_ADDRESSES_OR_SUBNETS", "IP_ADDRESSES", "MAC_ADDRESSES", "MAC":
+	default:
+		out.UnsupportedSelector = "unsupported switch ACL filter type"
+	}
+	// A negated compound (target AND port) selector cannot be split into
+	// independently negated target and port sets; only port-only negation maps
+	// directly onto NegatePort.
+	if ep.MatchOpposite && !out.AnyPort {
+		if !out.AnyTarget {
+			out.UnsupportedSelector = "negated compound switch ACL selector"
+		} else {
+			out.NegateTarget = false
+			out.NegatePort = true
+		}
+	}
+	for _, ip := range out.IPs {
+		if _, err := netip.ParseAddr(ip); err != nil {
+			if _, err := netip.ParsePrefix(ip); err != nil {
+				out.UnsupportedSelector = "invalid switch ACL address"
+			}
+		}
+	}
+	for _, m := range out.MACs {
+		if _, err := net.ParseMAC(m); err != nil {
+			out.UnsupportedSelector = "invalid switch ACL MAC"
+		}
 	}
 	return out
 }

@@ -237,9 +237,14 @@ type ScanConfig struct {
 }
 
 // StateConfig controls local persistence between scans.
+// StateConfig controls where UniBlue persists its baseline scan state.
 type StateConfig struct {
 	// Path is the filesystem location of the JSON state file used for diffing.
 	Path string `yaml:"path"`
+
+	// ExplicitPath reports whether state.path was explicitly configured in YAML
+	// rather than falling back to the default state path.
+	ExplicitPath bool `yaml:"-" json:"-"`
 }
 
 // NotifyConfig controls outbound webhook alerts during watch and serve modes.
@@ -308,11 +313,13 @@ func Load(path string) (*Config, error) {
 		// Clear default ports before unmarshaling so we can tell whether the
 		// user explicitly overrode scan.ports vs. left it omitted.
 		cfg.Scan.Ports = nil
+		cfg.State.Path = ""
 		dec := yaml.NewDecoder(bytes.NewReader(raw))
 		dec.KnownFields(true)
 		if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("parse config %q: %w", path, err)
 		}
+		cfg.State.ExplicitPath = cfg.State.Path != ""
 	}
 
 	// Overlay connection and secret values from the environment so UniBlue can

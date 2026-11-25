@@ -7,7 +7,11 @@
 package risk
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -890,13 +894,18 @@ func TestTransitBoundaryProbePerformanceManyDenyPorts(t *testing.T) {
 
 // TestPartialPortRangeApprovalAndPartialSourceBlockNeverHideAccess verifies:
 // (1) approving one port inside an allowed port range does not hide the other
-//     permitted ports (including across a synthetic sweep of controller port
-//     range representations);
+//
+//	permitted ports (including across a synthetic sweep of controller port
+//	range representations);
+//
 // (2) an earlier block on one source IP or MAC does not hide a neighbor source
-//     permitted by a later allow rule (both on transit and gateway-admin paths);
+//
+//	permitted by a later allow rule (both on transit and gateway-admin paths);
+//
 // (3) when an allow rule's uncovered equivalence space exceeds the exact
-//     verification cap, UniBlue returns IsolationUnknown rather than false
-//     blocked-ok.
+//
+//	verification cap, UniBlue returns IsolationUnknown rather than false
+//	blocked-ok.
 func TestPartialPortRangeApprovalAndPartialSourceBlockNeverHideAccess(t *testing.T) {
 	baseSnap := func(policies []unifi.FirewallPolicy) *unifi.Snapshot {
 		return &unifi.Snapshot{
@@ -1326,4 +1335,63 @@ func TestPartialPortRangeApprovalAndPartialSourceBlockNeverHideAccess(t *testing
 			}
 		}
 	})
+}
+
+// TestControllerPortFilterDoesNotBlockAllTraffic verifies end-to-end from a
+// real UniFi Integration v1 ACL wire payload (PORTS with portFilter:[443])
+// through unifi.Controller.FetchSnapshot into risk.Evaluate that blocking a
+// single destination port does not certify full inter-VLAN transit isolation.
+func TestControllerPortFilterDoesNotBlockAllTraffic(t *testing.T) {
+	const base = "/proxy/network/integration/v1/sites"
+	const sensorID = "6673035e-23a8-40cf-8a61-0127d0de3a44"
+	empty := `{"offset":0,"limit":200,"count":0,"totalCount":0,"data":[]}`
+	page := func(n int, rows string) string {
+		return fmt.Sprintf(`{"offset":0,"limit":200,"count":%d,"totalCount":%d,"data":%s}`, n, n, rows)
+	}
+	site := base + "/site-1/"
+	data := map[string]string{
+		base:                            page(1, `[{"id":"site-1","name":"Default","internalReference":"default"}]`),
+		site + "clients":                empty,
+		site + "devices":                page(1, `[{"id":"switch-a","name":"Switch","macAddress":"00:00:5e:00:53:01","model":"USW"}]`),
+		site + "networks":               page(2, `[{"id":"`+sensorID+`","name":"Sensors","vlanId":20,"isolationEnabled":true,"zoneId":"z-hot","routerDeviceMac":"00:00:5e:00:53:01","subnet":"198.51.100.1/24"},{"id":"office","name":"Office","vlanId":10,"zoneId":"z-lan","subnet":"192.0.2.1/24"}]`),
+		site + "firewall/zones":         page(2, `[{"id":"z-hot","name":"Hotspot","networkIds":["`+sensorID+`"]},{"id":"z-lan","name":"Internal","networkIds":["office"]}]`),
+		site + "firewall/policies":      empty,
+		site + "traffic-matching-lists": empty,
+		site + "acl-rules":              page(1, `[{"type":"IPV4","id":"ba6d1f92-4920-479d-84a7-81c1f3876665","index":1,"name":"Block one management port","action":"BLOCK","enabled":true,"metadata":{"origin":"USER_DEFINED"},"sourceFilter":{"type":"NETWORKS","networkIds":["`+sensorID+`"]},"destinationFilter":{"type":"PORTS","portFilter":[443]}}]`),
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := data[strings.TrimSuffix(r.URL.Path, "/")]; ok {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, body)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	ctrl, err := unifi.New(config.UniFiConfig{URL: srv.URL, Site: "default", APIKey: "test-only", InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrl.Login(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ctrl.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.SwitchACLs) != 1 || snap.SwitchACLCoverage.Status != "complete" {
+		t.Fatalf("ACL fixture not loaded: %+v", snap.SwitchACLCoverage)
+	}
+
+	rep := Evaluate(snap, nil, config.NetworkConfig{TrustedVLANs: []string{"Office"}, IsolatedVLANs: []string{"Sensors"}})
+	for _, cell := range rep.Isolation.Cells {
+		if cell.SourceNetwork == "Sensors" && cell.DestNetwork == "Office" && cell.DestFunction == "trusted-lan-transit" && cell.IPFamily == "ipv4" {
+			if cell.Verdict != IsolationViolation {
+				t.Fatalf("only port 443 is denied; controller -> report returned %s, enforcer=%s, rule=%s, ACL coverage=%s", cell.Verdict, cell.Enforcer, cell.DecisiveRuleName, snap.SwitchACLCoverage.Status)
+			}
+			return
+		}
+	}
+	t.Fatal("no transit cell found")
 }

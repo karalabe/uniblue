@@ -350,3 +350,184 @@ func TestLockedDownIoTAndIPv6InternetInboundParityLeaks(t *testing.T) {
 		}
 	})
 }
+
+// dualStackContainmentSite returns a test snapshot with two trusted LANs
+// sharing the Internal zone and one dual-stack isolated Sensors VLAN.
+func dualStackContainmentSite() (*unifi.Snapshot, config.NetworkConfig) {
+	snap := &unifi.Snapshot{
+		Networks: []unifi.Network{
+			{ID: "a", Name: "Office", ZoneName: "Internal", Subnet: "192.0.2.1/26", Purpose: "corporate"},
+			{ID: "b", Name: "Lab", ZoneName: "Internal", Subnet: "192.0.2.65/26", Purpose: "corporate"},
+			{ID: "s", Name: "Sensors", ZoneName: "Hotspot", Subnet: "198.51.100.1/24", IPv6Subnet: "2001:db8:1::1/64", Purpose: "corporate", IsolationEnabled: true},
+		},
+		Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true, SwitchACLsAvailable: true},
+		SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
+	}
+	netCfg := config.NetworkConfig{
+		TrustedVLANs: []string{"Office", "Lab"},
+		IsolationPolicy: config.IsolationIntent{
+			IoTVLANs:           []string{"Sensors"},
+			NoInternetVLANs:    []string{"Sensors"},
+			StrictInboundVLANs: []string{"Sensors"},
+		},
+	}
+	return snap, netCfg
+}
+
+// zoneRule constructs an enabled dual-stack firewall policy between two zones.
+func zoneRule(index int, src, dst, action, proto string) unifi.FirewallPolicy {
+	return unifi.FirewallPolicy{
+		ID:          action + proto,
+		Name:        action + proto,
+		Index:       index,
+		Enabled:     true,
+		Action:      action,
+		Protocol:    proto,
+		IPVersion:   "both",
+		Source:      unifi.PolicyEndpoint{ZoneName: src, AnyTarget: true, AnyPort: true},
+		Destination: unifi.PolicyEndpoint{ZoneName: dst, AnyTarget: true, AnyPort: true},
+	}
+}
+
+// sensorContainment evaluates the snapshot and returns the containment profile
+// for the Sensors network ("s").
+func sensorContainment(t *testing.T, s *unifi.Snapshot, c config.NetworkConfig) NetworkContainment {
+	t.Helper()
+	r := Evaluate(s, nil, c)
+	for _, v := range r.Isolation.Containment {
+		if v.NetworkID == "s" {
+			return v
+		}
+	}
+	t.Fatal("no containment output for explicitly configured Sensors")
+	return NetworkContainment{}
+}
+
+// TestUDPAllowedOnOtherwiseBlockedBoundaries verifies that permitting UDP ahead
+// of a catch-all block prevents Internet Egress and LAN Inbound from reporting
+// "blocked".
+func TestUDPAllowedOnOtherwiseBlockedBoundaries(t *testing.T) {
+	s, c := dualStackContainmentSite()
+	s.FirewallPolicies = []unifi.FirewallPolicy{
+		zoneRule(1, "Hotspot", "External", "ALLOW", "udp"),
+		zoneRule(2, "Hotspot", "External", "BLOCK", "all"),
+		zoneRule(1, "Internal", "Hotspot", "ALLOW", "udp"),
+		zoneRule(2, "Internal", "Hotspot", "BLOCK", "all"),
+	}
+	r := sensorContainment(t, s, c)
+	if r.InternetEgress.State == "blocked" {
+		t.Errorf("internet: all UDP is permitted; got %+v", r.InternetEgress)
+	}
+	if r.LANInbound.State == "blocked" {
+		t.Errorf("inbound: all UDP is permitted; got %+v", r.LANInbound)
+	}
+}
+
+// TestInboundSourcesAreOrderIndependent verifies that LAN Inbound containment
+// evaluates every trusted source network rather than only the first network in
+// snapshot order.
+func TestInboundSourcesAreOrderIndependent(t *testing.T) {
+	s, c := dualStackContainmentSite()
+	allow := zoneRule(1, "Internal", "Hotspot", "ALLOW", "all")
+	allow.Source.AnyTarget = false
+	allow.Source.NetworkIDs = []string{"b"}
+	s.FirewallPolicies = []unifi.FirewallPolicy{allow, zoneRule(2, "Internal", "Hotspot", "BLOCK", "all")}
+
+	a := sensorContainment(t, s, c).LANInbound
+	s.Networks[0], s.Networks[1] = s.Networks[1], s.Networks[0]
+	b := sensorContainment(t, s, c).LANInbound
+	if a.State != b.State {
+		t.Fatalf("identical policy and identical VLANs; Office first: %+v; Lab first: %+v", a, b)
+	}
+}
+
+// TestFlatInternalNetworkWithExplicitContainment verifies that a network named
+// in IsolationIntent containment lists still receives a containment profile even
+// when it resides in the Internal zone without IsolationEnabled.
+func TestFlatInternalNetworkWithExplicitContainment(t *testing.T) {
+	s, c := dualStackContainmentSite()
+	s.Networks[2].ZoneName = "Internal"
+	s.Networks[2].IsolationEnabled = false
+	s.FirewallPolicies = []unifi.FirewallPolicy{zoneRule(1, "Internal", "External", "ALLOW", "all")}
+	_ = sensorContainment(t, s, c)
+}
+
+// TestDualStackPeersWithIPv4OnlyDeny verifies that an IPv4-only switch deny ACL
+// does not certify dual-stack wired peers as isolated when IPv6 remains allowed.
+func TestDualStackPeersWithIPv4OnlyDeny(t *testing.T) {
+	s, c := dualStackContainmentSite()
+	s.Devices = []unifi.Device{{
+		Type:  "usw",
+		MAC:   "00:00:5e:00:53:01",
+		Ports: []unifi.SwitchPort{{PortIdx: 1, Up: true}, {PortIdx: 2, Up: true}},
+	}}
+	s.Clients = []unifi.Client{
+		{MAC: "00:00:5e:00:53:02", IP: "198.51.100.11", IPv6: []string{"2001:db8:1::11"}, NetworkName: "Sensors", IsWired: true, SwitchMAC: s.Devices[0].MAC, SwitchPort: 1},
+		{MAC: "00:00:5e:00:53:03", IP: "198.51.100.12", IPv6: []string{"2001:db8:1::12"}, NetworkName: "Sensors", IsWired: true, SwitchMAC: s.Devices[0].MAC, SwitchPort: 2},
+	}
+	s.SwitchACLs = []unifi.SwitchACL{{
+		ID:          "v4",
+		Name:        "deny ipv4",
+		Enabled:     true,
+		Action:      "BLOCK",
+		IPVersion:   "ipv4",
+		Protocol:    "all",
+		NetworkIDs:  []string{"s"},
+		Source:      unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
+		Destination: unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
+	}}
+	r := sensorContainment(t, s, c)
+	if r.Peers.State == "isolated" {
+		t.Fatalf("IPv6 switched peers remain unrestricted: %+v", r.Peers)
+	}
+}
+
+// TestWiredPeerACLUsesBothRealEndpoints verifies that directional switch ACLs
+// between two wired peers are checked in both directions using each client's
+// concrete MAC and IP addresses.
+func TestWiredPeerACLUsesBothRealEndpoints(t *testing.T) {
+	s, cfg := dualStackContainmentSite()
+	const sw = "00:00:5e:00:53:01"
+	a := unifi.Client{MAC: "00:00:5e:00:53:02", IP: "198.51.100.11", NetworkName: "Sensors", IsWired: true, SwitchMAC: sw, SwitchPort: 1}
+	b := unifi.Client{MAC: "00:00:5e:00:53:03", IP: "198.51.100.12", NetworkName: "Sensors", IsWired: true, SwitchMAC: sw, SwitchPort: 2}
+	s.Clients = []unifi.Client{a, b}
+	s.Devices = []unifi.Device{{
+		Type:  "usw",
+		MAC:   sw,
+		Ports: []unifi.SwitchPort{{PortIdx: 1, Up: true}, {PortIdx: 2, Up: true}},
+	}}
+	anyEP := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
+	s.SwitchACLs = []unifi.SwitchACL{
+		{
+			ID:          "exception",
+			Name:        "Return camera connection",
+			Enabled:     true,
+			Index:       1,
+			Action:      "ALLOW",
+			IPVersion:   "ipv4",
+			Protocol:    "tcp",
+			Source:      unifi.PolicyEndpoint{MACs: []string{b.MAC}, AnyPort: true},
+			Destination: unifi.PolicyEndpoint{IPs: []string{a.IP}, Ports: []int{8554}},
+			DeviceMACs:  []string{sw},
+		},
+		{
+			ID:          "block",
+			Name:        "Block other peers",
+			Enabled:     true,
+			Index:       2,
+			Action:      "BLOCK",
+			IPVersion:   "both",
+			Protocol:    "all",
+			Source:      anyEP,
+			Destination: anyEP,
+			DeviceMACs:  []string{sw},
+		},
+	}
+	if p := sensorContainment(t, s, cfg).Peers; !p.Violation {
+		t.Fatalf("missed reverse connection: %+v", p)
+	}
+	s.SwitchACLs[0].Destination.IPs = []string{"198.51.100.77"}
+	if p := sensorContainment(t, s, cfg).Peers; p.Violation || p.State != "isolated" {
+		t.Fatalf("unrelated exception affected cameras: %+v", p)
+	}
+}

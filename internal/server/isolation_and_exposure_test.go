@@ -8,6 +8,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -687,5 +688,72 @@ func TestGuestPrinterIPv6IsolationCustomApprovedPathAndDeviceChildren(t *testing
 	}
 	if ch := pm.Entities[gwEnt.ChildIDs[0]]; ch == nil || ch.ParentID != gwEnt.ID || ch.Label != "Front Doorbell" {
 		t.Fatalf("unexpected gateway child entity: %+v", ch)
+	}
+}
+
+// TestCameraPeerGapReachesInventory verifies that a mixed port-isolation gap on
+// a camera VLAN surfaces across all three user-visible layers (network
+// containment, switch ports, and attached camera hosts), clears once all ports
+// are isolated, and degrades to unverified when a port profile is unknown.
+func TestCameraPeerGapReachesInventory(t *testing.T) {
+	const sw = "00:00:5e:00:53:01"
+	snap := &unifi.Snapshot{
+		Networks:          []unifi.Network{{ID: "cam", Name: "Cameras", ZoneName: "Cameras", Subnet: "192.0.2.1/24", IsolationEnabled: true}},
+		Devices:           []unifi.Device{{MAC: sw, Type: "usw", Name: "Camera switch"}},
+		SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
+	}
+	var views []ClientView
+	for i := 1; i <= 3; i++ {
+		snap.Devices[0].Ports = append(snap.Devices[0].Ports, unifi.SwitchPort{PortIdx: i, Enabled: true, Up: true, Isolation: i != 3, MACTableCount: 1})
+		cl := unifi.Client{
+			MAC:         fmt.Sprintf("00:00:5e:00:53:%02x", 16+i),
+			IP:          fmt.Sprintf("192.0.2.%d", 10+i),
+			Name:        fmt.Sprintf("Camera %d", i),
+			IsWired:     true,
+			NetworkID:   "cam",
+			NetworkName: "Cameras",
+			SwitchMAC:   sw,
+			SwitchPort:  i,
+		}
+		snap.Clients = append(snap.Clients, cl)
+		views = append(views, ClientView{Client: cl})
+	}
+	evaluate := func() *PresentationModel {
+		report := risk.Evaluate(snap, nil, config.NetworkConfig{})
+		return BuildPresentationModel(snap, report, nil, views, nil, nil, nil)
+	}
+
+	vm := evaluate()
+	nc := vm.Logical[0].Containment
+	if nc == nil || !nc.Peers.Violation || nc.Peers.State != "partial" || !strings.Contains(nc.Peers.Detail, "Port 3") {
+		t.Fatalf("mixed port isolation: %+v", nc)
+	}
+	for _, cl := range snap.Clients {
+		for _, id := range []string{hostEntityID(cl), portEntityID(sw, cl.SwitchPort)} {
+			if e := vm.Entities[id]; e == nil || e.State != VerdictExposed {
+				t.Fatalf("missing peer warning on %s", id)
+			}
+		}
+	}
+	count := 0
+	for _, reason := range vm.Entities[netEntityID("cam", "Cameras")].Reasons {
+		if reason.Ref == "UB-UNIFI-ISO-SAME-VLAN" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected one primary network alert, got %d", count)
+	}
+
+	snap.Devices[0].Ports[2].Isolation = true
+	vm = evaluate()
+	if p := vm.Logical[0].Containment.Peers; p.State != "isolated" || p.Violation {
+		t.Fatalf("all ports isolated: %+v", p)
+	}
+
+	snap.Devices[0].Ports[2].IsolationUnknown = true
+	vm = evaluate()
+	if p := vm.Logical[0].Containment.Peers; p.State == "isolated" || vm.Entities[netEntityID("cam", "Cameras")].State == VerdictOK {
+		t.Fatalf("missing profile produced clean verdict: %+v", p)
 	}
 }

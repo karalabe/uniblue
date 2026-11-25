@@ -461,29 +461,29 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 	prevState, _ := risk.LoadState(cfg.State.Path)
 
 	return &Engine{
-		cfg:            cfg,
-		opts:           opts,
-		ctrl:           ctrl,
-		checkList:      checkList,
-		scanPorts:      scanPorts,
-		classifier:     classifier,
-		cveCache:       cveCache,
-		cveIdent:       cveIdent,
-		notifier:       notifier,
-		minNotify:      minSev,
-		logger:         opts.Logger,
-		startedAt:      time.Now().UTC(),
-		profilesByMAC:  make(map[string]probe.HostProfile),
-		findingsByMAC:  make(map[string][]checks.Finding),
-		missingClients: make(map[string]missingClient),
-		lastPorts:      make(map[string]portLiveState),
+		cfg:                   cfg,
+		opts:                  opts,
+		ctrl:                  ctrl,
+		checkList:             checkList,
+		scanPorts:             scanPorts,
+		classifier:            classifier,
+		cveCache:              cveCache,
+		cveIdent:              cveIdent,
+		notifier:              notifier,
+		minNotify:             minSev,
+		logger:                opts.Logger,
+		startedAt:             time.Now().UTC(),
+		profilesByMAC:         make(map[string]probe.HostProfile),
+		findingsByMAC:         make(map[string][]checks.Finding),
+		missingClients:        make(map[string]missingClient),
+		lastPorts:             make(map[string]portLiveState),
 		anomalies:             newAnomalyTracker(),
 		lastClasses:           make(map[string]classify.Result),
 		prevRiskState:         prevState,
 		webhookCoalesceWindow: defaultWebhookCoalesceWindow,
 		fullRescanCh:          make(chan string, 1),
-		hostScanCh:     make(chan hostScanTask, 64),
-		subscribers:    make(map[chan LiveEvent]struct{}),
+		hostScanCh:            make(chan hostScanTask, 64),
+		subscribers:           make(map[chan LiveEvent]struct{}),
 	}, nil
 }
 
@@ -2251,25 +2251,38 @@ func (e *Engine) enqueueWebhooks(ctx context.Context, items []pendingWebhook, st
 	}
 	e.webhookMu.Lock()
 	defer e.webhookMu.Unlock()
-	// Merge any coalesced live events into the first immediate webhook so bursts
-	// are delivered together without a duplicate follow-up push.
-	if len(e.coalescedEvents) > 0 {
-		if e.coalesceCancel != nil {
-			e.coalesceCancel()
-			e.coalesceCancel = nil
+	return e.commitWebhooksLocked(ctx, items, startDrainer)
+}
+
+// commitWebhooksLocked stages items (merging any buffered coalesced live events
+// into the first batch) and persists the resulting outbox in a single durable
+// write. On storage failure, both pendingWebhooks and coalescedEvents remain
+// untouched so the caller can retry without losing or duplicating alerts.
+func (e *Engine) commitWebhooksLocked(ctx context.Context, items []pendingWebhook, startDrainer bool) error {
+	previous, seq := e.pendingWebhooks, e.webhookSeq
+	e.pendingWebhooks = append([]pendingWebhook(nil), previous...)
+	for i, item := range items {
+		if i == 0 && len(e.coalescedEvents) > 0 {
+			item.diff.Events = appendUniqueAlertEvents(e.coalescedEvents, item.diff.Events)
 		}
-		e.coalesceGen++
-		items[0].diff.Events = appendUniqueAlertEvents(e.coalescedEvents, items[0].diff.Events)
-		e.coalescedEvents = nil
-		e.coalescedSite = ""
+		e.stageWebhookLocked(item)
 	}
-	var persistErr error
-	for _, item := range items {
-		if err := e.enqueueWebhookLocked(ctx, item, startDrainer); err != nil && persistErr == nil {
-			persistErr = err
-		}
+	if err := e.persistPendingWebhooksLocked(); err != nil {
+		e.pendingWebhooks, e.webhookSeq = previous, seq
+		return err
 	}
-	return persistErr
+	if e.coalesceCancel != nil {
+		e.coalesceCancel()
+		e.coalesceCancel = nil
+	}
+	e.coalesceGen++
+	e.coalescedEvents = nil
+	e.coalescedSite = ""
+	if startDrainer && !e.webhookRunning && e.notifier != nil {
+		e.webhookRunning = true
+		go e.drainWebhooks(ctx)
+	}
+	return nil
 }
 
 func (e *Engine) startWebhookDrainer(ctx context.Context) {
@@ -2281,7 +2294,15 @@ func (e *Engine) startWebhookDrainer(ctx context.Context) {
 	e.webhookMu.Unlock()
 }
 
+// enqueueWebhookLocked persists a single webhook batch via commitWebhooksLocked.
 func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, startDrainer bool) error {
+	return e.commitWebhooksLocked(ctx, []pendingWebhook{item}, startDrainer)
+}
+
+// stageWebhookLocked inserts item into the in-memory pendingWebhooks slice
+// while enforcing maxPendingWebhooks priority eviction rules and preserving any
+// currently in-flight webhook ID at index 0.
+func (e *Engine) stageWebhookLocked(item pendingWebhook) {
 	if item.id == "" {
 		item.id = notify.NewWebhookID()
 	}
@@ -2311,12 +2332,7 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 				}
 			}
 			if merged {
-				err := e.persistPendingWebhooksLocked()
-				if startDrainer && !e.webhookRunning && e.notifier != nil {
-					e.webhookRunning = true
-					go e.drainWebhooks(ctx)
-				}
-				return err
+				return
 			}
 			// Otherwise evict the oldest non-in-flight live-event batch if one exists;
 			// never evict a queued diff/finding batch for a live-event-only batch.
@@ -2329,7 +2345,7 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 			}
 			if evictIdx < 0 {
 				e.logger.Warn("webhook queue full of state-diff alerts; dropping live-event-only batch to preserve queued findings")
-				return nil
+				return
 			}
 			e.pendingWebhooks = append(e.pendingWebhooks[:evictIdx], e.pendingWebhooks[evictIdx+1:]...)
 		} else if isCVEOnlyDiff(item.diff) {
@@ -2353,7 +2369,7 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 			}
 			if evictIdx < 0 {
 				e.logger.Warn("webhook queue full of higher-priority finding alerts; dropping overflow CVE-only batch")
-				return nil
+				return
 			}
 			e.pendingWebhooks = append(e.pendingWebhooks[:evictIdx], e.pendingWebhooks[evictIdx+1:]...)
 		} else {
@@ -2382,12 +2398,6 @@ func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, 
 	e.webhookSeq++
 	item.seq = e.webhookSeq
 	e.pendingWebhooks = append(e.pendingWebhooks, item)
-	err := e.persistPendingWebhooksLocked()
-	if startDrainer && !e.webhookRunning && e.notifier != nil {
-		e.webhookRunning = true
-		go e.drainWebhooks(ctx)
-	}
-	return err
 }
 
 // enqueueLiveEvents buffers high-signal live security events for
@@ -2399,18 +2409,15 @@ func (e *Engine) enqueueLiveEvents(ctx context.Context, site string, events []ri
 	}
 	e.webhookMu.Lock()
 	window := e.webhookCoalesceWindow
-	if window <= 0 {
-		item := pendingWebhook{
-			id:   notify.NewWebhookID(),
-			site: site,
-			diff: risk.Diff{Events: appendUniqueAlertEvents(nil, events)},
-		}
-		e.enqueueWebhookLocked(ctx, item, true)
-		e.webhookMu.Unlock()
-		return
-	}
 	e.coalescedSite = site
 	e.coalescedEvents = appendUniqueAlertEvents(e.coalescedEvents, events)
+	if window <= 0 {
+		if err := e.enqueueWebhookLocked(ctx, pendingWebhook{site: site}, true); err == nil {
+			e.webhookMu.Unlock()
+			return
+		}
+		window = time.Second
+	}
 	if e.coalesceCancel != nil {
 		e.webhookMu.Unlock()
 		return
@@ -2445,14 +2452,13 @@ func (e *Engine) flushCoalescedEvents(ctx context.Context, gen uint64, startDrai
 		return
 	}
 	e.coalesceCancel = nil
-	item := pendingWebhook{
-		id:   notify.NewWebhookID(),
-		site: e.coalescedSite,
-		diff: risk.Diff{Events: e.coalescedEvents},
+	if err := e.enqueueWebhookLocked(ctx, pendingWebhook{site: e.coalescedSite}, startDrainer); err != nil {
+		e.logger.Error("failed to persist buffered webhook events", "err", err)
+		if startDrainer && ctx.Err() == nil {
+			timer := time.AfterFunc(time.Second, func() { e.flushCoalescedEvents(ctx, gen, ctx.Err() == nil) })
+			e.coalesceCancel = func() { timer.Stop() }
+		}
 	}
-	e.coalescedEvents = nil
-	e.coalescedSite = ""
-	e.enqueueWebhookLocked(ctx, item, startDrainer)
 }
 
 func splitEventCount(summary string) (string, int) {
@@ -2909,7 +2915,6 @@ func preserveUnavailableTelemetry(prevSnap, nextSnap *unifi.Snapshot) {
 						if len(p.PortSecurityMACs) == 0 && len(old.PortSecurityMACs) > 0 {
 							p.PortSecurityMACs = append([]string(nil), old.PortSecurityMACs...)
 						}
-						p.Isolation = old.Isolation
 						if p.PortConfID == "" && old.PortConfID != "" {
 							p.PortConfID = old.PortConfID
 						}

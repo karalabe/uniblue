@@ -66,6 +66,7 @@ type SwitchPortView struct {
 	PortSecurity     bool       `json:"port_security"`
 	PortSecurityMACs []string   `json:"port_security_macs,omitempty"`
 	Isolation        bool       `json:"isolation,omitempty"`
+	IsolationUnknown bool       `json:"isolation_unknown,omitempty"`
 	MACTableCount    int        `json:"mac_table_count,omitempty"`
 	STPState         string     `json:"stp_state,omitempty"`
 	RXErrors         int64      `json:"rx_errors,omitempty"`
@@ -306,6 +307,7 @@ func AnalyzeSwitchPorts(
 				PortSecurity:     sp.PortSecurityEnabled,
 				PortSecurityMACs: sp.PortSecurityMACs,
 				Isolation:        sp.Isolation,
+				IsolationUnknown: sp.IsolationUnknown,
 				MACTableCount:    sp.MACTableCount,
 				STPState:         sp.STPState,
 				RXErrors:         sp.RXErrors,

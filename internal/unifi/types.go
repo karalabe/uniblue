@@ -500,6 +500,11 @@ type SwitchPort struct {
 	// Isolation reports whether L2 port isolation is enabled on this port.
 	Isolation bool `json:"isolation,omitempty"`
 
+	// IsolationUnknown reports that the port inherits its settings from a port
+	// profile whose definition was missing from the snapshot, so the effective
+	// L2 isolation setting could not be determined.
+	IsolationUnknown bool `json:"isolation_unknown,omitempty"`
+
 	// MACTableCount is the number of active MAC addresses learned on this port.
 	MACTableCount int `json:"mac_table_count,omitempty"`
 
@@ -1188,13 +1193,13 @@ type integrationDevice struct {
 
 // integrationNetwork maps a network/VLAN entry returned by GET /integration/v1/sites/{id}/networks.
 type integrationNetwork struct {
-	ID                string     `json:"id"`
-	Name              string     `json:"name"`
-	Purpose           string     `json:"purpose"`
-	Management        string     `json:"management"`
-	VLANID            flexString `json:"vlanId"`
-	Subnet            string     `json:"subnet"`
-	IPv6Subnet        string     `json:"ipv6Subnet"`
+	ID                    string     `json:"id"`
+	Name                  string     `json:"name"`
+	Purpose               string     `json:"purpose"`
+	Management            string     `json:"management"`
+	VLANID                flexString `json:"vlanId"`
+	Subnet                string     `json:"subnet"`
+	IPv6Subnet            string     `json:"ipv6Subnet"`
 	IsolationEnabled      bool       `json:"isolationEnabled"`
 	InternetAccessEnabled *bool      `json:"internetAccessEnabled"`
 	ZoneID                string     `json:"zoneId"`
@@ -1351,34 +1356,40 @@ func (f *flexMACFilter) UnmarshalJSON(data []byte) error {
 
 // integrationACLRule maps a switch ACL rule returned by GET /integration/v1/sites/{id}/acl-rules.
 type integrationACLRule struct {
-	ID                    string                 `json:"id"`
-	Type                  string                 `json:"type"` // "IPV4" | "IPV6" | "MAC"
-	Name                  string                 `json:"name"`
-	Enabled               bool                   `json:"enabled"`
-	Index                 int                    `json:"index"`
-	Action                string                 `json:"action"` // "ALLOW" | "BLOCK"
-	ProtocolFilter        []string               `json:"protocolFilter"`
-	NetworkIDFilter       string                 `json:"networkIdFilter"`
-	NetworkIDs            []string               `json:"networkIds"`
-	EnforcingDeviceFilter *integrationDeviceRef  `json:"enforcingDeviceFilter"`
+	ID                    string                  `json:"id"`
+	Type                  string                  `json:"type"` // "IPV4" | "IPV6" | "MAC"
+	Name                  string                  `json:"name"`
+	Enabled               bool                    `json:"enabled"`
+	Index                 int                     `json:"index"`
+	Action                string                  `json:"action"` // "ALLOW" | "BLOCK"
+	ProtocolFilter        []string                `json:"protocolFilter"`
+	NetworkIDFilter       string                  `json:"networkIdFilter"`
+	NetworkIDs            []string                `json:"networkIds"`
+	EnforcingDeviceFilter *integrationDeviceRef   `json:"enforcingDeviceFilter"`
 	SourceFilter          *integrationACLEndpoint `json:"sourceFilter"`
 	DestinationFilter     *integrationACLEndpoint `json:"destinationFilter"`
 }
 
+// integrationDeviceRef maps an enforcingDeviceFilter on an Integration v1 ACL rule.
 type integrationDeviceRef struct {
 	Type      string   `json:"type"`
 	DeviceIDs []string `json:"deviceIds"`
 }
 
+// integrationACLEndpoint maps the sourceFilter or destinationFilter object on a
+// UniFi Integration v1 switch ACL rule across UniFi Network 10.x and 11.x schemas.
 type integrationACLEndpoint struct {
-	Type          string   `json:"type"`
-	MatchOpposite bool     `json:"matchOpposite"`
-	NetworkIDs    []string `json:"networkIds"`
-	IPAddresses   []string `json:"ipAddresses"`
-	IPs           []string `json:"ips"`
-	MACAddresses  []string `json:"macAddresses"`
-	Ports         []int    `json:"ports"`
-	Items         []struct {
+	Type                 string   `json:"type"`
+	MatchOpposite        bool     `json:"matchOpposite"`
+	NetworkIDs           []string `json:"networkIds"`
+	IPAddressesOrSubnets []string `json:"ipAddressesOrSubnets"`
+	IPAddresses          []string `json:"ipAddresses"`
+	IPs                  []string `json:"ips"`
+	MACAddresses         []string `json:"macAddresses"`
+	PrefixLength         *int     `json:"prefixLength"`
+	Ports                []int    `json:"ports"`
+	PortFilter           []int    `json:"portFilter"`
+	Items                []struct {
 		Type  string     `json:"type"`
 		Value flexString `json:"value"`
 		Start int        `json:"start"`

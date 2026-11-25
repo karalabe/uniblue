@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -159,7 +160,9 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 
 	if *saveState {
-		warnLegacyCWDState(slog.New(slog.NewTextHandler(stderr, nil)), cfg.State.Path)
+		if !cfg.State.ExplicitPath {
+			warnLegacyCWDState(slog.New(slog.NewTextHandler(stderr, nil)), cfg.State.Path)
+		}
 		prev, _ := risk.LoadState(cfg.State.Path)
 		st := risk.BuildStateWithPrev(prev, snap, report, cfg.Network, probedHostKeys(profiles))
 		if err := risk.SaveState(cfg.State.Path, st); err != nil {
@@ -213,8 +216,10 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
-	if err := checkLegacyCWDState(logger, cfg.State.Path); err != nil {
-		return err
+	if !cfg.State.ExplicitPath {
+		if err := checkLegacyCWDState(logger, cfg.State.Path); err != nil {
+			return err
+		}
 	}
 	logger.Info("starting uniblue watch",
 		"site", cfg.UniFi.Site,
@@ -268,6 +273,7 @@ type watchSession struct {
 	stateLoaded       bool
 	pendingWebhookID  string
 	pendingWebhookKey string
+	pendingDiff       risk.Diff
 
 	scanFn       func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
 	sendFn       func(ctx context.Context, site string, diff risk.Diff) error
@@ -276,14 +282,42 @@ type watchSession struct {
 	saveFn       func(path string, st *risk.State) error
 }
 
+// watchDiffFingerprint derives a stable SHA-256 identity from the alert-bearing
+// entries in diff, excluding volatile client telemetry (such as LastSeen or
+// byte counters) so webhook retries reuse the original idempotent webhook-id.
 func watchDiffFingerprint(site string, diff risk.Diff) string {
-	raw, err := json.Marshal(struct {
-		Site string    `json:"site"`
-		Diff risk.Diff `json:"diff"`
-	}{Site: site, Diff: diff})
-	if err != nil {
-		return ""
+	var parts []string
+	add := func(kind string, value any) {
+		raw, _ := json.Marshal(value)
+		parts = append(parts, kind+string(raw))
 	}
+	for _, f := range diff.NewFindings {
+		add("new", []string{f.Key(), f.EffectiveSeverity.String()})
+	}
+	for _, f := range diff.EscalatedFindings {
+		add("escalated", []string{f.Key(), f.EffectiveSeverity.String()})
+	}
+	for _, k := range diff.ResolvedKeys {
+		add("resolved", k)
+	}
+	for _, c := range diff.NewTrustedClients {
+		key := strings.ToLower(c.MAC)
+		if key == "" {
+			key = c.PrimaryIP()
+		}
+		add("trusted", []string{key, c.NetworkName})
+	}
+	for _, f := range diff.NewPortForwards {
+		add("forward", f)
+	}
+	for _, c := range diff.NewCVEs {
+		add("cve", c)
+	}
+	for _, e := range diff.Events {
+		add("event", e)
+	}
+	sort.Strings(parts)
+	raw, _ := json.Marshal(append([]string{site}, parts...))
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -332,8 +366,9 @@ func (w *watchSession) runCycle(ctx context.Context) {
 			if w.pendingWebhookID == "" || fp == "" || w.pendingWebhookKey != fp {
 				w.pendingWebhookID = notify.NewWebhookID()
 				w.pendingWebhookKey = fp
+				w.pendingDiff = diff
 			}
-			sendErr = w.sendWithIDFn(ctx, w.pendingWebhookID, snap.Site, diff)
+			sendErr = w.sendWithIDFn(ctx, w.pendingWebhookID, snap.Site, w.pendingDiff)
 		} else {
 			sendErr = w.sendFn(ctx, snap.Site, diff)
 		}
@@ -343,9 +378,11 @@ func (w *watchSession) runCycle(ctx context.Context) {
 		}
 		w.pendingWebhookID = ""
 		w.pendingWebhookKey = ""
+		w.pendingDiff = risk.Diff{}
 	} else {
 		w.pendingWebhookID = ""
 		w.pendingWebhookKey = ""
+		w.pendingDiff = risk.Diff{}
 	}
 
 	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedKeys)
@@ -421,10 +458,7 @@ func preserveUnavailableWatchTelemetry(prevSnap, nextSnap *unifi.Snapshot) bool 
 							p.PortSecurityMACs = append([]string(nil), old.PortSecurityMACs...)
 							changed = true
 						}
-						if p.Isolation != old.Isolation {
-							p.Isolation = old.Isolation
-							changed = true
-						}
+
 						if p.PortConfID == "" && old.PortConfID != "" {
 							p.PortConfID = old.PortConfID
 						}
@@ -946,8 +980,11 @@ func warnLegacyCWDState(logger *slog.Logger, resolvedPath string) {
 	)
 }
 
+// detectLegacyCWDState reports whether resolvedPath targets the default
+// uniblue-state.json filename at a non-existent location while a legacy
+// ./uniblue-state.json file exists in the current working directory.
 func detectLegacyCWDState(resolvedPath string) (string, bool) {
-	if strings.TrimSpace(resolvedPath) == "" {
+	if filepath.Base(resolvedPath) != "uniblue-state.json" {
 		return "", false
 	}
 	if _, err := os.Stat(resolvedPath); err == nil {
@@ -2048,8 +2085,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
-	if err := checkLegacyCWDState(logger, cfg.State.Path); err != nil {
-		return err
+	if !cfg.State.ExplicitPath {
+		if err := checkLegacyCWDState(logger, cfg.State.Path); err != nil {
+			return err
+		}
 	}
 	eng, err := server.NewEngine(cfg, checkList, scanPorts, server.Options{
 		ListenAddr:         *listen,

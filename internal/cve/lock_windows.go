@@ -14,34 +14,39 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
-// staleWindowsLockAge bounds how old an orphaned lock file can be before a new
-// sync reclaims it after an ungraceful termination on Windows.
-const staleWindowsLockAge = 30 * time.Minute
-
-// acquireCacheLock obtains an exclusive lock file on Windows using atomic
-// O_CREATE|O_EXCL creation, reclaiming stale lock files older than
-// staleWindowsLockAge left behind by crashed processes.
+// acquireCacheLock obtains an exclusive kernel byte-range lock on lockPath via
+// LockFileEx so concurrent sync processes wait safely and Windows automatically
+// releases the lock when the owning handle closes or the process exits.
 func acquireCacheLock(ctx context.Context, lockPath string) (func(), error) {
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	handle := windows.Handle(f.Fd())
+	var offset windows.Overlapped
 	for {
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err := ctx.Err(); err != nil {
+			f.Close()
+			return nil, err
+		}
+		err = windows.LockFileEx(handle, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &offset)
 		if err == nil {
-			_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
-			_ = f.Close()
 			return func() {
-				_ = os.Remove(lockPath)
+				_ = windows.UnlockFileEx(handle, 0, 1, 0, &offset)
+				_ = f.Close()
 			}, nil
 		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("create cache lock %s: %w", lockPath, err)
-		}
-		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > staleWindowsLockAge {
-			_ = os.Remove(lockPath)
-			continue
+		if !errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+			f.Close()
+			return nil, fmt.Errorf("lock cache: %w", err)
 		}
 		select {
 		case <-ctx.Done():
+			f.Close()
 			return nil, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}

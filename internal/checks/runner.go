@@ -42,6 +42,11 @@ type Finding struct {
 	// CheckID is the identifier of the check that triggered (e.g., "UB-0003").
 	CheckID string `json:"check_id"`
 
+	// AffectedClientMACs lists lowercase client MAC addresses linked to a
+	// network-scoped isolation finding so dashboards can highlight both the
+	// affected hosts and their attached switch ports.
+	AffectedClientMACs []string `json:"affected_client_macs,omitempty"`
+
 	// Title summarizes the detected exposure or vulnerability.
 	Title string `json:"title"`
 

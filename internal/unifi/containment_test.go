@@ -8,6 +8,7 @@ package unifi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -85,9 +86,9 @@ func TestIntegrationACLRulesInternetToggleDomainAndPostAuthScoping(t *testing.T)
 					"id":"acl-1","type":"IPV4","name":"Block IoT Peers","enabled":true,"index":10000,"action":"BLOCK",
 					"protocolFilter":["TCP","UDP"],
 					"networkIdFilter":"net-iot",
-					"enforcingDeviceFilter":{"type":"DEVICE_IDS","deviceIds":["dev-sw1"]},
-					"sourceFilter":{"type":"NETWORK","networkIds":["net-iot"]},
-					"destinationFilter":{"type":"NETWORK","networkIds":["net-iot"]}
+					"enforcingDeviceFilter":{"type":"DEVICES","deviceIds":["dev-sw1"]},
+					"sourceFilter":{"type":"NETWORKS","networkIds":["net-iot"]},
+					"destinationFilter":{"type":"NETWORKS","networkIds":["net-iot"],"portFilter":[443]}
 				}
 			]}`))
 		default:
@@ -151,5 +152,60 @@ func TestIntegrationACLRulesInternetToggleDomainAndPostAuthScoping(t *testing.T)
 	prot := snap.FirewallPolicies[1]
 	if prot.Destination.UnsupportedSelector != "" || prot.Destination.AnyPort || !slices.Equal(prot.Destination.Ports, []int{7080, 7442, 7444}) {
 		t.Fatalf("expected TRAFFIC_MATCHING_LIST port list to resolve cleanly, got %+v", prot.Destination)
+	}
+}
+
+// TestSwitchACLWirePortAndAddressRestrictions verifies that UniFi Integration
+// v1 OpenAPI switch ACL endpoint schemas (PORTS, IP_ADDRESSES_OR_SUBNETS, and
+// NETWORKS with portFilter) decode accurately into PolicyEndpoint restrictions.
+func TestSwitchACLWirePortAndAddressRestrictions(t *testing.T) {
+	for _, tc := range []struct {
+		label, wire string
+		check       func(PolicyEndpoint) bool
+	}{
+		{
+			label: "ports",
+			wire:  `{"type":"PORTS","portFilter":[443]}`,
+			check: func(e PolicyEndpoint) bool { return !e.AnyPort && e.MatchesPort(443) && !e.MatchesPort(80) },
+		},
+		{
+			label: "subnet",
+			wire:  `{"type":"IP_ADDRESSES_OR_SUBNETS","ipAddressesOrSubnets":["192.0.2.0/24"],"portFilter":[443]}`,
+			check: func(e PolicyEndpoint) bool {
+				return e.UnsupportedSelector == "" && slices.Contains(e.IPs, "192.0.2.0/24") && !e.AnyPort
+			},
+		},
+		{
+			label: "network and port",
+			wire:  `{"type":"NETWORKS","networkIds":["9d44c2a7-b959-4e35-8b98-fe2999d87b5b"],"portFilter":[443]}`,
+			check: func(e PolicyEndpoint) bool {
+				return !e.AnyTarget && !e.AnyPort && e.MatchesPort(443) && !e.MatchesPort(80)
+			},
+		},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			var raw integrationACLRule
+			if err := json.Unmarshal([]byte(`{"type":"IPV4","action":"BLOCK","enabled":true,"destinationFilter":`+tc.wire+`}`), &raw); err != nil {
+				t.Fatal(err)
+			}
+			got := convertIntegrationACLs([]integrationACLRule{raw}, nil)[0]
+			if !tc.check(got.Destination) {
+				t.Fatalf("decoded %+v", got.Destination)
+			}
+		})
+	}
+}
+
+// TestDeviceSpecificACLWithMissingInventory verifies that an enforcingDeviceFilter
+// referencing an unknown device ID is flagged as unsupported rather than silently
+// decoded as an unscoped site-wide ACL rule.
+func TestDeviceSpecificACLWithMissingInventory(t *testing.T) {
+	var raw integrationACLRule
+	if err := json.Unmarshal([]byte(`{"type":"IPV4","action":"BLOCK","enabled":true,"enforcingDeviceFilter":{"type":"DEVICES","deviceIds":["934368d4-4be5-4b9f-b9a0-6db897f785d9"]}}`), &raw); err != nil {
+		t.Fatal(err)
+	}
+	acls := convertIntegrationACLs([]integrationACLRule{raw}, map[string]string{})
+	if len(acls) > 0 && len(acls[0].DeviceMACs) == 0 && acls[0].Source.UnsupportedSelector == "" && acls[0].Destination.UnsupportedSelector == "" {
+		t.Fatal("unresolved device-specific ACL decoded as unscoped rule")
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -202,5 +203,70 @@ func TestCVECacheCleansStaleArtifactsMergesCollisionsResumesAndGuardsCurrentYear
 	return404 = true
 	if _, err := cache.Sync(context.Background(), opts); err == nil {
 		t.Fatal("expected error on transient 404 for already-synced current year")
+	}
+}
+
+// TestForceRefreshRequiresPreviouslyPublishedYears verifies that a transient
+// upstream 404 for an already-synced current-year feed fails the sync instead
+// of dropping cached CVEs, even when SyncOptions.Force is enabled.
+func TestForceRefreshRequiresPreviouslyPublishedYears(t *testing.T) {
+	year := time.Now().UTC().Year()
+	missing := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/kev.json" {
+			fmt.Fprint(w, `{"vulnerabilities":[]}`)
+			return
+		}
+		y := year - 1
+		if strings.Contains(r.URL.Path, strconv.Itoa(year)) {
+			y = year
+		}
+		feed := fmt.Sprintf(`{"vulnerabilities":[{"cve":{"id":"CVE-%d-50001","descriptions":[{"lang":"en","value":"fixture"}],"configurations":[{"nodes":[{"cpeMatch":[{"vulnerable":true,"criteria":"cpe:2.3:a:test:fixture:*:*:*:*:*:*:*:*"}]}]}]}}]}`, y)
+		if y == year && missing {
+			http.NotFound(w, r)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, ".meta") {
+			fmt.Fprintf(w, "sha256:%x\n", sha256.Sum256([]byte(feed)))
+			return
+		}
+		gz := gzip.NewWriter(w)
+		fmt.Fprint(gz, feed)
+		gz.Close()
+	}))
+	defer srv.Close()
+	cache := NewCache(t.TempDir())
+	cache.nvdBaseURL = srv.URL
+	cache.kevURL = srv.URL + "/kev.json"
+	opts := SyncOptions{SinceYear: year - 1, EndYear: year}
+	before, err := cache.Sync(context.Background(), opts)
+	if err != nil || before.TotalCVEs != 2 {
+		t.Fatalf("unexpected initial cache: %v %v", before, err)
+	}
+	missing = true
+	opts.Force = true
+	after, err := cache.Sync(context.Background(), opts)
+	if err == nil {
+		t.Fatalf("temporary missing feed accepted, advisory count changed from %d to %d", before.TotalCVEs, after.TotalCVEs)
+	}
+}
+
+// TestCleanupOnlyRemovesOwnedStagingFiles verifies that stale-sync cleanup
+// leaves unrelated operator .tmp files in the cache root untouched.
+func TestCleanupOnlyRemovesOwnedStagingFiles(t *testing.T) {
+	root := t.TempDir()
+	feeds, vendors := filepath.Join(root, "feeds"), filepath.Join(root, "vendors")
+	for _, dir := range []string{feeds, vendors} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := filepath.Join(root, "operator-export.tmp")
+	if err := os.WriteFile(file, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cleanupStaleSyncArtifacts(root, feeds, vendors)
+	if _, err := os.Stat(file); err != nil {
+		t.Fatal("unrelated file was removed from cache root")
 	}
 }

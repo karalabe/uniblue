@@ -433,3 +433,36 @@ func TestWebhookTransient4xxRetriesAndSameClientStableIPv6Only(t *testing.T) {
 		t.Fatal("IPv6-only host with completely disjoint routable IPv6 addresses should be detected as moved")
 	}
 }
+
+// TestOutboxCommitsOneBatchAfterStorageRecovers verifies that a failed webhook
+// outbox write rolls back pendingWebhooks cleanly so retrying the same batch
+// after storage recovers produces exactly one queued entry.
+func TestOutboxCommitsOneBatchAfterStorageRecovers(t *testing.T) {
+	dir := t.TempDir()
+	badDir := filepath.Join(dir, "unavailable")
+	if err := os.WriteFile(badDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := NewDemoEngineForTest(t)
+	e.cfg.State.Path = filepath.Join(badDir, "state.json")
+	item := pendingWebhook{
+		site: "default",
+		diff: risk.Diff{
+			NewFindings: []checks.Finding{{
+				CheckID:           "same-finding",
+				BaseSeverity:      checks.SeverityHigh,
+				EffectiveSeverity: checks.SeverityHigh,
+			}},
+		},
+	}
+	if err := e.enqueueWebhooks(context.Background(), []pendingWebhook{item}, false); err == nil {
+		t.Fatal("expected persistence error when outbox directory is not writable")
+	}
+	e.cfg.State.Path = filepath.Join(dir, "state.json")
+	if err := e.enqueueWebhooks(context.Background(), []pendingWebhook{item}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.pendingWebhooks) != 1 {
+		t.Fatalf("expected exactly 1 queued batch after storage recovery, got %d (%+v)", len(e.pendingWebhooks), e.pendingWebhooks)
+	}
+}

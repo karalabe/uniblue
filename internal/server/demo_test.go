@@ -34,8 +34,8 @@ func TestNewDemoEngineBuildsCompletePresentationModel(t *testing.T) {
 	if snap.View.Census.BMCCount != 1 || snap.View.Census.ExactCVEHosts != 2 {
 		t.Fatalf("unexpected demo census: %+v", snap.View.Census)
 	}
-	if snap.View.Isolation == nil || snap.View.Isolation.ApprovedCount == 0 || snap.View.Isolation.BlockedOKCount == 0 || snap.View.Isolation.ViolationCount == 0 || snap.View.Isolation.UnknownCount != 0 {
-		t.Fatalf("expected balanced isolation showcase (approved+blocked+violation, 0 unknown), got %+v", snap.View.Isolation)
+	if snap.View.Isolation == nil || snap.View.Isolation.ApprovedCount == 0 || snap.View.Isolation.BlockedOKCount == 0 || snap.View.Isolation.ViolationCount == 0 || snap.View.Isolation.UnknownCount == 0 {
+		t.Fatalf("expected balanced isolation showcase (approved, blocked, violation, and unverified paths), got %+v", snap.View.Isolation)
 	}
 	if snap.View.ServiceCoverage == nil || snap.View.ServiceCoverage.OutboundDependencies < 2 {
 		t.Fatalf("expected service coverage with outbound dependencies, got %+v", snap.View.ServiceCoverage)

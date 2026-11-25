@@ -181,7 +181,7 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	prevStats, _ := c.Stats()
 	prevSHAs := map[string]string{}
 	prevMeta := map[string]FeedFileMeta{}
-	if prevStats != nil && !opts.Force {
+	if prevStats != nil {
 		prevSHAs = prevStats.YearSHAs
 		prevMeta = prevStats.YearMeta
 	}
@@ -575,7 +575,7 @@ func (c *Cache) downloadFeedFile(ctx context.Context, url, dst, expectedSHA stri
 		return 0, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
 	}
 
-	tmpFile, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*.tmp")
+	tmpFile, err := os.CreateTemp(filepath.Dir(dst), ".uniblue-cve-sync-"+filepath.Base(dst)+".*.tmp")
 	if err != nil {
 		return 0, err
 	}
@@ -597,25 +597,40 @@ func (c *Cache) downloadFeedFile(ctx context.Context, url, dst, expectedSHA stri
 	return n, nil
 }
 
-// cleanupStaleSyncArtifacts removes temporary spill directories and partial
-// download/shard temp files left behind by an earlier hard kill or OOM.
+// cleanupStaleSyncArtifacts removes UniBlue-owned temporary spill directories
+// and partial staging files left behind by an earlier interrupted or OOM-killed
+// sync while leaving unrelated operator files in the cache directory untouched.
 func cleanupStaleSyncArtifacts(cacheDir, feedsDir, vendorsDir string) {
-	if entries, err := os.ReadDir(cacheDir); err == nil {
-		for _, ent := range entries {
-			name := ent.Name()
-			if ent.IsDir() && strings.HasPrefix(name, ".index-") {
-				_ = os.RemoveAll(filepath.Join(cacheDir, name))
-			} else if !ent.IsDir() && strings.HasSuffix(name, ".tmp") {
-				_ = os.Remove(filepath.Join(cacheDir, name))
+	for _, dir := range []string{cacheDir, feedsDir, vendorsDir} {
+		entries, _ := os.ReadDir(dir)
+		for _, entry := range entries {
+			name := entry.Name()
+			path := filepath.Join(dir, name)
+			if dir == cacheDir && entry.IsDir() && strings.HasPrefix(name, ".uniblue-index-") {
+				_ = os.RemoveAll(path)
+				continue
 			}
-		}
-	}
-	for _, dir := range []string{feedsDir, vendorsDir} {
-		if entries, err := os.ReadDir(dir); err == nil {
-			for _, ent := range entries {
-				if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".tmp") {
-					_ = os.Remove(filepath.Join(dir, ent.Name()))
+			// Older builds used a generic ".index-" directory prefix; only
+			// remove recognized spill bucket regular files and the now-empty
+			// directory rather than recursively deleting unknown contents.
+			if dir == cacheDir && entry.IsDir() && strings.HasPrefix(name, ".index-") {
+				children, _ := os.ReadDir(path)
+				removed := false
+				for _, child := range children {
+					if match, _ := filepath.Match("bucket-[0-9][0-9].ndjson", child.Name()); match && child.Type().IsRegular() {
+						if os.Remove(filepath.Join(path, child.Name())) == nil {
+							removed = true
+						}
+					}
 				}
+				if removed {
+					_ = os.Remove(path)
+				}
+				continue
+			}
+			legacyFeed, _ := filepath.Match("nvdcve-2.0-[0-9][0-9][0-9][0-9].json.gz.*.tmp", name)
+			if !entry.IsDir() && ((strings.HasPrefix(name, ".uniblue-cve-sync-") && strings.HasSuffix(name, ".tmp")) || (dir == feedsDir && legacyFeed)) {
+				_ = os.Remove(path)
 			}
 		}
 	}
@@ -632,7 +647,7 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 	}
 
 	const numBuckets = 64
-	tmpDir, err := os.MkdirTemp(c.dir, ".index-*")
+	tmpDir, err := os.MkdirTemp(c.dir, ".uniblue-index-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp index dir: %w", err)
 	}
@@ -1646,7 +1661,7 @@ func sanitizeVendor(vendor string) string {
 }
 
 func writeBytesAtomic(path string, raw []byte, mode os.FileMode) error {
-	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".uniblue-cve-sync-"+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
@@ -1684,7 +1699,7 @@ func writeJSONAtomic(path string, v any) error {
 // writeGzipJSONAtomic encodes v as gzipped JSON and atomically replaces path
 // using a unique temp file, returning the compressed byte size on disk.
 func writeGzipJSONAtomic(path string, v any) (int64, error) {
-	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".uniblue-cve-sync-"+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return 0, err
 	}
