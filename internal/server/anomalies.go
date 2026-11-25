@@ -229,11 +229,12 @@ func (a *anomalyTracker) EvaluateClientJoinAnomalies(cl unifi.Client, now time.T
 		if gap := now.Sub(lastTime); gap >= dormantWakeupThreshold {
 			days := int(gap.Hours() / 24)
 			events = append(events, LiveEvent{
-				Type:     "client_dormant_wakeup",
-				Severity: "medium",
-				Host:     cl.DisplayName(),
-				IP:       cl.IP,
-				Summary:  fmt.Sprintf("Dormant device %s (%s) woke up after %d day(s) offline on %s", cl.DisplayName(), cl.MAC, days, fallbackVLAN(cl.NetworkName)),
+				Type:      "client_dormant_wakeup",
+				Severity:  "medium",
+				Host:      cl.DisplayName(),
+				IP:        cl.PrimaryIP(),
+				SubjectID: hostEntityID(cl),
+				Summary:   fmt.Sprintf("Dormant device %s (%s) woke up after %d day(s) offline on %s", cl.DisplayName(), cl.MAC, days, fallbackVLAN(cl.NetworkName)),
 			})
 		}
 	}
@@ -244,11 +245,12 @@ func (a *anomalyTracker) EvaluateClientJoinAnomalies(cl unifi.Client, now time.T
 			prevMed, currMed = "Wired", "Wi-Fi"
 		}
 		events = append(events, LiveEvent{
-			Type:     "client_medium_swap",
-			Severity: "high",
-			Host:     cl.DisplayName(),
-			IP:       cl.IP,
-			Summary:  fmt.Sprintf("Connection medium changed for %s (%s): historically %s, now %s on %s", cl.DisplayName(), cl.MAC, prevMed, currMed, fallbackVLAN(cl.NetworkName)),
+			Type:      "client_medium_swap",
+			Severity:  "high",
+			Host:      cl.DisplayName(),
+			IP:        cl.PrimaryIP(),
+			SubjectID: hostEntityID(cl),
+			Summary:   fmt.Sprintf("Connection medium changed for %s (%s): historically %s, now %s on %s", cl.DisplayName(), cl.MAC, prevMed, currMed, fallbackVLAN(cl.NetworkName)),
 		})
 	}
 	return events

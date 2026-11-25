@@ -294,9 +294,10 @@ type persistedWebhook struct {
 }
 
 const (
-	maxPendingWebhooks = 64
-	maxWebhookRetries  = 288
-	maxWebhookAge      = 24 * time.Hour
+	maxPendingWebhooks           = 64
+	maxWebhookRetries            = 288
+	maxWebhookAge                = 24 * time.Hour
+	defaultWebhookCoalesceWindow = 15 * time.Second
 )
 
 // Engine coordinates UniFi event ingestion, targeted single-host live checks,
@@ -330,13 +331,18 @@ type Engine struct {
 	// fullScanMu serializes full scans executed on their own goroutine.
 	fullScanMu sync.Mutex
 
-	// webhookMu guards the asynchronous webhook delivery & retry queue so slow
-	// or failing webhook endpoints never stall recomputeMu or pollDelta.
-	webhookMu        sync.Mutex
-	pendingWebhooks  []pendingWebhook
-	webhookSeq       uint64
-	webhookRunning   bool
-	webhookRetryBase time.Duration
+	// webhookMu guards the asynchronous webhook delivery, coalescing & retry queue
+	// so slow or failing webhook endpoints never stall recomputeMu or pollDelta.
+	webhookMu             sync.Mutex
+	pendingWebhooks       []pendingWebhook
+	webhookSeq            uint64
+	webhookRunning        bool
+	webhookRetryBase      time.Duration
+	webhookCoalesceWindow time.Duration
+	coalesceGen           uint64
+	coalesceCancel        context.CancelFunc
+	coalescedSite         string
+	coalescedEvents       []risk.AlertEvent
 
 	// authLimiter throttles repeated failed API/dashboard auth attempts per IP.
 	authLimiter authFailureLimiter
@@ -440,10 +446,11 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 		findingsByMAC:  make(map[string][]checks.Finding),
 		missingClients: make(map[string]missingClient),
 		lastPorts:      make(map[string]portLiveState),
-		anomalies:      newAnomalyTracker(),
-		lastClasses:    make(map[string]classify.Result),
-		prevRiskState:  prevState,
-		fullRescanCh:   make(chan string, 1),
+		anomalies:             newAnomalyTracker(),
+		lastClasses:           make(map[string]classify.Result),
+		prevRiskState:         prevState,
+		webhookCoalesceWindow: defaultWebhookCoalesceWindow,
+		fullRescanCh:          make(chan string, 1),
 		hostScanCh:     make(chan hostScanTask, 64),
 		subscribers:    make(map[chan LiveEvent]struct{}),
 	}, nil
@@ -1719,6 +1726,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	report := risk.Evaluate(snap, rawFindings, e.cfg.Network)
 
 	var exactCVEs, potentialCVEs []cve.ProductSummary
+	var rawExactMatches []cve.Match
 	cveLoaded := false
 	if cveCache != nil && cveIdent != nil {
 		cveLoaded = true
@@ -1727,6 +1735,11 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 			MinSeverity:          checks.SeverityHigh,
 			PotentialMaxAgeYears: 2,
 		}); err == nil {
+			for _, m := range matches {
+				if m.Confidence == cve.ConfidenceExact {
+					rawExactMatches = append(rawExactMatches, m)
+				}
+			}
 			for _, s := range cve.RollupMatches(matches) {
 				if s.Confidence == cve.ConfidenceExact {
 					exactCVEs = append(exactCVEs, s)
@@ -1805,8 +1818,15 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	postEvents := append([]LiveEvent(nil), extraEvents...)
 	nextState := prevRisk
 	var webhookToSend *pendingWebhook
+	var liveEventsToPush []risk.AlertEvent
 	if baselineReady {
 		diff := risk.ComputeDiffWithProbed(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
+		var nextExactCVEs map[string]string
+		if cveLoaded {
+			var newCVEs []risk.CVEAlert
+			newCVEs, nextExactCVEs = diffExactCVEs(prevRisk, snap, probedHostKeys, rawExactMatches, exactCVEs)
+			diff.NewCVEs = newCVEs
+		}
 		if prevRisk != nil {
 			for _, nf := range diff.NewFindings {
 				postEvents = append(postEvents, LiveEvent{
@@ -1818,11 +1838,20 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 					Summary:   fmt.Sprintf("New [%s] %s: %s", strings.ToUpper(nf.EffectiveSeverity.String()), nf.CheckID, nf.Title),
 				})
 			}
-			if diff.HasAlerts(e.minNotify) && e.notifier != nil {
-				webhookToSend = &pendingWebhook{id: notify.NewWebhookID(), site: snap.Site, diff: diff}
+			pushEvents := selectPushWorthyEvents(extraEvents, snap, e.cfg.Network, e.minNotify)
+			if e.notifier != nil {
+				if diff.HasAlerts(e.minNotify) {
+					diff.Events = append(diff.Events, pushEvents...)
+					webhookToSend = &pendingWebhook{id: notify.NewWebhookID(), site: snap.Site, diff: diff}
+				} else if len(pushEvents) > 0 {
+					liveEventsToPush = pushEvents
+				}
 			}
 		}
 		nextState = risk.BuildStateWithPrev(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
+		if cveLoaded {
+			nextState.ExactCVEs = nextExactCVEs
+		}
 		if e.cfg != nil && e.cfg.State.Path != "" {
 			if err := risk.SaveState(e.cfg.State.Path, nextState); err != nil {
 				e.logger.Error("failed to persist state baseline", "path", e.cfg.State.Path, "err", err)
@@ -1871,6 +1900,8 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 
 	if webhookToSend != nil {
 		e.enqueueWebhook(ctx, *webhookToSend)
+	} else if len(liveEventsToPush) > 0 {
+		e.enqueueLiveEvents(ctx, snap.Site, liveEventsToPush)
 	}
 }
 
@@ -2022,6 +2053,29 @@ func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
 		item.queuedAt = time.Now().UTC()
 	}
 	e.webhookMu.Lock()
+	// Merge any coalesced live events into this immediate webhook so bursts are
+	// delivered together without a duplicate follow-up push.
+	if len(e.coalescedEvents) > 0 {
+		if e.coalesceCancel != nil {
+			e.coalesceCancel()
+			e.coalesceCancel = nil
+		}
+		e.coalesceGen++
+		item.diff.Events = appendUniqueAlertEvents(e.coalescedEvents, item.diff.Events)
+		e.coalescedEvents = nil
+		e.coalescedSite = ""
+	}
+	e.enqueueWebhookLocked(ctx, item, true)
+	e.webhookMu.Unlock()
+}
+
+func (e *Engine) enqueueWebhookLocked(ctx context.Context, item pendingWebhook, startDrainer bool) {
+	if item.id == "" {
+		item.id = notify.NewWebhookID()
+	}
+	if item.queuedAt.IsZero() {
+		item.queuedAt = time.Now().UTC()
+	}
 	e.webhookSeq++
 	item.seq = e.webhookSeq
 	if len(e.pendingWebhooks) >= maxPendingWebhooks {
@@ -2035,11 +2089,285 @@ func (e *Engine) enqueueWebhook(ctx context.Context, item pendingWebhook) {
 	}
 	e.pendingWebhooks = append(e.pendingWebhooks, item)
 	e.persistPendingWebhooksLocked()
-	if !e.webhookRunning && e.notifier != nil {
+	if startDrainer && !e.webhookRunning && e.notifier != nil {
 		e.webhookRunning = true
 		go e.drainWebhooks(ctx)
 	}
+}
+
+// enqueueLiveEvents buffers high-signal live security events for
+// webhookCoalesceWindow so rapid admin/policy edits coalesce into one clean
+// webhook delivery, flushing immediately if the window is zero or on shutdown.
+func (e *Engine) enqueueLiveEvents(ctx context.Context, site string, events []risk.AlertEvent) {
+	if len(events) == 0 || e.notifier == nil {
+		return
+	}
+	e.webhookMu.Lock()
+	window := e.webhookCoalesceWindow
+	if window <= 0 {
+		item := pendingWebhook{
+			id:   notify.NewWebhookID(),
+			site: site,
+			diff: risk.Diff{Events: appendUniqueAlertEvents(nil, events)},
+		}
+		e.enqueueWebhookLocked(ctx, item, true)
+		e.webhookMu.Unlock()
+		return
+	}
+	e.coalescedSite = site
+	e.coalescedEvents = appendUniqueAlertEvents(e.coalescedEvents, events)
+	if e.coalesceCancel != nil {
+		e.webhookMu.Unlock()
+		return
+	}
+	e.coalesceGen++
+	gen := e.coalesceGen
+	waitCtx, cancel := context.WithCancel(ctx)
+	e.coalesceCancel = cancel
 	e.webhookMu.Unlock()
+
+	go func() {
+		timer := time.NewTimer(window)
+		defer timer.Stop()
+		defer cancel()
+		select {
+		case <-timer.C:
+			e.flushCoalescedEvents(ctx, gen, true)
+		case <-waitCtx.Done():
+			// If parent ctx was cancelled (shutdown), persist buffered events to
+			// disk without starting a new drainer so restart delivers them.
+			if ctx.Err() != nil {
+				e.flushCoalescedEvents(ctx, gen, false)
+			}
+		}
+	}()
+}
+
+func (e *Engine) flushCoalescedEvents(ctx context.Context, gen uint64, startDrainer bool) {
+	e.webhookMu.Lock()
+	defer e.webhookMu.Unlock()
+	if e.coalesceGen != gen || len(e.coalescedEvents) == 0 {
+		return
+	}
+	e.coalesceCancel = nil
+	item := pendingWebhook{
+		id:   notify.NewWebhookID(),
+		site: e.coalescedSite,
+		diff: risk.Diff{Events: e.coalescedEvents},
+	}
+	e.coalescedEvents = nil
+	e.coalescedSite = ""
+	e.enqueueWebhookLocked(ctx, item, startDrainer)
+}
+
+func appendUniqueAlertEvents(dst, src []risk.AlertEvent) []risk.AlertEvent {
+	seen := make(map[string]struct{}, len(dst)+len(src))
+	out := make([]risk.AlertEvent, 0, len(dst)+len(src))
+	add := func(ev risk.AlertEvent) {
+		key := ev.Type + "|" + ev.Host + "|" + ev.IP + "|" + ev.Summary
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, ev)
+	}
+	for _, ev := range dst {
+		add(ev)
+	}
+	for _, ev := range src {
+		add(ev)
+	}
+	return out
+}
+
+// diffExactCVEs compares freshly matched exact-version CVEs against the
+// previous baseline state, returning newly matched (or newly KEV-promoted)
+// CVE alerts and the next persisted ExactCVEs map. When prev == nil or
+// prev.ExactCVEs == nil (initial seed or first run after upgrade), it seeds
+// the baseline silently without emitting a storm of historical CVEs.
+func diffExactCVEs(
+	prev *risk.State,
+	snap *unifi.Snapshot,
+	probedHostKeys map[string]struct{},
+	exactMatches []cve.Match,
+	exactRollups []cve.ProductSummary,
+) ([]risk.CVEAlert, map[string]string) {
+	fixedByProd := make(map[string]string, len(exactRollups))
+	for _, s := range exactRollups {
+		pk := fmt.Sprintf("%s|%s|%s",
+			strings.ToLower(strings.TrimSpace(s.Product.HostIP)),
+			strings.ToLower(strings.TrimSpace(s.Product.Label)),
+			strings.ToLower(strings.TrimSpace(s.Product.Version)),
+		)
+		if s.MinFixedVersion != "" {
+			fixedByProd[pk] = s.MinFixedVersion
+		}
+	}
+
+	next := make(map[string]string, len(exactMatches))
+	var alerts []risk.CVEAlert
+	seeded := prev != nil && prev.ExactCVEs != nil
+
+	for _, m := range exactMatches {
+		hostIP := strings.ToLower(strings.TrimSpace(m.Product.HostIP))
+		label := strings.ToLower(strings.TrimSpace(m.Product.Label))
+		ver := strings.ToLower(strings.TrimSpace(m.Product.Version))
+		key := fmt.Sprintf("%s|%s|%s|%s", hostIP, label, ver, m.Record.ID)
+		status := m.Record.Severity.String()
+		if m.Record.KEV {
+			status += "|kev"
+		}
+		next[key] = status
+
+		if !seeded {
+			continue
+		}
+		prevStatus, existed := prev.ExactCVEs[key]
+		kevPromoted := m.Record.KEV && !strings.HasSuffix(prevStatus, "|kev")
+		if existed && !kevPromoted {
+			continue
+		}
+		pk := fmt.Sprintf("%s|%s|%s", hostIP, label, ver)
+		alerts = append(alerts, risk.CVEAlert{
+			CVEID:           m.Record.ID,
+			HostName:        m.Product.HostName,
+			HostIP:          m.Product.HostIP,
+			VLAN:            m.Product.VLAN,
+			Product:         m.Product.Label,
+			Version:         m.Product.Version,
+			Severity:        m.Record.Severity,
+			CVSS:            m.Record.CVSS,
+			KEV:             m.Record.KEV,
+			WANExposed:      m.Product.WANExposed,
+			MinFixedVersion: fixedByProd[pk],
+		})
+	}
+
+	// Carry forward exact CVE keys for hosts not currently online/probed so a
+	// sleeping laptop or briefly disconnected appliance does not re-alert its
+	// existing CVEs when it reconnects.
+	if seeded {
+		activeIPs := make(map[string]struct{})
+		if snap != nil {
+			for _, d := range snap.Devices {
+				if ip := strings.ToLower(strings.TrimSpace(d.IP)); ip != "" {
+					activeIPs[ip] = struct{}{}
+				}
+			}
+			for _, cl := range snap.Clients {
+				for _, ip := range cl.AllIPs() {
+					if low := strings.ToLower(strings.TrimSpace(ip)); low != "" {
+						activeIPs[low] = struct{}{}
+					}
+				}
+			}
+		}
+		for k, v := range prev.ExactCVEs {
+			if _, exists := next[k]; exists {
+				continue
+			}
+			hostIP, _, _ := strings.Cut(k, "|")
+			_, isActive := activeIPs[hostIP]
+			_, wasProbed := probedHostKeys[hostIP]
+			if !isActive || (probedHostKeys != nil && !wasProbed && !isInfraDeviceIP(snap, hostIP)) {
+				next[k] = v
+			}
+		}
+	}
+
+	sort.Slice(alerts, func(i, j int) bool {
+		if alerts[i].KEV != alerts[j].KEV {
+			return alerts[i].KEV
+		}
+		if alerts[i].Severity != alerts[j].Severity {
+			return alerts[i].Severity > alerts[j].Severity
+		}
+		if alerts[i].CVSS != alerts[j].CVSS {
+			return alerts[i].CVSS > alerts[j].CVSS
+		}
+		if alerts[i].HostIP != alerts[j].HostIP {
+			return alerts[i].HostIP < alerts[j].HostIP
+		}
+		return alerts[i].CVEID < alerts[j].CVEID
+	})
+	return alerts, next
+}
+
+func isInfraDeviceIP(snap *unifi.Snapshot, hostIPLow string) bool {
+	if snap == nil || hostIPLow == "" {
+		return false
+	}
+	for _, d := range snap.Devices {
+		if strings.ToLower(strings.TrimSpace(d.IP)) == hostIPLow {
+			return true
+		}
+	}
+	return false
+}
+
+// selectPushWorthyEvents filters live engine events down to high-signal
+// security and edge-tamper events worthy of waking an operator or AI agent:
+// admin activity, firewall/config drift, internal honeypot hits, physical edge
+// tampering (external/unused port link/PoE/config changes and MAC surges),
+// evil-twin Wi-Fi SSIDs, and trusted-VLAN wired/Wi-Fi medium swaps.
+func selectPushWorthyEvents(events []LiveEvent, snap *unifi.Snapshot, netCfg config.NetworkConfig, minNotify checks.Severity) []risk.AlertEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	isSensitivePortSummary := func(summary string) bool {
+		low := strings.ToLower(summary)
+		return strings.Contains(low, "zone=external") || strings.Contains(low, "zone=unused")
+	}
+	isTrustedSwap := func(ev LiveEvent) bool {
+		if snap == nil {
+			return false
+		}
+		for _, cl := range snap.Clients {
+			if (ev.SubjectID != "" && hostEntityID(cl) == ev.SubjectID) ||
+				(ev.IP != "" && clientHasIP(cl, ev.IP)) {
+				return risk.IsClientOnTrustedVLAN(snap, cl, netCfg)
+			}
+		}
+		return false
+	}
+
+	var out []risk.AlertEvent
+	for _, ev := range events {
+		push := false
+		switch ev.Type {
+		case "admin_activity", "policy_changed", "config_drift", "honeypot_hit", "wifi_evil_twin", "port_mac_surge":
+			push = true
+		case "port_poe_tamper":
+			push = strings.EqualFold(ev.Severity, "critical") || isSensitivePortSummary(ev.Summary)
+		case "port_link_up", "port_link_down", "port_config_changed":
+			push = isSensitivePortSummary(ev.Summary)
+		case "client_medium_swap":
+			push = isTrustedSwap(ev)
+		}
+		if !push {
+			continue
+		}
+		sev, err := checks.ParseSeverity(ev.Severity)
+		if err != nil {
+			sev = checks.SeverityMedium
+		}
+		if sev < minNotify {
+			continue
+		}
+		ts := ev.Time
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+		out = append(out, risk.AlertEvent{
+			Type:     ev.Type,
+			Severity: sev,
+			Time:     ts,
+			Host:     ev.Host,
+			IP:       ev.IP,
+			Summary:  ev.Summary,
+		})
+	}
+	return out
 }
 
 func (e *Engine) drainWebhooks(ctx context.Context) {

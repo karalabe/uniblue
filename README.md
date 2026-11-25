@@ -154,9 +154,32 @@ UniBlue is a single unprivileged Go binary (~30-50 MB RAM, no root or `CAP_NET_R
 
 Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes in real time, discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
 
-- **Push alerts with Standard Webhooks signing:** Point `UNIBLUE_WEBHOOK_URL` (`notify.webhook_url`, default `format: "json"`) at your agent's webhook listener and set `UNIBLUE_WEBHOOK_SECRET` (`notify.webhook_secret`, accepting either a raw shared secret or `whsec_<base64>`). Each POST is signed using the Standard Webhooks v1 scheme (`webhook-id`, `webhook-timestamp`, and `webhook-signature: v1,<base64 HMAC-SHA256>`). Retries preserve the exact same `webhook-id` for deduplication while re-signing a fresh `webhook-timestamp` so backoff retries stay within replay windows. Agents without persistent SSE listeners do not need to poll `/api/state`.
+- **Push alerts with Standard Webhooks signing:** Point `UNIBLUE_WEBHOOK_URL` (`notify.webhook_url`, default `format: "json"`) at your agent's webhook listener and set `UNIBLUE_WEBHOOK_SECRET` (`notify.webhook_secret`, accepting either a raw shared secret or padded `whsec_<base64>`). Each POST is signed using the Standard Webhooks v1 scheme (`webhook-id`, `webhook-timestamp`, and `webhook-signature: v1,<base64 HMAC-SHA256>`), with durable retries keeping the same `webhook-id` and re-signing fresh timestamps. Agents without persistent SSE listeners do not need to poll `/api/state`.
 - **Inspect and verify via API:** Set `UNIBLUE_API_TOKEN` so your agent can authenticate with `Authorization: Bearer <token>` to query `GET /api/state` (findings, CVEs, topology, recent events) or subscribe to the live SSE stream at `GET /api/events`. Once you approve a fix (applied manually in UniFi or by your agent on a managed host), it can call `POST /api/rescan?ip=<ip>` to verify the issue is closed.
 - **Keep your dashboard locked down on LAN:** Whenever `UNIBLUE_API_TOKEN` is set, `/api/*` requires either a Bearer token or an `HttpOnly` `SameSite=Strict` session cookie established through the built-in login prompt, with per-IP brute-force lockout (5 bad attempts within 15 minutes triggers a 15-minute lockout, escalating up to 1 hour). If you expose UniBlue behind a reverse proxy or custom domain, add that hostname to `UNIBLUE_ALLOWED_HOSTS` so DNS-rebinding Host checks permit it.
+
+### Webhook events
+
+With `format: "json"` (the default), each webhook POST sends `{"site", "summary", "diff"}` filtered by `min_severity` (default `medium`). Rapid live-event bursts coalesce over 15 seconds into one delivery, while new findings, CVEs, trusted devices, and port forwards dispatch immediately (merging any buffered live events).
+
+| Payload field / `diff.events[].type` | Trigger |
+| --- | --- |
+| `diff.new_findings` | New security or posture finding at or above `min_severity` |
+| `diff.escalated_findings` | Existing finding whose effective severity increased (e.g., host moved to a trusted VLAN or port-forwarded) |
+| `diff.new_cves` | Newly matched High/Critical exact-version CVE or newly CISA KEV-listed CVE (includes `cve_id`, `product`, `version`, `cvss`, `kev`, `min_fixed_version`) |
+| `diff.new_trusted_clients` | Previously unseen device joining a trusted VLAN |
+| `diff.new_port_forwards` | Newly enabled WAN port-forwarding rule |
+| `admin_activity` | UniFi console admin logins, account edits, and settings changes |
+| `policy_changed` | Firewall policy or WAN port-forward rule set changed |
+| `config_drift` | Controller security controls (SSH, UPnP, IPS, Honeypot, DoH, Teleport) or Wi-Fi SSID security changed |
+| `honeypot_hit` | Internal LAN host probed UniFi's internal Honeypot |
+| `port_link_up` / `port_link_down` / `port_config_changed` | Link or port-config changes on ports zoned `external`, `external_uplink`, or `unused` |
+| `port_poe_tamper` | PoE device replaced by a non-PoE host on an `external` or `unused` port |
+| `port_mac_surge` | Single-MAC access port jumped to 2+ MACs (possible inline hub or tap) |
+| `wifi_evil_twin` | Unknown AP broadcasting one of your site's Wi-Fi SSIDs |
+| `client_medium_swap` | Trusted-VLAN device switched between wired and Wi-Fi with the same MAC |
+
+Intentionally kept on the dashboard/SSE only (not pushed to webhooks): WAN IPS/IDS blocked scanner traffic (`ids_threat`), internal port link/PoE/config flaps, STP blocks, dormant device wakeups, untrusted-VLAN joins/medium swaps, low/info findings, and resolved items.
 
 ### Environment variables (Docker / Unraid / zero-config)
 

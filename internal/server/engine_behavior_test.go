@@ -1528,3 +1528,186 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 	now = now.Add(sessionTTL + time.Minute)
 	checkState(ck2, http.StatusUnauthorized)
 }
+
+// TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise verifies:
+// (1) initial/upgraded CVE baselines seed silently without blasting old CVEs,
+//     while newly discovered or newly KEV-promoted exact CVEs push immediately;
+// (2) bursty admin/policy/config events coalesce into a single webhook push;
+// (3) edge physical tamper, evil-twin, honeypot, and trusted medium-swap events
+//     push, whereas WAN IPS blocks, internal link/PoE/STP flaps, dormant wakeups,
+//     and untrusted medium swaps stay off the push.
+func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing.T) {
+	type receivedWebhook struct {
+		Diff risk.Diff `json:"diff"`
+	}
+	var mu sync.Mutex
+	var received []receivedWebhook
+	notifyCh := make(chan struct{}, 16)
+
+	whSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p receivedWebhook
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		mu.Lock()
+		received = append(received, p)
+		mu.Unlock()
+		select {
+		case notifyCh <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer whSrv.Close()
+
+	cacheDir := t.TempDir()
+	writeShard := func(recs []cve.Record, stats *cve.CacheStats) {
+		t.Helper()
+		vendorsDir := filepath.Join(cacheDir, "vendors")
+		if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Create(filepath.Join(vendorsDir, "f5.json.gz"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gz := gzip.NewWriter(f)
+		if err := json.NewEncoder(gz).Encode(recs); err != nil {
+			t.Fatal(err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(stats)
+		if err := os.WriteFile(filepath.Join(cacheDir, "stats.json"), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec1 := cve.Record{
+		ID: "CVE-2026-88001", Severity: checks.SeverityHigh, CVSS: 7.5,
+		Matches: []cve.CPEMatch{{Part: "a", Vendor: "f5", Product: "nginx", StartIncl: "1.26.0", EndExcl: "1.26.4"}},
+	}
+	rec2 := cve.Record{
+		ID: "CVE-2026-88002", Severity: checks.SeverityCritical, CVSS: 9.8, KEV: true,
+		Matches: []cve.CPEMatch{{Part: "a", Vendor: "f5", Product: "nginx", StartIncl: "1.26.0", EndExcl: "1.26.5"}},
+	}
+	writeShard([]cve.Record{rec1}, &cve.CacheStats{SyncedAt: time.Now().UTC(), TotalCVEs: 1, IndexedCPECVEs: 1, VendorCount: 1})
+
+	cfg := config.Default()
+	cfg.UniFi.URL = "https://192.0.2.1"
+	cfg.UniFi.APIKey = "test"
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	cfg.CVE.CacheDir = cacheDir
+	cfg.Notify.WebhookURL = whSrv.URL
+	cfg.Notify.Format = "json"
+	cfg.Notify.MinSeverity = "medium"
+	cfg.Network.TrustedVLANs = []string{"Main"}
+	cfg.Network.IsolatedVLANs = []string{"IoT"}
+
+	eng, err := NewEngine(cfg, nil, nil, Options{})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	eng.webhookCoalesceWindow = 30 * time.Millisecond
+
+	trustedCl := unifi.Client{MAC: "02:aa:bb:00:00:10", IP: "10.0.1.10", Name: "workstation", NetworkName: "Main", IsWired: true}
+	iotCl := unifi.Client{MAC: "02:aa:bb:00:00:20", IP: "10.0.20.20", Name: "amp", NetworkName: "IoT", IsWired: true}
+	snap := &unifi.Snapshot{
+		Site: "Home",
+		Networks: []unifi.Network{
+			{ID: "n1", Name: "Main", Subnet: "10.0.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
+			{ID: "n2", Name: "IoT", Subnet: "10.0.20.1/24", Purpose: "corporate", ZoneName: "IoT", IsolationEnabled: true},
+		},
+		Clients: []unifi.Client{trustedCl, iotCl},
+	}
+
+	eng.mu.Lock()
+	eng.snap = snap
+	eng.baselineComplete = true
+	// Simulate upgraded state.json where ExactCVEs was not yet seeded (nil map).
+	eng.prevRiskState = &risk.State{
+		UpdatedAt:      time.Now().UTC(),
+		Findings:       map[string]checks.Severity{},
+		TrustedClients: map[string]string{trustedCl.MAC: trustedCl.Name},
+		PortForwards:   map[string]string{},
+	}
+	eng.profilesByMAC[clientKey(iotCl)] = probe.HostProfile{
+		Client:    iotCl,
+		OpenPorts: []int{80},
+		HTTP:      map[int]probe.HTTPBanner{80: {Server: "nginx/1.26.3"}},
+		ScannedAt: time.Now().UTC(),
+	}
+	eng.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. First recompute seeds ExactCVEs silently; noisy events must NOT push.
+	eng.recomputeAndPublish(ctx, false, []LiveEvent{
+		{Type: "ids_threat", Severity: "high", Summary: "Blocked WAN scan"},
+		{Type: "port_stp_blocked", Severity: "high", Summary: "STP blocked Switch Port 3"},
+		{Type: "client_dormant_wakeup", Severity: "medium", Summary: "Old tablet woke up"},
+		{Type: "port_link_up", Severity: "info", Summary: "Physical link UP on Main Switch Port 2 (zone=internal, VLAN=Main)"},
+		{Type: "port_poe_tamper", Severity: "high", Summary: "Possible physical cable swap on Main Switch Port 2 (zone=internal)"},
+		{Type: "client_medium_swap", Severity: "high", SubjectID: hostEntityID(iotCl), IP: iotCl.IP, Summary: "IoT device swapped medium"},
+	})
+	time.Sleep(60 * time.Millisecond)
+	mu.Lock()
+	if len(received) != 0 {
+		t.Fatalf("expected 0 webhooks on silent CVE seed + noisy events, got %+v", received)
+	}
+	mu.Unlock()
+
+	// 2. Burst of high-signal events (admin + policy + edge tamper + trusted swap)
+	// coalesces into a SINGLE webhook delivery.
+	eng.recomputeAndPublish(ctx, false, []LiveEvent{
+		{Type: "admin_activity", Severity: "medium", Summary: "Alice changed firewall settings"},
+		{Type: "policy_changed", Severity: "high", Summary: "UniFi firewall policies changed"},
+	})
+	eng.recomputeAndPublish(ctx, false, []LiveEvent{
+		{Type: "port_link_down", Severity: "high", Summary: "Physical link DOWN on Garage Switch Port 4 (zone=external)"},
+		{Type: "port_poe_tamper", Severity: "critical", Summary: "Possible physical cable swap on Garage Switch Port 4 (zone=external)"},
+		{Type: "port_mac_surge", Severity: "high", Summary: "MAC table jumped 1 -> 2 on Switch Port 5 (zone=internal)"},
+		{Type: "wifi_evil_twin", Severity: "critical", Summary: "Possible Evil-Twin AP broadcasting HomeWiFi"},
+		{Type: "honeypot_hit", Severity: "high", Summary: "Internal device probed UniFi Honeypot"},
+		{Type: "client_medium_swap", Severity: "high", SubjectID: hostEntityID(trustedCl), IP: trustedCl.IP, Summary: "workstation swapped Wired -> Wi-Fi"},
+	})
+
+	select {
+	case <-notifyCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for coalesced live-event webhook")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	if len(received) != 1 {
+		t.Fatalf("expected burst of live events to coalesce into 1 webhook, got %d (%+v)", len(received), received)
+	}
+	if len(received[0].Diff.Events) != 8 {
+		t.Fatalf("expected 8 coalesced high-signal events, got %d (%+v)", len(received[0].Diff.Events), received[0].Diff.Events)
+	}
+	mu.Unlock()
+
+	// 3. New KEV CVE lands in cache -> pushes immediately with CVE + MinFixedVersion.
+	writeShard([]cve.Record{rec1, rec2}, &cve.CacheStats{SyncedAt: time.Now().UTC().Add(time.Second), TotalCVEs: 2, IndexedCPECVEs: 2, VendorCount: 1, KEVCount: 1})
+	eng.recomputeAndPublish(ctx, false, nil)
+
+	select {
+	case <-notifyCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for new exact CVE webhook")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 2 {
+		t.Fatalf("expected 2 total webhooks, got %d", len(received))
+	}
+	cves := received[1].Diff.NewCVEs
+	if len(cves) != 1 || cves[0].CVEID != "CVE-2026-88002" || !cves[0].KEV || cves[0].MinFixedVersion != "1.26.5" {
+		t.Fatalf("unexpected NewCVEs webhook payload: %+v", cves)
+	}
+}

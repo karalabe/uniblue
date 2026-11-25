@@ -103,6 +103,40 @@ type State struct {
 
 	// PortForwards maps enabled port-forward keys to a human-readable summary.
 	PortForwards map[string]string `json:"port_forwards"`
+
+	// ExactCVEs maps exact-version CVE alert keys ("host|product|version|cveID")
+	// to their last known status ("high", "critical", "high|kev", etc.) so only
+	// newly matched or newly KEV-promoted exact CVEs trigger outbound webhooks.
+	// A nil map indicates the CVE baseline has not been seeded yet.
+	ExactCVEs map[string]string `json:"exact_cves,omitempty"`
+}
+
+// AlertEvent represents a high-signal live security event (admin activity,
+// firewall or config drift, honeypot hit, edge physical tamper, evil-twin AP,
+// or trusted-VLAN medium swap) forwarded via webhook alongside diff changes.
+type AlertEvent struct {
+	Type     string          `json:"type"`
+	Severity checks.Severity `json:"severity"`
+	Time     time.Time       `json:"time,omitempty"`
+	Host     string          `json:"host,omitempty"`
+	IP       string          `json:"ip,omitempty"`
+	Summary  string          `json:"summary"`
+}
+
+// CVEAlert represents a newly matched or newly KEV-promoted exact-version CVE
+// on a LAN host or UniFi infrastructure appliance.
+type CVEAlert struct {
+	CVEID           string          `json:"cve_id"`
+	HostName        string          `json:"host_name"`
+	HostIP          string          `json:"host_ip"`
+	VLAN            string          `json:"vlan,omitempty"`
+	Product         string          `json:"product"`
+	Version         string          `json:"version,omitempty"`
+	Severity        checks.Severity `json:"severity"`
+	CVSS            float64         `json:"cvss,omitempty"`
+	KEV             bool            `json:"kev,omitempty"`
+	WANExposed      bool            `json:"wan_exposed,omitempty"`
+	MinFixedVersion string          `json:"min_fixed_version,omitempty"`
 }
 
 // Diff summarizes security-relevant changes between the previous persisted
@@ -123,6 +157,12 @@ type Diff struct {
 
 	// NewPortForwards lists newly enabled WAN port-forwarding rules.
 	NewPortForwards []unifi.PortForward `json:"new_port_forwards,omitempty"`
+
+	// NewCVEs lists newly matched (or newly KEV-listed) exact-version CVEs.
+	NewCVEs []CVEAlert `json:"new_cves,omitempty"`
+
+	// Events lists high-signal live security events warranting operator or agent review.
+	Events []AlertEvent `json:"events,omitempty"`
 }
 
 // HasAlerts reports whether Diff contains any notable event matching or
@@ -138,7 +178,24 @@ func (d Diff) HasAlerts(minSeverity checks.Severity) bool {
 			return true
 		}
 	}
+	for _, c := range d.NewCVEs {
+		if c.KEV || c.Severity >= minSeverity {
+			return true
+		}
+	}
+	for _, ev := range d.Events {
+		if ev.Severity >= minSeverity {
+			return true
+		}
+	}
 	return len(d.NewTrustedClients) > 0 || len(d.NewPortForwards) > 0
+}
+
+// IsClientOnTrustedVLAN reports whether cl sits on a VLAN classified as trusted
+// by UniBlue's VLAN tier resolution.
+func IsClientOnTrustedVLAN(snap *unifi.Snapshot, cl unifi.Client, netCfg config.NetworkConfig) bool {
+	trustedSet, _ := resolveVLANTiers(snap, netCfg)
+	return matchesVLAN(cl, trustedSet)
 }
 
 // Evaluate applies UniFi blast-radius scoring to raw check findings and appends
@@ -518,6 +575,12 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 			if pf.Enabled {
 				st.PortForwards[portForwardKey(pf)] = fmt.Sprintf("%s (%s:%s -> %s:%s)", pf.Name, pf.Proto, pf.DstPort, pf.FwdIP, pf.FwdPort)
 			}
+		}
+	}
+	if prev != nil && prev.ExactCVEs != nil {
+		st.ExactCVEs = make(map[string]string, len(prev.ExactCVEs))
+		for k, v := range prev.ExactCVEs {
+			st.ExactCVEs[k] = v
 		}
 	}
 	return st

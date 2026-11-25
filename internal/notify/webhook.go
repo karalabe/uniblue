@@ -296,7 +296,7 @@ func escapeSlack(s string) string {
 	return r.Replace(s)
 }
 
-// filterDiff returns a copy of diff containing only findings at or above minSev.
+// filterDiff returns a copy of diff containing only items at or above minSev.
 func filterDiff(d risk.Diff, minSev checks.Severity) risk.Diff {
 	out := risk.Diff{
 		ResolvedKeys:      d.ResolvedKeys,
@@ -311,6 +311,16 @@ func filterDiff(d risk.Diff, minSev checks.Severity) risk.Diff {
 	for _, f := range d.EscalatedFindings {
 		if f.EffectiveSeverity >= minSev {
 			out.EscalatedFindings = append(out.EscalatedFindings, f)
+		}
+	}
+	for _, c := range d.NewCVEs {
+		if c.KEV || c.Severity >= minSev {
+			out.NewCVEs = append(out.NewCVEs, c)
+		}
+	}
+	for _, ev := range d.Events {
+		if ev.Severity >= minSev {
+			out.Events = append(out.Events, ev)
 		}
 	}
 	return out
@@ -332,7 +342,7 @@ func formatSummary(site string, d risk.Diff, escape func(string) string) string 
 
 	for _, f := range d.NewFindings {
 		fmt.Fprintf(&b, "- [NEW %s] %s on %s (%s): %s\n",
-			strings.ToUpper(f.EffectiveSeverity.String()), esc(f.Title), esc(f.Client.DisplayName()), esc(f.Client.IP), esc(f.Evidence))
+			strings.ToUpper(f.EffectiveSeverity.String()), esc(f.Title), esc(f.Client.DisplayName()), esc(f.Client.PrimaryIP()), esc(f.Evidence))
 	}
 	for _, f := range d.EscalatedFindings {
 		reasons := make([]string, len(f.RiskReasons))
@@ -340,26 +350,56 @@ func formatSummary(site string, d risk.Diff, escape func(string) string) string 
 			reasons[i] = esc(r)
 		}
 		fmt.Fprintf(&b, "- [ESCALATED %s] %s on %s (%s): %s\n",
-			strings.ToUpper(f.EffectiveSeverity.String()), esc(f.Title), esc(f.Client.DisplayName()), esc(f.Client.IP), strings.Join(reasons, "; "))
+			strings.ToUpper(f.EffectiveSeverity.String()), esc(f.Title), esc(f.Client.DisplayName()), esc(f.Client.PrimaryIP()), strings.Join(reasons, "; "))
+	}
+	for _, c := range d.NewCVEs {
+		kevTag := ""
+		if c.KEV {
+			kevTag = " KEV"
+		}
+		fixTag := ""
+		if c.MinFixedVersion != "" {
+			fixTag = ", fix >= " + esc(c.MinFixedVersion)
+		}
+		ver := strings.TrimSpace(esc(c.Product) + " " + esc(c.Version))
+		fmt.Fprintf(&b, "- [NEW CVE %s%s] %s on %s (%s): %s (CVSS %.1f%s)\n",
+			strings.ToUpper(c.Severity.String()), kevTag, esc(c.CVEID), esc(c.HostName), esc(c.HostIP), ver, c.CVSS, fixTag)
 	}
 	for _, cl := range d.NewTrustedClients {
 		fmt.Fprintf(&b, "- [NEW TRUSTED DEVICE] %s (%s / %s) joined %s\n",
-			esc(cl.DisplayName()), esc(cl.IP), esc(cl.MAC), esc(cl.NetworkName))
+			esc(cl.DisplayName()), esc(cl.PrimaryIP()), esc(cl.MAC), esc(cl.NetworkName))
 	}
 	for _, pf := range d.NewPortForwards {
 		fmt.Fprintf(&b, "- [NEW PORT FORWARD] %s: %s WAN:%s -> %s:%s\n",
 			esc(pf.Name), esc(pf.Proto), esc(pf.DstPort), esc(pf.FwdIP), esc(pf.FwdPort))
 	}
+	for _, ev := range d.Events {
+		fmt.Fprintf(&b, "- [%s %s] %s\n",
+			strings.ToUpper(ev.Severity.String()), strings.ToUpper(esc(ev.Type)), esc(ev.Summary))
+	}
 	return strings.TrimSpace(b.String())
 }
 
-// ntfyPriority maps the highest finding severity in the diff to an ntfy
-// priority level ("default", "high", or "urgent").
+// ntfyPriority maps the highest severity item in the diff to an ntfy priority
+// level ("default", "high", or "urgent").
 func ntfyPriority(d risk.Diff) string {
 	highest := checks.SeverityMedium
 	for _, f := range append(append([]checks.Finding(nil), d.NewFindings...), d.EscalatedFindings...) {
 		if f.EffectiveSeverity > highest {
 			highest = f.EffectiveSeverity
+		}
+	}
+	for _, c := range d.NewCVEs {
+		if c.KEV && checks.SeverityCritical > highest {
+			highest = checks.SeverityCritical
+		}
+		if c.Severity > highest {
+			highest = c.Severity
+		}
+	}
+	for _, ev := range d.Events {
+		if ev.Severity > highest {
+			highest = ev.Severity
 		}
 	}
 	switch highest {

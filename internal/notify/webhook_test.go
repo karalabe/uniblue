@@ -467,3 +467,77 @@ func TestNotifierStandardWebhooksSigning(t *testing.T) {
 		}
 	})
 }
+
+// TestNotifierFormatsNewCVEsAndSecurityEvents verifies that NewCVEs and high-signal
+// AlertEvents pass HasAlerts, serialize cleanly in JSON payloads, format human
+// summaries with KEV/fix metadata, and raise ntfy priority appropriately.
+func TestNotifierFormatsNewCVEsAndSecurityEvents(t *testing.T) {
+	var body []byte
+	var priority string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		priority = r.Header.Get("Priority")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	diff := risk.Diff{
+		NewCVEs: []risk.CVEAlert{{
+			CVEID:           "CVE-2026-99999",
+			HostName:        "LivingRoomAmp",
+			HostIP:          "10.0.30.50",
+			VLAN:            "IoT",
+			Product:         "nginx",
+			Version:         "1.26.3",
+			Severity:        checks.SeverityHigh,
+			CVSS:            8.8,
+			KEV:             true,
+			MinFixedVersion: "1.26.4",
+		}},
+		Events: []risk.AlertEvent{
+			{Type: "admin_activity", Severity: checks.SeverityMedium, Summary: "Alice made 2 changes to Firewall settings"},
+			{Type: "policy_changed", Severity: checks.SeverityHigh, Summary: "UniFi firewall policies changed"},
+		},
+	}
+
+	// JSON webhook for agents (min_severity=high keeps KEV CVE and high event, filters medium event).
+	nJSON, err := New(config.NotifyConfig{WebhookURL: srv.URL, Format: "json", MinSeverity: "high"})
+	if err != nil {
+		t.Fatalf("New(json): %v", err)
+	}
+	if err := nJSON.Send(context.Background(), "Home", diff); err != nil {
+		t.Fatalf("Send(json): %v", err)
+	}
+	var payload struct {
+		Site    string    `json:"site"`
+		Summary string    `json:"summary"`
+		Diff    risk.Diff `json:"diff"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal json payload: %v", err)
+	}
+	if len(payload.Diff.NewCVEs) != 1 || payload.Diff.NewCVEs[0].CVEID != "CVE-2026-99999" {
+		t.Fatalf("expected 1 NewCVE in JSON diff, got %+v", payload.Diff.NewCVEs)
+	}
+	if len(payload.Diff.Events) != 1 || payload.Diff.Events[0].Type != "policy_changed" {
+		t.Fatalf("expected only high policy_changed event above min_severity=high, got %+v", payload.Diff.Events)
+	}
+	if !strings.Contains(payload.Summary, "CVE-2026-99999") || !strings.Contains(payload.Summary, "KEV") || !strings.Contains(payload.Summary, "fix >= 1.26.4") {
+		t.Fatalf("unexpected CVE summary: %s", payload.Summary)
+	}
+	if !strings.Contains(payload.Summary, "[HIGH POLICY_CHANGED]") {
+		t.Fatalf("unexpected event summary: %s", payload.Summary)
+	}
+
+	// ntfy escalates KEV CVE to urgent priority.
+	nNtfy, err := New(config.NotifyConfig{WebhookURL: srv.URL, Format: "ntfy", MinSeverity: "medium"})
+	if err != nil {
+		t.Fatalf("New(ntfy): %v", err)
+	}
+	if err := nNtfy.Send(context.Background(), "Home", diff); err != nil {
+		t.Fatalf("Send(ntfy): %v", err)
+	}
+	if priority != "urgent" {
+		t.Fatalf("expected ntfy urgent priority for KEV CVE, got %q", priority)
+	}
+}
