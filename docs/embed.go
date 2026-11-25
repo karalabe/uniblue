@@ -12,5 +12,5 @@ import "embed"
 
 // LogoFS contains the UniBlue SVG brand logos and favicon icon.
 //
-//go:embed logo-horizontal-light.svg logo-horizontal-dark.svg logo-light.svg
+//go:embed logo-header-light.svg logo-header-dark.svg logo-light.svg
 var LogoFS embed.FS

@@ -84,8 +84,8 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", e.handleState)
 	mux.HandleFunc("GET /api/events", e.handleEventsSSE)
 	mux.HandleFunc("POST /api/rescan", e.handleRescan)
-	mux.HandleFunc("GET /assets/logo-light.svg", serveEmbeddedSVG("logo-horizontal-light.svg"))
-	mux.HandleFunc("GET /assets/logo-dark.svg", serveEmbeddedSVG("logo-horizontal-dark.svg"))
+	mux.HandleFunc("GET /assets/logo-light.svg", serveEmbeddedSVG("logo-header-light.svg"))
+	mux.HandleFunc("GET /assets/logo-dark.svg", serveEmbeddedSVG("logo-header-dark.svg"))
 	mux.HandleFunc("GET /assets/favicon.svg", serveEmbeddedSVG("logo-light.svg"))
 	mux.HandleFunc("GET /favicon.ico", serveEmbeddedSVG("logo-light.svg"))
 	return e.protectHTTP(mux)
@@ -186,11 +186,11 @@ func RenderStaticHTML(w io.Writer, snap StateSnapshot) error {
 	safeJSON := strings.ReplaceAll(string(rawState), "</", `<\/`)
 
 	html := string(dashboardHTML)
-	if light, err := fs.ReadFile(docs.LogoFS, "logo-horizontal-light.svg"); err == nil && len(light) > 0 {
+	if light, err := fs.ReadFile(docs.LogoFS, "logo-header-light.svg"); err == nil && len(light) > 0 {
 		uri := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(light)
 		html = strings.ReplaceAll(html, `src="/assets/logo-light.svg"`, `src="`+uri+`"`)
 	}
-	if dark, err := fs.ReadFile(docs.LogoFS, "logo-horizontal-dark.svg"); err == nil && len(dark) > 0 {
+	if dark, err := fs.ReadFile(docs.LogoFS, "logo-header-dark.svg"); err == nil && len(dark) > 0 {
 		uri := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(dark)
 		html = strings.ReplaceAll(html, `srcset="/assets/logo-dark.svg"`, `srcset="`+uri+`"`)
 	}
