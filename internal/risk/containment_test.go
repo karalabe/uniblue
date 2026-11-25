@@ -268,4 +268,63 @@ func TestLockedDownIoTAndIPv6InternetInboundParityLeaks(t *testing.T) {
 			t.Fatalf("expected both High IPv6 leak findings, got %+v", findings)
 		}
 	})
+
+	t.Run("subnet-scoped Isolated Networks rule resolves Cameras to BMC as blocked-ok and LAN egress as blocked", func(t *testing.T) {
+		snap := &unifi.Snapshot{
+			Networks: []unifi.Network{
+				{ID: "net-srv", Name: "Servers", VLAN: "2", Purpose: "corporate", ZoneName: "Internal", Subnet: "10.2.0.1/16"},
+				{ID: "net-cam", Name: "Cameras", VLAN: "3", Purpose: "corporate", ZoneName: "Cameras", Subnet: "10.3.0.1/16", IsolationEnabled: true, InternetAccessEnabled: boolPtr(false)},
+			},
+			Devices: []unifi.Device{
+				{MAC: "aa:bb:cc:00:00:01", Name: "UDM Pro", Type: "udm", IP: "10.0.0.1"},
+			},
+			Clients: []unifi.Client{
+				{MAC: "11:22:33:44:55:99", Name: "Unraid Management Console", IP: "10.2.0.5", NetworkName: "Servers", IsWired: true},
+			},
+			FirewallPolicies: []unifi.FirewallPolicy{
+				{
+					ID: "p-iso", Name: "Isolated Networks", Enabled: true, Index: 30000, Action: "BLOCK", IPVersion: "both", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Cameras", IPs: []string{"10.3.0.0/16"}, AnyTarget: false, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+				{
+					ID: "p-cam-int", Name: "Block All Traffic", Enabled: true, Index: 2147483647, Action: "BLOCK", IPVersion: "both", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Cameras", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				},
+				{
+					ID: "p-cam-gw-dhcp", Name: "Allow DHCP & NTP", Enabled: true, Index: 10001, Action: "ALLOW", IPVersion: "both", Protocol: "udp",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Cameras", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, AnyPort: false, Ports: []int{67, 123, 10001}},
+				},
+				{
+					ID: "p-cam-gw-blk", Name: "Block All Traffic", Enabled: true, Index: 10003, Action: "BLOCK", IPVersion: "both", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Cameras", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, AnyPort: true},
+				},
+				{
+					ID: "p-int-cam", Name: "Block All Traffic", Enabled: true, Index: 2147483647, Action: "BLOCK", IPVersion: "both", Protocol: "all",
+					Source:      unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+					Destination: unifi.PolicyEndpoint{ZoneName: "Cameras", AnyTarget: true, AnyPort: true},
+				},
+			},
+			SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
+			Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true, SwitchACLsAvailable: true},
+		}
+
+		mat, findings, notes := EvaluateIsolation(snap, nil, config.NetworkConfig{})
+		if len(mat.Containment) != 1 {
+			t.Fatalf("expected 1 containment entry, got %+v", mat.Containment)
+		}
+		nc := mat.Containment[0]
+		if nc.Peers.State != "isolated" || nc.LANEgress.State != "blocked" || nc.InternetEgress.State != "blocked" || nc.LANInbound.State != "blocked" {
+			t.Fatalf("expected all 4 Cameras containment axes green, got %+v", nc)
+		}
+		if mat.UnknownCount != 0 || mat.BrokenDepCount != 0 || mat.ViolationCount != 0 {
+			t.Fatalf("expected 0 unknown/broken/violation cells for locked-down Cameras, got unknown=%d broken=%d viol=%d cells=%+v", mat.UnknownCount, mat.BrokenDepCount, mat.ViolationCount, mat.Cells)
+		}
+		if len(findings) != 0 || len(notes) != 0 {
+			t.Fatalf("expected 0 findings and 0 notes, got findings=%+v notes=%+v", findings, notes)
+		}
+	})
 }

@@ -793,6 +793,21 @@ func evaluateRoutedPath(
 	q pathQuery,
 	destHost, destFunction, expected string,
 ) IsolationCell {
+	// When a network-wide query leaves srcIP/srcMAC unspecified (for example,
+	// Untrusted -> BMC, Guest -> Printer, or Gateway DHCP/DNS), partition the
+	// source network across all policy source selectors so subnet-scoped rules
+	// (such as UniFi's "Isolated Networks" with source 10.3.0.0/16) resolve
+	// cleanly while single-host rules still get exact multi-partition coverage.
+	if strings.TrimSpace(q.srcIP) == "" && strings.TrimSpace(q.srcMAC) == "" {
+		if sample := sampleNetworkIPForFamily(srcNet, snap, q.ipFamily); sample != "" {
+			return evaluateRoutedPathAcrossSourceNetwork(
+				snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
+				switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
+				q, destHost, destFunction, expected, sample,
+			)
+		}
+	}
+
 	isGatewayLocal := strings.EqualFold(q.dstZone, "gateway")
 	pathKind := "gateway-routed"
 	if isGatewayLocal {
@@ -866,6 +881,157 @@ func evaluateRoutedPath(
 	dec := evaluateGatewayPolicies(sortedPolicies, q)
 	applyDecisionToCell(&cell, dec)
 	return cell
+}
+
+// evaluateRoutedPathAcrossSourceNetwork evaluates a network-wide routed query
+// across every distinct source IP/MAC equivalence class of srcNet so subnet-scoped
+// rules resolve deterministically without ever masking partial-subnet leaks.
+func evaluateRoutedPathAcrossSourceNetwork(
+	snap *unifi.Snapshot,
+	sortedPolicies []unifi.FirewallPolicy,
+	gwPoliciesAvailable bool,
+	gwMissingReason string,
+	switchACLStatus, switchACLReason, gwName string,
+	srcNet, dstNet unifi.Network,
+	q pathQuery,
+	destHost, destFunction, expected, srcIPSample string,
+) IsolationCell {
+	var srcPosSelectors, srcNegSelectors []string
+	srcMACSet := make(map[string]struct{})
+	hasSrcMAC := false
+
+	collectEndpoint := func(ep unifi.PolicyEndpoint) {
+		if ep.ZoneName != "" && q.srcZone != "" && !strings.EqualFold(ep.ZoneName, q.srcZone) {
+			return
+		}
+		if !endpointMatchesNetworkSelector(ep, srcNet) {
+			return
+		}
+		if ep.AnyTarget {
+			return
+		}
+		if ep.NegateTarget {
+			srcNegSelectors = append(srcNegSelectors, ep.IPs...)
+		} else {
+			srcPosSelectors = append(srcPosSelectors, ep.IPs...)
+		}
+		for _, m := range ep.MACs {
+			if ml := strings.ToLower(strings.TrimSpace(m)); ml != "" {
+				hasSrcMAC = true
+				srcMACSet[ml] = struct{}{}
+			}
+		}
+	}
+
+	for _, pol := range sortedPolicies {
+		if !pol.Enabled || !matchesIPFamily(pol.IPVersion, q.ipFamily) || !matchesConnState(pol.ConnectionStates, q.state) {
+			continue
+		}
+		if pol.Destination.ZoneName != "" && q.dstZone != "" && !strings.EqualFold(pol.Destination.ZoneName, q.dstZone) {
+			continue
+		}
+		collectEndpoint(pol.Source)
+	}
+	if !strings.EqualFold(q.dstZone, "gateway") && firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC) != "" {
+		for _, acl := range snap.SwitchACLs {
+			if !acl.Enabled || !matchesIPFamily(acl.IPVersion, q.ipFamily) {
+				continue
+			}
+			collectEndpoint(acl.Source)
+		}
+	}
+
+	srcNetPfx, hasSrcNetPfx := networkPrefixForFamily(srcNet, q.ipFamily)
+	prefSrc, _ := netip.ParseAddr(strings.TrimSpace(srcIPSample))
+	prefSrc = prefSrc.Unmap()
+
+	var srcIPs []string
+	for _, iv := range partitionIPIntervals(srcNet, snap, q.ipFamily, srcPosSelectors, srcNegSelectors, nil) {
+		if rep := representativeIPInInterval(iv, srcNetPfx, hasSrcNetPfx, prefSrc); rep != "" {
+			srcIPs = append(srcIPs, rep)
+		}
+	}
+	if len(srcIPs) == 0 {
+		srcIPs = []string{srcIPSample}
+	}
+
+	var srcMACs []string
+	if hasSrcMAC {
+		for m := range srcMACSet {
+			srcMACs = append(srcMACs, m)
+		}
+		sort.Strings(srcMACs)
+		srcMACs = append(srcMACs, syntheticOtherMAC)
+	} else {
+		srcMACs = []string{""}
+	}
+
+	var firstCell IsolationCell
+	var unknownCell *IsolationCell
+	var brokenCell *IsolationCell
+	first := true
+	evals := 0
+	for _, sip := range srcIPs {
+		for _, smac := range srcMACs {
+			evals++
+			if evals > maxExactBoundaryEvals {
+				if first {
+					firstCell = evaluateRoutedPath(
+						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
+						switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
+						pathQuery{
+							srcZone: q.srcZone, srcNetID: q.srcNetID, srcNetName: q.srcNetName,
+							srcIP: srcIPSample, srcPort: q.srcPort,
+							dstZone: q.dstZone, dstNetID: q.dstNetID, dstNetName: q.dstNetName,
+							dstIP: q.dstIP, dstMAC: q.dstMAC,
+							proto: q.proto, port: q.port, ipFamily: q.ipFamily, state: q.state,
+						}, destHost, destFunction, expected,
+					)
+				}
+				firstCell.Effective = "unknown"
+				firstCell.Verdict = IsolationUnknown
+				firstCell.MissingInput = fmt.Sprintf("Policy evaluation exceeded %d exact source partitions for %s -> %s.", maxExactBoundaryEvals, srcNet.Name, dstNet.Name)
+				return firstCell
+			}
+			sub := q
+			sub.srcIP = sip
+			sub.srcMAC = smac
+			cell := evaluateRoutedPath(
+				snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
+				switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
+				sub, destHost, destFunction, expected,
+			)
+			if first {
+				firstCell = cell
+				first = false
+			}
+			if expected == "deny" {
+				if cell.Verdict == IsolationViolation {
+					return cell
+				}
+				if cell.Verdict == IsolationUnknown && unknownCell == nil {
+					cp := cell
+					unknownCell = &cp
+				}
+			} else {
+				if cell.Verdict == IsolationBrokenDependency && brokenCell == nil {
+					cp := cell
+					brokenCell = &cp
+				}
+				if cell.Verdict == IsolationUnknown && unknownCell == nil {
+					cp := cell
+					unknownCell = &cp
+				}
+			}
+		}
+	}
+	if brokenCell != nil {
+		return *brokenCell
+	}
+	if unknownCell != nil {
+		return *unknownCell
+	}
+	return firstCell
 }
 
 func applyDecisionToCell(cell *IsolationCell, dec policyDecision) {
