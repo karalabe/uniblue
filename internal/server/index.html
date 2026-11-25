@@ -1436,8 +1436,11 @@ function humanEventType(t) {
   if (l.includes("client_left")) return { label: "Device left", tone: "neutral" };
   if (l.includes("host_scanning")) return { label: "Rescanning", tone: "blue" };
   if (l.includes("host_scanned")) return { label: "Device checked", tone: "neutral" };
+  if (l.includes("scan_complete")) return { label: "Scan complete", tone: "ok" };
+  if (l.includes("startup")) return { label: "Started", tone: "neutral" };
   if (l.includes("vpn")) return { label: "Remote VPN", tone: "blue" };
   if (l.includes("finding")) return { label: "New alert", tone: "warn" };
+  if (l === "controller") return { label: "Router log", tone: "neutral" };
   return { label: t.replace(/_/g, " "), tone: "neutral" };
 }
 
@@ -2454,10 +2457,12 @@ function renderActivity() {
   for (const lg of (state.report?.unifi_posture?.recent_logs || [])) {
     if (seen.has(lg.message)) continue;
     let t = "controller";
+    const evName = (lg.event || "").toUpperCase();
     if (lg.category === "ADMIN") t = "admin_activity";
-    else if ((lg.event || "").includes("HONEYPOT")) t = "honeypot_hit";
-    else if (lg.category === "SECURITY" || (lg.event || "").includes("THREAT")) t = "ids_threat";
-    logs.push({ time: lg.timestamp, severity: lg.severity || "info", type: t, summary: lg.message || lg.event, subject: "", ip: lg.src_ip || "" });
+    else if (evName.includes("HONEYPOT")) t = "honeypot_hit";
+    else if (lg.category === "SECURITY" || evName.includes("THREAT")) t = "ids_threat";
+    else if (evName.includes("VPN")) t = "vpn_connected";
+    logs.push({ time: lg.timestamp, severity: lg.severity || "info", type: t, summary: lg.message || lg.event, subject: "", ip: lg.src_ip || "", dst_ip: lg.dst_ip || "" });
   }
   logs.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
 
@@ -2486,7 +2491,7 @@ function renderActivity() {
     </div>
     <div class="card">
       ${filtered.length ? filtered.map(ev => {
-        const target = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || "";
+        const target = ev.subject || (ev.ip ? entByIP[ev.ip] : "") || (ev.dst_ip ? entByIP[ev.dst_ip] : "") || "";
         const ht = humanEventType(ev.type);
         const click = target ? `clickable" onclick="openEntity('${esc(target)}')"` : `"`;
         return `<div class="act-row ${click}>
@@ -2544,6 +2549,39 @@ function plainSummaryForEntity(vm, ent) {
   return `Review this security rule below to make sure it matches what you want allowed on your network.`;
 }
 
+function isPrivateIPv4(ip) {
+  if (!ip) return false;
+  return ip.startsWith("10.") || ip.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+}
+
+function hostSecurityLogs(ent) {
+  if (!ent || ent.kind !== "host" || !ent.ip) return [];
+  const out = [];
+  const seen = new Set();
+  for (const lg of (state?.report?.unifi_posture?.recent_logs || [])) {
+    const evName = (lg.event || "").toUpperCase();
+    const isThreat = evName.includes("HONEYPOT") || lg.category === "SECURITY" || evName.includes("THREAT");
+    if (!isThreat) continue;
+    const isSrc = lg.src_ip === ent.ip;
+    const isDst = lg.dst_ip === ent.ip;
+    if (!isSrc && !isDst) continue;
+    const key = (lg.timestamp || "") + "|" + (lg.message || lg.event || "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      time: lg.timestamp,
+      severity: lg.severity || "high",
+      type: evName.includes("HONEYPOT") ? "honeypot_hit" : "ids_threat",
+      message: lg.message || lg.event,
+      src_ip: lg.src_ip || "",
+      dst_ip: lg.dst_ip || "",
+      direction: isSrc ? "outbound" : "inbound"
+    });
+  }
+  out.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+  return out;
+}
+
 function renderDrawer() {
   const vm = state?.view;
   const id = currentDrawerID();
@@ -2559,11 +2597,23 @@ function renderDrawer() {
   if (!vm.entities[id]) return;
   const ent = vm.entities[id];
   const tone = humanStateTone(ent);
+  const hostAlerts = hostSecurityLogs(ent);
+  const hasOutboundAlert = hostAlerts.some(a => a.direction === "outbound" || a.type === "honeypot_hit");
+  const alertOnlyHost = ent.kind === "host" && ent.state === "ok" && hostAlerts.length > 0;
+  const summaryTone = alertOnlyHost ? (hasOutboundAlert ? "crit" : "warn") : (tone === "unk" ? "blue" : tone);
+  const summaryText = alertOnlyHost
+    ? (hasOutboundAlert
+      ? `<strong>${esc(ent.label)}</strong> has no open-port vulnerabilities, but your UniFi router blocked <strong>${hostAlerts.length} security alert${hostAlerts.length === 1 ? "" : "s"} originating from this device</strong> in the last 24h. Review the alert${hostAlerts.length === 1 ? "" : "s"} below.`
+      : `<strong>${esc(ent.label)}</strong> has no open-port vulnerabilities, and your UniFi router blocked <strong>${hostAlerts.length} inbound intrusion attempt${hostAlerts.length === 1 ? "" : "s"} targeting this device</strong> in the last 24h.`)
+    : plainSummaryForEntity(vm, ent);
 
   document.getElementById("drawer-hd-content").innerHTML = `
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
       ${drawerStack.length > 1 ? `<button class="btn sm" onclick="popDrawer()">← Back</button>` : ""}
-      <span class="tag ${tone}">${esc(humanStateLabel(ent))}</span>
+      ${alertOnlyHost
+        ? `<span class="tag ${hasOutboundAlert ? "crit" : "warn"}">Router alert (${hostAlerts.length})</span><span class="tag neutral">Services clean</span>`
+        : `<span class="tag ${tone}">${esc(humanStateLabel(ent))}</span>`}
+      ${!alertOnlyHost && hostAlerts.length ? `<span class="tag ${hasOutboundAlert ? "crit" : "warn"}">${hostAlerts.length} router alert${hostAlerts.length === 1 ? "" : "s"}</span>` : ""}
       ${ent.is_bmc ? `<span class="tag warn">Hardware Control</span>` : ""}
       ${ent.side === "outside" ? `<span class="tag neutral">Outside House</span>` : ""}
       ${!isStaticMode && ent.kind === "host" && ent.ip ? `<button class="btn sm" onclick="triggerRescan('${esc(ent.ip)}')">Recheck</button>` : ""}
@@ -2571,7 +2621,35 @@ function renderDrawer() {
     <div style="font-size:19px;font-weight:800;letter-spacing:-.02em;line-height:1.2">${esc(ent.label)}</div>
     <div class="small" style="margin-top:3px">${esc(ent.kind === "host" ? humanRole(ent.role, ent.is_bmc) : (ent.subtitle || ent.model || ""))}${ent.network_name ? ` · ${esc(ent.network_name)} network` : ""}${ent.ip ? ` · <span class="mono">${esc(ent.ip)}</span>` : ""}</div>`;
 
-  let b = `<div class="summary-box ${tone === "unk" ? "blue" : tone}">${plainSummaryForEntity(vm, ent)}</div>`;
+  let b = `<div class="summary-box ${summaryTone}">${summaryText}</div>`;
+
+  // 0. Recent UniFi Router Security Alerts (IPS / Honeypot) involving this host
+  if (hostAlerts.length) {
+    b += `<div class="dsec"><div class="dsec-t">Recent Router Security Alerts (${hostAlerts.length})</div>`;
+    for (const al of hostAlerts) {
+      const aTone = (al.direction === "outbound" || al.type === "honeypot_hit") ? "crit" : "warn";
+      const title = al.type === "honeypot_hit"
+        ? "Triggered UniFi internal honeypot"
+        : (al.direction === "outbound"
+          ? `Blocked outbound threat${al.dst_ip ? " → " + al.dst_ip : ""}`
+          : `Blocked inbound threat${al.src_ip ? " from " + al.src_ip : ""}`);
+      let hint = "Verify no unnecessary ports are forwarded to this device from the internet.";
+      if (al.direction === "outbound") {
+        hint = isPrivateIPv4(al.dst_ip)
+          ? `Your router's IPS blocked traffic from this device to internal IP ${al.dst_ip}. If UniBlue or another network scanner is running on this machine, its probes can trigger UniFi IPS. Otherwise, check what app on this device is scanning your LAN.`
+          : `Your router's IPS blocked suspicious outbound traffic from this device${al.dst_ip ? " to " + al.dst_ip : ""}. Inspect running apps and recent downloads on this device.`;
+      }
+      b += `<div class="fix-card ${aTone}">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
+          <strong style="font-size:14.5px">${esc(title)}</strong>
+          <span class="tag ${aTone}">${esc(fmtTime(al.time))}</span>
+        </div>
+        <div class="small" style="margin-top:6px;color:var(--text-2)">${esc(al.message)}</div>
+        <div class="fix-step"><strong>What to check:</strong> ${esc(hint)}</div>
+      </div>`;
+    }
+    b += `</div>`;
+  }
 
   // 1. Known Software Security Bugs (Exact CVEs, always prominently at the top)
   if (ent.exact_cves && ent.exact_cves.length) {
