@@ -184,12 +184,6 @@ func AnalyzeUniFiPosture(
 	}
 
 	// 2. Detect Evil-Twin SSID spoofing & Unauthorized APs plugged into our wired LAN.
-	ownedDevMACs := make([]string, 0, len(snap.Devices))
-	for _, d := range snap.Devices {
-		if m := strings.ToLower(strings.TrimSpace(d.MAC)); m != "" {
-			ownedDevMACs = append(ownedDevMACs, m)
-		}
-	}
 	wiredClientsByPrefix := make(map[string]unifi.Client)
 	for _, cl := range snap.Clients {
 		if cl.IsWired && cl.MAC != "" {
@@ -200,7 +194,7 @@ func AnalyzeUniFiPosture(
 	seenEvil := make(map[string]struct{})
 	seenRogueWired := make(map[string]struct{})
 	for _, rap := range snap.RogueAPs {
-		if rap.BSSID == "" || isOwnedUniFiRadio(rap, ownedDevMACs) {
+		if rap.BSSID == "" || isOwnedUniFiRadio(rap, nil) {
 			continue
 		}
 		essidLower := strings.ToLower(strings.TrimSpace(rap.ESSID))
@@ -446,66 +440,28 @@ func primaryGatewayDevice(snap *unifi.Snapshot) unifi.Device {
 	return unifi.Device{Name: "UniFi Gateway"}
 }
 
-// isOwnedUniFiRadio returns true only when UniFi itself did NOT flag the entry
-// as rogue AND the BSSID matches an adopted site radio (exact MAC, or a
-// non-rogue Ubiquiti multi-SSID VAP whose octet-0 differs only in the LAA/VAP
-// bits and whose vendor OUI is empty or Ubiquiti). If an attacker clones a
-// BSSID (marked is_rogue=true by the controller, or advertising a foreign OUI),
-// it is never suppressed.
-func isOwnedUniFiRadio(rap unifi.RogueAP, ownedMACs []string) bool {
-	if rap.IsRogue {
-		return false
-	}
-	if ouiLow := strings.ToLower(strings.TrimSpace(rap.OUI)); ouiLow != "" &&
-		!strings.Contains(ouiLow, "ubiquiti") && !strings.Contains(ouiLow, "ubnt") {
+// isOwnedUniFiRadio reports whether a rogue-AP entry is known to belong to an
+// authoritative owned VAP BSSID list. UniFi's stat/rogueap feed reports
+// neighboring/unmanaged radios rather than the site's own adopted VAPs, and an
+// evil twin routinely clones or near-clones an adopted AP's BSSID (exact MAC,
+// locally-administered octet-0 flip, or last-octet tweak with Ubiquiti's OUI),
+// even when is_rogue is false. Therefore, never suppress entries by MAC-prefix
+// heuristics or base device MAC similarity; only an explicit, non-rogue exact
+// match against an authoritative known VAP BSSID list may suppress an entry.
+func isOwnedUniFiRadio(rap unifi.RogueAP, knownOwnedVAPBSSIDs []string) bool {
+	if rap.IsRogue || len(knownOwnedVAPBSSIDs) == 0 {
 		return false
 	}
 	bssid := strings.ToLower(strings.TrimSpace(rap.BSSID))
-	bParts := strings.Split(bssid, ":")
-	if len(bParts) != 6 {
+	if bssid == "" {
 		return false
 	}
-	b0, errB := parseHexByte(bParts[0])
-	if errB != nil {
-		return false
-	}
-	for _, om := range ownedMACs {
-		if om == bssid {
-			return true
-		}
-		oParts := strings.Split(om, ":")
-		if len(oParts) != 6 {
-			continue
-		}
-		o0, errO := parseHexByte(oParts[0])
-		if errO != nil {
-			continue
-		}
-		if (b0&^0x0e) == (o0&^0x0e) && bParts[1] == oParts[1] && bParts[2] == oParts[2] && bParts[3] == oParts[3] && bParts[4] == oParts[4] {
+	for _, known := range knownOwnedVAPBSSIDs {
+		if strings.ToLower(strings.TrimSpace(known)) == bssid {
 			return true
 		}
 	}
 	return false
-}
-
-func parseHexByte(s string) (byte, error) {
-	if len(s) != 2 {
-		return 0, fmt.Errorf("invalid hex byte %q", s)
-	}
-	var v byte
-	for i := 0; i < 2; i++ {
-		c := s[i]
-		v <<= 4
-		switch {
-		case c >= '0' && c <= '9':
-			v |= c - '0'
-		case c >= 'a' && c <= 'f':
-			v |= c - 'a' + 10
-		default:
-			return 0, fmt.Errorf("invalid hex char %q", c)
-		}
-	}
-	return v, nil
 }
 
 // macStem returns the middle/OUI+device prefix (first 5 octets) used to

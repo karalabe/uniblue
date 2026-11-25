@@ -272,7 +272,7 @@ func AnalyzeExtendedNetworkChecks(
 		if act != "BLOCK" && act != "REJECT" && act != "DROP" {
 			continue
 		}
-		if !strings.EqualFold(pol.Protocol, "icmpv6") || !pol.Destination.AnyPort || !pol.Destination.AnyTarget || !pol.Source.AnyTarget {
+		if pol.ProtocolNegated || !strings.EqualFold(pol.Protocol, "icmpv6") || !pol.Destination.AnyPort || !pol.Destination.AnyTarget || !pol.Source.AnyTarget {
 			continue
 		}
 		// Skip if an earlier enabled ALLOW policy explicitly permits ICMPv6 on the same zone pair.
@@ -282,9 +282,14 @@ func AnalyzeExtendedNetworkChecks(
 			if !prev.Enabled || !strings.EqualFold(prev.Action, "ALLOW") {
 				continue
 			}
-			if strings.EqualFold(prev.Protocol, "icmpv6") &&
-				strings.EqualFold(prev.Source.ZoneName, pol.Source.ZoneName) &&
-				strings.EqualFold(prev.Destination.ZoneName, pol.Destination.ZoneName) {
+			if !strings.EqualFold(prev.Source.ZoneName, pol.Source.ZoneName) ||
+				!strings.EqualFold(prev.Destination.ZoneName, pol.Destination.ZoneName) {
+				continue
+			}
+			explicitICMPv6 := !prev.ProtocolNegated && strings.EqualFold(prev.Protocol, "icmpv6")
+			broadAllowICMPv6 := matchesPolicyProtocol(prev.Protocol, prev.ProtocolNegated, "icmpv6") &&
+				prev.Source.AnyTarget && prev.Destination.AnyTarget && prev.Destination.CoversAllPorts()
+			if explicitICMPv6 || broadAllowICMPv6 {
 				earlierAllowsICMPv6 = true
 				break
 			}

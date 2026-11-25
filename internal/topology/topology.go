@@ -16,6 +16,7 @@ import (
 
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
+	"github.com/karalabe/uniblue/internal/risk"
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
@@ -505,20 +506,11 @@ func buildWANRoutes(snap *unifi.Snapshot) []WANRoute {
 	return routes
 }
 
-// structuralIsolatedZones mirrors internal/risk's structural zone isolation check.
+// structuralIsolatedZones delegates to risk.IsolatedZones so topology and risk
+// share the exact same effective zone isolation semantics (respecting policy
+// ordering, protocol, IP family, connection state, schedules, and pinholes).
 func structuralIsolatedZones(snap *unifi.Snapshot) map[string]bool {
-	zones := map[string]bool{"hotspot": true, "dmz": true}
-	for _, pol := range snap.FirewallPolicies {
-		if !pol.Enabled || (pol.Action != "BLOCK" && pol.Action != "REJECT") {
-			continue
-		}
-		src := strings.ToLower(strings.TrimSpace(pol.Source.ZoneName))
-		dst := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
-		if src != "" && src != "internal" && src != "external" && src != "gateway" && dst == "internal" && pol.Destination.AnyTarget && pol.Destination.AnyPort {
-			zones[src] = true
-		}
-	}
-	return zones
+	return risk.IsolatedZones(snap)
 }
 
 // isNetworkIsolated determines whether n is structurally isolated from Internal.

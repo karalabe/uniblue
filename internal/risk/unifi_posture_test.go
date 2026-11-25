@@ -99,12 +99,20 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 			},
 		},
 		RogueAPs: []unifi.RogueAP{
-			// Owned AP virtual BSSID (middle 4 octets match aa:bb:cc:11:22:01) must not alert.
+			// Near-cloned BSSID broadcasting our SSID with is_rogue=false must still alert as Evil-Twin.
 			{
 				BSSID:   "ae:bb:cc:11:22:05",
 				ESSID:   "HomeWiFi",
 				Channel: 36,
 				RSSI:    -45,
+			},
+			// Neighboring AP broadcasting a different SSID must not alert.
+			{
+				BSSID:   "cc:dd:ee:00:11:22",
+				ESSID:   "NeighborWiFi",
+				OUI:     "Netgear",
+				Channel: 1,
+				RSSI:    -78,
 			},
 			// True Evil-Twin broadcasting our SSID must alert Critical.
 			{
@@ -150,8 +158,8 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 	_, portFindings, _ := AnalyzeSwitchPorts(snap, config.NetworkConfig{}, trusted, isolated)
 	summary, postureFindings, notes := AnalyzeUniFiPosture(snap, trusted, isolated)
 
-	if summary == nil || summary.EvilTwinCount != 1 {
-		t.Fatalf("expected EvilTwinCount=1, got %+v", summary)
+	if summary == nil || summary.EvilTwinCount != 2 {
+		t.Fatalf("expected EvilTwinCount=2 (foreign + near-cloned BSSID), got %+v", summary)
 	}
 
 	all := append(portFindings, postureFindings...)
@@ -183,5 +191,58 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 	}
 	if len(notes) < 3 {
 		t.Errorf("expected posture notes for WPA2-only, IPS disabled, Honeypot disabled, DoH off; got %d", len(notes))
+	}
+}
+
+// TestEvilTwinClonedAndNearClonedBSSIDsDetected verifies that exact clones,
+// locally-administered octet-0 flips, and last-octet near-clones carrying a
+// Ubiquiti OUI with is_rogue=false are never silently suppressed as owned radios.
+func TestEvilTwinClonedAndNearClonedBSSIDsDetected(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Site: "default",
+		Devices: []unifi.Device{
+			{Name: "Hallway AP", MAC: "24:5a:4c:11:22:33", IP: "192.168.1.5", Model: "U6-Pro", Type: "uap"},
+		},
+		WLANs: []unifi.WLANConfig{
+			{ID: "w1", Name: "HomeWiFi", Enabled: true, Security: "wpapsk", WPAMode: "wpa2", WPA3Support: true, PMFMode: "optional", NetworkName: "Default"},
+		},
+		RogueAPs: []unifi.RogueAP{
+			// Exact BSSID clone with Ubiquiti OUI and is_rogue=false.
+			{BSSID: "24:5a:4c:11:22:33", ESSID: "HomeWiFi", OUI: "Ubiquiti", Channel: 6, RSSI: -48, IsRogue: false},
+			// Locally-administered octet-0 flip clone (24 -> 26).
+			{BSSID: "26:5a:4c:11:22:33", ESSID: "HomeWiFi", OUI: "Ubiquiti", Channel: 11, RSSI: -50, IsRogue: false},
+			// Last-octet near-clone (33 -> 34).
+			{BSSID: "24:5a:4c:11:22:34", ESSID: "HomeWiFi", OUI: "Ubiquiti", Channel: 36, RSSI: -52, IsRogue: false},
+			// Unrelated neighbor SSID must not trigger an evil-twin alert.
+			{BSSID: "24:5a:4c:11:22:35", ESSID: "OtherNet", OUI: "Ubiquiti", Channel: 1, RSSI: -75, IsRogue: false},
+		},
+	}
+
+	summary, findings, _ := AnalyzeUniFiPosture(snap, map[string]struct{}{"default": {}}, nil)
+	if summary == nil || summary.EvilTwinCount != 3 {
+		t.Fatalf("expected EvilTwinCount=3 for exact, LAA, and last-octet clones, got %+v", summary)
+	}
+	flagged := make(map[string]bool)
+	for _, f := range findings {
+		if f.CheckID == "UB-UNIFI-WIFI-EVIL-TWIN" {
+			flagged[f.Client.MAC] = true
+		}
+	}
+	for _, want := range []string{"24:5a:4c:11:22:33", "26:5a:4c:11:22:33", "24:5a:4c:11:22:34"} {
+		if !flagged[want] {
+			t.Fatalf("expected cloned BSSID %s to raise UB-UNIFI-WIFI-EVIL-TWIN, got %+v", want, flagged)
+		}
+	}
+
+	// Verify explicit known VAP BSSID matching only suppresses non-rogue exact matches.
+	knownVAPs := []string{"26:5a:4c:11:22:33"}
+	if !isOwnedUniFiRadio(unifi.RogueAP{BSSID: "26:5a:4c:11:22:33", IsRogue: false}, knownVAPs) {
+		t.Fatal("expected exact match in authoritative known VAP BSSID list to be recognized as owned")
+	}
+	if isOwnedUniFiRadio(unifi.RogueAP{BSSID: "26:5a:4c:11:22:33", IsRogue: true}, knownVAPs) {
+		t.Fatal("expected is_rogue=true never to be suppressed even if BSSID matches known VAP")
+	}
+	if isOwnedUniFiRadio(unifi.RogueAP{BSSID: "24:5a:4c:11:22:34", IsRogue: false}, knownVAPs) {
+		t.Fatal("expected near-clone not in authoritative known VAP list never to be suppressed")
 	}
 }

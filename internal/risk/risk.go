@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +25,10 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 	"github.com/karalabe/uniblue/rules"
 )
+
+// offlineFindingTTL bounds how long findings for an offline client host are
+// carried forward in persisted state before aging out as resolved.
+const offlineFindingTTL = 7 * 24 * time.Hour
 
 // Report holds the complete risk-scored output of a single UniBlue scan.
 type Report struct {
@@ -80,6 +85,11 @@ type State struct {
 	// Findings maps finding keys ("checkID|mac|port") to their last known
 	// effective severity.
 	Findings map[string]checks.Severity `json:"findings"`
+
+	// FindingLastSeen records when each finding key was last actively observed
+	// (UTC). Carried-forward findings for offline hosts age out after
+	// offlineFindingTTL so permanently departed hosts do not stay forever.
+	FindingLastSeen map[string]time.Time `json:"finding_last_seen,omitempty"`
 
 	// TrustedClients maps normalized MAC addresses previously seen on a trusted
 	// VLAN to their display names.
@@ -167,6 +177,11 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 		cl, known := clientsByIP[pf.FwdIP]
 		if !known {
 			cl = unifi.Client{IP: pf.FwdIP, Name: pf.Name}
+			if net, ok := lookupNetworkByIP(snap, pf.FwdIP); ok {
+				cl.NetworkID = net.ID
+				cl.NetworkName = net.Name
+				cl.VLAN = net.VLAN
+			}
 		}
 
 		assessment := classifier.Classify(pf, cl)
@@ -397,12 +412,14 @@ func BuildState(snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig
 // they return and are rescanned.
 func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig, probedHostKeys map[string]struct{}) *State {
 	trustedSet, _ := resolveVLANTiers(snap, netCfg)
+	now := time.Now().UTC()
 
 	st := &State{
-		UpdatedAt:      time.Now().UTC(),
-		Findings:       make(map[string]checks.Severity, len(report.Findings)),
-		TrustedClients: make(map[string]string),
-		PortForwards:   make(map[string]string),
+		UpdatedAt:       now,
+		Findings:        make(map[string]checks.Severity, len(report.Findings)),
+		FindingLastSeen: make(map[string]time.Time, len(report.Findings)),
+		TrustedClients:  make(map[string]string),
+		PortForwards:    make(map[string]string),
 	}
 
 	// Carry forward previously known trusted clients so a household phone or
@@ -413,45 +430,58 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 		}
 	}
 
+	activeHosts := activeClientHostSet(snap)
+
 	for _, f := range report.Findings {
 		if f.IsInventoryOnly() {
 			continue
 		}
-		k := f.Key()
-		if existing, ok := st.Findings[k]; !ok || f.EffectiveSeverity > existing {
-			st.Findings[k] = f.EffectiveSeverity
+		k := stateFindingKey(f)
+		sev := f.EffectiveSeverity
+		// If a port-forward target host is temporarily offline and its VLAN could
+		// not be resolved from configured subnets, retain the previous severity
+		// so a host reboot never causes a false downgrade followed by escalation.
+		if f.CheckID == "UB-UNIFI-PORTFWD" && prev != nil {
+			ipLow := strings.ToLower(strings.TrimSpace(f.Client.IP))
+			_, targetOnline := activeHosts[ipLow]
+			if !targetOnline {
+				if prevSev, ok := prev.Findings[k]; ok && prevSev > sev {
+					sev = prevSev
+				}
+			}
 		}
+		if existing, ok := st.Findings[k]; !ok || sev > existing {
+			st.Findings[k] = sev
+		}
+		st.FindingLastSeen[k] = now
 	}
 
 	// Carry forward previous host-scoped findings for offline or not-yet-probed
-	// hosts so transient disconnects never drop and re-alert unchanged findings.
+	// hosts so transient disconnects never drop and re-alert unchanged findings,
+	// while expiring findings for permanently gone hosts after offlineFindingTTL.
 	if prev != nil && snap != nil {
-		activeHosts := make(map[string]struct{}, len(snap.Clients)*2)
-		for _, cl := range snap.Clients {
-			if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
-				activeHosts[m] = struct{}{}
-			}
-			for _, ip := range cl.AllIPs() {
-				activeHosts[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
-			}
-		}
 		for k, sev := range prev.Findings {
 			if _, exists := st.Findings[k]; exists {
 				continue
 			}
 			checkID, hostID := splitFindingKey(k)
-			if hostID == "" || strings.HasPrefix(checkID, "UB-UNIFI-") {
+			if !isClientScopedFinding(checkID, hostID) {
 				continue
 			}
 			hostLow := strings.ToLower(strings.TrimSpace(hostID))
 			_, isActive := activeHosts[hostLow]
 			if !isActive {
-				st.Findings[k] = sev
+				lastSeen := findingLastSeen(prev, k, now)
+				if now.Sub(lastSeen) <= offlineFindingTTL {
+					st.Findings[k] = sev
+					st.FindingLastSeen[k] = lastSeen
+				}
 				continue
 			}
 			if probedHostKeys != nil {
 				if _, wasProbed := probedHostKeys[hostLow]; !wasProbed {
 					st.Findings[k] = sev
+					st.FindingLastSeen[k] = findingLastSeen(prev, k, now)
 				}
 			}
 		}
@@ -470,6 +500,94 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 		}
 	}
 	return st
+}
+
+// activeClientHostSet builds a normalized lookup set of all MACs and IPs for
+// currently online clients in snap.
+func activeClientHostSet(snap *unifi.Snapshot) map[string]struct{} {
+	if snap == nil {
+		return nil
+	}
+	activeHosts := make(map[string]struct{}, len(snap.Clients)*2)
+	for _, cl := range snap.Clients {
+		if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
+			activeHosts[m] = struct{}{}
+		}
+		for _, ip := range cl.AllIPs() {
+			activeHosts[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
+		}
+	}
+	return activeHosts
+}
+
+// stateFindingKey returns the persisted state key for f. For WAN port forwards,
+// the key is anchored to the stable port-forward identifier rather than the
+// target client's MAC/IP so an offline host never flips the key and re-alerts.
+func stateFindingKey(f checks.Finding) string {
+	if f.CheckID == "UB-UNIFI-PORTFWD" && strings.HasPrefix(f.Property, "portfwd:") {
+		return fmt.Sprintf("%s|%s|%d", f.CheckID, f.Property, f.Port)
+	}
+	return f.Key()
+}
+
+// isClientScopedFinding reports whether a state finding key belongs to an
+// individual LAN client host (as opposed to site-wide, gateway, switch, VLAN,
+// WLAN, or firewall-policy posture) and should be carried forward across brief
+// host offline windows.
+func isClientScopedFinding(checkID, hostID string) bool {
+	if hostID == "" {
+		return false
+	}
+	hostLow := strings.ToLower(strings.TrimSpace(hostID))
+	for _, pfx := range []string{"fw:", "gw:", "iso:", "vlan:", "wlan:", "portfwd:"} {
+		if strings.HasPrefix(hostLow, pfx) {
+			return false
+		}
+	}
+	if !strings.HasPrefix(checkID, "UB-UNIFI-") {
+		return true
+	}
+	switch checkID {
+	case "UB-UNIFI-ISO-BMC-PATH",
+		"UB-UNIFI-ISO-BMC-IPV6",
+		"UB-UNIFI-BMC-SHARED-VLAN",
+		"UB-UNIFI-ISO-PRINTER-ADMIN",
+		"UB-UNIFI-WIFI-ROGUE-WIRED-AP":
+		return true
+	default:
+		return false
+	}
+}
+
+// findingLastSeen resolves the last actively observed timestamp for a finding
+// key in prev, falling back to prev.UpdatedAt and then fallback for legacy
+// state files that predate FindingLastSeen.
+func findingLastSeen(prev *State, key string, fallback time.Time) time.Time {
+	if prev != nil {
+		if ts, ok := prev.FindingLastSeen[key]; ok && !ts.IsZero() {
+			return ts
+		}
+		if !prev.UpdatedAt.IsZero() {
+			return prev.UpdatedAt
+		}
+	}
+	return fallback
+}
+
+// shouldCarryForwardOffline reports whether oldKey belongs to an offline client
+// host whose finding is still within offlineFindingTTL and should be retained
+// silently rather than emitted as resolved.
+func shouldCarryForwardOffline(prev *State, oldKey string, activeHosts map[string]struct{}, now time.Time) bool {
+	checkID, hostID := splitFindingKey(oldKey)
+	if !isClientScopedFinding(checkID, hostID) {
+		return false
+	}
+	hostLow := strings.ToLower(strings.TrimSpace(hostID))
+	if _, isActive := activeHosts[hostLow]; isActive {
+		return false
+	}
+	lastSeen := findingLastSeen(prev, oldKey, now)
+	return now.Sub(lastSeen) <= offlineFindingTTL
 }
 
 // splitFindingKey extracts the CheckID and host identifier from a Finding.Key()
@@ -499,12 +617,15 @@ func ComputeDiff(prev *State, snap *unifi.Snapshot, report Report, netCfg config
 		return diff
 	}
 
+	now := time.Now().UTC()
+	activeHosts := activeClientHostSet(snap)
+
 	currentKeys := make(map[string]struct{}, len(report.Findings))
 	for _, f := range report.Findings {
 		if f.IsInventoryOnly() {
 			continue
 		}
-		key := f.Key()
+		key := stateFindingKey(f)
 		currentKeys[key] = struct{}{}
 		oldSev, existed := prev.Findings[key]
 		if !existed {
@@ -515,9 +636,13 @@ func ComputeDiff(prev *State, snap *unifi.Snapshot, report Report, netCfg config
 	}
 
 	for oldKey := range prev.Findings {
-		if _, stillActive := currentKeys[oldKey]; !stillActive {
-			diff.ResolvedKeys = append(diff.ResolvedKeys, oldKey)
+		if _, stillActive := currentKeys[oldKey]; stillActive {
+			continue
 		}
+		if snap != nil && shouldCarryForwardOffline(prev, oldKey, activeHosts, now) {
+			continue
+		}
+		diff.ResolvedKeys = append(diff.ResolvedKeys, oldKey)
 	}
 	sort.Strings(diff.ResolvedKeys)
 
@@ -615,6 +740,7 @@ func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (truste
 	}
 
 	isoZones := isolatedZoneSet(snap)
+	intendedIsoZones := intendedIsolatedZoneSet(snap)
 
 	for _, n := range snap.Networks {
 		nameLower := strings.ToLower(strings.TrimSpace(n.Name))
@@ -655,6 +781,12 @@ func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (truste
 			if vlanLower != "" {
 				isolated[vlanLower] = struct{}{}
 			}
+		case intendedIsoZones[zoneLower]:
+			// Custom zones with isolation intent (e.g., a shadowed, narrow, or
+			// leaking BLOCK toward Internal) do NOT earn the isolated-VLAN
+			// mitigation downgrade, but must also never fall through into
+			// trustedSet (which would suppress leak auditing and trigger false
+			// new-trusted-device alerts).
 		case zoneLower == "internal" || purposeLower == "corporate" || vlanLower == "1":
 			if nameLower != "" {
 				trusted[nameLower] = struct{}{}
@@ -667,11 +799,49 @@ func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (truste
 	return trusted, isolated
 }
 
+// IsolatedZones returns the lowercase set of UniFi firewall zone names that
+// effectively enforce isolation from Internal LANs. Shared by topology and risk
+// so both packages agree on zone isolation semantics.
+func IsolatedZones(snap *unifi.Snapshot) map[string]bool {
+	return isolatedZoneSet(snap)
+}
+
+// intendedIsolatedZoneSet returns the lowercase set of UniFi firewall zones
+// that express isolation intent from Internal: Hotspot, DMZ, and any custom
+// zone that has at least one enabled BLOCK/REJECT/DROP policy targeting
+// Internal (even if narrow, scheduled, or shadowed by an earlier ALLOW).
+func intendedIsolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
+	zones := map[string]bool{
+		"hotspot": true,
+		"dmz":     true,
+	}
+	if snap == nil {
+		return zones
+	}
+	for _, pol := range snap.FirewallPolicies {
+		if !pol.Enabled {
+			continue
+		}
+		act := strings.ToUpper(strings.TrimSpace(pol.Action))
+		if act != "BLOCK" && act != "REJECT" && act != "DROP" {
+			continue
+		}
+		src := strings.ToLower(strings.TrimSpace(pol.Source.ZoneName))
+		dst := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
+		if src == "" || src == "internal" || src == "external" || src == "gateway" || src == "vpn" || dst != "internal" {
+			continue
+		}
+		zones[src] = true
+	}
+	return zones
+}
+
 // isolatedZoneSet returns the lowercase set of UniFi firewall zone names that
 // genuinely enforce isolation from internal LANs: UniFi's built-in Hotspot and
 // DMZ zones, plus any custom zone where enabled firewall policies actually block
-// new IPv4 TCP and UDP transit into Internal (respecting policy ordering,
-// protocol, IP family, source selectors, connection states, and schedules).
+// general new TCP and UDP transit into Internal (respecting policy ordering,
+// protocol, IPv4/IPv6 families, source/destination selectors, connection states,
+// and schedules while tolerating pinpoint single-host pinholes).
 func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 	zones := map[string]bool{
 		"hotspot": true,
@@ -701,7 +871,7 @@ func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 		srcRaw := strings.TrimSpace(pol.Source.ZoneName)
 		src := strings.ToLower(srcRaw)
 		dst := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
-		if src == "" || src == "internal" || src == "external" || src == "gateway" || dst != "internal" {
+		if src == "" || src == "internal" || src == "external" || src == "gateway" || src == "vpn" || dst != "internal" {
 			continue
 		}
 		if pol.Schedule != "" || !pol.Source.AnyTarget || !pol.Destination.AnyTarget || !pol.Destination.CoversAllPorts() {
@@ -719,29 +889,206 @@ func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 		candidates[src] = srcRaw
 	}
 
-	for srcLow, srcRaw := range candidates {
-		// Verify no earlier ALLOW/unknown policy supersedes the BLOCK on TCP or UDP.
-		tcpDec := evaluateGatewayPolicies(sorted, pathQuery{
-			srcZone:  srcRaw,
-			dstZone:  "Internal",
-			proto:    "tcp",
-			port:     443,
-			ipFamily: "ipv4",
-			state:    "new",
-		})
-		udpDec := evaluateGatewayPolicies(sorted, pathQuery{
-			srcZone:  srcRaw,
-			dstZone:  "Internal",
-			proto:    "udp",
-			port:     53,
-			ipFamily: "ipv4",
-			state:    "new",
-		})
-		if tcpDec.action == "deny" && udpDec.action == "deny" && tcpDec.ruleID != "" && udpDec.ruleID != "" {
-			zones[srcLow] = true
+	var intNet unifi.Network
+	for _, n := range snap.Networks {
+		if strings.EqualFold(strings.TrimSpace(n.ZoneName), "internal") {
+			intNet = n
+			break
 		}
 	}
+
+	for srcLow, srcRaw := range candidates {
+		var srcNet unifi.Network
+		for _, n := range snap.Networks {
+			if strings.EqualFold(strings.TrimSpace(n.ZoneName), srcRaw) {
+				srcNet = n
+				break
+			}
+		}
+
+		// Collect pinhole IP/MAC selectors on enabled ALLOW policies for this
+		// zone pair so general-transit verification picks representative IPs
+		// outside pinpoint pinholes (avoiding false "unknown" verdicts that
+		// would misclassify an isolated zone as non-isolated).
+		var dstPinholesV4, srcPinholesV4 []string
+		var dstPinholesV6, srcPinholesV6 []string
+		hasSrcMAC, hasDstMAC := false, false
+		for _, pol := range sorted {
+			if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
+				continue
+			}
+			if !strings.EqualFold(pol.Source.ZoneName, srcRaw) || !strings.EqualFold(pol.Destination.ZoneName, "internal") {
+				continue
+			}
+			if matchesIPFamily(pol.IPVersion, "ipv4") {
+				if !pol.Destination.AnyTarget && !pol.Destination.NegateTarget {
+					dstPinholesV4 = append(dstPinholesV4, pol.Destination.IPs...)
+				}
+				if !pol.Source.AnyTarget && !pol.Source.NegateTarget {
+					srcPinholesV4 = append(srcPinholesV4, pol.Source.IPs...)
+				}
+			}
+			if matchesIPFamily(pol.IPVersion, "ipv6") {
+				if !pol.Destination.AnyTarget && !pol.Destination.NegateTarget {
+					dstPinholesV6 = append(dstPinholesV6, pol.Destination.IPs...)
+				}
+				if !pol.Source.AnyTarget && !pol.Source.NegateTarget {
+					srcPinholesV6 = append(srcPinholesV6, pol.Source.IPs...)
+				}
+			}
+			if len(pol.Source.MACs) > 0 {
+				hasSrcMAC = true
+			}
+			if len(pol.Destination.MACs) > 0 {
+				hasDstMAC = true
+			}
+		}
+
+		pickRepIP := func(net unifi.Network, fam string, pinholes []string) string {
+			if len(pinholes) == 0 {
+				return ""
+			}
+			if ip := sampleIPOutsideSelectors(net, snap, fam, pinholes); ip != "" {
+				return ip
+			}
+			// Pinholes cover the entire network subnet; probe a real subnet address
+			// so the broad ALLOW matches as "allow" instead of being bypassed.
+			if fam == "ipv4" {
+				return subnetGatewayIP(net.Subnet)
+			}
+			return sampleNetworkIPv6(net, snap)
+		}
+
+		dstIPv4 := pickRepIP(intNet, "ipv4", dstPinholesV4)
+		srcIPv4 := pickRepIP(srcNet, "ipv4", srcPinholesV4)
+		srcMAC := ""
+		if hasSrcMAC {
+			srcMAC = "02:00:00:00:00:fe"
+		}
+		dstMAC := ""
+		if hasDstMAC {
+			dstMAC = "02:00:00:00:00:fd"
+		}
+
+		// Verify no earlier broad ALLOW/unknown policy supersedes the BLOCK on IPv4 TCP or UDP.
+		tcpDec := evaluateGatewayPolicies(sorted, pathQuery{
+			srcZone:    srcRaw,
+			srcNetID:   srcNet.ID,
+			srcNetName: srcNet.Name,
+			srcIP:      srcIPv4,
+			srcMAC:     srcMAC,
+			dstZone:    "Internal",
+			dstNetID:   intNet.ID,
+			dstNetName: intNet.Name,
+			dstIP:      dstIPv4,
+			dstMAC:     dstMAC,
+			proto:      "tcp",
+			port:       443,
+			ipFamily:   "ipv4",
+			state:      "new",
+		})
+		udpDec := evaluateGatewayPolicies(sorted, pathQuery{
+			srcZone:    srcRaw,
+			srcNetID:   srcNet.ID,
+			srcNetName: srcNet.Name,
+			srcIP:      srcIPv4,
+			srcMAC:     srcMAC,
+			dstZone:    "Internal",
+			dstNetID:   intNet.ID,
+			dstNetName: intNet.Name,
+			dstIP:      dstIPv4,
+			dstMAC:     dstMAC,
+			proto:      "udp",
+			port:       53,
+			ipFamily:   "ipv4",
+			state:      "new",
+		})
+		if tcpDec.action != "deny" || udpDec.action != "deny" || tcpDec.ruleID == "" || udpDec.ruleID == "" {
+			continue
+		}
+
+		// Also check IPv6 so an IPv4-only BLOCK with open IPv6 (e.g., followed
+		// by a dual-stack ALLOW all, or missing an explicit IPv6 BLOCK on a
+		// dual-stack site) is never treated as fully isolated.
+		dstIPv6 := pickRepIP(intNet, "ipv6", dstPinholesV6)
+		srcIPv6 := pickRepIP(srcNet, "ipv6", srcPinholesV6)
+		tcpDecV6 := evaluateGatewayPolicies(sorted, pathQuery{
+			srcZone:    srcRaw,
+			srcNetID:   srcNet.ID,
+			srcNetName: srcNet.Name,
+			srcIP:      srcIPv6,
+			srcMAC:     srcMAC,
+			dstZone:    "Internal",
+			dstNetID:   intNet.ID,
+			dstNetName: intNet.Name,
+			dstIP:      dstIPv6,
+			dstMAC:     dstMAC,
+			proto:      "tcp",
+			port:       443,
+			ipFamily:   "ipv6",
+			state:      "new",
+		})
+		udpDecV6 := evaluateGatewayPolicies(sorted, pathQuery{
+			srcZone:    srcRaw,
+			srcNetID:   srcNet.ID,
+			srcNetName: srcNet.Name,
+			srcIP:      srcIPv6,
+			srcMAC:     srcMAC,
+			dstZone:    "Internal",
+			dstNetID:   intNet.ID,
+			dstNetName: intNet.Name,
+			dstIP:      dstIPv6,
+			dstMAC:     dstMAC,
+			proto:      "udp",
+			port:       53,
+			ipFamily:   "ipv6",
+			state:      "new",
+		})
+		if tcpDecV6.action != "deny" || udpDecV6.action != "deny" {
+			continue
+		}
+		if zoneHasIPv6Context(snap, srcLow) && (tcpDecV6.ruleID == "" || udpDecV6.ruleID == "") {
+			continue
+		}
+
+		zones[srcLow] = true
+	}
 	return zones
+}
+
+// lookupNetworkByIP resolves an IPv4/IPv6 address to its most specific
+// configured UniFi LAN network using longest-prefix matching.
+func lookupNetworkByIP(snap *unifi.Snapshot, rawIP string) (unifi.Network, bool) {
+	if snap == nil {
+		return unifi.Network{}, false
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(rawIP))
+	if err != nil {
+		return unifi.Network{}, false
+	}
+	addr = addr.Unmap()
+	var best unifi.Network
+	bestBits := -1
+	for _, n := range snap.Networks {
+		p := strings.ToLower(strings.TrimSpace(n.Purpose))
+		if p == "wan" || p == "wan2" {
+			continue
+		}
+		for _, cidr := range []string{n.Subnet, n.IPv6Subnet} {
+			if cidr == "" {
+				continue
+			}
+			pfx, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+			if err != nil {
+				continue
+			}
+			if pfx.Contains(addr) && pfx.Bits() > bestBits {
+				best = n
+				bestBits = pfx.Bits()
+			}
+		}
+	}
+	return best, bestBits >= 0
 }
 
 // matchesVLAN reports whether a client's resolved network name or numeric VLAN

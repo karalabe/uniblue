@@ -182,9 +182,14 @@ func (r *ExposureRule) matches(pf unifi.PortForward) bool {
 		return false
 	}
 
+	// Never allow WAN-side DstPort fallback to classify an unrelated internal
+	// service as a benign/informational P2P or VPN listener (for example,
+	// forwarding WAN 4001 -> internal 8096 must stay unclassified medium).
+	isBenign := r.Class == "expected-p2p" || r.Class == "vpn-entrypoint" || r.Severity <= checks.SeverityInfo
+
 	portHit := false
 	for _, p := range r.Ports {
-		if pf.ExposesPort(p) || portSpecMatches(pf.DstPort, p) {
+		if pf.ExposesPort(p) || (!isBenign && portSpecMatches(pf.DstPort, p)) {
 			portHit = true
 			break
 		}
@@ -193,7 +198,7 @@ func (r *ExposureRule) matches(pf unifi.PortForward) bool {
 	// On benign expected-p2p / vpn-entrypoint rules, require portHit AND
 	// name_regex when name_regex is specified so ambiguous ports (like 9000 for
 	// Portainer/MinIO/php-fpm) are never misclassified as safe P2P listeners.
-	if r.Class == "expected-p2p" || r.Class == "vpn-entrypoint" {
+	if isBenign {
 		if !portHit {
 			return false
 		}
@@ -360,7 +365,10 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 		return nil
 	}
 
-	isoZones := isolatedZoneSet(snap)
+	// Use isolation-intended zones (including custom zones with leaking or
+	// shadowed BLOCK policies) so broad ALLOW rules defeating custom-zone
+	// isolation are still flagged as isolation leaks.
+	isoZones := intendedIsolatedZoneSet(snap)
 	gwName, gwIP := findGatewayIdentity(snap)
 
 	// Sort policies by Index so we can detect when an earlier broad BLOCK/REJECT
@@ -392,8 +400,8 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 				!strings.EqualFold(earlier.IPVersion, "both") && earlier.IPVersion != "" {
 				continue
 			}
-			if earlier.Source.AnyTarget && earlier.Destination.AnyTarget && earlier.Destination.AnyPort &&
-				(earlier.Protocol == "" || strings.EqualFold(earlier.Protocol, "all") || strings.EqualFold(earlier.Protocol, pol.Protocol)) &&
+			if earlier.Source.AnyTarget && earlier.Destination.AnyTarget && earlier.Destination.CoversAllPorts() &&
+				protocolCovers(earlier.Protocol, earlier.ProtocolNegated, pol.Protocol, pol.ProtocolNegated) &&
 				len(earlier.ConnectionStates) == 0 && earlier.Schedule == "" &&
 				!earlier.Source.NegateTarget && !earlier.Destination.NegateTarget && !earlier.Destination.NegatePort {
 				return true
@@ -424,16 +432,13 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 
 		zonePath := fmt.Sprintf("%s -> %s", pol.Source.ZoneName, pol.Destination.ZoneName)
 		portDesc := formatPolicyPorts(pol.Destination)
-		protoDesc := pol.Protocol
-		if protoDesc == "" {
-			protoDesc = "all"
-		}
+		protoDesc := formatPolicyProtocol(pol.Protocol, pol.ProtocolNegated)
 
 		switch {
 		case srcZone == "external" && dstZone == "gateway":
 			sev := checks.SeverityHigh
 			title := fmt.Sprintf("WAN-to-Gateway Firewall Policy Allows Direct Access (%s)", pol.Name)
-			if pol.Destination.AnyPort || strings.EqualFold(protoDesc, "all") {
+			if pol.Destination.AnyPort || pol.Destination.CoversAllPorts() || (!pol.ProtocolNegated && strings.EqualFold(protoDesc, "all")) {
 				sev = checks.SeverityCritical
 				title = fmt.Sprintf("Unrestricted WAN-to-Gateway Firewall Policy (%s)", pol.Name)
 			}
@@ -461,7 +466,7 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 		case srcZone == "external" && dstZone != "external":
 			sev := checks.SeverityHigh
 			title := fmt.Sprintf("WAN-to-LAN Firewall Policy Allows Inbound Traffic (%s)", pol.Name)
-			if pol.Destination.AnyPort || pol.Destination.AnyTarget {
+			if pol.Destination.AnyPort || pol.Destination.CoversAllPorts() || pol.Destination.AnyTarget {
 				sev = checks.SeverityCritical
 				title = fmt.Sprintf("Broad WAN-to-LAN Firewall Policy (%s)", pol.Name)
 			}
@@ -564,6 +569,41 @@ func formatPolicyTarget(ep unifi.PolicyEndpoint) string {
 		return strings.Join(ep.IPs, ",")
 	}
 	return "filtered"
+}
+
+// protocolCovers reports whether an earlier policy's protocol selector is a
+// superset of (fully shadows) a later policy's protocol selector.
+func protocolCovers(earlierProto string, earlierNeg bool, targetProto string, targetNeg bool) bool {
+	ep := strings.ToLower(strings.TrimSpace(earlierProto))
+	tp := strings.ToLower(strings.TrimSpace(targetProto))
+	if ep == "" || ep == "all" || ep == "any" {
+		return !earlierNeg
+	}
+	if tp == "" || tp == "all" || tp == "any" {
+		return targetNeg
+	}
+	if earlierNeg {
+		if targetNeg {
+			return ep == tp
+		}
+		return !matchesProtocol(ep, tp)
+	}
+	if targetNeg {
+		return false
+	}
+	return matchesProtocol(ep, tp)
+}
+
+// formatPolicyProtocol renders a policy protocol selector cleanly for evidence.
+func formatPolicyProtocol(proto string, negated bool) string {
+	p := strings.TrimSpace(proto)
+	if p == "" {
+		p = "all"
+	}
+	if negated {
+		return "not " + p
+	}
+	return p
 }
 
 // firstOrFallback returns items[0] when non-empty, otherwise fallback.

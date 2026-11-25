@@ -113,3 +113,93 @@ func TestBuildGroupsUnassignedClientsIntoSingleVLAN(t *testing.T) {
 		t.Fatalf("got %d clients in Unassigned VLAN group, want 3", unassignedClients)
 	}
 }
+
+// TestBuildZoneIsolationMatchesEffectivePolicyOrder verifies that topology
+// marks a custom zone isolated only when firewall policies effectively block
+// general transit to Internal (respecting policy ordering, protocol, schedule,
+// and pinpoint pinholes), matching risk package isolation semantics.
+func TestBuildZoneIsolationMatchesEffectivePolicyOrder(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Site:           "default",
+		ControllerType: "integration-v1",
+		Zones: []unifi.FirewallZone{
+			{ID: "z-int", Name: "Internal", NetworkIDs: []string{"n-lan"}},
+			{ID: "z-cam", Name: "CamZone", NetworkIDs: []string{"n-cam"}},
+			{ID: "z-icmp", Name: "ICMPOnlyZone", NetworkIDs: []string{"n-icmp"}},
+			{ID: "z-sched", Name: "ScheduledZone", NetworkIDs: []string{"n-sched"}},
+			{ID: "z-iot", Name: "IoTZone", NetworkIDs: []string{"n-iot"}},
+		},
+		Networks: []unifi.Network{
+			{ID: "n-lan", Name: "LAN", VLAN: "1", Subnet: "192.168.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
+			{ID: "n-cam", Name: "Cameras", VLAN: "20", Subnet: "192.168.20.1/24", Purpose: "corporate", ZoneName: "CamZone"},
+			{ID: "n-icmp", Name: "Sensors", VLAN: "30", Subnet: "192.168.30.1/24", Purpose: "corporate", ZoneName: "ICMPOnlyZone"},
+			{ID: "n-sched", Name: "Kids", VLAN: "40", Subnet: "192.168.40.1/24", Purpose: "corporate", ZoneName: "ScheduledZone"},
+			{ID: "n-iot", Name: "IoT", VLAN: "50", Subnet: "192.168.50.1/24", Purpose: "corporate", ZoneName: "IoTZone"},
+		},
+		FirewallPolicies: []unifi.FirewallPolicy{
+			// Shadowed BLOCK: earlier ALLOW at index 5 supersedes BLOCK at index 10.
+			{
+				ID: "cam-allow", Index: 5, Name: "Allow CamZone to Internal", Enabled: true, Action: "ALLOW",
+				IPVersion: "both", Protocol: "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "CamZone", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+			{
+				ID: "cam-block", Index: 10, Name: "Block CamZone to Internal", Enabled: true, Action: "BLOCK",
+				IPVersion: "both", Protocol: "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "CamZone", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+			// ICMP-only BLOCK does not isolate TCP/UDP.
+			{
+				ID: "icmp-block", Index: 20, Name: "Block ICMP only", Enabled: true, Action: "BLOCK",
+				IPVersion: "both", Protocol: "icmp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "ICMPOnlyZone", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+			// Scheduled BLOCK does not provide continuous isolation.
+			{
+				ID: "sched-block", Index: 30, Name: "Nighttime Block", Enabled: true, Action: "BLOCK",
+				IPVersion: "both", Protocol: "all", Schedule: "bedtime",
+				Source:      unifi.PolicyEndpoint{ZoneName: "ScheduledZone", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+			// Pinpoint DNS pinhole ahead of broad BLOCK still keeps IoTZone effectively isolated.
+			{
+				ID: "iot-dns", Index: 40, Name: "Allow IoT DNS to Pi-hole", Enabled: true, Action: "ALLOW",
+				IPVersion: "ipv4", Protocol: "udp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "IoTZone", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"192.168.1.53"}, Ports: []int{53}},
+			},
+			{
+				ID: "iot-block", Index: 50, Name: "Block IoT to Internal", Enabled: true, Action: "BLOCK",
+				IPVersion: "both", Protocol: "all",
+				Source:      unifi.PolicyEndpoint{ZoneName: "IoTZone", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+			},
+		},
+	}
+
+	model := Build(snap, nil, config.NetworkConfig{})
+	vlanIso := make(map[string]bool, len(model.VLANs))
+	for _, vg := range model.VLANs {
+		vlanIso[vg.Name] = vg.Isolated
+	}
+	zoneIso := make(map[string]bool, len(model.Zones))
+	for _, z := range model.Zones {
+		zoneIso[z.Name] = z.Isolated
+	}
+
+	if vlanIso["Cameras"] || zoneIso["CamZone"] {
+		t.Fatalf("expected CamZone with ALLOW ahead of BLOCK not to be isolated, vlan=%v zone=%v", vlanIso["Cameras"], zoneIso["CamZone"])
+	}
+	if vlanIso["Sensors"] || zoneIso["ICMPOnlyZone"] {
+		t.Fatalf("expected ICMPOnlyZone not to be isolated, vlan=%v zone=%v", vlanIso["Sensors"], zoneIso["ICMPOnlyZone"])
+	}
+	if vlanIso["Kids"] || zoneIso["ScheduledZone"] {
+		t.Fatalf("expected ScheduledZone not to be isolated, vlan=%v zone=%v", vlanIso["Kids"], zoneIso["ScheduledZone"])
+	}
+	if !vlanIso["IoT"] || !zoneIso["IoTZone"] {
+		t.Fatalf("expected IoTZone with single-host DNS pinhole before BLOCK to remain isolated, vlan=%v zone=%v", vlanIso["IoT"], zoneIso["IoTZone"])
+	}
+}
