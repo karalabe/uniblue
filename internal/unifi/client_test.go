@@ -18,6 +18,8 @@ import (
 	"github.com/karalabe/uniblue/internal/config"
 )
 
+// TestFetchSnapshotUniFiOS verifies UniFi OS cookie login with CSRF propagation
+// and legacy REST snapshot assembly under /proxy/network.
 func TestFetchSnapshotUniFiOS(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
@@ -75,6 +77,8 @@ func TestFetchSnapshotUniFiOS(t *testing.T) {
 	}
 }
 
+// TestFetchSnapshotClassicFallback verifies automatic fallback to /api/login
+// when /api/auth/login returns 404 on classic controllers.
 func TestFetchSnapshotClassicFallback(t *testing.T) {
 	mux := http.NewServeMux()
 	// Classic Cloud Key returns 404 for /api/auth/login and uses /api/login instead.
@@ -122,6 +126,8 @@ func TestFetchSnapshotClassicFallback(t *testing.T) {
 	}
 }
 
+// TestFetchSnapshotIntegrationV1 verifies API-key authentication, offset
+// pagination, CIDR-based VLAN resolution, and graceful 401 degradation on legacy endpoints.
 func TestFetchSnapshotIntegrationV1(t *testing.T) {
 	mux := http.NewServeMux()
 	checkKey := func(w http.ResponseWriter, r *http.Request) bool {
@@ -205,6 +211,7 @@ func TestFetchSnapshotIntegrationV1(t *testing.T) {
 	}
 }
 
+// TestPortMatchesSpec verifies single-port, range, and comma-separated UniFi port specs.
 func TestPortMatchesSpec(t *testing.T) {
 	tests := []struct {
 		spec string
@@ -224,6 +231,9 @@ func TestPortMatchesSpec(t *testing.T) {
 	}
 }
 
+// TestFetchSnapshotFirewallVisibilityAndPolicySemantics verifies that HTTP 403
+// marks GatewayPoliciesAvailable false while 200 OK preserves rule order, state,
+// negation, and unsupported filter markers.
 func TestFetchSnapshotFirewallVisibilityAndPolicySemantics(t *testing.T) {
 	// Verify Integration v1 HTTP 403 on firewall/policies marks GatewayPoliciesAvailable=false,
 	// while a 200 OK response preserves Index, ConnectionStates, MatchReturnTraffic,
@@ -277,7 +287,7 @@ func TestFetchSnapshotFirewallVisibilityAndPolicySemantics(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// 1. 403 on firewall/policies -> GatewayPoliciesAvailable MUST be false!
+	// 1. HTTP 403 on firewall/policies must mark GatewayPoliciesAvailable false.
 	snap403, err := ctrl.FetchSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("FetchSnapshot(403): %v", err)
@@ -286,7 +296,7 @@ func TestFetchSnapshotFirewallVisibilityAndPolicySemantics(t *testing.T) {
 		t.Fatalf("expected GatewayPoliciesAvailable=false on HTTP 403, got %+v", snap403.Visibility)
 	}
 
-	// 2. 200 OK -> GatewayPoliciesAvailable=true and wire fields preserved accurately!
+	// 2. HTTP 200 OK must mark GatewayPoliciesAvailable true and preserve wire fields.
 	policiesStatus = http.StatusOK
 	snapOK, err := ctrl.FetchSnapshot(context.Background())
 	if err != nil {

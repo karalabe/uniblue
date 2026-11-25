@@ -78,10 +78,10 @@ func runFullPipelineForTest(t *testing.T, snap *unifi.Snapshot, profiles []probe
 	return report, pm
 }
 
-// Acceptance Case 1:
-// A guest can discover and use an approved IPPS printer. Printer administration
-// is blocked. UniBlue reports approved printing and leaves the action queue clear.
-func TestAcceptanceCase1_GuestApprovedIPPSPrintingAdminBlocked(t *testing.T) {
+// TestGuestApprovedIPPSPrintingAdminBlocked verifies that an approved guest
+// IPPS printing path (TCP 631) stays out of the action queue when printer web
+// administration (TCP 80/443) is blocked, and flags admin access if opened.
+func TestGuestApprovedIPPSPrintingAdminBlocked(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Devices: []unifi.Device{
@@ -176,7 +176,7 @@ func TestAcceptanceCase1_GuestApprovedIPPSPrintingAdminBlocked(t *testing.T) {
 		t.Fatalf("expected action queue to be completely clear for approved guest printing, got %+v", pm.Queue)
 	}
 
-	// Counterexample: if guest rule also allows TCP 443 (printer admin), UniBlue MUST flag it!
+	// Counterexample: if the guest rule also allows TCP 443 (printer admin), UniBlue flags it.
 	snap.FirewallPolicies[0].Destination.Ports = []int{631, 443}
 	reportBad, pmBad := runFullPipelineForTest(t, snap, profiles, netCfg, nil)
 	if reportBad.Isolation.ViolationCount == 0 || len(pmBad.Queue) == 0 {
@@ -184,12 +184,11 @@ func TestAcceptanceCase1_GuestApprovedIPPSPrintingAdminBlocked(t *testing.T) {
 	}
 }
 
-// Acceptance Case 2:
-// A BMC is visible to the admin workstation. Guest IPv4 access is denied, but a
-// specific IPv6 rule permits guest access. UniBlue identifies Redfish, reports
-// the configured IPv6 path, and names the rule to narrow.
-func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
-	// Spin up a local Redfish ServiceRoot HTTP mock to test UB-0020 end-to-end!
+// TestBMCRedfishGuestIPv4DeniedIPv6Allowed verifies that Redfish ServiceRoot is
+// recorded as service-observed inventory while an IPv6 guest-to-BMC firewall rule
+// is flagged separately from blocked IPv4 access, naming the decisive rule.
+func TestBMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
+	// Spin up a local Redfish ServiceRoot HTTP mock to test UB-0020 end-to-end.
 	redfishSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/redfish/v1") {
 			w.Header().Set("Content-Type", "application/json")
@@ -319,14 +318,14 @@ func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
 		t.Fatalf("expected IPv4 blocked-ok (%v) and IPv6 violation (%v), cells=%+v", v4Blocked, v6Violation, report.Isolation.Cells)
 	}
 
-	// 2b. Verify an IPv6 rule scoped to a DIFFERENT IPv6 address does NOT match this BMC!
+	// 2b. Verify an IPv6 rule scoped to a different IPv6 address does not match this BMC.
 	snap.FirewallPolicies[1].Destination.IPs = []string{"2001:db8:90::99"}
 	repOther, pmOther := runFullPipelineForTest(t, snap, profiles, netCfg, []*checks.Check{redfishCheck})
 	if repOther.Isolation.ViolationCount != 0 || len(pmOther.Queue) != 0 {
 		t.Fatalf("IPv6 rule for unrelated address must not trigger BMC violation, got iso=%+v queue=%+v", repOther.Isolation, pmOther.Queue)
 	}
 
-	// 3. Counterexample: disabling the IPv6 leak leaves isolated Redfish BMC as clean inventory with empty Queue!
+	// 3. Counterexample: disabling the IPv6 leak leaves the isolated Redfish BMC as clean inventory with an empty queue.
 	snap.FirewallPolicies[1].Enabled = false
 	_, pmClean := runFullPipelineForTest(t, snap, profiles, netCfg, []*checks.Check{redfishCheck})
 	if len(pmClean.Queue) != 0 {
@@ -339,10 +338,9 @@ func TestAcceptanceCase2_BMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
 	_ = pm
 }
 
-// Acceptance Case 3:
-// A UDP game forward and an internal TCP admin service share a port number.
-// UniBlue associates the forward only with UDP.
-func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T) {
+// TestUDPForwardDoesNotPromoteTCPAdminOnSamePort verifies that a UDP WAN port
+// forward never escalates an internal TCP service sharing the same port number.
+func TestUDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Networks: []unifi.Network{
@@ -380,7 +378,7 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 	if tcpFinding == nil {
 		t.Fatal("expected UB-0040 finding in report")
 	}
-	// Because the forward is UDP-only, TCP finding on isolated IoT VLAN must NOT become WAN-Critical!
+	// Because the forward is UDP-only, a TCP finding on an isolated IoT VLAN must not become WAN-Critical.
 	if tcpFinding.EffectiveSeverity == checks.SeverityCritical {
 		t.Fatalf("UDP game forward must NOT promote TCP admin finding on port 27015 to Critical: %+v", tcpFinding)
 	}
@@ -390,7 +388,7 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 		}
 	}
 
-	// Verify PresentationModel marks TCP 27015 as vlan-only (NOT wan) and UDP 27015 as wan!
+	// Verify PresentationModel marks TCP 27015 as vlan-only (not wan) and UDP 27015 as wan.
 	now := time.Now().UTC()
 	cv := []ClientView{{Client: snap.Clients[0], OpenPorts: []int{27015}, LastScannedAt: &now}}
 	pm := BuildPresentationModel(snap, report, nil, cv, nil, nil, []probe.HostProfile{{Client: snap.Clients[0], OpenPorts: []int{27015}, ScannedAt: now}})
@@ -414,8 +412,8 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 		t.Fatalf("UDP 27015 should be marked WAN reachable; got %+v", ent.Services)
 	}
 
-	// Counterexample: changing forward to TCP DOES escalate TCP 27015 to Critical,
-	// even if an earlier source-restricted TCP forward appears first!
+	// Counterexample: changing the forward to TCP escalates TCP 27015 to Critical,
+	// even when an earlier source-restricted TCP forward appears first.
 	snap.PortForwards = []unifi.PortForward{
 		{ID: "pf-tcp-restricted", Name: "TCP Admin Restricted", Enabled: true, Proto: "tcp", DstPort: "27015", FwdIP: "10.0.20.15", FwdPort: "27015", Src: "203.0.113.5/32"},
 		{ID: "pf-tcp-open", Name: "TCP Admin Open", Enabled: true, Proto: "tcp", DstPort: "27015", FwdIP: "10.0.20.15", FwdPort: "27015", Src: "any"},
@@ -435,10 +433,10 @@ func TestAcceptanceCase3_UDPForwardDoesNotPromoteTCPAdminOnSamePort(t *testing.T
 	}
 }
 
-// Acceptance Case 4:
-// An NVR reports a camera on its private PoE network. UniBlue shows the camera
-// as a child with recorder-supplied identity and direct LAN reachability marked unknown.
-func TestAcceptanceCase4_NVRChildCameraPrivatePoE(t *testing.T) {
+// TestNVRChildCameraPrivatePoE verifies that an NVR-reported private-PoE camera
+// appears as a child entity with recorder-supplied identity, direct LAN reachability
+// marked unknown, and zero spurious direct-LAN exposures.
+func TestNVRChildCameraPrivatePoE(t *testing.T) {
 	nvrInventoryJSON := `{
 		"parent_ip": "10.0.30.10",
 		"parent_mac": "11:22:33:44:55:04",
@@ -496,16 +494,16 @@ func TestAcceptanceCase4_NVRChildCameraPrivatePoE(t *testing.T) {
 		childEnt.DirectLANReachability != "unknown" || childEnt.State != VerdictUnknown {
 		t.Fatalf("unexpected child camera entity: %+v", childEnt)
 	}
-	// NVR private PoE child must NOT generate a false direct-LAN exposure in the action queue!
+	// NVR private-PoE child must not generate a false direct-LAN exposure in the action queue.
 	if len(pm.Queue) != 0 {
 		t.Fatalf("private PoE child camera must not claim direct LAN exposure in queue: %+v", pm.Queue)
 	}
 }
 
-// Acceptance Case 5:
-// The controller omits the applicable switch ACL. UniBlue identifies the
-// missing evidence and leaves that isolation verdict unknown.
-func TestAcceptanceCase5_OmittedSwitchACLYieldsUnknownIsolationVerdict(t *testing.T) {
+// TestOmittedSwitchACLYieldsUnknownIsolationVerdict verifies that L3 switch-routed
+// and wired same-VLAN cells remain unknown when switch ACL telemetry is omitted,
+// and resolve once complete switch ACLs are provided.
+func TestOmittedSwitchACLYieldsUnknownIsolationVerdict(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Devices: []unifi.Device{
@@ -550,8 +548,8 @@ func TestAcceptanceCase5_OmittedSwitchACLYieldsUnknownIsolationVerdict(t *testin
 		t.Fatalf("expected both L3 switch-routed (%v) and wired same-VLAN (%v) verdicts to be unknown with missing evidence, cells=%+v", foundL3Unknown, foundL2Unknown, report.Isolation.Cells)
 	}
 
-	// Counterexample: when controller supplies complete switch ACLs, BOTH the L3
-	// switch-routed cell AND the L2 wired-same-vlan cell must remain present!
+	// Counterexample: when the controller supplies complete switch ACLs, both the L3
+	// switch-routed cell and the L2 wired-same-vlan cell remain present.
 	snap.SwitchACLCoverage = &unifi.SwitchACLCoverage{Status: "complete"}
 	snap.SwitchACLs = []unifi.SwitchACL{
 		{

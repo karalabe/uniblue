@@ -12,6 +12,8 @@ import (
 	"testing"
 )
 
+// TestMDNSPacketParseAndTXTAllowlist verifies RFC 1035 compressed DNS-SD packet
+// parsing and filtering of sensitive TXT keys.
 func TestMDNSPacketParseAndTXTAllowlist(t *testing.T) {
 	// Build a minimal DNS response packet containing PTR, SRV, TXT, and A records
 	// with RFC 1035 name compression and verify unsafe TXT keys are dropped.
@@ -89,6 +91,8 @@ func TestMDNSPacketParseAndTXTAllowlist(t *testing.T) {
 	}
 }
 
+// TestValidateSameHostURLPinning verifies that SSDP/WSD URL pinning accepts
+// same-host HTTP(S) URLs and rejects cross-host SSRF, userinfo, and non-HTTP schemes.
 func TestValidateSameHostURLPinning(t *testing.T) {
 	if port, u, ok := validateSameHostURL("http://192.0.2.10:49000/tr64desc.xml", "192.0.2.10"); !ok || port != 49000 || u == "" {
 		t.Fatalf("expected same-host UPnP URL to pass, got ok=%v port=%d u=%q", ok, port, u)
@@ -107,6 +111,8 @@ func TestValidateSameHostURLPinning(t *testing.T) {
 	}
 }
 
+// TestUPnPAndWSDParsers verifies XML extraction of UPnP device/service metadata
+// and WS-Discovery ProbeMatch types, scopes, and same-host XAddr ports.
 func TestUPnPAndWSDParsers(t *testing.T) {
 	upnpXML := `<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -149,6 +155,8 @@ func TestUPnPAndWSDParsers(t *testing.T) {
 	}
 }
 
+// TestRawPrintSinkGuard verifies that fixed raw print ports (9100, 515) and
+// mDNS-advertised raw print sinks are protected while regular ports remain allowed.
 func TestRawPrintSinkGuard(t *testing.T) {
 	disc := &LANDiscovery{
 		RawPrintIPs: map[string]map[int]struct{}{

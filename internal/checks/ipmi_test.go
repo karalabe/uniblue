@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+// TestProbeIPMIRMCPAndCipher0 verifies read-only IPMI RMCP GetChannelAuthCap
+// vendor decoding and RMCP+ Open Session Cipher 0 bypass detection.
 func TestProbeIPMIRMCPAndCipher0(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

@@ -19,6 +19,8 @@ import (
 	"github.com/praetorian-inc/nerva/pkg/plugins"
 )
 
+// TestFingerprintHostAndExclusions verifies open port discovery, exclude_ips
+// enforcement, and HTTP landing-page title and header extraction.
 func TestFingerprintHostAndExclusions(t *testing.T) {
 	// Start a local HTTP listener simulating an embedded ventilation web panel.
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +64,9 @@ func TestFingerprintHostAndExclusions(t *testing.T) {
 	}
 }
 
+// TestShouldKeepNervaFindingFiltersSyntheticHTTPAnonAccess verifies that
+// Nerva's synthetic HTTP product-detection anon-access notices are dropped while
+// real protocol misconfigurations (such as SMBv1) are kept.
 func TestShouldKeepNervaFindingFiltersSyntheticHTTPAnonAccess(t *testing.T) {
 	// Synthetic HTTP fingerprinter finding emitted on public /api/health or /login must be dropped.
 	synthetic := plugins.SecurityFinding{

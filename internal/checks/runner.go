@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	// maxProbeBodyBytes caps HTTP response reads during Stage 2 verification so
+	// maxProbeBodyBytes caps HTTP response reads during active probe verification so
 	// large pages never consume excessive memory.
 	maxProbeBodyBytes = 64 * 1024
 
@@ -229,8 +229,8 @@ func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Fin
 	return all
 }
 
-// RunHost evaluates all checks whose Stage 1 preconditions match hp and executes
-// their Stage 2 verification probes sequentially against that host.
+// RunHost evaluates all checks whose preconditions match hp and executes
+// their verification probes sequentially against that host.
 func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 	var findings []Finding
 	// Track (checkID|port) pairs superseded by more specific device checks on
@@ -297,12 +297,12 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 	return filtered
 }
 
-// matchPreconditions checks Stage 1 rules against already-fingerprinted host
+// matchPreconditions evaluates precondition rules against already-fingerprinted host
 // metadata without sending any network packets. It returns the target port(s)
 // to probe when all preconditions hold.
 func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	// Match open ports first since it is the cheapest filter and also selects
-	// which concrete ports Stage 2 should probe.
+	// which concrete ports the verification probe should target.
 	for _, p := range chk.Preconditions.PortsAll {
 		if !hp.HasPort(p) {
 			return nil, false
@@ -515,7 +515,7 @@ func matchPreconditions(chk *Check, hp probe.HostProfile) ([]int, bool) {
 	return matchedPorts, true
 }
 
-// executeProbe runs the Stage 2 verification step for a single check against ip:port.
+// executeProbe runs the verification probe for a single check against ip:port.
 func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port int) (string, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, chk.Probe.Timeout)
 	defer cancel()

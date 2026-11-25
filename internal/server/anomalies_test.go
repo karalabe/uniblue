@@ -14,6 +14,9 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestAnomalyTrackerPortTamperAndBehavioralSignals verifies detection of PoE
+// cable swaps, inline hub MAC surges, STP blocking, dormant wakeups, wired/Wi-Fi
+// swaps, IoT upload spikes, Evil-Twin APs, WAN/VPN transitions, and config drift.
 func TestAnomalyTrackerPortTamperAndBehavioralSignals(t *testing.T) {
 	now := time.Now().UTC()
 	tr := newAnomalyTracker()

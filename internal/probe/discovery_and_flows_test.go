@@ -109,11 +109,14 @@ func buildMDNSTestPacket(svcType, instance, targetHost string, port uint16, ttl 
 	return pkt.Bytes()
 }
 
+// TestDiscoveryCache_MatterUDPException_IPv6_Reflection_TTLWithdrawal verifies
+// Matter _matter._tcp UDP transport handling, IPv6 AAAA assembly, mDNS reflector
+// attribution, RFC 6762 TTL=0 withdrawal, TXT key replacement, and TTL expiry.
 func TestDiscoveryCache_MatterUDPException_IPv6_Reflection_TTLWithdrawal(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	cache := NewDiscoveryCache()
 
-	// 1. Matter operational (_matter._tcp) with IPv6 AAAA only -> MUST stay UDP & NEVER enter TCP PortsByIP!
+	// 1. Matter operational (_matter._tcp) with IPv6 AAAA only must stay UDP and never enter TCP PortsByIP.
 	ipv6Bytes := net.ParseIP("fd00:1::10").To16()
 	matterPkt := buildMDNSTestPacket("_matter._tcp", "ABCDEF0123456789-0000000000000001", "matter-lamp.local", 5540, 120, nil, ipv6Bytes, []string{"sii=500", "sai=300"})
 	cache.IngestMDNSPacket(matterPkt, "fd00:1::10", "eth0.20", "IoT", now)
@@ -128,7 +131,7 @@ func TestDiscoveryCache_MatterUDPException_IPv6_Reflection_TTLWithdrawal(t *test
 
 	snap := cache.Snapshot(now)
 
-	// Verify Matter operational IPv6 record exists, has Transport=="udp", AddressFamily=="ipv6", and ZERO TCP ports planned!
+	// Verify Matter operational IPv6 record has Transport=="udp", AddressFamily=="ipv6", and zero TCP ports planned.
 	matterSvcs := snap.MDNS["fd00:1::10"]
 	foundMatter := false
 	for _, s := range matterSvcs {
@@ -155,7 +158,7 @@ func TestDiscoveryCache_MatterUDPException_IPv6_Reflection_TTLWithdrawal(t *test
 		t.Fatalf("expected reflected printer service on 10.0.1.30 with ObserverVLAN=Guest, got %+v", prnSvcs)
 	}
 
-	// Verify RFC 6762 TTL=0 goodbye packet immediately withdraws the printer service!
+	// Verify RFC 6762 TTL=0 goodbye packet immediately withdraws the printer service.
 	byePkt := buildMDNSTestPacket("_ipps._tcp", "OfficePrinter", "printer.local", 631, 0, []byte{10, 0, 1, 30}, nil, nil)
 	cache.IngestMDNSPacket(byePkt, "10.0.50.1", "eth0.50", "Guest", now.Add(5*time.Second))
 	snapAfterBye := cache.Snapshot(now.Add(5 * time.Second))
@@ -163,7 +166,7 @@ func TestDiscoveryCache_MatterUDPException_IPv6_Reflection_TTLWithdrawal(t *test
 		t.Fatalf("expected TTL=0 goodbye packet to withdraw service, still got %+v", snapAfterBye.MDNS["10.0.1.30"])
 	}
 
-	// Verify TXT replacement: cm=0 refresh replaces cm=1 (never leaves stale cm=1 behind)!
+	// Verify TXT replacement: cm=0 refresh replaces cm=1 without leaving stale values.
 	commOpen := buildMDNSTestPacket("_matterc._udp", "LAMP01", "lamp01.local", 5540, 120, []byte{10, 0, 20, 44}, nil, []string{"cm=1", "d=1234"})
 	cache.IngestMDNSPacket(commOpen, "10.0.20.44", "eth0.20", "IoT", now)
 	commClosed := buildMDNSTestPacket("_matterc._udp", "LAMP01", "lamp01.local", 5540, 120, []byte{10, 0, 20, 44}, nil, []string{"cm=0", "d=1234"})
@@ -177,7 +180,7 @@ func TestDiscoveryCache_MatterUDPException_IPv6_Reflection_TTLWithdrawal(t *test
 		}
 	}
 
-	// Verify unresolved SRV target host is NEVER falsely attributed to reflector IP!
+	// Verify unresolved SRV target host is never falsely attributed to reflector IP.
 	unresolvedPkt := buildMDNSTestPacket("_ipp._tcp", "GhostPrinter", "unknown-printer.local", 631, 60, nil, nil, []string{"ty=Ghost"})
 	cache.IngestMDNSPacket(unresolvedPkt, "10.0.50.1", "eth0.50", "Guest", now)
 	snapUnres := cache.Snapshot(now)
@@ -185,13 +188,15 @@ func TestDiscoveryCache_MatterUDPException_IPv6_Reflection_TTLWithdrawal(t *test
 		t.Fatalf("unresolved SRV target must not be assigned to reflector 10.0.50.1, got %+v", snapUnres.MDNS["10.0.50.1"])
 	}
 
-	// Verify TTL expiry removes Matter after 121 seconds!
+	// Verify TTL expiry removes Matter after 121 seconds.
 	snapExpired := cache.Snapshot(now.Add(125 * time.Second))
 	if len(snapExpired.MDNS["fd00:1::10"]) != 0 {
 		t.Fatalf("expected expired mDNS records to drop after TTL, got %+v", snapExpired.MDNS["fd00:1::10"])
 	}
 }
 
+// TestRawPrinterReceivesZeroApplicationBytesAtSocketBoundary verifies at the
+// TCP socket boundary that Fingerprinter writes zero application bytes to raw print sinks.
 func TestRawPrinterReceivesZeroApplicationBytesAtSocketBoundary(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -240,6 +245,9 @@ func TestRawPrinterReceivesZeroApplicationBytesAtSocketBoundary(t *testing.T) {
 	}
 }
 
+// TestNervaMatrixAudit_AlternatePorts_AndTLSUnknownApp verifies Nerva registry
+// introspection, alternate-port SSH detection, raw TLS unknown-app preservation,
+// and separation of hosted passive services from outbound CDN dependencies.
 func TestNervaMatrixAudit_AlternatePorts_AndTLSUnknownApp(t *testing.T) {
 	// 1. Audit pinned Nerva registry counts (must report TCP/TLS + UDP/SCTP recognizers).
 	entries := AuditPinnedNervaPlugins()
@@ -298,7 +306,7 @@ func TestNervaMatrixAudit_AlternatePorts_AndTLSUnknownApp(t *testing.T) {
 		t.Fatalf("expected 1 profile, got %d", len(profiles))
 	}
 
-	// Verify passive flows separate hosted UDP services from outbound CDN/encrypted dependencies!
+	// Verify passive flows separate hosted UDP services from outbound CDN/encrypted dependencies.
 	now := time.Now().UTC()
 	ApplyPassiveFlows(profiles, []PassiveFlowRecord{
 		{Direction: "hosted", LocalIP: "127.0.0.1", Port: 53, Transport: "udp", Protocol: "dns", Source: "zeek", Observer: "Core", ObservedAt: &now},
@@ -352,6 +360,8 @@ func TestNervaMatrixAudit_AlternatePorts_AndTLSUnknownApp(t *testing.T) {
 	}
 }
 
+// TestBridgeInventoryParsers_Zigbee2MQTT_And_ZWaveJS verifies parsing of
+// Zigbee2MQTT and Z-Wave JS exports into normalized non-IP child device records.
 func TestBridgeInventoryParsers_Zigbee2MQTT_And_ZWaveJS(t *testing.T) {
 	z2m := `[
 		{"ieee_address":"0x00124b0001","type":"Coordinator","friendly_name":"Coordinator"},

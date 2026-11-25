@@ -19,6 +19,9 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestBuildPresentationModelInvariants verifies PresentationModel verdict and
+// layout invariants: exact-CVE hosts are Exposed, unscanned hosts are Unknown,
+// BMCs stay pinned in their VLAN lane, and census counts match entity predicates.
 func TestBuildPresentationModelInvariants(t *testing.T) {
 	now := time.Now().UTC()
 	snap := &unifi.Snapshot{
@@ -32,13 +35,13 @@ func TestBuildPresentationModelInvariants(t *testing.T) {
 			{Name: "Orphan Switch", MAC: "aa:00:00:00:00:02", IP: "192.0.2.2", Model: "USW-8", Type: "usw"},
 		},
 		Clients: []unifi.Client{
-			// Regression fixture: 0 check findings + 3 exact CVEs -> MUST be Exposed, never OK/Clean!
+			// Fixture: 0 check findings + 3 exact CVEs must be Exposed, never OK.
 			{MAC: "11:11:11:11:11:01", IP: "192.0.2.10", Name: "app-cve-host", NetworkName: "Servers", IsWired: true},
-			// Unscanned host -> MUST be Unknown, never OK!
+			// Unscanned host must be Unknown, never OK.
 			{MAC: "11:11:11:11:11:02", IP: "192.0.2.11", Name: "unscanned-host", NetworkName: "Servers", IsWired: true},
-			// BMC host -> MUST be placed in LogicalLane.BMCIDs (never collapsed into CleanHostIDs) with Weight=3!
+			// BMC host must be placed in LogicalLane.BMCIDs (never collapsed into CleanHostIDs) with Weight=3.
 			{MAC: "11:11:11:11:11:03", IP: "192.0.2.5", Name: "Server Management Console", NetworkName: "Servers", IsWired: true},
-			// Freshly scanned clean host -> MUST be OK!
+			// Freshly scanned clean host must be OK.
 			{MAC: "11:11:11:11:11:04", IP: "192.0.2.12", Name: "clean-host", NetworkName: "Servers", IsWired: true},
 		},
 	}

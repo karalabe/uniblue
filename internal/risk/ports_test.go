@@ -14,6 +14,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestAnalyzeSwitchPortsExternalDeviceAndFeederTracing verifies external switch
+// sorting, LLDP feeder cable tracing, and exterior port security findings.
 func TestAnalyzeSwitchPortsExternalDeviceAndFeederTracing(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
@@ -256,6 +258,8 @@ func TestAnalyzeSwitchPortsExternalDeviceAndFeederTracing(t *testing.T) {
 	}
 }
 
+// TestAnalyzeSwitchPortsUnauthorizedMACAndAutoExternal verifies explicit
+// allowed_macs enforcement and automatic outdoor switch inference by device name.
 func TestAnalyzeSwitchPortsUnauthorizedMACAndAutoExternal(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",

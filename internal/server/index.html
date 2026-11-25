@@ -882,7 +882,7 @@
   }
   .link-card:hover { border-color: var(--blue); background: var(--surface); }
 
-  /* Collapsible Technical Details (Power Users!) */
+  /* Collapsible Technical Details */
   details.tech {
     border: 1px solid var(--border);
     border-radius: 13px;
@@ -2138,7 +2138,7 @@ function renderDevices() {
     html += `<div class="card"><div class="empty">No devices match your current filter.</div></div>`;
   }
 
-  // Wi-Fi Networks (Plain-English cards!)
+  // Wi-Fi Networks
   const wlans = state.report?.unifi_posture?.wlans || [];
   if (wlans.length && deviceFilter === "all" && !deviceSearch) {
     html += `<div class="card">
@@ -2166,7 +2166,7 @@ function renderDevices() {
     </div>`;
   }
 
-  // Internet Port Forwards (Plain-English!)
+  // Internet Port Forwards
   const wanFlows = (vm.wan_flows || []).filter(f => f.kind === "forward");
   if (wanFlows.length && (deviceFilter === "all" || deviceFilter === "wan")) {
     html += `<div class="card">
@@ -2417,7 +2417,7 @@ function renderDrawer() {
     b += `</div>`;
   }
 
-  // 3. Connected To (Clickable cross-links with Back stack!)
+  // 3. Connected To (clickable cross-links with Back stack)
   const links = [];
   if (ent.kind === "host") {
     if (ent.port_id && vm.entities[ent.port_id]) {
@@ -2463,7 +2463,7 @@ function renderDrawer() {
     b += `</div>`;
   }
 
-  // 4. Collapsible Technical Details (Full Fidelity for Power Users!)
+  // 4. Collapsible Technical Details
   b += `<details class="tech">
     <summary>Technical details (IP, MAC, ports &amp; raw checks)</summary>
     <div class="tech-body">

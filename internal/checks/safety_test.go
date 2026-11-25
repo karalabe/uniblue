@@ -19,6 +19,9 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestNewChecksAddZeroGlobalPortsAndZeroConnectionsToUnrelatedHosts verifies
+// that discovery-only, passive, and UDP checks never expand the global TCP sweep
+// and make zero connections to unrelated hosts.
 func TestNewChecksAddZeroGlobalPortsAndZeroConnectionsToUnrelatedHosts(t *testing.T) {
 	all, err := LoadFromFS(builtinchecks.BuiltinFS)
 	if err != nil {
@@ -79,6 +82,9 @@ func TestNewChecksAddZeroGlobalPortsAndZeroConnectionsToUnrelatedHosts(t *testin
 	}
 }
 
+// TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter verifies
+// that Matter cm=0 extended discovery does not fire commissioning alerts, DoorBird
+// OUI prevents Axis misattribution, and raw print sinks receive zero probe bytes.
 func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *testing.T) {
 	all, err := LoadFromFS(builtinchecks.BuiltinFS)
 	if err != nil {
@@ -87,7 +93,7 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 	r := NewRunner(all, 1)
 
 	// 1. Matter cm=1 (active commissioning) fires UB-2026-0020 at Info severity;
-	// cm=0 (extended discovery outside commissioning window) MUST NOT fire!
+	// cm=0 (extended discovery outside commissioning window) must not fire.
 	matterActive := probe.HostProfile{
 		Client:       unifi.Client{IP: "192.0.2.10"},
 		MDNSServices: []probe.MDNSService{{Type: "_matterc._udp", Port: 5540, TXT: []string{"cm=1", "d=3840"}}},
@@ -121,7 +127,7 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 	}
 
 	// 3. Raw printer zero-byte guard in Runner: even if a raw print sink overlaps
-	// an HTTP check port, Runner must NOT write any bytes to that socket!
+	// an HTTP check port, Runner must not write any bytes to that socket.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -171,6 +177,9 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 	}
 }
 
+// TestPropertyKeyedNervaDeduplicationPreservesIndependentFindings verifies that
+// Nerva deduplication keys on security property so distinct findings on the same
+// port (such as SMBv1 vs. SMB signing, or HTTP vs. expired TLS cert) both survive.
 func TestPropertyKeyedNervaDeduplicationPreservesIndependentFindings(t *testing.T) {
 	hp := probe.HostProfile{
 		Client: unifi.Client{IP: "192.0.2.50", MAC: "aa:bb:cc:dd:ee:50"},

@@ -822,7 +822,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
-	// Run Stage 2 active/passive checks once per full scan on deep-cloned enriched
+	// Run active and passive checks once per full scan on deep-cloned enriched
 	// profiles and cache per-host results so subsequent topology/policy-only
 	// recomputations require ZERO device network I/O.
 	enriched := make([]probe.HostProfile, len(profiles))

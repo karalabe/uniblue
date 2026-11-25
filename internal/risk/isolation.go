@@ -342,7 +342,7 @@ func EvaluateIsolation(
 			addCell(ippsCell)
 
 			// If CUPS exposes unauthenticated /admin on the same 631 printing socket
-			// and guests can reach 631, surface the shared-socket admin violation!
+			// and guests can reach 631, surface the shared-socket admin violation.
 			if cupsAdminOn631 && ippsCell.Effective == "allow" {
 				sharedCell := IsolationCell{
 					SourceZone:       srcZone,
@@ -385,7 +385,7 @@ func EvaluateIsolation(
 				addCell(sharedCell)
 			}
 
-			// 2b. Dedicated Printer Web Administration (TCP 443 / 80): MUST be denied from Guest!
+			// 2b. Dedicated Printer Web Administration (TCP 443 / 80) must be denied from Guest.
 			for _, adminPort := range []int{443, 80} {
 				adminCell := evaluateRoutedPath(
 					snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
@@ -435,7 +435,7 @@ func EvaluateIsolation(
 	}
 
 	// 3. Evaluate L3 Switch-Routed and Inter-Zone Untrusted -> Trusted Boundaries
-	// (including IPv4/IPv6 parity & Switch ACL availability) plus Gateway admin & DNS/DHCP!
+	// (including IPv4/IPv6 parity and switch ACL availability) plus gateway admin and DNS/DHCP.
 	for _, srcNet := range untrustedNets {
 		srcZone := strings.TrimSpace(srcNet.ZoneName)
 		for _, dstNet := range trustedNets {
@@ -493,7 +493,7 @@ func EvaluateIsolation(
 			}
 		}
 
-		// 3b. Untrusted -> Gateway Administration (always enforced by Gateway Zone Firewall, NEVER L3 switch!).
+		// 3b. Untrusted -> Gateway Administration (always enforced by the Gateway Zone Firewall, never an L3 switch).
 		gwAdminCell := evaluateRoutedPath(
 			snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
 			switchACLStatus, switchACLReason, gwName, srcNet, unifi.Network{Name: "Gateway", ZoneName: "Gateway"},
@@ -1029,7 +1029,7 @@ func evaluateSameVLANPeerIsolation(
 			}
 		}
 
-		// Wired same-VLAN peer isolation (gateway never sees local L2 switching!).
+		// Wired same-VLAN peer isolation (gateway never sees local L2 switching).
 		if len(wiredClients) >= 2 || (explicitReq && len(wiredClients) >= 1) {
 			allPortsIsolated := len(wiredClients) > 0
 			for _, wc := range wiredClients {

@@ -15,6 +15,9 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestAnalyzeUniFiPostureAndPhysicalTamper verifies Wi-Fi encryption/isolation,
+// Evil-Twin vs. owned virtual BSSID filtering, unauthorized wired AP correlation,
+// gateway security controls, and shared-VLAN BMC detection.
 func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
@@ -96,14 +99,14 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 			},
 		},
 		RogueAPs: []unifi.RogueAP{
-			// Owned AP virtual BSSID (middle 4 octets match aa:bb:cc:11:22:01) -> must NOT alert!
+			// Owned AP virtual BSSID (middle 4 octets match aa:bb:cc:11:22:01) must not alert.
 			{
 				BSSID:   "ae:bb:cc:11:22:05",
 				ESSID:   "HomeWiFi",
 				Channel: 36,
 				RSSI:    -45,
 			},
-			// True Evil-Twin broadcasting our SSID -> MUST alert CRITICAL!
+			// True Evil-Twin broadcasting our SSID must alert Critical.
 			{
 				BSSID:    "66:77:88:99:aa:bb",
 				ESSID:    "HomeWiFi",
@@ -112,7 +115,7 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 				RSSI:     -52,
 				Security: "wpapsk",
 			},
-			// Foreign BSSID sharing MAC stem with wired client de:ad:be:ef:01:10 -> MUST alert HIGH!
+			// Foreign BSSID sharing a MAC stem with wired client de:ad:be:ef:01:10 must alert High.
 			{
 				BSSID:   "de:ad:be:ef:01:12",
 				ESSID:   "HiddenRouter",

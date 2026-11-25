@@ -21,6 +21,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestCompareVersionsAndRange verifies version ordering (including patch and
+// pre-release suffixes) and CPE version-range boundary matching.
 func TestCompareVersionsAndRange(t *testing.T) {
 	if CompareVersions("6.0.17", "6.0.9") <= 0 {
 		t.Fatal("expected 6.0.17 > 6.0.9")
@@ -44,6 +46,8 @@ func TestCompareVersionsAndRange(t *testing.T) {
 	}
 }
 
+// TestPatternMatchingPreventsPrefixLeakage verifies that exact CPE product
+// tokens do not match sibling prefixes while explicit wildcards match families.
 func TestPatternMatchingPreventsPrefixLeakage(t *testing.T) {
 	// Exact patterns must not bleed into similarly prefixed sibling products.
 	if matchesAnyPattern([]string{"nginx", "nginx_open_source"}, "nginx_unit") {
@@ -61,6 +65,9 @@ func TestPatternMatchingPreventsPrefixLeakage(t *testing.T) {
 	}
 }
 
+// TestSyncMatchLookupAndSearch exercises end-to-end NVD + KEV cache syncing,
+// exact vs. potential CVE matching with age filtering, single-CVE lookup, search,
+// and per-product summary rollups.
 func TestSyncMatchLookupAndSearch(t *testing.T) {
 	sampleNVD := `{
 		"vulnerabilities": [

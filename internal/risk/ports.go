@@ -154,7 +154,7 @@ func AnalyzeSwitchPorts(
 	}
 
 	// First pass: determine which UniFi devices are physically external, and
-	// trace their LLDP uplinks back to the indoor parent switch feeder ports!
+	// trace their LLDP uplinks back to the indoor parent switch feeder ports.
 	isExtDev := make(map[string]string) // devMAC -> zoneSource ("config" or "auto")
 	extFeederPorts := make(map[string]string)
 	for _, d := range snap.Devices {
@@ -354,9 +354,9 @@ func AnalyzeSwitchPorts(
 
 			case "external":
 				if !sp.Enabled {
-					// Properly disabled external port -> OK!
+					// Properly disabled external port.
 				} else if !sp.Up {
-					// Unused port on external switch or external drop still enabled!
+					// Unused port on an external switch or exterior drop is still enabled.
 					pv.Status = "warn"
 					pv.Issues = append(pv.Issues, "Unused external port is still administratively enabled")
 					if isTrunkAll {
@@ -365,7 +365,7 @@ func AnalyzeSwitchPorts(
 					dv.AtRiskPorts++
 					extUnusedPorts = append(extUnusedPorts, sp.PortIdx)
 				} else {
-					// Active external port! Check VLAN isolation, trunking, and MAC lock.
+					// Active external port: verify VLAN isolation, trunking, and MAC lock.
 					var problems []string
 					if isTrunkAll {
 						problems = append(problems, "Tagged VLANs = All (VLAN-hopping trunk)")
@@ -428,7 +428,7 @@ func AnalyzeSwitchPorts(
 						pv.Issues = append(pv.Issues, "Inactive port left enabled with All VLANs")
 					}
 				} else if sp.Enabled && sp.Up {
-					// Active client access port on an Isolated VLAN that still allows All tagged VLANs!
+					// Active client access port on an isolated VLAN that still allows all tagged VLANs.
 					if nativeIsIsolated && isTrunkAll {
 						pv.Status = "critical"
 						pv.Issues = append(pv.Issues, "Isolated-VLAN access port still allows All tagged VLANs (VLAN-hopping risk)")

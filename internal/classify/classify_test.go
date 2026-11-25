@@ -15,6 +15,9 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestClassifyDeterministicSignals verifies deterministic device classification
+// across protocol/port proof, virtual MAC prefixes, IEEE OUIs, hostnames, and
+// locally-administered randomized MAC addresses.
 func TestClassifyDeterministicSignals(t *testing.T) {
 	c, err := Load(classifydata.BuiltinFS, oui.New(t.TempDir()))
 	if err != nil {

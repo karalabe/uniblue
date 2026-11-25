@@ -23,6 +23,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestPerHostPortPlannerZeroBloatAt1000Rules verifies that scaling to 1,000
+// identity-gated device rules adds zero global TCP ports and targets only matching hosts.
 func TestPerHostPortPlannerZeroBloatAt1000Rules(t *testing.T) {
 	base := []int{80, 443}
 	var rules []*Check
@@ -46,7 +48,7 @@ probe:
 		rules = append(rules, chk)
 	}
 
-	// Acceptance criterion: adding 1,000 device-specific rules adds ZERO ports
+	// Adding 1,000 device-specific rules must add zero ports
 	// to the global TCP sweep.
 	global := PlanGlobalPorts(base, rules)
 	if len(global) != 2 || global[0] != 80 || global[1] != 443 {
@@ -67,7 +69,9 @@ probe:
 	}
 }
 
-func TestV2RuleEngineObserveJSONAndMultiPath(t *testing.T) {
+// TestRuleEngineObserveJSONAndMultiPath verifies passive observe checks,
+// multi-path HTTP fallback with JSONPath predicates, and forbidden header rejection.
+func TestRuleEngineObserveJSONAndMultiPath(t *testing.T) {
 	// 1. Passive mDNS observe check (unpaired HomeKit sf=1 vs paired sf=0).
 	chk, err := Parse([]byte(`
 id: UB-TEST-HAP
@@ -165,6 +169,8 @@ probe:
 	}
 }
 
+// TestExtendedReadOnlyProtocolProbes verifies read-only probes for TP-Link Kasa,
+// Memcached, rsync, MPD, SNMPv2c, CoAP, and NAT-PMP against local mocks.
 func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 	t.Run("kasa xor get_sysinfo", func(t *testing.T) {
 		port, closeFn := startMockTCP(t, func(conn net.Conn) {
@@ -295,6 +301,8 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 	})
 }
 
+// TestNervaDedupPreservesIndependentTLSFinding verifies that a generic TLS
+// protocol finding on port 443 does not suppress an expired-certificate finding.
 func TestNervaDedupPreservesIndependentTLSFinding(t *testing.T) {
 	profiles := []probe.HostProfile{
 		{

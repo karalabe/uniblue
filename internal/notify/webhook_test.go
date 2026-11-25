@@ -20,6 +20,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestNotifierFormatsAndFiltering verifies that Notifier suppresses diffs below
+// minSeverity and formats urgent ntfy headers and bodies when high-severity findings fire.
 func TestNotifierFormatsAndFiltering(t *testing.T) {
 	var receivedBody string
 	var receivedTitle string

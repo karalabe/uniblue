@@ -18,6 +18,8 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
+// TestIsolationUnavailableGatewayPoliciesMustYieldUnknown verifies that missing
+// gateway firewall policies produce unknown verdicts rather than false blocked-ok cells.
 func TestIsolationUnavailableGatewayPoliciesMustYieldUnknown(t *testing.T) {
 	// Critical safety invariant: when controller firewall policy telemetry is
 	// unavailable (e.g. HTTP 403/404 or legacy API), UniBlue MUST NEVER invent
@@ -58,10 +60,12 @@ func TestIsolationUnavailableGatewayPoliciesMustYieldUnknown(t *testing.T) {
 	}
 }
 
+// TestIsolationPolicyPrecedenceAndReturnStateHandling verifies rule index order,
+// connection-state matching (new vs. established return), and unsupported selector handling.
 func TestIsolationPolicyPrecedenceAndReturnStateHandling(t *testing.T) {
 	// A preceding BLOCK rule must override a later ALLOW rule, an
 	// ESTABLISHED/RELATED-only ALLOW rule must NOT permit NEW initiation, and
-	// MatchReturnTraffic in the reverse direction allows established return traffic!
+	// MatchReturnTraffic in the reverse direction allows established return traffic.
 	policies := []unifi.FirewallPolicy{
 		{
 			ID:               "r-return",
@@ -129,13 +133,16 @@ func TestIsolationPolicyPrecedenceAndReturnStateHandling(t *testing.T) {
 	}
 }
 
+// TestExtendedNetworkChecksPositiveAndCounterexamples verifies CGNAT notices,
+// dynamic NAT mappings, reverse-proxy/tunnel admin checks, overlapping subnets,
+// native VLAN mismatches, blanket ICMPv6 blocks, DHCP exhaustion, and backup freshness.
 func TestExtendedNetworkChecksPositiveAndCounterexamples(t *testing.T) {
 	stale := time.Now().UTC().Add(-45 * 24 * time.Hour)
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Health: &unifi.SystemHealth{
 			WANStatus: "ok",
-			WANIP:     "100.64.12.5", // RFC 6598 CGNAT!
+			WANIP:     "100.64.12.5", // RFC 6598 CGNAT
 		},
 		Devices: []unifi.Device{
 			{
@@ -214,7 +221,7 @@ func TestExtendedNetworkChecksPositiveAndCounterexamples(t *testing.T) {
 		t.Fatalf("expected CGNAT (%v), DHCP (%v), backup (%v), visibility (%v) notes, got %+v", hasCGNAT, hasDHCP, hasBackup, hasVis, notes)
 	}
 
-	// Counterexample: authenticated tunnel + authenticated proxy + aligned native VLAN + disjoint subnets + healthy backup -> 0 findings & 0 bad notes!
+	// Counterexample: authenticated tunnel and proxy, aligned native VLAN, disjoint subnets, and healthy backup yield zero findings.
 	fresh := time.Now().UTC().Add(-2 * 24 * time.Hour)
 	cleanSnap := &unifi.Snapshot{
 		Site: "default",

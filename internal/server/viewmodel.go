@@ -452,7 +452,7 @@ func BuildPresentationModel(
 		pm.Entities[id] = ent
 	}
 
-	// 2. Register Clients / Hosts (single source of truth for checks + exact CVEs + BMCs + scan coverage!).
+	// 2. Register clients and hosts (single source of truth for checks, exact CVEs, BMCs, and scan coverage).
 	clientByIP := make(map[string]ClientView, len(clients))
 	clientByMAC := make(map[string]ClientView, len(clients))
 	hostIDByIP := make(map[string]string, len(clients))
@@ -596,7 +596,7 @@ func BuildPresentationModel(
 			}
 		}
 
-		// Build structured Services[] with computed reachability!
+		// Build structured Services[] with computed reachability.
 		hp := profileByIP[cl.IP]
 		behindCGNAT := isSnapshotWANBehindCGNAT(snap)
 		ent.Services = buildHostServices(cv, hp, wanByIP[cl.IP], netIsolated[strings.ToLower(cl.NetworkName)], behindCGNAT)
@@ -756,7 +756,7 @@ func BuildPresentationModel(
 		}
 	}
 
-	// 4. Attach ALL Confirmed Findings from report.Findings to their exact typed Entity!
+	// 4. Attach confirmed findings from report.Findings to their target entities.
 	for idxF, f := range report.Findings {
 		if f.CheckID == "UB-UNIFI-PORTFWD" || f.CheckID == "UB-UNIFI-FIRMWARE" {
 			continue
@@ -769,7 +769,7 @@ func BuildPresentationModel(
 			swMAC := strings.ToLower(f.Client.MAC)
 			pid := portEntityID(swMAC, f.Port)
 			if f.CheckID == "UB-UNIFI-PORT-EXT-UNUSED-OPEN" {
-				// Attach to each unused external port on this switch AND the switch device itself!
+				// Attach to each unused external port on this switch and the switch device itself.
 				if sw, ok := swByMAC[swMAC]; ok {
 					for _, sp := range sw.Ports {
 						if (sp.Zone == "external" || sp.Zone == "unused") && sp.State == "inactive_enabled" {
@@ -927,7 +927,7 @@ func BuildPresentationModel(
 			}
 
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-"):
-			// Site-level controller / SSH / UPnP / Honeypot / Wi-Fi findings attach to Gateway!
+			// Site-level controller, SSH, UPnP, honeypot, and Wi-Fi findings attach to Gateway.
 			if gw, ok := pm.Entities[pm.GatewayID]; ok {
 				gw.Reasons = append(gw.Reasons, Reason{
 					ID:          fid,
@@ -946,7 +946,7 @@ func BuildPresentationModel(
 			}
 
 		default:
-			// Host-level LAN service / BMC probe finding!
+			// Host-level LAN service or BMC probe finding.
 			hid := hostIDByIP[f.Client.IP]
 			if hid == "" {
 				hid = hostIDByMAC[strings.ToLower(f.Client.MAC)]
@@ -1014,7 +1014,7 @@ func BuildPresentationModel(
 		})
 	}
 
-	// 6. Finalize Verdict State & Label for EVERY Entity (Single Source of Truth!).
+	// 6. Finalize verdict state and label for every entity.
 	for _, ent := range pm.Entities {
 		if ent.Kind == "child" {
 			continue
@@ -1040,7 +1040,7 @@ func BuildPresentationModel(
 	}
 	pm.Census.TotalWallGates = len(pm.WallGates)
 
-	// 7. Build Ranked Fix-Next Queue & Assign Deterministic Pin Numbers!
+	// 7. Build ranked fix-next queue and assign deterministic pin numbers.
 	pm.Queue = buildFixNextQueue(pm)
 	for i := range pm.Queue {
 		pin := i + 1
@@ -1063,13 +1063,13 @@ func BuildPresentationModel(
 		}
 	}
 
-	// 8. Build Physical Blueprint Rows (real LLDP tree order + UplinkUnknown + APs without port tables!).
+	// 8. Build physical blueprint rows in LLDP tree order (including UplinkUnknown and APs without port tables).
 	pm.Physical = buildPhysicalRows(snap, swByMAC, gwMAC, apClientCount, pm.Entities)
 
-	// 9. Build Logical Zone Lanes (BMCs always pinned in their real VLAN, clean hosts in dot grid!).
+	// 9. Build logical zone lanes (BMCs stay pinned in their real VLAN, clean hosts group in the dot grid).
 	pm.Logical = buildLogicalLanes(snap, topo, pm.Entities, netEntByName)
 
-	// 10. Compute Census counts from the exact finalized entities!
+	// 10. Compute census counts from the finalized entities.
 	for _, ent := range pm.Entities {
 		switch ent.Kind {
 		case "host":
@@ -1096,7 +1096,7 @@ func BuildPresentationModel(
 		}
 	}
 
-	// 11. Build 1-Sentence Verdict Headline!
+	// 11. Build one-sentence verdict headline.
 	if len(pm.Queue) == 0 {
 		pm.Headline = fmt.Sprintf("All clear: %d VLANs, %d devices, and %d wall gates match policy.", len(pm.Logical), len(snap.Devices), pm.Census.TotalWallGates)
 	} else if len(pm.Queue) == 1 {
@@ -1109,7 +1109,7 @@ func BuildPresentationModel(
 }
 
 func finalizeEntityVerdict(ent *Entity) {
-	// Sort reasons worst-first so the top reason is always visible first in the inspector!
+	// Sort reasons worst-first so the highest-priority reason appears first in the inspector.
 	sort.SliceStable(ent.Reasons, func(i, j int) bool {
 		if verdictRank(ent.Reasons[i].State) != verdictRank(ent.Reasons[j].State) {
 			return verdictRank(ent.Reasons[i].State) > verdictRank(ent.Reasons[j].State)
@@ -1207,7 +1207,7 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 				sentence = fmt.Sprintf("%s carries %s VLANs to external %s", ent.Label, ent.TaggedPolicy, ent.Subtitle)
 			} else if ent.PortZone == "external" {
 				if ent.PortState == "inactive_enabled" {
-					// Already aggregated per external switch device above to keep queue crisp!
+					// Already aggregated per external switch device above to keep the queue concise.
 					continue
 				}
 				sentence = fmt.Sprintf("%s (external) is unrestricted (%s / %s)", ent.Label, ent.NativeVLAN, ent.TaggedPolicy)

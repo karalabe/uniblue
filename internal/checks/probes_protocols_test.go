@@ -21,6 +21,9 @@ import (
 	"time"
 )
 
+// TestHigherLevelAppAndLANProtocolProbes verifies read-only wire probes for
+// Bitcoin P2P/RPC, Ethereum Engine API, NUT, PJLink, LIFX, NBNS, PCP, DNS
+// recursion, NTP, and STUN against positive and negative local mocks.
 func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 	ctx := context.Background()
 

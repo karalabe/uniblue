@@ -123,7 +123,7 @@ func (a *anomalyTracker) EvaluatePortAnomalies(prevPorts, currPorts map[string]p
 		// 1. PoE cable-swap / tamper detection:
 		// A port that previously powered a PoE device (>= 2W, e.g., outdoor camera)
 		// is now link UP while drawing < 0.5W (e.g., laptop/implant plugged into the
-		// camera cable, potentially spoofing the camera's MAC address!).
+		// camera cable, potentially spoofing the camera's MAC address).
 		baseW := a.poeBaselineWatts[pk]
 		wasDrawingPoE := prev.PoEPowerWatts >= poeBaselineMinWatts || (!prev.Up && curr.Up && baseW >= poeBaselineMinWatts)
 		if curr.Up && baseW >= poeBaselineMinWatts && curr.PoEPowerWatts <= poeDropMaxWatts && wasDrawingPoE {

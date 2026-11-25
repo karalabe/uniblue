@@ -180,7 +180,7 @@ type Check struct {
 	// Severity is the base impact before UniFi VLAN/WAN blast-radius scoring.
 	Severity Severity `yaml:"severity"`
 
-	// Safety declares the probe's operational impact. v0.1 strictly requires
+	// Safety declares the probe's operational impact. UniBlue strictly requires
 	// "read-only" so community checks cannot alter or reboot fragile devices.
 	Safety string `yaml:"safety"`
 
@@ -193,7 +193,7 @@ type Check struct {
 	Metadata Metadata `yaml:"metadata"`
 
 	// Preconditions are evaluated cheaply against already-collected host
-	// fingerprints; Stage 2 only runs when all specified preconditions pass.
+	// fingerprints; the verification probe only runs when all preconditions pass.
 	Preconditions Preconditions `yaml:"preconditions"`
 
 	// Probe defines the bounded, target-only network verification step.

@@ -13,6 +13,9 @@ import (
 	"testing"
 )
 
+// TestSyncAndLongestPrefixLookup verifies IEEE CSV syncing, gzipped persistence,
+// longest-prefix matching (36-bit MA-S over 28-bit MA-M over 24-bit MA-L),
+// built-in virtual MAC detection, and locally-administered bit decoding.
 func TestSyncAndLongestPrefixLookup(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oui.csv", func(w http.ResponseWriter, r *http.Request) {

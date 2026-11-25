@@ -12,6 +12,8 @@ import (
 	"testing"
 )
 
+// TestLoadZeroConfigFromEnv verifies that Load builds a valid configuration
+// solely from environment variables when config.yaml does not exist.
 func TestLoadZeroConfigFromEnv(t *testing.T) {
 	t.Setenv("UNIBLUE_UNIFI_URL", "https://10.0.0.1")
 	t.Setenv("UNIBLUE_UNIFI_API_KEY", "test-key")
@@ -28,6 +30,8 @@ func TestLoadZeroConfigFromEnv(t *testing.T) {
 	}
 }
 
+// TestLoadInheritsDefaultPortsAndDedupesExtraPorts verifies that omitting scan.ports
+// inherits DefaultPorts and merges scan.extra_ports without duplicates.
 func TestLoadInheritsDefaultPortsAndDedupesExtraPorts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

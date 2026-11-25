@@ -287,7 +287,7 @@ func classifyPassiveServiceState(proto, app, source string) string {
 		return ServiceStateUnknown
 	case "tls", "ssl", "dtls", "quic":
 		// Explicitly preserve unknown application when evidence establishes only
-		// TLS, DTLS, or QUIC transport encryption!
+		// TLS, DTLS, or QUIC transport encryption.
 		return ServiceStateTLSUnknownApp
 	default:
 		return ServiceStateObservedProtocol

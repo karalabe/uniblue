@@ -94,7 +94,7 @@ var mdnsQueryTypes = []string{
 	"_airgradient._tcp.local.",
 	"_rfb._tcp.local.",
 	"_smb._tcp.local.",
-	// Stage 2 high-value DNS-SD additions from Home Assistant coverage index:
+	// Additional smart-home, media, lighting, energy, and infrastructure DNS-SD types:
 	"_matter._tcp.local.",
 	"_matterc._udp.local.",
 	"_meshcop._udp.local.",
@@ -539,7 +539,7 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 				}
 				continue
 			}
-			// Never dial Matter operational (_matter._tcp uses UDP!) or any UDP service via TCP.
+			// Never dial Matter operational (_matter._tcp uses UDP) or any UDP service via TCP.
 			if svc.Transport == "tcp" && svc.Port > 0 && !svc.Reflected {
 				addPort(ip, svc.Port)
 			}

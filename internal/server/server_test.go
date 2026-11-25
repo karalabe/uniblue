@@ -64,6 +64,8 @@ func newTestEngine() *Engine {
 	return eng
 }
 
+// TestHTTPHandlers verifies the dashboard HTML, static logo assets, JSON state
+// endpoint, offline HTML export, and full/single-host rescan endpoints.
 func TestHTTPHandlers(t *testing.T) {
 	eng := newTestEngine()
 	h := eng.Handler()
@@ -175,6 +177,8 @@ func TestHTTPHandlers(t *testing.T) {
 	})
 }
 
+// TestEventsSSE verifies that /api/events sends an initial keepalive frame and
+// streams live Engine events to subscribed clients.
 func TestEventsSSE(t *testing.T) {
 	eng := newTestEngine()
 	srv := httptest.NewServer(eng.Handler())

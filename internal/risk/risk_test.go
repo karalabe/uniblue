@@ -16,6 +16,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestEvaluateBlastRadiusScoring verifies severity escalation on trusted VLANs,
+// de-escalation on isolated VLANs, and Critical promotion on WAN port forwards.
 func TestEvaluateBlastRadiusScoring(t *testing.T) {
 	netCfg := config.NetworkConfig{
 		TrustedVLANs:  []string{"Default"},
@@ -60,6 +62,8 @@ func TestEvaluateBlastRadiusScoring(t *testing.T) {
 	}
 }
 
+// TestStatePersistenceAndDiffing verifies state save/load round-trips and diff
+// detection for escalated findings and newly appearing trusted clients.
 func TestStatePersistenceAndDiffing(t *testing.T) {
 	netCfg := config.NetworkConfig{
 		TrustedVLANs:  []string{"Default"},
@@ -113,6 +117,8 @@ func TestStatePersistenceAndDiffing(t *testing.T) {
 	}
 }
 
+// TestExposureClassificationAndPostureNotes verifies WAN forward classification
+// (expected P2P vs. critical RPC) and unused isolated VLAN posture notes.
 func TestExposureClassificationAndPostureNotes(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
@@ -164,6 +170,8 @@ func TestExposureClassificationAndPostureNotes(t *testing.T) {
 	}
 }
 
+// TestStructuralZoneIsolationAndFlatTopology verifies zone-based isolation
+// resolution without relying on VLAN names, plus flat-topology posture reporting.
 func TestStructuralZoneIsolationAndFlatTopology(t *testing.T) {
 	// Use completely opaque VLAN names ("ZoneA", "ZoneB", "ZoneC") to guarantee
 	// zero reliance on user-chosen network names.
@@ -234,6 +242,8 @@ func TestStructuralZoneIsolationAndFlatTopology(t *testing.T) {
 	}
 }
 
+// TestFirewallPolicyAuditing verifies flagging of broad WAN-to-Gateway, WAN-to-LAN,
+// and isolated-to-Internal ALLOW policies while ignoring system rules and pinpoint pinholes.
 func TestFirewallPolicyAuditing(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",

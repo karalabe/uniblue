@@ -14,6 +14,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestBuildTopologyPlacement verifies that Build groups clients by VLAN and
+// assigns PlacementIsolate to internal IoT appliances and PlacementReview to WAN proxies.
 func TestBuildTopologyPlacement(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site:           "default",

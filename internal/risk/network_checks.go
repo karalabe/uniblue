@@ -18,7 +18,7 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
-// AnalyzeExtendedNetworkChecks evaluates Stage 6 network, infrastructure,
+// AnalyzeExtendedNetworkChecks evaluates extended network, infrastructure,
 // dependency, and operational health checks from controller and owner-supplied
 // telemetry while strictly preserving legitimate dependencies and avoiding
 // overstatement when upstream evidence is absent.
@@ -35,7 +35,7 @@ func AnalyzeExtendedNetworkChecks(
 	gwClient := unifi.Client{MAC: "gw:" + snap.Site, IP: gwIP, Name: gwName}
 
 	// 1. Upstream NAT / CGNAT WAN reachability disclaimer (never overstate
-	// public internet reachability behind RFC1918 / RFC6598 CGNAT WAN IPs!).
+	// public internet reachability behind RFC1918 / RFC6598 CGNAT WAN IPs).
 	if snap.Health != nil && snap.Health.WANIP != "" {
 		if addr, err := netip.ParseAddr(strings.TrimSpace(snap.Health.WANIP)); err == nil {
 			if isPrivateOrCGNAT(addr) && len(snap.PortForwards) > 0 {

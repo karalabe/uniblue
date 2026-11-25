@@ -23,6 +23,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestBuiltinChecksAreValid verifies that every embedded YAML check parses,
+// satisfies safety and schema validation, and merges with unique IDs.
 func TestBuiltinChecksAreValid(t *testing.T) {
 	list, err := LoadFromFS(builtinchecks.BuiltinFS)
 	if err != nil {
@@ -36,6 +38,9 @@ func TestBuiltinChecksAreValid(t *testing.T) {
 	}
 }
 
+// TestValidationSafetyGuardrails verifies that Validate rejects non-read-only
+// checks, mutating HTTP methods, external URLs, missing preconditions, and
+// oversized probe timeouts.
 func TestValidationSafetyGuardrails(t *testing.T) {
 	cases := []struct {
 		name string
@@ -108,6 +113,8 @@ probe:
 	}
 }
 
+// TestHTTPCheckExecution verifies end-to-end precondition matching and HTTP
+// probe evaluation against a local mock web server.
 func TestHTTPCheckExecution(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/system/status" {
@@ -159,6 +166,9 @@ probe:
 	}
 }
 
+// TestProtocolProbes verifies read-only TCP/UDP protocol probes (MQTT, Modbus,
+// VNC, Telnet, Denon/Marantz AVR, ComfoConnect, Ethereum RPC, ADB, RDP NLA,
+// anonymous FTP, ES File Explorer, and Redis) against local mock servers.
 func TestProtocolProbes(t *testing.T) {
 	t.Run("mqtt anonymous accepted", func(t *testing.T) {
 		port, closeFn := startMockTCP(t, func(conn net.Conn) {
@@ -476,6 +486,9 @@ func TestProtocolProbes(t *testing.T) {
 	})
 }
 
+// TestIoTBuiltinHTTPChecksAuthVsUnauth verifies built-in HTTP appliance checks
+// (Shelly Gen2, Transmission, Brother CVE-2024-51977, iOS SSH ports_all, and
+// Python SimpleHTTP) match unauthenticated endpoints and reject auth challenges.
 func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 	allChecks, err := LoadFromFS(builtinchecks.BuiltinFS)
 	if err != nil {
@@ -605,6 +618,8 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 	})
 }
 
+// TestFindingsFromProfilesDeduplicationAndNormalization verifies that Nerva
+// finding IDs normalize cleanly and skip properties already covered by YAML checks.
 func TestFindingsFromProfilesDeduplicationAndNormalization(t *testing.T) {
 	profiles := []probe.HostProfile{
 		{
