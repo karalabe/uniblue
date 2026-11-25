@@ -137,6 +137,15 @@ type Runner struct {
 	// httpClient enforces redirect suppression and local-LAN TLS handling for
 	// every HTTP probe.
 	httpClient *http.Client
+
+	// onProgress receives optional per-host progress updates during RunAll.
+	onProgress func(done, total int, host string)
+}
+
+// SetProgressFunc registers an optional callback invoked as each host finishes
+// check evaluation inside RunAll.
+func (r *Runner) SetProgressFunc(fn func(done, total int, host string)) {
+	r.onProgress = fn
 }
 
 // NewRunner constructs a Runner for the provided checks and worker count.
@@ -174,8 +183,12 @@ func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Fin
 		workers = len(profiles)
 	}
 
+	type hostResult struct {
+		host     string
+		findings []Finding
+	}
 	jobs := make(chan probe.HostProfile)
-	results := make(chan []Finding, workers)
+	results := make(chan hostResult, workers)
 	done := make(chan struct{}, workers)
 
 	// Each worker handles one host at a time so probes against a single fragile
@@ -184,8 +197,9 @@ func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Fin
 		go func() {
 			defer func() { done <- struct{}{} }()
 			for hp := range jobs {
-				if findings := r.RunHost(ctx, hp); len(findings) > 0 {
-					results <- findings
+				results <- hostResult{
+					host:     hp.Client.DisplayName(),
+					findings: r.RunHost(ctx, hp),
 				}
 			}
 		}()
@@ -210,8 +224,15 @@ func (r *Runner) RunAll(ctx context.Context, profiles []probe.HostProfile) []Fin
 	}()
 
 	var all []Finding
-	for batch := range results {
-		all = append(all, batch...)
+	completed := 0
+	for res := range results {
+		completed++
+		if len(res.findings) > 0 {
+			all = append(all, res.findings...)
+		}
+		if r.onProgress != nil {
+			r.onProgress(completed, len(profiles), res.host)
+		}
 	}
 
 	sort.Slice(all, func(i, j int) bool {

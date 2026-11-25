@@ -595,3 +595,47 @@ func TestServeExitsImmediatelyWithActiveSSE(t *testing.T) {
 		t.Fatalf("Serve hung on shutdown while SSE stream was open")
 	}
 }
+
+// TestScanProgressBroadcastWithoutActivitySpam verifies that live scan progress
+// updates are exposed in Snapshot().ScanProgress and pushed over SSE to wake UI
+// clients without cluttering the persisted Activity event history.
+func TestScanProgressBroadcastWithoutActivitySpam(t *testing.T) {
+	eng := newTestEngine()
+	subCh, unsub := eng.Subscribe()
+	defer unsub()
+
+	eng.setScanProgress(&ScanProgress{
+		Phase:       "probing",
+		Label:       "Probing devices for open ports (3 of 10)…",
+		Completed:   3,
+		Total:       10,
+		CurrentHost: "workstation-1",
+		Percent:     28,
+		Initial:     true,
+	})
+
+	snap := eng.Snapshot()
+	if !snap.Scanning || snap.ScanProgress == nil {
+		t.Fatalf("expected Scanning=true and non-nil ScanProgress, got %+v", snap)
+	}
+	if snap.ScanProgress.Phase != "probing" || snap.ScanProgress.Completed != 3 || snap.ScanProgress.Percent != 28 {
+		t.Fatalf("unexpected ScanProgress: %+v", snap.ScanProgress)
+	}
+	if len(snap.Events) != 0 {
+		t.Fatalf("expected transient scan_progress not to pollute Activity events, got %d events", len(snap.Events))
+	}
+
+	select {
+	case ev := <-subCh:
+		if ev.Type != "scan_progress" {
+			t.Fatalf("SSE event type = %q, want scan_progress", ev.Type)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected transient scan_progress SSE notification")
+	}
+
+	eng.setScanProgress(nil)
+	if after := eng.Snapshot(); after.ScanProgress != nil {
+		t.Fatalf("expected ScanProgress to clear after setScanProgress(nil), got %+v", after.ScanProgress)
+	}
+}

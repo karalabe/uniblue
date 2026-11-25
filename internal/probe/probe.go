@@ -344,6 +344,9 @@ type Fingerprinter struct {
 	// accepted so local LAN devices can be fingerprinted without leaking requests
 	// to external hosts.
 	httpClient *http.Client
+
+	// onProgress receives optional per-host progress updates during FingerprintAll.
+	onProgress func(phase string, done, total int, host string)
 }
 
 // SetHostPortHints attaches optional per-host TCP port hints (such as ports
@@ -351,6 +354,18 @@ type Fingerprinter struct {
 // the base scan port list when fingerprinting matching hosts.
 func (f *Fingerprinter) SetHostPortHints(hints map[string][]int) {
 	f.hostPortHints = hints
+}
+
+// SetProgressFunc registers an optional callback invoked on the collector
+// goroutine as discovery, per-host port probing, and protocol fingerprinting advance.
+func (f *Fingerprinter) SetProgressFunc(fn func(phase string, done, total int, host string)) {
+	f.onProgress = fn
+}
+
+func (f *Fingerprinter) reportProgress(phase string, done, total int, host string) {
+	if f.onProgress != nil {
+		f.onProgress(phase, done, total, host)
+	}
 }
 
 // NewFingerprinter creates a Fingerprinter with safe defaults for zero-valued
@@ -415,6 +430,7 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	// when profiling non-loopback LAN hosts so per-host port hints and passive
 	// service metadata enrich every matching HostProfile with zero blind dials.
 	if !f.skipDiscovery && hasNonLoopbackTarget(targets) {
+		f.reportProgress("discovery", 0, len(targets), "")
 		f.discovery = DiscoverLAN(ctx, f.httpClient)
 	}
 	return f.collectProfiles(ctx, targets, workers)
@@ -467,9 +483,11 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 		}
 	}()
 
+	f.reportProgress("probing", 0, len(targets), "")
 	profiles := make([]HostProfile, 0, len(targets))
 	for p := range results {
 		profiles = append(profiles, p)
+		f.reportProgress("probing", len(profiles), len(targets), p.Client.DisplayName())
 	}
 	sort.Slice(profiles, func(i, j int) bool {
 		return profiles[i].Client.IP < profiles[j].Client.IP
@@ -477,6 +495,7 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 
 	// Enrich every discovered open port using Nerva's FastMode protocol
 	// fingerprinters (170+ protocols, MaxHostConn=1 for IoT safety).
+	f.reportProgress("fingerprinting", len(profiles), len(targets), "")
 	f.enrichWithNerva(ctx, profiles)
 	return profiles
 }

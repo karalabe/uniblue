@@ -141,6 +141,10 @@ type StateSnapshot struct {
 	// Scanning reports whether a full or targeted probe is currently running.
 	Scanning bool `json:"scanning"`
 
+	// ScanProgress reports live per-stage progress while a full baseline or
+	// manual rescan is executing, or nil when idle.
+	ScanProgress *ScanProgress `json:"scan_progress,omitempty"`
+
 	// Site is the UniFi site name.
 	Site string `json:"site"`
 
@@ -171,6 +175,32 @@ type StateSnapshot struct {
 	// View holds the pre-evaluated single-source-of-truth UI presentation model
 	// (entities, verdicts, fix-next queue, physical blueprint, logical lanes).
 	View *PresentationModel `json:"view,omitempty"`
+}
+
+// ScanProgress reports live step-by-step progress while a full LAN baseline or
+// manual rescan is executing so the UI can display an accurate progress bar.
+type ScanProgress struct {
+	// Phase identifies the active stage ("topology", "discovery", "probing",
+	// "fingerprinting", "checks", "evaluating").
+	Phase string `json:"phase"`
+
+	// Label is a plain-English description of the active stage.
+	Label string `json:"label"`
+
+	// Completed is the number of hosts finished in the current stage.
+	Completed int `json:"completed"`
+
+	// Total is the total number of hosts in the current stage.
+	Total int `json:"total"`
+
+	// CurrentHost is the most recently completed host name, if any.
+	CurrentHost string `json:"current_host,omitempty"`
+
+	// Percent is the overall 0..100 completion estimate across all stages.
+	Percent int `json:"percent"`
+
+	// Initial is true during the first baseline scan before LastFullScanAt is set.
+	Initial bool `json:"initial"`
 }
 
 // missingClient records a client that disappeared from UniFi's active list
@@ -228,24 +258,26 @@ type Engine struct {
 	eventSeq  atomic.Int64
 
 	// mu protects the live state maps and the published StateSnapshot.
-	mu             sync.RWMutex
-	snap           *unifi.Snapshot
-	profilesByMAC  map[string]probe.HostProfile
-	findingsByMAC  map[string][]checks.Finding
-	missingClients map[string]missingClient
-	lastPorts      map[string]portLiveState
-	anomalies      *anomalyTracker
-	lastClasses    map[string]classify.Result
-	lastPolicySig  string
-	lastFwdSig     string
-	prevRiskState  *risk.State
-	events         []LiveEvent
-	current        StateSnapshot
-	activeScans    atomic.Int32
-	fullRescanCh   chan string
-	hostScanCh     chan hostScanTask
-	subMu          sync.Mutex
-	subscribers    map[chan LiveEvent]struct{}
+	mu               sync.RWMutex
+	snap             *unifi.Snapshot
+	profilesByMAC    map[string]probe.HostProfile
+	findingsByMAC    map[string][]checks.Finding
+	missingClients   map[string]missingClient
+	lastPorts        map[string]portLiveState
+	anomalies        *anomalyTracker
+	lastClasses      map[string]classify.Result
+	lastPolicySig    string
+	lastFwdSig       string
+	prevRiskState    *risk.State
+	events           []LiveEvent
+	current          StateSnapshot
+	scanProgress     *ScanProgress
+	lastProgressEmit time.Time
+	activeScans      atomic.Int32
+	fullRescanCh     chan string
+	hostScanCh       chan hostScanTask
+	subMu            sync.Mutex
+	subscribers      map[chan LiveEvent]struct{}
 }
 
 // NewEngine initializes all UniBlue components (UniFi client, checks, IEEE OUI
@@ -369,6 +401,13 @@ func (e *Engine) Start(ctx context.Context) error {
 		go e.websocketLoop(ctx)
 	}
 	// Queue the full LAN baseline probe asynchronously so Serve binds immediately.
+	e.setScanProgress(&ScanProgress{
+		Phase:   "topology",
+		Label:   "Preparing initial network checkup…",
+		Total:   len(snap.Clients),
+		Percent: 4,
+		Initial: true,
+	})
 	e.queueFullRescan("initial baseline")
 	go e.pollAndReconcileLoop(ctx)
 	return nil
@@ -379,8 +418,61 @@ func (e *Engine) Snapshot() StateSnapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	cp := e.current
-	cp.Scanning = e.activeScans.Load() > 0
+	cp.Scanning = e.activeScans.Load() > 0 || (e.scanProgress != nil && e.scanProgress.Initial)
+	if e.scanProgress != nil {
+		sp := *e.scanProgress
+		cp.ScanProgress = &sp
+	}
 	return cp
+}
+
+// setScanProgress updates the live scan progress snapshot and broadcasts a
+// throttled, non-persisted SSE refresh signal so open dashboards update smoothly
+// without cluttering the Activity event history.
+func (e *Engine) setScanProgress(p *ScanProgress) {
+	now := time.Now().UTC()
+	e.mu.Lock()
+	prevPhase := ""
+	if e.scanProgress != nil {
+		prevPhase = e.scanProgress.Phase
+	}
+	if p == nil {
+		e.scanProgress = nil
+		e.lastProgressEmit = now
+		e.mu.Unlock()
+		return
+	}
+	cp := *p
+	e.scanProgress = &cp
+	shouldBroadcast := cp.Phase != prevPhase ||
+		(cp.Total > 0 && cp.Completed >= cp.Total) ||
+		now.Sub(e.lastProgressEmit) >= 250*time.Millisecond
+	if shouldBroadcast {
+		e.lastProgressEmit = now
+		e.emitTransientLocked(LiveEvent{
+			Type:     "scan_progress",
+			Severity: "info",
+			Time:     now,
+			Summary:  cp.Label,
+		})
+	}
+	e.mu.Unlock()
+}
+
+// emitTransientLocked fans out a live SSE hint without recording it in e.events.
+func (e *Engine) emitTransientLocked(ev LiveEvent) {
+	ev.ID = e.eventSeq.Add(1)
+	if ev.Time.IsZero() {
+		ev.Time = time.Now().UTC()
+	}
+	e.subMu.Lock()
+	for ch := range e.subscribers {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+	e.subMu.Unlock()
 }
 
 // TriggerFullRescan queues an asynchronous full scan if one is not already queued.
@@ -997,6 +1089,15 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	e.activeScans.Add(1)
 	defer e.activeScans.Add(-1)
+	defer e.setScanProgress(nil)
+
+	isInitial := e.Snapshot().LastFullScanAt.IsZero()
+	e.setScanProgress(&ScanProgress{
+		Phase:   "topology",
+		Label:   "Reading UniFi router, switches, cables & firewall rules…",
+		Percent: 5,
+		Initial: isInitial,
+	})
 
 	e.logger.Info("starting full scan", "reason", reason)
 	snap, err := e.ctrl.FetchSnapshot(ctx)
@@ -1005,9 +1106,45 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	}
 	currPorts := snapshotPortStates(snap, e.cfg.Network)
 	snap.Clients = filterOfflineWiredClients(snap.Clients, currPorts)
+	totalClients := len(snap.Clients)
 
 	fp := probe.NewFingerprinter(e.scanPorts, e.cfg.Scan.Concurrency, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
+	fp.SetProgressFunc(func(phase string, done, total int, host string) {
+		switch phase {
+		case "discovery":
+			e.setScanProgress(&ScanProgress{
+				Phase:   "discovery",
+				Label:   "Listening for local service announcements (mDNS & UPnP)…",
+				Total:   total,
+				Percent: 10,
+				Initial: isInitial,
+			})
+		case "probing":
+			pct := 14
+			if total > 0 {
+				pct = 14 + (done*48)/total
+			}
+			e.setScanProgress(&ScanProgress{
+				Phase:       "probing",
+				Label:       fmt.Sprintf("Probing devices for open ports (%d of %d)…", done, total),
+				Completed:   done,
+				Total:       total,
+				CurrentHost: host,
+				Percent:     pct,
+				Initial:     isInitial,
+			})
+		case "fingerprinting":
+			e.setScanProgress(&ScanProgress{
+				Phase:     "fingerprinting",
+				Label:     "Identifying services across discovered ports…",
+				Completed: done,
+				Total:     total,
+				Percent:   65,
+				Initial:   isInitial,
+			})
+		}
+	})
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
 	// Run active and passive checks once per full scan on deep-cloned enriched
@@ -1019,12 +1156,43 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	}
 	attachConfiguredEnrichments(snap, enriched, e.cfg.Network)
 	runner := checks.NewRunner(e.checkList, e.cfg.Scan.Concurrency)
+	runner.SetProgressFunc(func(done, total int, host string) {
+		pct := 68
+		if total > 0 {
+			pct = 68 + (done*26)/total
+		}
+		e.setScanProgress(&ScanProgress{
+			Phase:       "checks",
+			Label:       fmt.Sprintf("Running read-only security checks (%d of %d)…", done, total),
+			Completed:   done,
+			Total:       total,
+			CurrentHost: host,
+			Percent:     pct,
+			Initial:     isInitial,
+		})
+	})
+	e.setScanProgress(&ScanProgress{
+		Phase:   "checks",
+		Label:   fmt.Sprintf("Running read-only security checks (0 of %d)…", len(enriched)),
+		Total:   len(enriched),
+		Percent: 68,
+		Initial: isInitial,
+	})
 	freshFindings := runner.RunAll(ctx, enriched)
 	byMAC := make(map[string][]checks.Finding, len(profiles))
 	for _, f := range freshFindings {
 		k := clientKey(f.Client)
 		byMAC[k] = append(byMAC[k], f)
 	}
+
+	e.setScanProgress(&ScanProgress{
+		Phase:     "evaluating",
+		Label:     "Evaluating firewall isolation, risk & security bugs (CVEs)…",
+		Completed: totalClients,
+		Total:     totalClients,
+		Percent:   96,
+		Initial:   isInitial,
+	})
 
 	e.mu.Lock()
 	e.snap = snap
@@ -1037,6 +1205,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	}
 	e.findingsByMAC = byMAC
 	e.missingClients = make(map[string]missingClient)
+	e.scanProgress = nil
 	e.mu.Unlock()
 
 	e.recomputeAndPublish(ctx, true, nil)

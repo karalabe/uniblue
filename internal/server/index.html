@@ -985,6 +985,85 @@
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
   }
+
+  /* Initial baseline scan progress screen & slim rescan bar */
+  .init-splash {
+    max-width: 640px;
+    margin: 34px auto 24px;
+    padding: 34px 36px 28px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: var(--shadow-lg);
+    text-align: center;
+  }
+  .init-ring { margin: 0 auto 18px; width: 88px; height: 88px; position: relative; }
+  .init-title { margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -.025em; }
+  .init-sub { margin: 8px auto 0; max-width: 500px; font-size: 14.5px; color: var(--text-2); line-height: 1.55; }
+  .pbar-wrap { margin: 22px 0 8px; text-align: left; }
+  .pbar-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 13px; color: var(--text-2); margin-bottom: 8px; }
+  .pbar-track {
+    width: 100%;
+    height: 9px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .pbar-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: var(--blue);
+    transition: width .35s cubic-bezier(.16, 1, .3, 1);
+  }
+  .pbar-host { font-size: 12px; color: var(--muted); min-height: 18px; margin-top: 7px; text-align: left; }
+  .init-steps {
+    margin: 20px 0 0;
+    padding: 14px 16px;
+    border-radius: 14px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .init-step { display: flex; align-items: center; gap: 10px; font-size: 13.5px; color: var(--muted); }
+  .init-step.done { color: var(--text-2); }
+  .init-step.active { color: var(--text); font-weight: 600; }
+  .step-dot {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 800;
+    flex-shrink: 0;
+    border: 1.5px solid var(--border-strong);
+    color: var(--muted);
+  }
+  .init-step.done .step-dot { background: var(--ok-solid); border-color: var(--ok-solid); color: #fff; }
+  .init-step.active .step-dot { background: var(--blue-bg); border-color: var(--blue); color: var(--blue); animation: pulse 1.2s infinite; }
+  .init-foot { margin-top: 20px; display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; }
+  .scan-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 11px 16px;
+    margin-bottom: 18px;
+    border-radius: 13px;
+    background: var(--blue-bg);
+    border: 1px solid var(--blue-bd);
+    color: var(--text);
+    font-size: 13px;
+  }
+  .scan-banner-bar { width: 160px; height: 7px; border-radius: 999px; background: var(--surface); border: 1px solid var(--blue-bd); overflow: hidden; flex-shrink: 0; }
+  .scan-banner-bar > div { height: 100%; background: var(--blue); transition: width .35s ease; }
+  .nav-pills.locked { opacity: .45; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -1028,6 +1107,8 @@
 </header>
 
 <main>
+  <div id="scan-banner"></div>
+  <section id="view-initial" class="view"></section>
   <section id="view-checkup" class="view active"></section>
   <section id="view-house" class="view"></section>
   <section id="view-devices" class="view"></section>
@@ -1061,6 +1142,9 @@ let deviceFilter = "all";     // "all" | "issues" | "bmc" | "cve" | "wan" | "che
 let deviceSearch = "";
 let activityFilter = "all";
 let drawerStack = [];
+let bypassInitialSplash = false;
+let fetchInFlight = false;
+let fetchQueued = false;
 let initialHashApplied = false;
 
 /* ============================================================================
@@ -1618,12 +1702,111 @@ document.addEventListener("click", e => {
 /* ============================================================================
    HEADER & NAV COUNTS
    ============================================================================ */
+function isInitialScanActive() {
+  if (!state || isStaticMode) return false;
+  const hasBaseline = Boolean(state.last_full_scan_at && !String(state.last_full_scan_at).startsWith("0001-"));
+  if (hasBaseline) return false;
+  return Boolean(state.scanning || state.scan_progress?.initial || (state.view?.census?.unassessed_count || 0) > 0);
+}
+
+function renderScanBanner(initial) {
+  const host = document.getElementById("scan-banner");
+  if (!host) return;
+  const sp = state?.scan_progress;
+  if (!state?.scanning || !sp || (initial && !bypassInitialSplash)) {
+    host.innerHTML = "";
+    return;
+  }
+  const pct = Math.max(4, Math.min(99, Number(sp.percent) || 0));
+  host.innerHTML = `<div class="scan-banner">
+    <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1">
+      <span class="sdot" style="background:var(--blue);animation:pulse 1.2s infinite;flex-shrink:0"></span>
+      <div style="min-width:0">
+        <strong>${initial ? "Initial checkup in progress" : "Refreshing network scan"}:</strong>
+        <span>${esc(sp.label || "Checking devices…")}</span>
+        ${initial ? `<span class="small"> · Counts below are partial until baseline completes.</span>` : ""}
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <div class="scan-banner-bar"><div style="width:${pct}%"></div></div>
+      <span class="mono" style="font-size:12px;font-weight:700;color:var(--blue)">${pct}%</span>
+      ${initial ? `<button class="btn sm" onclick="bypassInitialSplash=false; renderActiveTab()">Show progress</button>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderInitialSplash() {
+  const vm = state?.view || { census: {}, entities: {} };
+  const hosts = Object.values(vm.entities || {}).filter(e => e.kind === "host");
+  const sp = state?.scan_progress || {
+    phase: "topology",
+    label: "Starting initial network checkup…",
+    completed: 0,
+    total: hosts.length,
+    percent: 4
+  };
+  const pct = Math.max(4, Math.min(99, Number(sp.percent) || 4));
+  const totalHosts = sp.total || hosts.length;
+  const C = 226.2;
+  const offset = C * (1 - pct / 100);
+
+  const phaseRank = { topology: 0, discovery: 1, probing: 1, fingerprinting: 1, checks: 2, evaluating: 3 };
+  const rank = phaseRank[sp.phase] ?? 0;
+  const stepState = (idx) => (idx < rank ? "done" : (idx === rank ? "active" : ""));
+  const stepMark = (idx) => (idx < rank ? "✓" : (idx === rank ? "·" : ""));
+
+  const probeCount = (sp.phase === "probing" && sp.total > 0)
+    ? ` (${sp.completed} / ${sp.total})`
+    : (rank > 1 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts})` : "");
+  const checkCount = (sp.phase === "checks" && sp.total > 0)
+    ? ` (${sp.completed} / ${sp.total})`
+    : (rank > 2 && totalHosts > 0 ? ` (${totalHosts} / ${totalHosts})` : "");
+
+  document.getElementById("view-initial").innerHTML = `
+    <div class="init-splash">
+      <div class="init-ring">
+        <svg class="ring-svg" viewBox="0 0 84 84">
+          <circle class="ring-bg" cx="42" cy="42" r="36"></circle>
+          <circle class="ring-fg" cx="42" cy="42" r="36" stroke="var(--blue)" stroke-dasharray="${C}" stroke-dashoffset="${offset.toFixed(1)}"></circle>
+        </svg>
+        <div class="ring-center" style="color:var(--blue)">${pct}%</div>
+      </div>
+      <h1 class="init-title">Checking your home network…</h1>
+      <p class="init-sub">
+        UniBlue is gently checking ${totalHosts ? `<strong>${totalHosts}</strong> devices` : "your devices"}, cables, and firewall rules.
+        Your full security checkup will appear automatically as soon as this first scan completes.
+      </p>
+
+      <div class="pbar-wrap">
+        <div class="pbar-meta">
+          <strong style="color:var(--text)">${esc(sp.label || "Checking devices…")}</strong>
+          <span class="mono" style="font-weight:700;color:var(--blue)">${pct}%</span>
+        </div>
+        <div class="pbar-track"><div class="pbar-fill" style="width:${pct}%"></div></div>
+        <div class="pbar-host">${sp.current_host ? `Last checked: <strong>${esc(sp.current_host)}</strong>` : "Read-only &amp; rate-paced so fragile IoT gear stays undisturbed."}</div>
+      </div>
+
+      <div class="init-steps">
+        <div class="init-step ${stepState(0)}"><span class="step-dot">${stepMark(0)}</span>Read UniFi router, switches, cables &amp; firewall rules</div>
+        <div class="init-step ${stepState(1)}"><span class="step-dot">${stepMark(1)}</span>Probe devices for open ports &amp; services${esc(probeCount)}</div>
+        <div class="init-step ${stepState(2)}"><span class="step-dot">${stepMark(2)}</span>Run read-only security checks${esc(checkCount)}</div>
+        <div class="init-step ${stepState(3)}"><span class="step-dot">${stepMark(3)}</span>Evaluate firewall isolation &amp; known security bugs (CVEs)</div>
+      </div>
+
+      <div class="init-foot">
+        <button class="btn sm ghost" onclick="bypassInitialSplash=true; renderActiveTab()">Peek at partial cables &amp; devices while scanning →</button>
+      </div>
+    </div>`;
+}
+
 function renderHeader() {
   const vm = state.view || { census: {}, queue: [], entities: {} };
   const c = vm.census || {};
   const hosts = Object.values(vm.entities || {}).filter(e => e.kind === "host");
   const unassessed = c.unassessed_count || 0;
+  const initial = isInitialScanActive();
   const checking = Boolean(state.scanning || unassessed > 0);
+  const sp = state.scan_progress;
 
   const pill = document.getElementById("status-pill");
   const lbl = document.getElementById("status-lbl");
@@ -1633,8 +1816,12 @@ function renderHeader() {
     document.getElementById("rescan-btn").style.display = "none";
   } else if (checking) {
     pill.className = "status-pill scanning";
-    const done = Math.max(0, hosts.length - unassessed);
-    lbl.textContent = unassessed > 0 ? `Checking ${done}/${hosts.length}…` : "Checking network…";
+    if (sp && sp.percent > 0) {
+      lbl.textContent = `Scanning ${sp.percent}%…`;
+    } else {
+      const done = Math.max(0, hosts.length - unassessed);
+      lbl.textContent = unassessed > 0 ? `Checking ${done}/${hosts.length}…` : "Checking network…";
+    }
   } else {
     pill.className = "status-pill live";
     lbl.textContent = "Live · " + fmtTime(state.updated_at);
@@ -1651,19 +1838,29 @@ function renderHeader() {
     || hosts.some(e => e.state === "exposed" && e.max_severity === "critical")
     || (vm.wan_flows || []).some(f => !f.expected && f.severity === "critical");
   const ckB = document.getElementById("nb-ck");
-  ckB.textContent = checking && !checkupTotal ? "…" : checkupTotal;
-  ckB.className = "nav-cnt" + (checkupHasCrit ? " crit" : checkupTotal ? " warn" : checking ? " blue" : "");
+  if (initial && !bypassInitialSplash) {
+    ckB.textContent = "…";
+    ckB.className = "nav-cnt blue";
+  } else {
+    ckB.textContent = checking && !checkupTotal ? "…" : checkupTotal;
+    ckB.className = "nav-cnt" + (checkupHasCrit ? " crit" : checkupTotal ? " warn" : checking ? " blue" : "");
+  }
 
   const openGates = c.open_wall_gates || 0;
   const hsB = document.getElementById("nb-hs");
   hsB.textContent = openGates;
-  hsB.style.display = openGates ? "" : "none";
+  hsB.style.display = (openGates && !(initial && !bypassInitialSplash)) ? "" : "none";
   hsB.className = "nav-cnt crit";
 
   const expHosts = hosts.filter(e => e.state === "exposed").length;
   const dvB = document.getElementById("nb-dv");
-  dvB.textContent = expHosts || hosts.length;
-  dvB.className = "nav-cnt" + (hosts.some(e => e.state === "exposed" && e.max_severity === "critical") ? " crit" : expHosts ? " warn" : "");
+  if (initial && !bypassInitialSplash) {
+    dvB.textContent = hosts.length ? String(hosts.length) : "…";
+    dvB.className = "nav-cnt";
+  } else {
+    dvB.textContent = expHosts || hosts.length;
+    dvB.className = "nav-cnt" + (hosts.some(e => e.state === "exposed" && e.max_severity === "critical") ? " crit" : expHosts ? " warn" : "");
+  }
 
   const actCount = (state.events || []).length + (state.report?.unifi_posture?.recent_logs || []).length;
   document.getElementById("nb-ac").textContent = actCount;
@@ -2950,7 +3147,23 @@ function renderCoveragePanelDrawer(vm) {
    ============================================================================ */
 function renderActiveTab() {
   if (!state) return;
+  const initial = isInitialScanActive();
+  if (!initial) bypassInitialSplash = false;
   renderHeader();
+  renderScanBanner(initial);
+
+  const initSec = document.getElementById("view-initial");
+  const showSplash = initial && !bypassInitialSplash;
+  const navPills = document.querySelector(".nav-pills");
+  if (navPills) navPills.classList.toggle("locked", showSplash);
+  if (initSec) initSec.classList.toggle("active", showSplash);
+  if (showSplash) {
+    document.querySelectorAll("main > section.view:not(#view-initial)").forEach(s => s.classList.remove("active"));
+    renderInitialSplash();
+    return;
+  }
+
+  document.querySelectorAll("main > section.view:not(#view-initial)").forEach(s => s.classList.toggle("active", s.id === "view-" + activeTab));
   if (activeTab === "checkup") renderCheckup();
   else if (activeTab === "house") renderHouse();
   else if (activeTab === "devices") renderDevices();
@@ -2960,15 +3173,28 @@ function renderActiveTab() {
 
 async function fetchState() {
   if (isStaticMode) return;
-  const r = await fetch("/api/state", {cache: "no-store"});
-  if (!r.ok) return;
-  state = await r.json();
-  if (!initialHashApplied) {
-    initialHashApplied = true;
-    applyHash();
-    syncHash(false);
+  if (fetchInFlight) {
+    fetchQueued = true;
+    return;
   }
-  renderActiveTab();
+  fetchInFlight = true;
+  try {
+    const r = await fetch("/api/state", {cache: "no-store"});
+    if (!r.ok) return;
+    state = await r.json();
+    if (!initialHashApplied) {
+      initialHashApplied = true;
+      applyHash();
+      syncHash(false);
+    }
+    renderActiveTab();
+  } finally {
+    fetchInFlight = false;
+    if (fetchQueued) {
+      fetchQueued = false;
+      fetchState();
+    }
+  }
 }
 
 async function triggerRescan(ip) {
@@ -2992,7 +3218,7 @@ function resolveEventSubject(ev) {
 function showToast(ev) {
   if (!ev || !ev.summary) return;
   const t = (ev.type || "").toLowerCase();
-  if (t === "startup") return;
+  if (t === "startup" || t === "scan_progress") return;
   const stack = document.getElementById("toast-stack");
   if (!stack) return;
 
