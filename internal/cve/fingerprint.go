@@ -41,7 +41,9 @@ type FingerprintRule struct {
 	// MACPrefix matches against colon-separated lowercase MAC prefixes.
 	MACPrefix []string `yaml:"mac_prefix"`
 
-	// PortsAny matches when any listed TCP port was observed open.
+	// PortsAny optionally restricts a rule to hosts where at least one listed
+	// TCP port was observed open. PortsAny never attributes a vendor on its own
+	// without an identity signal (banner, HTTP header/title, hostname, or MAC).
 	PortsAny []int `yaml:"ports_any"`
 
 	// Vendors lists one or more NVD CPE vendor shards to query for this product.
@@ -149,13 +151,53 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 	}
 
 	var products []Product
-	seen := make(map[string]struct{})
+	seenPairs := make(map[string]struct{})
+	seenFallback := make(map[string]struct{})
 	add := func(p Product) {
-		key := fmt.Sprintf("%s|%s|%s", p.HostIP, p.Label, p.Version)
-		if _, dup := seen[key]; dup {
+		hostKey := strings.ToLower(strings.TrimSpace(p.HostIP))
+		if hostKey == "" {
+			hostKey = strings.ToLower(strings.TrimSpace(p.HostName))
+		}
+		verKey := strings.ToLower(strings.TrimSpace(p.Version))
+
+		// Dedupe by host + canonical vendor/product + version rather than display
+		// label so a built-in rule and a Nerva CPE never produce duplicate rollups.
+		var keys []string
+		for _, v := range p.Vendors {
+			v = strings.ToLower(strings.TrimSpace(v))
+			if v == "" {
+				continue
+			}
+			for _, prod := range p.Products {
+				prod = strings.ToLower(strings.TrimSpace(prod))
+				if prod == "" {
+					continue
+				}
+				keys = append(keys, fmt.Sprintf("%s|%s|%s|%s", hostKey, v, prod, verKey))
+			}
+		}
+		if len(keys) == 0 {
+			fb := fmt.Sprintf("%s|%s|%s", hostKey, strings.ToLower(strings.TrimSpace(p.Label)), verKey)
+			if _, dup := seenFallback[fb]; dup {
+				return
+			}
+			seenFallback[fb] = struct{}{}
+			products = append(products, p)
 			return
 		}
-		seen[key] = struct{}{}
+		allSeen := true
+		for _, k := range keys {
+			if _, ok := seenPairs[k]; !ok {
+				allSeen = false
+				break
+			}
+		}
+		if allSeen {
+			return
+		}
+		for _, k := range keys {
+			seenPairs[k] = struct{}{}
+		}
 		products = append(products, p)
 	}
 
@@ -164,10 +206,14 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 	// reports stay clean and deduplicated.
 	if snap != nil {
 		for _, dev := range snap.Devices {
+			cpeProducts := mapUniFiDeviceProducts(dev)
+			if len(cpeProducts) == 0 {
+				continue
+			}
 			add(Product{
 				Label:    fmt.Sprintf("UniFi %s (%s)", dev.Name, dev.Model),
 				Vendors:  []string{"ui"},
-				Products: mapUniFiDeviceProducts(dev),
+				Products: cpeProducts,
 				Version:  dev.Version,
 				Source:   "unifi-firmware",
 				HostName: dev.Name,
@@ -183,25 +229,23 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 	for _, hp := range profiles {
 		wan := wanExposedIPs[hp.Client.IP]
 		for _, rule := range f.rules {
-			ver, model, source, ok := rule.match(hp)
-			if !ok {
-				continue
+			for _, hit := range rule.matchAll(hp) {
+				label := rule.Name
+				if hit.model != "" {
+					label = fmt.Sprintf("%s %s", rule.Name, strings.ToUpper(hit.model))
+				}
+				add(Product{
+					Label:      label,
+					Vendors:    rule.Vendors,
+					Products:   expandProductPatterns(rule.Products, hit.model),
+					Version:    hit.version,
+					Source:     hit.source,
+					HostName:   hp.Client.DisplayName(),
+					HostIP:     hp.Client.IP,
+					VLAN:       hp.Client.NetworkName,
+					WANExposed: wan,
+				})
 			}
-			label := rule.Name
-			if model != "" {
-				label = fmt.Sprintf("%s %s", rule.Name, strings.ToUpper(model))
-			}
-			add(Product{
-				Label:      label,
-				Vendors:    rule.Vendors,
-				Products:   expandProductPatterns(rule.Products, model),
-				Version:    ver,
-				Source:     source,
-				HostName:   hp.Client.DisplayName(),
-				HostIP:     hp.Client.IP,
-				VLAN:       hp.Client.NetworkName,
-				WANExposed: wan,
-			})
 		}
 
 		// Extract exact-version products directly from any versioned CPE 2.3
@@ -240,24 +284,22 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 			}
 			hp := probe.HostProfile{Client: cl}
 			for _, rule := range f.rules {
-				ver, model, source, ok := rule.match(hp)
-				if !ok {
-					continue
+				for _, hit := range rule.matchAll(hp) {
+					label := rule.Name
+					if hit.model != "" {
+						label = fmt.Sprintf("%s %s", rule.Name, strings.ToUpper(hit.model))
+					}
+					add(Product{
+						Label:    label,
+						Vendors:  rule.Vendors,
+						Products: expandProductPatterns(rule.Products, hit.model),
+						Version:  hit.version,
+						Source:   hit.source,
+						HostName: cl.DisplayName(),
+						HostIP:   cl.IP,
+						VLAN:     cl.NetworkName,
+					})
 				}
-				label := rule.Name
-				if model != "" {
-					label = fmt.Sprintf("%s %s", rule.Name, strings.ToUpper(model))
-				}
-				add(Product{
-					Label:    label,
-					Vendors:  rule.Vendors,
-					Products: expandProductPatterns(rule.Products, model),
-					Version:  ver,
-					Source:   source,
-					HostName: cl.DisplayName(),
-					HostIP:   cl.IP,
-					VLAN:     cl.NetworkName,
-				})
 			}
 		}
 	}
@@ -266,42 +308,82 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 		if products[i].HostIP != products[j].HostIP {
 			return products[i].HostIP < products[j].HostIP
 		}
-		return products[i].Label < products[j].Label
+		if products[i].Label != products[j].Label {
+			return products[i].Label < products[j].Label
+		}
+		return products[i].Version < products[j].Version
 	})
 	return products
 }
 
-// match checks whether any configured signal on a FingerprintRule matches hp,
-// preferring version-bearing signals (SSH banner, HTTP Server) over identity-only signals.
-func (r *FingerprintRule) match(hp probe.HostProfile) (version, model, source string, ok bool) {
+// ruleHit records one deterministic match emitted by FingerprintRule.matchAll.
+type ruleHit struct {
+	version string
+	model   string
+	source  string
+}
+
+// matchAll checks whether any configured identity signal on a FingerprintRule
+// matches hp, preferring version-bearing signals (SSH banner, HTTP Server) over
+// identity-only signals and iterating HTTP ports in deterministic sorted order.
+// PortsAny never produces a match on its own; when set, it acts as a port
+// precondition that must hold alongside an identity signal.
+func (r *FingerprintRule) matchAll(hp probe.HostProfile) []ruleHit {
+	if len(r.PortsAny) > 0 {
+		portOK := false
+		for _, p := range r.PortsAny {
+			if hp.HasPort(p) {
+				portOK = true
+				break
+			}
+		}
+		if !portOK {
+			return nil
+		}
+	}
+
 	if r.sshBannerRe != nil && hp.SSHBanner != "" {
 		if m := r.sshBannerRe.FindStringSubmatch(hp.SSHBanner); m != nil {
-			return captureGroup(m, r.VersionGroup), captureGroup(m, r.ModelGroup), "ssh-banner", true
+			return []ruleHit{{
+				version: captureGroup(m, r.VersionGroup),
+				model:   captureGroup(m, r.ModelGroup),
+				source:  "ssh-banner",
+			}}
 		}
 	}
-	if r.httpServerRe != nil {
-		for _, b := range hp.HTTP {
-			if b.Server != "" {
-				if m := r.httpServerRe.FindStringSubmatch(b.Server); m != nil {
-					return captureGroup(m, r.VersionGroup), captureGroup(m, r.ModelGroup), "http-server", true
-				}
-			}
+
+	var ports []int
+	if (r.httpServerRe != nil || r.httpTitleRe != nil) && len(hp.HTTP) > 0 {
+		ports = make([]int, 0, len(hp.HTTP))
+		for port := range hp.HTTP {
+			ports = append(ports, port)
+		}
+		sort.Ints(ports)
+	}
+
+	if r.httpServerRe != nil && len(ports) > 0 {
+		if hits := matchHTTPField(ports, hp.HTTP, r.httpServerRe, r.VersionGroup, r.ModelGroup, "http-server", func(b probe.HTTPBanner) string {
+			return b.Server
+		}); len(hits) > 0 {
+			return hits
 		}
 	}
-	if r.httpTitleRe != nil {
-		for _, b := range hp.HTTP {
-			if b.Title != "" {
-				if m := r.httpTitleRe.FindStringSubmatch(b.Title); m != nil {
-					return captureGroup(m, r.VersionGroup), captureGroup(m, r.ModelGroup), "http-title", true
-				}
-			}
+	if r.httpTitleRe != nil && len(ports) > 0 {
+		if hits := matchHTTPField(ports, hp.HTTP, r.httpTitleRe, r.VersionGroup, r.ModelGroup, "http-title", func(b probe.HTTPBanner) string {
+			return b.Title
+		}); len(hits) > 0 {
+			return hits
 		}
 	}
 	if r.hostnameRe != nil {
 		for _, candidate := range []string{hp.Client.Name, hp.Client.Hostname} {
 			if candidate != "" {
 				if m := r.hostnameRe.FindStringSubmatch(candidate); m != nil {
-					return captureGroup(m, r.VersionGroup), captureGroup(m, r.ModelGroup), "hostname", true
+					return []ruleHit{{
+						version: captureGroup(m, r.VersionGroup),
+						model:   captureGroup(m, r.ModelGroup),
+						source:  "hostname",
+					}}
 				}
 			}
 		}
@@ -310,18 +392,59 @@ func (r *FingerprintRule) match(hp probe.HostProfile) (version, model, source st
 		macLower := strings.ToLower(hp.Client.MAC)
 		for _, pfx := range r.MACPrefix {
 			if strings.HasPrefix(macLower, strings.ToLower(pfx)) {
-				return "", "", "mac-prefix", true
+				return []ruleHit{{source: "mac-prefix"}}
 			}
 		}
 	}
-	if len(r.PortsAny) > 0 {
-		for _, p := range r.PortsAny {
-			if hp.HasPort(p) {
-				return "", "", "port", true
+	return nil
+}
+
+// matchHTTPField scans HTTP banners in ascending port order, preferring banners
+// that yield a non-empty version (or model) capture and emitting one hit per
+// distinct (version, model) pair so multi-port hosts stay deterministic.
+func matchHTTPField(
+	ports []int,
+	banners map[int]probe.HTTPBanner,
+	re *regexp.Regexp,
+	verGroup, modelGroup int,
+	source string,
+	extract func(probe.HTTPBanner) string,
+) []ruleHit {
+	var versioned []ruleHit
+	var fallback *ruleHit
+	seen := make(map[string]struct{})
+
+	for _, port := range ports {
+		val := extract(banners[port])
+		if val == "" {
+			continue
+		}
+		m := re.FindStringSubmatch(val)
+		if m == nil {
+			continue
+		}
+		ver := captureGroup(m, verGroup)
+		model := captureGroup(m, modelGroup)
+		hit := ruleHit{version: ver, model: model, source: source}
+		if ver != "" || model != "" {
+			k := strings.ToLower(ver) + "|" + strings.ToLower(model)
+			if _, dup := seen[k]; !dup {
+				seen[k] = struct{}{}
+				versioned = append(versioned, hit)
 			}
+			continue
+		}
+		if fallback == nil {
+			fallback = &hit
 		}
 	}
-	return "", "", "", false
+	if len(versioned) > 0 {
+		return versioned
+	}
+	if fallback != nil {
+		return []ruleHit{*fallback}
+	}
+	return nil
 }
 
 // expandProductPatterns substitutes "{model}" placeholders with the captured
@@ -342,21 +465,25 @@ func expandProductPatterns(patterns []string, model string) []string {
 	return out
 }
 
-// parseVersionedCPE23 parses a CPE 2.3 URI ("cpe:2.3:a:vendor:product:version:...")
+// parseVersionedCPE23 parses a CPE 2.3 URI ("cpe:2.3:a:vendor:product:version:update:...")
 // and returns (vendor, product, version, true) only when a concrete version
-// token (not "*", "-", or empty) is present.
+// token (not "*", "-", or empty) is present, folding any non-wildcard update
+// component (parts[6]) into version.
 func parseVersionedCPE23(raw string) (vendor, product, version string, ok bool) {
 	parts := strings.Split(strings.ToLower(strings.TrimSpace(raw)), ":")
 	if len(parts) < 6 || parts[0] != "cpe" || parts[1] != "2.3" {
 		return "", "", "", false
 	}
-	vendor = parts[3]
-	product = parts[4]
-	version = parts[5]
+	vendor = strings.TrimSpace(parts[3])
+	product = strings.TrimSpace(parts[4])
+	version = strings.TrimSpace(parts[5])
 	if vendor == "" || vendor == "*" || vendor == "-" ||
 		product == "" || product == "*" || product == "-" ||
 		version == "" || version == "*" || version == "-" {
 		return "", "", "", false
+	}
+	if len(parts) > 6 {
+		version = joinCPEVersionUpdate(version, parts[6])
 	}
 	return vendor, product, version, true
 }
@@ -381,35 +508,104 @@ func captureGroup(matches []string, idx int) string {
 	return strings.TrimSpace(matches[idx])
 }
 
-// mapUniFiDeviceProducts maps a UniFi hardware model name to the exact NVD CPE
-// product tokens used in Ubiquiti's CVE entries, taking care not to mix models
-// that use separate firmware version tracks (such as USW Flex Mini's 2.x branch).
+// mapUniFiDeviceProducts maps a UniFi hardware device's Type and Model code to
+// the exact NVD CPE product tokens used in Ubiquiti's CVE entries, taking care
+// never to inspect user-configured dev.Name strings, never to conflate AP or
+// switch "Pro Max" models with UDM Pro Max, and never to fall back to
+// unifi_network_application for a device firmware version.
 func mapUniFiDeviceProducts(dev unifi.Device) []string {
-	m := strings.ToLower(dev.Model + " " + dev.Name)
-	switch {
-	case strings.Contains(m, "pro max"):
-		return []string{"unifi_dream_machine_pro_max_firmware", "unifi_os"}
-	case strings.Contains(m, "udm se") || strings.Contains(m, "special edition"):
-		return []string{"unifi_dream_machine_special_edition_firmware", "unifi_os"}
-	case strings.Contains(m, "udm pro") || strings.Contains(m, "dream machine pro"):
-		return []string{"unifi_dream_machine_pro_firmware", "unifi_os"}
-	case strings.Contains(m, "udm") || strings.Contains(m, "dream machine"):
-		return []string{"unifi_dream_machine_firmware", "unifi_os"}
-	case strings.Contains(m, "dream router") || strings.Contains(m, "udr"):
-		return []string{"unifi_dream_router_firmware", "unifi_os"}
-	case strings.Contains(m, "cloud gateway") || strings.Contains(m, "ucg"):
-		return []string{"unifi_cloud_gateway_*_firmware", "unifi_os"}
-	case strings.Contains(m, "cloud key") || strings.Contains(m, "uck"):
-		return []string{"unifi_cloudkey_firmware", "unifi_cloud_key_plus_firmware"}
-	case strings.Contains(m, "flex mini") || strings.Contains(m, "flex-mini"):
-		// Flex Mini runs an independent 2.x firmware branch and is explicitly
-		// excluded from standard 6.x/7.x UniFi Switch advisories.
-		return []string{"unifi_switch_flex_mini_firmware"}
-	case strings.Contains(m, "usw") || strings.Contains(m, "switch"):
-		return []string{"unifi_switch_firmware"}
-	case strings.Contains(m, "ap") || strings.Contains(m, "iw ") || strings.Contains(m, "u6") || strings.Contains(m, "u7"):
+	typ := strings.ToLower(strings.TrimSpace(dev.Type))
+	model := strings.ToLower(strings.TrimSpace(dev.Model))
+	compact := strings.NewReplacer("-", "", "_", "", " ", "").Replace(model)
+
+	// 1. Discriminate on controller-reported dev.Type first so APs, switches,
+	// and gateways are never misclassified by model suffixes like "Pro Max".
+	switch typ {
+	case "uap":
 		return []string{"unifi_uap_firmware"}
-	default:
-		return []string{"unifi_os", "unifi_network_application"}
+	case "usw":
+		if strings.Contains(compact, "flexmini") || compact == "usmini" {
+			// Flex Mini runs an independent 2.x firmware branch and is explicitly
+			// excluded from standard 6.x/7.x UniFi Switch advisories.
+			return []string{"unifi_switch_flex_mini_firmware"}
+		}
+		return []string{"unifi_switch_firmware"}
+	case "uxg":
+		if strings.Contains(compact, "pro") {
+			return []string{"unifi_next-generation_gateway_pro_firmware", "unifi_gateway_firmware"}
+		}
+		return []string{"unifi_gateway_firmware"}
+	case "ugw":
+		return []string{"unifi_security_gateway_firmware"}
+	case "uck":
+		return []string{"unifi_cloudkey_firmware", "unifi_cloud_key_plus_firmware"}
 	}
+
+	// 2. Discriminate on model codes when dev.Type is "udm" or omitted.
+	// Order AP, switch, and gateway cases before UDM/Pro Max console patterns.
+	switch {
+	// Access points (UAP, UAL6, U6-*, U7-*, U7 Pro Max, UK-Ultra, etc.).
+	case strings.HasPrefix(compact, "uap") ||
+		strings.HasPrefix(compact, "ual") ||
+		strings.HasPrefix(compact, "u6") ||
+		strings.HasPrefix(compact, "u7") ||
+		strings.HasPrefix(compact, "uac") ||
+		strings.HasPrefix(compact, "ukultra") ||
+		strings.Contains(model, "access point"):
+		return []string{"unifi_uap_firmware"}
+
+	// Switches (USW-Flex-Mini, USW-*, USW Pro Max, USL16LP, US8P60, etc.).
+	case strings.Contains(compact, "flexmini") || compact == "usmini":
+		return []string{"unifi_switch_flex_mini_firmware"}
+	case strings.HasPrefix(compact, "usw") ||
+		strings.HasPrefix(compact, "usl") ||
+		strings.HasPrefix(compact, "usf") ||
+		strings.HasPrefix(compact, "usagg") ||
+		isClassicUniFiSwitchCode(compact) ||
+		strings.Contains(model, "switch"):
+		return []string{"unifi_switch_firmware"}
+
+	// Standalone gateways (UXGPRO, UXG-Lite, USG, UGW).
+	case strings.HasPrefix(compact, "uxg"):
+		if strings.Contains(compact, "pro") {
+			return []string{"unifi_next-generation_gateway_pro_firmware", "unifi_gateway_firmware"}
+		}
+		return []string{"unifi_gateway_firmware"}
+	case strings.HasPrefix(compact, "ugw") || strings.HasPrefix(compact, "usg"):
+		return []string{"unifi_security_gateway_firmware"}
+
+	// UniFi OS consoles (UDM Pro Max, UDM SE, UDM Pro, UDM, UDR, UCG, UDW).
+	case strings.Contains(compact, "udmpromax") ||
+		strings.Contains(compact, "dreammachinepromax") ||
+		(typ == "udm" && strings.Contains(compact, "promax")):
+		return []string{"unifi_dream_machine_pro_max_firmware", "unifi_os"}
+	case strings.Contains(compact, "udmse") ||
+		strings.Contains(compact, "dreammachinese") ||
+		strings.Contains(compact, "specialedition"):
+		return []string{"unifi_dream_machine_special_edition_firmware", "unifi_os"}
+	case strings.Contains(compact, "udmpro") || strings.Contains(compact, "dreammachinepro"):
+		return []string{"unifi_dream_machine_pro_firmware", "unifi_os"}
+	case strings.HasPrefix(compact, "udm") || strings.Contains(compact, "dreammachine"):
+		return []string{"unifi_dream_machine_firmware", "unifi_os"}
+	case strings.HasPrefix(compact, "udr") || strings.Contains(compact, "dreamrouter"):
+		return []string{"unifi_dream_router_firmware", "unifi_os"}
+	case strings.HasPrefix(compact, "ucg") || strings.Contains(compact, "cloudgateway"):
+		return []string{"unifi_cloud_gateway_*_firmware", "unifi_os"}
+	case strings.HasPrefix(compact, "udw") || strings.Contains(compact, "dreamwall"):
+		return []string{"unifi_dream_wall_firmware", "unifi_os"}
+	case strings.HasPrefix(compact, "uck") || strings.Contains(compact, "cloudkey"):
+		return []string{"unifi_cloudkey_firmware", "unifi_cloud_key_plus_firmware"}
+	case typ == "udm":
+		return []string{"unifi_os"}
+	default:
+		// Never fall back to unifi_network_application with a device firmware version.
+		return nil
+	}
+}
+
+// isClassicUniFiSwitchCode reports whether compact is a classic UniFi switch
+// model code consisting of "us" followed by a digit (e.g., "us8p60", "us24p250",
+// "us48", "us16xg").
+func isClassicUniFiSwitchCode(compact string) bool {
+	return len(compact) >= 3 && strings.HasPrefix(compact, "us") && compact[2] >= '0' && compact[2] <= '9'
 }

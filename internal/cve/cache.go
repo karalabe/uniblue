@@ -10,6 +10,8 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/karalabe/uniblue/internal/checks"
@@ -138,13 +141,19 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 		progress = func(string) {}
 	}
 
+	endYear := opts.EndYear
+	if endYear == 0 {
+		endYear = time.Now().UTC().Year()
+	} else if endYear < firstNVDYear {
+		return nil, fmt.Errorf("invalid end year %d: must be >= %d", endYear, firstNVDYear)
+	}
+
 	since := opts.SinceYear
-	if since < firstNVDYear {
+	if since == 0 {
 		since = firstNVDYear
 	}
-	endYear := opts.EndYear
-	if endYear <= 0 {
-		endYear = time.Now().UTC().Year()
+	if since < firstNVDYear || since > endYear {
+		return nil, fmt.Errorf("invalid since year %d: must be between %d and %d", since, firstNVDYear, endYear)
 	}
 
 	feedsDir := filepath.Join(c.dir, "feeds")
@@ -164,7 +173,7 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 
 	// Step 1: Fetch CISA KEV catalog (single ~1.5 MB JSON file, fast and zero rate limits).
 	progress("Fetching CISA KEV catalog...")
-	kevSet, err := c.fetchKEV(ctx)
+	kevSet, kevSHA, err := c.fetchKEV(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetch cisa kev: %w", err)
 	}
@@ -241,19 +250,28 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	if err := errors.Join(errs...); err != nil {
 		return nil, fmt.Errorf("sync nvd feeds: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	sort.Strings(feedFiles)
 
-	// Skip rebuilding vendor shards when nothing changed and shards already exist.
-	if downloaded == 0 && !opts.Force && prevStats != nil && prevStats.VendorCount > 0 && len(prevStats.YearSHAs) == len(newSHAs) {
-		progress("All NVD yearly feeds are already up to date.")
+	// Skip rebuilding vendor shards only when both NVD feeds and the CISA KEV
+	// catalog are unchanged and shards already exist.
+	if downloaded == 0 && !opts.Force && prevStats != nil && prevStats.VendorCount > 0 &&
+		prevStats.KEVSHA != "" && prevStats.KEVSHA == kevSHA &&
+		equalStringMaps(prevStats.YearSHAs, newSHAs) {
+		progress("All NVD yearly feeds and CISA KEV catalog are already up to date.")
 		return prevStats, nil
 	}
 
 	// Step 3: Parse all local yearly .json.gz feeds concurrently over channels
 	// and merge them into vendor-sharded compressed index files.
 	progress(fmt.Sprintf("Indexing %d NVD yearly feeds into vendor shards...", len(feedFiles)))
-	stats, err := c.buildVendorIndex(ctx, feedFiles, vendorsDir, kevSet, newSHAs, rawBytes, start)
+	stats, err := c.buildVendorIndex(ctx, feedFiles, vendorsDir, kevSet, kevSHA, newSHAs, rawBytes, start)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -261,6 +279,19 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 		return nil, err
 	}
 	return stats, nil
+}
+
+// equalStringMaps reports whether a and b contain identical key/value pairs.
+func equalStringMaps(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 // syncYearFeed fetches the .meta checksum for a single NVD year and downloads
@@ -319,23 +350,26 @@ func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string
 }
 
 // fetchKEV downloads CISA's KEV catalog, persists it locally, and returns a
-// lookup map of all actively exploited CVE IDs.
-func (c *Cache) fetchKEV(ctx context.Context) (map[string]struct{}, error) {
+// lookup map of all actively exploited CVE IDs along with the catalog's SHA256.
+func (c *Cache) fetchKEV(ctx context.Context) (map[string]struct{}, string, error) {
 	kevPath := filepath.Join(c.dir, "kev.json")
 	if _, err := c.downloadFile(ctx, c.kevURL, kevPath); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	raw, err := os.ReadFile(kevPath)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	sum := sha256.Sum256(raw)
+	kevSHA := hex.EncodeToString(sum[:])
+
 	var payload struct {
 		Vulnerabilities []struct {
 			CVEID string `json:"cveID"`
 		} `json:"vulnerabilities"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("decode kev json: %w", err)
+		return nil, "", fmt.Errorf("decode kev json: %w", err)
 	}
 	set := make(map[string]struct{}, len(payload.Vulnerabilities))
 	for _, v := range payload.Vulnerabilities {
@@ -343,7 +377,7 @@ func (c *Cache) fetchKEV(ctx context.Context) (map[string]struct{}, error) {
 			set[id] = struct{}{}
 		}
 	}
-	return set, nil
+	return set, kevSHA, nil
 }
 
 // fetchMetaSHA downloads an NVD .meta file and extracts its sha256 line.
@@ -415,13 +449,20 @@ func (c *Cache) downloadFile(ctx context.Context, url, dst string) (int64, error
 // buildVendorIndex parses all yearly NVD .json.gz feeds in parallel over a
 // channel worker pool, groups Records by CPE vendor, and writes compact
 // gzipped vendor shard files under vendorsDir.
-func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendorsDir string, kevSet map[string]struct{}, yearSHAs map[string]string, rawBytes int64, started time.Time) (*CacheStats, error) {
+func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendorsDir string, kevSet map[string]struct{}, kevSHA string, yearSHAs map[string]string, rawBytes int64, started time.Time) (*CacheStats, error) {
 	type parsedFeed struct {
 		total    int
 		withCPE  int
 		byVendor map[string][]Record
 		err      error
 	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	parseCtx, cancelParse := context.WithCancel(ctx)
+	defer cancelParse()
 
 	workers := syncWorkers
 	if len(feedFiles) < workers && len(feedFiles) > 0 {
@@ -430,50 +471,72 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 
 	jobs := make(chan string)
 	results := make(chan parsedFeed, workers)
-	done := make(chan struct{}, workers)
 
+	var parseWG sync.WaitGroup
 	for range workers {
+		parseWG.Add(1)
 		go func() {
-			defer func() { done <- struct{}{} }()
+			defer parseWG.Done()
 			for path := range jobs {
-				if ctx.Err() != nil {
+				if parseCtx.Err() != nil {
 					return
 				}
 				total, withCPE, byVendor, err := parseNVDFeed(path, kevSet)
-				results <- parsedFeed{total: total, withCPE: withCPE, byVendor: byVendor, err: err}
+				select {
+				case results <- parsedFeed{total: total, withCPE: withCPE, byVendor: byVendor, err: err}:
+				case <-parseCtx.Done():
+					return
+				}
 			}
 		}()
 	}
+	parseProdDone := make(chan struct{})
 	go func() {
-		for range workers {
-			<-done
-		}
-		close(results)
-	}()
-	go func() {
+		defer close(parseProdDone)
 		defer close(jobs)
 		for _, p := range feedFiles {
 			select {
-			case <-ctx.Done():
+			case <-parseCtx.Done():
 				return
 			case jobs <- p:
 			}
 		}
 	}()
+	go func() {
+		parseWG.Wait()
+		<-parseProdDone
+		close(results)
+	}()
 
-	// Merge per-year vendor buckets in the single collector goroutine (zero locks).
+	// Merge per-year vendor buckets in the single collector goroutine (zero locks),
+	// always draining results after cancellation so workers never leak.
 	merged := make(map[string][]Record, 4096)
 	totalCVEs := 0
 	indexedCPECVEs := 0
+	var parseErr error
 	for pf := range results {
 		if pf.err != nil {
-			return nil, pf.err
+			if parseErr == nil {
+				parseErr = pf.err
+				cancelParse()
+			}
+			continue
+		}
+		if parseErr != nil {
+			continue
 		}
 		totalCVEs += pf.total
 		indexedCPECVEs += pf.withCPE
 		for vendor, recs := range pf.byVendor {
 			merged[vendor] = append(merged[vendor], recs...)
 		}
+	}
+	cancelParse()
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Write vendor shard files concurrently using a channel worker pool so
@@ -487,14 +550,22 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 		err  error
 	}
 
-	writeJobs := make(chan vendorJob)
-	writeResults := make(chan writeRes, syncWorkers*2)
-	writeDone := make(chan struct{}, syncWorkers*2)
+	writeCtx, cancelWrite := context.WithCancel(ctx)
+	defer cancelWrite()
 
-	for range syncWorkers * 2 {
+	writeWorkers := syncWorkers * 2
+	writeJobs := make(chan vendorJob)
+	writeResults := make(chan writeRes, writeWorkers)
+
+	var writeWG sync.WaitGroup
+	for range writeWorkers {
+		writeWG.Add(1)
 		go func() {
-			defer func() { writeDone <- struct{}{} }()
+			defer writeWG.Done()
 			for vj := range writeJobs {
+				if writeCtx.Err() != nil {
+					return
+				}
 				// Sort newest/highest-severity CVEs first inside each vendor shard.
 				sort.Slice(vj.recs, func(i, j int) bool {
 					if vj.recs[i].KEV != vj.recs[j].KEV {
@@ -507,33 +578,50 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 				})
 				shardPath := filepath.Join(vendorsDir, sanitizeVendor(vj.vendor)+".json.gz")
 				sz, err := writeGzipJSONAtomic(shardPath, vj.recs)
-				writeResults <- writeRes{size: sz, err: err}
+				select {
+				case writeResults <- writeRes{size: sz, err: err}:
+				case <-writeCtx.Done():
+					return
+				}
 			}
 		}()
 	}
+	writeProdDone := make(chan struct{})
 	go func() {
-		for range syncWorkers * 2 {
-			<-writeDone
-		}
-		close(writeResults)
-	}()
-	go func() {
+		defer close(writeProdDone)
 		defer close(writeJobs)
 		for vendor, recs := range merged {
 			select {
-			case <-ctx.Done():
+			case <-writeCtx.Done():
 				return
 			case writeJobs <- vendorJob{vendor: vendor, recs: recs}:
 			}
 		}
 	}()
+	go func() {
+		writeWG.Wait()
+		<-writeProdDone
+		close(writeResults)
+	}()
 
 	var indexBytes int64
+	var writeErr error
 	for wr := range writeResults {
 		if wr.err != nil {
-			return nil, wr.err
+			if writeErr == nil {
+				writeErr = wr.err
+				cancelWrite()
+			}
+			continue
 		}
 		indexBytes += wr.size
+	}
+	cancelWrite()
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	return &CacheStats{
@@ -542,6 +630,7 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 		IndexedCPECVEs: indexedCPECVEs,
 		VendorCount:    len(merged),
 		KEVCount:       len(kevSet),
+		KEVSHA:         kevSHA,
 		RawFeedBytes:   rawBytes,
 		IndexBytes:     indexBytes,
 		ElapsedMS:      time.Since(started).Milliseconds(),
@@ -703,7 +792,7 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					continue
 				}
 
-				dedupKey := fmt.Sprintf("%s|%s|%s", rec.ID, prod.HostIP, prod.Label)
+				dedupKey := fmt.Sprintf("%s|%s|%s|%s", rec.ID, prod.HostIP, prod.Label, prod.Version)
 				if _, dup := seen[dedupKey]; dup {
 					continue
 				}
@@ -1123,7 +1212,9 @@ func wildcardMatch(pattern, s string) bool {
 }
 
 // ParseCPE23 extracts part, vendor, product, and version from an NVD CPE 2.3
-// URI string such as "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*".
+// URI string such as "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*", folding any
+// non-wildcard update component (parts[6]) into Version (e.g., "8.5:p1" ->
+// "8.5p1", "2.0:rc1" -> "2.0-rc1").
 func ParseCPE23(criteria string) (CPEMatch, bool) {
 	parts := strings.Split(criteria, ":")
 	if len(parts) < 6 || parts[0] != "cpe" || parts[1] != "2.3" {
@@ -1138,12 +1229,52 @@ func ParseCPE23(criteria string) (CPEMatch, bool) {
 	if version == "*" || version == "-" {
 		version = ""
 	}
+	if version != "" && len(parts) > 6 {
+		version = joinCPEVersionUpdate(version, parts[6])
+	}
 	return CPEMatch{
 		Part:    parts[2],
 		Vendor:  vendor,
 		Product: product,
 		Version: version,
 	}, true
+}
+
+// joinCPEVersionUpdate folds a non-wildcard CPE 2.3 update field (parts[6])
+// into a concrete version string (e.g., "8.5"+"p1" -> "8.5p1", "2.0"+"rc1" ->
+// "2.0-rc1").
+func joinCPEVersionUpdate(version, update string) string {
+	version = strings.TrimSpace(version)
+	update = strings.TrimSpace(update)
+	if version == "" || update == "" || update == "*" || update == "-" {
+		return version
+	}
+	lower := strings.ToLower(update)
+	if strings.HasSuffix(strings.ToLower(version), lower) {
+		return version
+	}
+	if isDirectCPEUpdate(lower) {
+		return version + update
+	}
+	return version + "-" + update
+}
+
+// isDirectCPEUpdate reports whether a CPE update token attaches directly to the
+// base version without a hyphen (OpenSSH patch levels like "p1" or single-letter
+// releases like "a").
+func isDirectCPEUpdate(update string) bool {
+	if len(update) == 1 && update[0] >= 'a' && update[0] <= 'z' {
+		return true
+	}
+	if len(update) >= 2 && update[0] == 'p' {
+		for i := 1; i < len(update); i++ {
+			if update[i] < '0' || update[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // sanitizeVendor converts a CPE vendor token into a safe filename component.

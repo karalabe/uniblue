@@ -16,7 +16,9 @@ import (
 //
 // When version is non-empty:
 //   - If the CPE specifies an exact version or any start/end bounds, it returns
-//     (inRange, ConfidenceExact).
+//     (inRange, ConfidenceExact), except when the observed version is only a
+//     coarse numeric prefix of a more-specific bound (e.g., "2.4" against
+//     EndExcl "2.4.7"), in which case it returns (true, ConfidencePotential).
 //   - If the CPE is completely unbounded (version="*" and no start/end bounds),
 //     it returns (true, ConfidencePotential) so wildcards never pretend to be
 //     exact version confirmations.
@@ -35,22 +37,80 @@ func MatchesRange(version string, m CPEMatch) (bool, Confidence) {
 		return true, ConfidencePotential
 	}
 	if hasExact {
+		if isCoarsePrefix(version, m.Version) {
+			return true, ConfidencePotential
+		}
 		return CompareVersions(version, m.Version) == 0, ConfidenceExact
 	}
 
-	if m.StartIncl != "" && CompareVersions(version, m.StartIncl) < 0 {
-		return false, ConfidenceExact
+	ambiguous := false
+
+	if m.StartIncl != "" {
+		cmp := CompareVersions(version, m.StartIncl)
+		if isCoarsePrefix(version, m.StartIncl) {
+			// If StartIncl has non-zero trailing components (e.g., "2.4.2"),
+			// an observed "2.4" could be either below or at/above the bound.
+			// If cmp == 0 (e.g., "2.4.0"), every 2.4.x is >= 2.4.0.
+			if cmp < 0 {
+				ambiguous = true
+			}
+		} else if cmp < 0 {
+			return false, ConfidenceExact
+		}
 	}
-	if m.StartExcl != "" && CompareVersions(version, m.StartExcl) <= 0 {
-		return false, ConfidenceExact
+	if m.StartExcl != "" {
+		if isCoarsePrefix(version, m.StartExcl) {
+			// Any more-specific StartExcl under the same prefix (e.g., "2.4.0"
+			// or "2.4.2") leaves some 2.4.x versions inside and some outside.
+			ambiguous = true
+		} else if CompareVersions(version, m.StartExcl) <= 0 {
+			return false, ConfidenceExact
+		}
 	}
-	if m.EndIncl != "" && CompareVersions(version, m.EndIncl) > 0 {
-		return false, ConfidenceExact
+	if m.EndIncl != "" {
+		if isCoarsePrefix(version, m.EndIncl) {
+			// Any more-specific EndIncl under the same prefix (e.g., "2.4.0"
+			// or "2.4.7") leaves some 2.4.x versions inside and some outside.
+			ambiguous = true
+		} else if CompareVersions(version, m.EndIncl) > 0 {
+			return false, ConfidenceExact
+		}
 	}
-	if m.EndExcl != "" && CompareVersions(version, m.EndExcl) >= 0 {
-		return false, ConfidenceExact
+	if m.EndExcl != "" {
+		cmp := CompareVersions(version, m.EndExcl)
+		if isCoarsePrefix(version, m.EndExcl) {
+			// If cmp == 0 (e.g., EndExcl "2.4.0"), no 2.4.x release is < 2.4.0.
+			if cmp >= 0 {
+				return false, ConfidenceExact
+			}
+			ambiguous = true
+		} else if cmp >= 0 {
+			return false, ConfidenceExact
+		}
+	}
+	if ambiguous {
+		return true, ConfidencePotential
 	}
 	return true, ConfidenceExact
+}
+
+// isCoarsePrefix reports whether observed has strictly fewer tokens than bound,
+// matches every token of bound up to its own length, and bound's next token is
+// a numeric component (such as observed "2.4" vs bound "2.4.7" or "2.4.0").
+// Non-numeric patch or pre-release suffixes (such as "9.3" vs "9.3p1" or
+// "1.1.1" vs "1.1.1a") are distinct releases rather than truncated prefixes.
+func isCoarsePrefix(observed, bound string) bool {
+	to := tokenizeVersion(observed)
+	tb := tokenizeVersion(bound)
+	if len(to) == 0 || len(to) >= len(tb) {
+		return false
+	}
+	for i := range to {
+		if to[i] != tb[i] {
+			return false
+		}
+	}
+	return tb[len(to)].isNum
 }
 
 // CompareVersions compares two software/firmware version strings (such as
@@ -66,19 +126,44 @@ func CompareVersions(a, b string) int {
 	}
 
 	for i := 0; i < maxLen; i++ {
+		hasA := i < len(ta)
+		hasB := i < len(tb)
 		var va, vb versionToken
-		if i < len(ta) {
+		if hasA {
 			va = ta[i]
 		}
-		if i < len(tb) {
+		if hasB {
 			vb = tb[i]
 		}
 
-		// Handle pre-release tokens (alpha/beta/rc) sorting before release
-		// versions when one version has an extra pre-release suffix.
+		// Handle pre-release tokens (alpha/beta/rc/dev/pre) sorting before
+		// release versions when one version has an extra pre-release suffix.
 		if va.preRelease != vb.preRelease {
 			if va.preRelease {
 				return -1
+			}
+			return 1
+		}
+
+		// When one side has run out of components, treat its missing trailing
+		// component as 0 against a numeric token on the other side, and as less
+		// than a non-pre-release alphabetic suffix (e.g., 1.1.1 < 1.1.1a,
+		// 9.3 < 9.3p1).
+		if !hasA {
+			if vb.isNum {
+				if vb.num > 0 {
+					return -1
+				}
+				continue
+			}
+			return -1
+		}
+		if !hasB {
+			if va.isNum {
+				if va.num > 0 {
+					return 1
+				}
+				continue
 			}
 			return 1
 		}
@@ -91,6 +176,21 @@ func CompareVersions(a, b string) int {
 				return 1
 			}
 			continue
+		}
+		if va.isNum != vb.isNum {
+			// A zero numeric component behaves like an omitted component
+			// (e.g., 1.0.0 < 1.0p1), whereas a non-zero numeric component
+			// sorts after a patch suffix (e.g., 1.0.1 > 1.0p1).
+			if va.isNum {
+				if va.num == 0 {
+					return -1
+				}
+				return 1
+			}
+			if vb.num == 0 {
+				return 1
+			}
+			return -1
 		}
 		if va.text < vb.text {
 			return -1
@@ -139,7 +239,10 @@ func tokenizeVersion(v string) []versionToken {
 			i++
 		}
 		word := v[start:i]
-		pre := word == "alpha" || word == "a" || word == "beta" || word == "b" || word == "rc" || word == "dev" || word == "pre"
+		// Only full pre-release words sort before the base release; single
+		// letters like "a" or "b" are post-release patch levels (OpenSSL
+		// 1.1.1 < 1.1.1a < 1.1.1b < 1.1.1c, ProFTPD, etc.).
+		pre := word == "alpha" || word == "beta" || word == "rc" || word == "dev" || word == "pre"
 		tokens = append(tokens, versionToken{text: word, preRelease: pre})
 	}
 	return tokens

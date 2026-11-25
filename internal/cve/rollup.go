@@ -41,8 +41,17 @@ type ProductSummary struct {
 	TopCVEs []string `json:"top_cves"`
 
 	// MinFixedVersion records the highest exclusive upper bound (versionEndExcluding)
-	// observed across matching CVEs (e.g., "7.3.0" -> operator should verify >= 7.3.0).
+	// observed across matching CVEs when it strictly exceeds every matched inclusive
+	// upper bound (e.g., "7.3.0" -> operator should verify >= 7.3.0). It is left
+	// empty if a matched EndIncl bound is at or above it so callers never suggest
+	// upgrading to a still-vulnerable version.
 	MinFixedVersion string `json:"min_fixed_version,omitempty"`
+
+	// MaxAffectedVersion records the highest inclusive upper bound
+	// (versionEndIncluding or exact vulnerable version) when it is at or above
+	// any matched EndExcl bound, indicating the operator must upgrade strictly
+	// past this version (> X).
+	MaxAffectedVersion string `json:"max_affected_version,omitempty"`
 }
 
 // RollupMatches deterministically collapses a slice of granular CVE Matches
@@ -58,9 +67,14 @@ func RollupMatches(matches []Match) []ProductSummary {
 		ver    string
 		conf   Confidence
 	}
+	type groupState struct {
+		summary *ProductSummary
+		maxExcl string
+		maxIncl string
+	}
 
 	order := make([]groupKey, 0)
-	groups := make(map[groupKey]*ProductSummary)
+	groups := make(map[groupKey]*groupState)
 
 	for _, m := range matches {
 		k := groupKey{
@@ -69,15 +83,18 @@ func RollupMatches(matches []Match) []ProductSummary {
 			ver:    m.Product.Version,
 			conf:   m.Confidence,
 		}
-		sum, exists := groups[k]
+		st, exists := groups[k]
 		if !exists {
-			sum = &ProductSummary{
-				Product:    m.Product,
-				Confidence: m.Confidence,
+			st = &groupState{
+				summary: &ProductSummary{
+					Product:    m.Product,
+					Confidence: m.Confidence,
+				},
 			}
-			groups[k] = sum
+			groups[k] = st
 			order = append(order, k)
 		}
+		sum := st.summary
 
 		sum.TotalCVEs++
 		if m.Record.KEV {
@@ -99,18 +116,33 @@ func RollupMatches(matches []Match) []ProductSummary {
 			sum.TopCVEs = append(sum.TopCVEs, m.Record.ID)
 		}
 
-		// Track the highest fixed version bound (EndExcl) so we can tell the
-		// operator "verify version >= X" deterministically without guessing.
+		// Track both exclusive (EndExcl) and inclusive (EndIncl / exact Version)
+		// upper bounds so upgrade advice never recommends a still-vulnerable version.
 		if fix := m.MatchedCPE.EndExcl; fix != "" {
-			if sum.MinFixedVersion == "" || CompareVersions(fix, sum.MinFixedVersion) > 0 {
-				sum.MinFixedVersion = fix
+			if st.maxExcl == "" || CompareVersions(fix, st.maxExcl) > 0 {
+				st.maxExcl = fix
+			}
+		}
+		incl := m.MatchedCPE.EndIncl
+		if incl == "" && m.MatchedCPE.Version != "" && m.MatchedCPE.Version != "*" && m.MatchedCPE.Version != "-" {
+			incl = m.MatchedCPE.Version
+		}
+		if incl != "" {
+			if st.maxIncl == "" || CompareVersions(incl, st.maxIncl) > 0 {
+				st.maxIncl = incl
 			}
 		}
 	}
 
 	out := make([]ProductSummary, 0, len(order))
 	for _, k := range order {
-		out = append(out, *groups[k])
+		st := groups[k]
+		if st.maxExcl != "" && (st.maxIncl == "" || CompareVersions(st.maxExcl, st.maxIncl) > 0) {
+			st.summary.MinFixedVersion = st.maxExcl
+		} else if st.maxIncl != "" {
+			st.summary.MaxAffectedVersion = st.maxIncl
+		}
+		out = append(out, *st.summary)
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -147,6 +179,8 @@ func (s ProductSummary) Headline() string {
 	}
 	if s.MinFixedVersion != "" {
 		extra += fmt.Sprintf(", verify >= %s", s.MinFixedVersion)
+	} else if s.MaxAffectedVersion != "" {
+		extra += fmt.Sprintf(", verify > %s", s.MaxAffectedVersion)
 	}
 	return fmt.Sprintf("%s%s: %d CVE(s) (max CVSS %.1f%s)", s.Product.Label, ver, s.TotalCVEs, s.MaxCVSS, extra)
 }

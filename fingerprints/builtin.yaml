@@ -24,7 +24,6 @@
 - name: Home Assistant
   hostname_regex: "(?i)home.?assistant"
   http_title_regex: "(?i)home\\s+assistant"
-  ports_any: [8123]
   vendors: ["home-assistant"]
   products: ["home-assistant"]
 
@@ -92,7 +91,7 @@
   version_group: 1
 
 - name: Apache HTTP Server
-  http_server_regex: "(?i)apache(?:/([0-9][0-9a-zA-Z._-]*))?"
+  http_server_regex: "(?i)^apache(?:/([0-9][0-9a-zA-Z._-]*)|$)"
   vendors: ["apache"]
   products: ["http_server"]
   version_group: 1
@@ -123,7 +122,6 @@
 
 - name: Node-RED
   http_title_regex: "(?i)^node-red"
-  ports_any: [1880]
   vendors: ["nodered", "openjsf"]
   products: ["node-red"]
 
@@ -161,7 +159,6 @@
 
 - name: Transmission
   http_title_regex: "(?i)transmission web interface"
-  ports_any: [9091]
   vendors: ["transmissionbt"]
   products: ["transmission"]
 
@@ -171,14 +168,14 @@
   products: ["traefik"]
 
 - name: Ollama
-  ports_any: [11434]
+  hostname_regex: "(?i)ollama"
+  http_title_regex: "(?i)ollama"
   vendors: ["ollama"]
   products: ["ollama"]
 
 - name: AMI MegaRAC / ASUS ASMB BMC
-  hostname_regex: "(?i)(megarac|asmb|management console|ipmi|bmc)"
+  hostname_regex: "(?i)(megarac|asmb)"
   http_title_regex: "(?i)(megarac|asmb|american megatrends|ikvm)"
-  ports_any: [623, 5120, 5123, 7578]
   vendors: ["ami", "asus"]
   products: ["*megarac*", "*asmb*"]
 
@@ -201,7 +198,6 @@
   products: ["*integrated_lights-out*", "*ilo*"]
 
 - name: Intel AMT / vPro
-  ports_any: [16992, 16993]
   http_title_regex: "(?i)intel.*active management"
   vendors: ["intel"]
   products: ["*active_management_technology*"]

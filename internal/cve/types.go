@@ -98,6 +98,11 @@ type CacheStats struct {
 	// KEVCount is the number of entries in the cached CISA KEV catalog.
 	KEVCount int `json:"kev_count"`
 
+	// KEVSHA records the SHA256 digest of the cached CISA KEV catalog so
+	// newly KEV-listed CVEs trigger a vendor shard rebuild even when NVD
+	// yearly feed SHAs have not changed.
+	KEVSHA string `json:"kev_sha,omitempty"`
+
 	// RawFeedBytes is the total compressed size of downloaded NVD .json.gz feeds.
 	RawFeedBytes int64 `json:"raw_feed_bytes"`
 
