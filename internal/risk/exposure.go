@@ -184,19 +184,23 @@ func (r *ExposureRule) matches(pf unifi.PortForward) bool {
 
 	portHit := false
 	for _, p := range r.Ports {
-		if pf.ExposesPort(p) {
+		if pf.ExposesPort(p) || portSpecMatches(pf.DstPort, p) {
 			portHit = true
 			break
 		}
 	}
 
-	// For expected-p2p rules that define both ports and a name_regex, require
-	// either the port match OR name match only when ports are empty; when both
-	// are present on high-risk admin rules, either match catches it; on benign
-	// expected-p2p rules, require portHit (and if nameRe is set, confirm intent
-	// if ambiguous, or accept well-known port directly).
+	// On benign expected-p2p / vpn-entrypoint rules, require portHit AND
+	// name_regex when name_regex is specified so ambiguous ports (like 9000 for
+	// Portainer/MinIO/php-fpm) are never misclassified as safe P2P listeners.
 	if r.Class == "expected-p2p" || r.Class == "vpn-entrypoint" {
-		return portHit
+		if !portHit {
+			return false
+		}
+		if r.nameRe != nil {
+			return r.nameRe.MatchString(pf.Name)
+		}
+		return true
 	}
 	if portHit {
 		return true
@@ -484,8 +488,9 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 
 		case isoZones[srcZone] && dstZone == "internal":
 			// Allow pinpoint pinholes (explicit destination IP + explicit port),
-			// but flag broad zone-to-Internal ALLOW rules that defeat isolation.
-			if !pol.Destination.AnyTarget && !pol.Destination.AnyPort {
+			// but flag broad zone-to-Internal ALLOW rules (including 1-65535 ranges)
+			// that defeat isolation.
+			if !pol.Destination.AnyTarget && !pol.Destination.CoversAllPorts() {
 				continue
 			}
 			findings = append(findings, checks.Finding{
@@ -529,17 +534,23 @@ func findGatewayIdentity(snap *unifi.Snapshot) (name, ip string) {
 			return n, d.IP
 		}
 	}
-	return "UniFi Gateway", "gateway"
+	return "UniFi Gateway", ""
 }
 
 // formatPolicyPorts formats a PolicyEndpoint's destination port restriction.
 func formatPolicyPorts(ep unifi.PolicyEndpoint) string {
-	if ep.AnyPort || len(ep.Ports) == 0 {
+	if ep.CoversAllPorts() {
 		return "any"
 	}
-	parts := make([]string, 0, len(ep.Ports))
+	parts := make([]string, 0, len(ep.Ports)+len(ep.PortRanges))
 	for _, p := range ep.Ports {
 		parts = append(parts, strconv.Itoa(p))
+	}
+	for _, r := range ep.PortRanges {
+		parts = append(parts, fmt.Sprintf("%d-%d", r.Start, r.End))
+	}
+	if len(parts) == 0 {
+		return "any"
 	}
 	return strings.Join(parts, ",")
 }

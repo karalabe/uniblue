@@ -187,10 +187,17 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 			continue
 		}
 
+		fwdProp := "portfwd:" + firstNonEmptyStr(pf.ID, fmt.Sprintf("%s-%s-%s-%s", pf.Proto, pf.DstPort, pf.FwdIP, pf.FwdPort))
+		fwdPort := 0
+		if expanded := pf.ExpandFwdPorts(1); len(expanded) > 0 {
+			fwdPort = expanded[0]
+		}
 		scored = append(scored, checks.Finding{
 			CheckID:           "UB-UNIFI-PORTFWD",
 			Title:             fmt.Sprintf("%s (%s -> %s:%s)", assessment.RuleName, pf.DstPort, pf.FwdIP, pf.FwdPort),
 			Category:          assessment.Class,
+			Property:          fwdProp,
+			Port:              fwdPort,
 			BaseSeverity:      assessment.Severity,
 			EffectiveSeverity: assessment.Severity,
 			RiskReasons:       reasons,
@@ -373,8 +380,22 @@ func scoreFinding(f checks.Finding, forwards []unifi.PortForward, trustedSet, is
 }
 
 // BuildState extracts a compact State baseline from a UniFi snapshot and its
-// evaluated Report.
+// evaluated Report, retaining the highest EffectiveSeverity whenever two
+// findings share a key.
 func BuildState(snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig) *State {
+	return BuildStateWithPrev(nil, snap, report, netCfg, nil)
+}
+
+// BuildStateWithPrev constructs the next persisted baseline while carrying
+// forward known TrustedClients and findings belonging to hosts that are
+// temporarily offline or not yet rescanned, preventing false "[NEW TRUSTED
+// DEVICE]" and "[NEW ...]" alert storms across brief reconnects or restarts.
+//
+// When probedHostKeys is non-nil, only hosts present in probedHostKeys have
+// their previous host-scoped findings eligible to expire/resolve; hosts absent
+// from snap.Clients always retain their previous host-scoped findings until
+// they return and are rescanned.
+func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig, probedHostKeys map[string]struct{}) *State {
 	trustedSet, _ := resolveVLANTiers(snap, netCfg)
 
 	st := &State{
@@ -383,23 +404,82 @@ func BuildState(snap *unifi.Snapshot, report Report, netCfg config.NetworkConfig
 		TrustedClients: make(map[string]string),
 		PortForwards:   make(map[string]string),
 	}
+
+	// Carry forward previously known trusted clients so a household phone or
+	// rebooting NAS is never re-alerted as a brand-new trusted device.
+	if prev != nil {
+		for mac, name := range prev.TrustedClients {
+			st.TrustedClients[mac] = name
+		}
+	}
+
 	for _, f := range report.Findings {
 		if f.IsInventoryOnly() {
 			continue
 		}
-		st.Findings[f.Key()] = f.EffectiveSeverity
-	}
-	for _, cl := range snap.Clients {
-		if cl.MAC != "" && matchesVLAN(cl, trustedSet) {
-			st.TrustedClients[cl.MAC] = cl.DisplayName()
+		k := f.Key()
+		if existing, ok := st.Findings[k]; !ok || f.EffectiveSeverity > existing {
+			st.Findings[k] = f.EffectiveSeverity
 		}
 	}
-	for _, pf := range snap.PortForwards {
-		if pf.Enabled {
-			st.PortForwards[portForwardKey(pf)] = fmt.Sprintf("%s (%s:%s -> %s:%s)", pf.Name, pf.Proto, pf.DstPort, pf.FwdIP, pf.FwdPort)
+
+	// Carry forward previous host-scoped findings for offline or not-yet-probed
+	// hosts so transient disconnects never drop and re-alert unchanged findings.
+	if prev != nil && snap != nil {
+		activeHosts := make(map[string]struct{}, len(snap.Clients)*2)
+		for _, cl := range snap.Clients {
+			if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
+				activeHosts[m] = struct{}{}
+			}
+			for _, ip := range cl.AllIPs() {
+				activeHosts[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
+			}
+		}
+		for k, sev := range prev.Findings {
+			if _, exists := st.Findings[k]; exists {
+				continue
+			}
+			checkID, hostID := splitFindingKey(k)
+			if hostID == "" || strings.HasPrefix(checkID, "UB-UNIFI-") {
+				continue
+			}
+			hostLow := strings.ToLower(strings.TrimSpace(hostID))
+			_, isActive := activeHosts[hostLow]
+			if !isActive {
+				st.Findings[k] = sev
+				continue
+			}
+			if probedHostKeys != nil {
+				if _, wasProbed := probedHostKeys[hostLow]; !wasProbed {
+					st.Findings[k] = sev
+				}
+			}
+		}
+	}
+
+	if snap != nil {
+		for _, cl := range snap.Clients {
+			if cl.MAC != "" && matchesVLAN(cl, trustedSet) {
+				st.TrustedClients[cl.MAC] = cl.DisplayName()
+			}
+		}
+		for _, pf := range snap.PortForwards {
+			if pf.Enabled {
+				st.PortForwards[portForwardKey(pf)] = fmt.Sprintf("%s (%s:%s -> %s:%s)", pf.Name, pf.Proto, pf.DstPort, pf.FwdIP, pf.FwdPort)
+			}
 		}
 	}
 	return st
+}
+
+// splitFindingKey extracts the CheckID and host identifier from a Finding.Key()
+// formatted as "<CheckID>|<host>|<port>[|<property>]".
+func splitFindingKey(key string) (checkID, host string) {
+	parts := strings.Split(key, "|")
+	if len(parts) < 2 {
+		return key, ""
+	}
+	return parts[0], parts[1]
 }
 
 // ComputeDiff compares a previous baseline against the current scan and returns
@@ -487,15 +567,33 @@ func SaveState(path string, st *State) error {
 		return fmt.Errorf("encode state: %w", err)
 	}
 	dir := filepath.Dir(path)
-	if dir != "" && dir != "." {
+	if dir == "" {
+		dir = "."
+	}
+	if dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("create state dir %q: %w", dir, err)
 		}
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp state in %q: %w", dir, err)
+	}
+	tmp := tmpFile.Name()
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("chmod temp state %q: %w", tmp, err)
+	}
+	if _, err := tmpFile.Write(raw); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write temp state %q: %w", tmp, err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close temp state %q: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
@@ -570,27 +668,77 @@ func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (truste
 }
 
 // isolatedZoneSet returns the lowercase set of UniFi firewall zone names that
-// enforce isolation from internal LANs: UniFi's built-in Hotspot and DMZ zones,
-// plus any custom zone that has an enabled BLOCK/REJECT policy targeting Internal.
+// genuinely enforce isolation from internal LANs: UniFi's built-in Hotspot and
+// DMZ zones, plus any custom zone where enabled firewall policies actually block
+// new IPv4 TCP and UDP transit into Internal (respecting policy ordering,
+// protocol, IP family, source selectors, connection states, and schedules).
 func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 	zones := map[string]bool{
 		"hotspot": true,
 		"dmz":     true,
 	}
-	if snap == nil {
+	if snap == nil || len(snap.FirewallPolicies) == 0 {
 		return zones
 	}
-	for _, pol := range snap.FirewallPolicies {
+	sorted := make([]unifi.FirewallPolicy, len(snap.FirewallPolicies))
+	copy(sorted, snap.FirewallPolicies)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Index != sorted[j].Index {
+			return sorted[i].Index < sorted[j].Index
+		}
+		return i < j
+	})
+
+	candidates := make(map[string]string)
+	for _, pol := range sorted {
 		if !pol.Enabled {
 			continue
 		}
-		if pol.Action != "BLOCK" && pol.Action != "REJECT" {
+		act := strings.ToUpper(strings.TrimSpace(pol.Action))
+		if act != "BLOCK" && act != "REJECT" && act != "DROP" {
 			continue
 		}
-		src := strings.ToLower(strings.TrimSpace(pol.Source.ZoneName))
+		srcRaw := strings.TrimSpace(pol.Source.ZoneName)
+		src := strings.ToLower(srcRaw)
 		dst := strings.ToLower(strings.TrimSpace(pol.Destination.ZoneName))
-		if src != "" && src != "internal" && src != "external" && src != "gateway" && dst == "internal" && pol.Destination.AnyTarget && pol.Destination.AnyPort {
-			zones[src] = true
+		if src == "" || src == "internal" || src == "external" || src == "gateway" || dst != "internal" {
+			continue
+		}
+		if pol.Schedule != "" || !pol.Source.AnyTarget || !pol.Destination.AnyTarget || !pol.Destination.CoversAllPorts() {
+			continue
+		}
+		if !matchesIPFamily(pol.IPVersion, "ipv4") {
+			continue
+		}
+		if !matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "tcp") || !matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "udp") {
+			continue
+		}
+		if !matchesConnState(pol.ConnectionStates, "new") {
+			continue
+		}
+		candidates[src] = srcRaw
+	}
+
+	for srcLow, srcRaw := range candidates {
+		// Verify no earlier ALLOW/unknown policy supersedes the BLOCK on TCP or UDP.
+		tcpDec := evaluateGatewayPolicies(sorted, pathQuery{
+			srcZone:  srcRaw,
+			dstZone:  "Internal",
+			proto:    "tcp",
+			port:     443,
+			ipFamily: "ipv4",
+			state:    "new",
+		})
+		udpDec := evaluateGatewayPolicies(sorted, pathQuery{
+			srcZone:  srcRaw,
+			dstZone:  "Internal",
+			proto:    "udp",
+			port:     53,
+			ipFamily: "ipv4",
+			state:    "new",
+		})
+		if tcpDec.action == "deny" && udpDec.action == "deny" && tcpDec.ruleID != "" && udpDec.ruleID != "" {
+			zones[srcLow] = true
 		}
 	}
 	return zones

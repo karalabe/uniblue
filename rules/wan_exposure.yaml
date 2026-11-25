@@ -85,15 +85,27 @@
     - audit_proxied_upstreams
 
 - id: eth-p2p-expected
-  name: Ethereum P2P Peering (DevP2P / LibP2P)
+  name: Ethereum P2P Peering (DevP2P)
   class: expected-p2p
   severity: info
-  ports: [30303, 30304, 9000, 9001, 12000, 13000]
+  ports: [30303, 30304]
+  summary: >
+    Expected Ethereum DevP2P peer-to-peer networking port required for healthy
+    node peering. Safe to expose on WAN as long as RPC/Engine ports
+    (8545/8551/5052) remain strictly private.
+  actions:
+    - verify_rpc_ports_not_forwarded
+
+- id: eth-consensus-p2p-expected
+  name: Ethereum Consensus P2P Peering (LibP2P)
+  class: expected-p2p
+  severity: info
+  ports: [9000, 9001, 12000, 13000]
   name_regex: "(?i)(ethereum|devp2p|libp2p|beacon|consensus|execution|geth|reth|lighthouse|prysm|teku|nimbus)"
   summary: >
-    Expected Ethereum peer-to-peer networking port required for healthy node
-    peering. Safe to expose on WAN as long as RPC/Engine ports (8545/8551/5052)
-    remain strictly private.
+    Expected Ethereum consensus LibP2P networking port required for healthy
+    node peering. Safe to expose on WAN as long as RPC/Engine ports
+    (8545/8551/5052) remain strictly private.
   actions:
     - verify_rpc_ports_not_forwarded
 

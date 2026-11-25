@@ -110,16 +110,17 @@ func AnalyzeSwitchPorts(
 		return nil, nil, nil
 	}
 
-	// Build explicit config lookup sets.
+	// Build explicit config lookup sets with canonicalized MACs so dash/dot/bare
+	// MAC formats always match UniFi colon-form MACs.
 	extDevSet := make(map[string]struct{}, len(netCfg.ExternalDevices))
 	for _, raw := range netCfg.ExternalDevices {
-		if norm := strings.ToLower(strings.TrimSpace(raw)); norm != "" {
+		if norm := config.CanonicalMAC(raw); norm != "" {
 			extDevSet[norm] = struct{}{}
 		}
 	}
 	portRuleByKey := make(map[string]config.PhysicalPortRule, len(netCfg.PhysicalPorts))
 	for _, r := range netCfg.PhysicalPorts {
-		key := fmt.Sprintf("%s|%d", strings.ToLower(strings.TrimSpace(r.Device)), r.Port)
+		key := fmt.Sprintf("%s|%d", config.CanonicalMAC(r.Device), r.Port)
 		portRuleByKey[key] = r
 	}
 
@@ -257,10 +258,14 @@ func AnalyzeSwitchPorts(
 				zoneSrc = "parent_link"
 				label = "Feeds external " + extChild
 			} else if devExternal {
-				if sp.IsUplink {
+				if sp.IsUplink || hasUniFiDevicePeer(peers) {
 					zone = "uplink"
 					zoneSrc = extSource
-					label = "External device uplink"
+					if sp.IsUplink {
+						label = "External device uplink"
+					} else {
+						label = "External device UniFi downlink"
+					}
 				} else {
 					zone = "external"
 					zoneSrc = extSource
@@ -465,7 +470,8 @@ func AnalyzeSwitchPorts(
 
 			// Detect inline hubs / rogue mini-switches / MITM taps on external access ports
 			// (multiple MAC addresses learned behind a single exterior cable drop).
-			if zone == "external" && sp.Enabled && sp.Up && (sp.MACTableCount > 1 || len(peers) > 1) {
+			// Never flag ports feeding adopted downstream UniFi devices (APs/switches).
+			if zone == "external" && sp.Enabled && sp.Up && !hasUniFiDevicePeer(peers) && (sp.MACTableCount > 1 || len(peers) > 1) {
 				macCount := sp.MACTableCount
 				if len(peers) > macCount {
 					macCount = len(peers)
@@ -542,10 +548,10 @@ func AnalyzeSwitchPorts(
 			if hasRule && len(rule.AllowedMACs) > 0 && len(peers) > 0 {
 				allowSet := make(map[string]struct{}, len(rule.AllowedMACs))
 				for _, m := range rule.AllowedMACs {
-					allowSet[strings.ToLower(strings.TrimSpace(m))] = struct{}{}
+					allowSet[config.CanonicalMAC(m)] = struct{}{}
 				}
 				for _, peer := range peers {
-					if _, ok := allowSet[peer.MAC]; !ok {
+					if _, ok := allowSet[config.CanonicalMAC(peer.MAC)]; !ok {
 						pv.Status = "critical"
 						pv.Issues = append(pv.Issues, fmt.Sprintf("Unauthorized MAC %s (%s)", peer.MAC, peer.Name))
 						dv.AtRiskPorts++
@@ -553,6 +559,7 @@ func AnalyzeSwitchPorts(
 							CheckID:           "UB-UNIFI-PORT-UNAUTHORIZED-MAC",
 							Title:             fmt.Sprintf("Unauthorized Device Connected to %s Port %d", dev.Name, sp.PortIdx),
 							Category:          "physical-port",
+							Property:          fmt.Sprintf("port:%s/%d", devMAC, sp.PortIdx),
 							BaseSeverity:      checks.SeverityCritical,
 							EffectiveSeverity: checks.SeverityCritical,
 							Client: unifi.Client{
@@ -560,6 +567,8 @@ func AnalyzeSwitchPorts(
 								IP:          peer.IP,
 								Name:        peer.Name,
 								NetworkName: sp.NativeNetworkName,
+								SwitchMAC:   devMAC,
+								SwitchPort:  sp.PortIdx,
 							},
 							Port:     sp.PortIdx,
 							Evidence: fmt.Sprintf("MAC %s (%s) connected on %s Port %d is not in configured allowed_macs %v", peer.MAC, peer.Name, dev.Name, sp.PortIdx, rule.AllowedMACs),

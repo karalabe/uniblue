@@ -78,6 +78,7 @@ func AnalyzeUniFiPosture(
 			enabledSSIDs[strings.ToLower(w.Name)] = w
 		}
 
+		wlanProp := "wlan:" + firstNonEmptyStr(w.ID, strings.ToLower(strings.TrimSpace(w.Name)))
 		// Open or legacy WEP Wi-Fi network.
 		if w.Security == "open" || w.Security == "wep" || w.Security == "" {
 			sev := checks.SeverityCritical
@@ -88,6 +89,7 @@ func AnalyzeUniFiPosture(
 				CheckID:           "UB-UNIFI-WIFI-OPEN",
 				Title:             fmt.Sprintf("Unencrypted or Weak Wi-Fi Network (%s)", w.Name),
 				Category:          "wifi-security",
+				Property:          wlanProp,
 				BaseSeverity:      sev,
 				EffectiveSeverity: sev,
 				Client: unifi.Client{
@@ -120,6 +122,7 @@ func AnalyzeUniFiPosture(
 				CheckID:           "UB-UNIFI-WIFI-IOT-ON-TRUSTED",
 				Title:             fmt.Sprintf("Guest/IoT Wi-Fi SSID Mapped to Trusted VLAN (%s -> %s)", w.Name, w.NetworkName),
 				Category:          "wifi-security",
+				Property:          wlanProp,
 				BaseSeverity:      checks.SeverityHigh,
 				EffectiveSeverity: checks.SeverityHigh,
 				Client: unifi.Client{
@@ -144,6 +147,7 @@ func AnalyzeUniFiPosture(
 				CheckID:           "UB-UNIFI-WIFI-NO-L2-ISOLATION",
 				Title:             fmt.Sprintf("Guest/IoT Wi-Fi Missing Client Device Isolation (%s)", w.Name),
 				Category:          "wifi-security",
+				Property:          wlanProp,
 				BaseSeverity:      checks.SeverityMedium,
 				EffectiveSeverity: checks.SeverityMedium,
 				Client: unifi.Client{
@@ -194,8 +198,9 @@ func AnalyzeUniFiPosture(
 	}
 
 	seenEvil := make(map[string]struct{})
+	seenRogueWired := make(map[string]struct{})
 	for _, rap := range snap.RogueAPs {
-		if rap.BSSID == "" || matchesOwnedUniFiRadio(rap.BSSID, ownedDevMACs) {
+		if rap.BSSID == "" || isOwnedUniFiRadio(rap, ownedDevMACs) {
 			continue
 		}
 		essidLower := strings.ToLower(strings.TrimSpace(rap.ESSID))
@@ -228,6 +233,11 @@ func AnalyzeUniFiPosture(
 		// Check whether a foreign BSSID shares the same hardware MAC stem as a wired LAN client
 		// (e.g., someone plugged an unauthorized consumer router/AP into an Ethernet jack).
 		if wiredCl, ok := wiredClientsByPrefix[macStem(rap.BSSID)]; ok {
+			wiredKey := strings.ToLower(strings.TrimSpace(wiredCl.MAC))
+			if _, dup := seenRogueWired[wiredKey]; dup {
+				continue
+			}
+			seenRogueWired[wiredKey] = struct{}{}
 			findings = append(findings, checks.Finding{
 				CheckID:           "UB-UNIFI-WIFI-ROGUE-WIRED-AP",
 				Title:             fmt.Sprintf("Unauthorized Wireless AP Connected to Wired LAN (%s)", wiredCl.DisplayName()),
@@ -436,13 +446,27 @@ func primaryGatewayDevice(snap *unifi.Snapshot) unifi.Device {
 	return unifi.Device{Name: "UniFi Gateway"}
 }
 
-// matchesOwnedUniFiRadio returns true when bssid belongs to one of the site's
-// own adopted UniFi APs/gateways (accounting for UniFi's multi-SSID BSSID
-// derivation where the first octet's locally-administered bit or the last
-// octet's low nibble differs from the AP's base MAC).
-func matchesOwnedUniFiRadio(bssid string, ownedMACs []string) bool {
-	bParts := strings.Split(strings.ToLower(bssid), ":")
+// isOwnedUniFiRadio returns true only when UniFi itself did NOT flag the entry
+// as rogue AND the BSSID matches an adopted site radio (exact MAC, or a
+// non-rogue Ubiquiti multi-SSID VAP whose octet-0 differs only in the LAA/VAP
+// bits and whose vendor OUI is empty or Ubiquiti). If an attacker clones a
+// BSSID (marked is_rogue=true by the controller, or advertising a foreign OUI),
+// it is never suppressed.
+func isOwnedUniFiRadio(rap unifi.RogueAP, ownedMACs []string) bool {
+	if rap.IsRogue {
+		return false
+	}
+	if ouiLow := strings.ToLower(strings.TrimSpace(rap.OUI)); ouiLow != "" &&
+		!strings.Contains(ouiLow, "ubiquiti") && !strings.Contains(ouiLow, "ubnt") {
+		return false
+	}
+	bssid := strings.ToLower(strings.TrimSpace(rap.BSSID))
+	bParts := strings.Split(bssid, ":")
 	if len(bParts) != 6 {
+		return false
+	}
+	b0, errB := parseHexByte(bParts[0])
+	if errB != nil {
 		return false
 	}
 	for _, om := range ownedMACs {
@@ -453,13 +477,35 @@ func matchesOwnedUniFiRadio(bssid string, ownedMACs []string) bool {
 		if len(oParts) != 6 {
 			continue
 		}
-		// UniFi virtual BSSIDs typically match middle 4 octets (bytes 1..4) and
-		// differ only in the LAA bit of octet 0 or low bits of octet 5.
-		if bParts[1] == oParts[1] && bParts[2] == oParts[2] && bParts[3] == oParts[3] && bParts[4] == oParts[4] {
+		o0, errO := parseHexByte(oParts[0])
+		if errO != nil {
+			continue
+		}
+		if (b0&^0x0e) == (o0&^0x0e) && bParts[1] == oParts[1] && bParts[2] == oParts[2] && bParts[3] == oParts[3] && bParts[4] == oParts[4] {
 			return true
 		}
 	}
 	return false
+}
+
+func parseHexByte(s string) (byte, error) {
+	if len(s) != 2 {
+		return 0, fmt.Errorf("invalid hex byte %q", s)
+	}
+	var v byte
+	for i := 0; i < 2; i++ {
+		c := s[i]
+		v <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			v |= c - '0'
+		case c >= 'a' && c <= 'f':
+			v |= c - 'a' + 10
+		default:
+			return 0, fmt.Errorf("invalid hex char %q", c)
+		}
+	}
+	return v, nil
 }
 
 // macStem returns the middle/OUI+device prefix (first 5 octets) used to
