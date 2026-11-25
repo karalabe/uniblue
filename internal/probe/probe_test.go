@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,5 +89,92 @@ func TestShouldKeepNervaFindingFiltersSyntheticHTTPAnonAccess(t *testing.T) {
 		if !shouldKeepNervaFinding(realFinding) {
 			t.Fatalf("expected genuine finding %q to be kept", realFinding.ID)
 		}
+	}
+}
+
+// TestFingerprintingReportsPerPortProgress verifies that Nerva service
+// identification and alternate-port fallback emit monotonic per-port progress
+// updates naming the active host and port.
+func TestFingerprintingReportsPerPortProgress(t *testing.T) {
+	// Start an alternate-port SSH banner listener so both Nerva FastMode and the
+	// unclassified-port fallback run and emit progress updates.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte("SSH-2.0-OpenSSH_9.9\r\n"))
+				time.Sleep(50 * time.Millisecond)
+			}(conn)
+		}
+	}()
+
+	_, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split addr: %v", err)
+	}
+	altPort, _ := strconv.Atoi(portStr)
+
+	type progressEvent struct {
+		phase string
+		done  int
+		total int
+		host  string
+	}
+	var (
+		mu     sync.Mutex
+		events []progressEvent
+	)
+	fp := NewFingerprinter([]int{altPort}, 4, time.Second, nil)
+	fp.SetProgressFunc(func(phase string, done, total int, host string) {
+		mu.Lock()
+		events = append(events, progressEvent{phase: phase, done: done, total: total, host: host})
+		mu.Unlock()
+	})
+
+	profiles := fp.FingerprintAll(context.Background(), []unifi.Client{
+		{IP: "127.0.0.1", MAC: "aa:bb:cc:dd:ee:09", Name: "Lab Box"},
+	})
+	if len(profiles) != 1 || !profiles[0].HasPort(altPort) {
+		t.Fatalf("expected open port %d on Lab Box, got %+v", altPort, profiles)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantHostPort := "Lab Box:" + portStr
+	sawFPStart, sawFPComplete, sawFBComplete := false, false, false
+	lastDone := make(map[string]int)
+	for _, ev := range events {
+		if prev, ok := lastDone[ev.phase]; ok && ev.done < prev {
+			t.Fatalf("phase %q progress went backwards: %d -> %d (%+v)", ev.phase, prev, ev.done, events)
+		}
+		lastDone[ev.phase] = ev.done
+		switch ev.phase {
+		case "fingerprinting":
+			if ev.done == 0 && ev.total == 1 {
+				sawFPStart = true
+			}
+			if ev.done == 1 && ev.total == 1 && strings.HasPrefix(ev.host, wantHostPort) {
+				sawFPComplete = true
+			}
+		case "fingerprinting-fallback":
+			if ev.done == 1 && ev.total == 1 && strings.HasPrefix(ev.host, wantHostPort) {
+				sawFBComplete = true
+			}
+		}
+	}
+	if !sawFPStart || !sawFPComplete {
+		t.Fatalf("expected fingerprinting start and completion for %q, got %+v", wantHostPort, events)
+	}
+	if !sawFBComplete {
+		t.Fatalf("expected fingerprinting-fallback completion for %q, got %+v", wantHostPort, events)
 	}
 }

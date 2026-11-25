@@ -11,12 +11,14 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/praetorian-inc/nerva/pkg/plugins"
@@ -95,6 +97,11 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 		nervaTimeout = 2 * time.Second
 	}
 
+	// Report live per-port service identification progress as Nerva workers
+	// complete each target so startup never appears stalled on large LANs.
+	f.reportProgress("fingerprinting", 0, len(targets), "")
+	var progressMu sync.Mutex
+	completedTargets := 0
 	services, err := scan.ScanTargets(ctx, targets, scan.Config{
 		DefaultTimeout: nervaTimeout,
 		Workers:        f.concurrency,
@@ -102,6 +109,25 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 		Misconfigs:     true,
 		FastMode:       true,
 		ScanDepth:      scan.ScanDepthFast,
+		OnProgress: func(target plugins.Target, results []plugins.Service, completed int64) {
+			hostLabel := target.Host
+			if idx, ok := idxByIP[target.Host]; ok {
+				hostLabel = profiles[idx].Client.DisplayName()
+			}
+			label := fmt.Sprintf("%s:%d", hostLabel, target.Address.Port())
+			if len(results) > 0 && strings.TrimSpace(results[0].Protocol) != "" {
+				label += fmt.Sprintf(" (%s)", strings.ToLower(strings.TrimSpace(results[0].Protocol)))
+			}
+			progressMu.Lock()
+			if c := int(completed); c > completedTargets {
+				completedTargets = c
+			} else {
+				completedTargets++
+			}
+			done := min(completedTargets, len(targets))
+			progressMu.Unlock()
+			f.reportProgress("fingerprinting", done, len(targets), label)
+		},
 	})
 	if err == nil {
 		for _, rawSvc := range services {
@@ -145,9 +171,17 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 
 	// Alternate-port & TLS fallback: for open non-raw-print TCP ports that Nerva
 	// FastMode did not classify (because FastMode prioritizes default ports),
-	// reuse observed HTTP/TLS metadata first, then perform a single bounded
-	// read-only banner/TLS check so alternate-port SSH and raw TLS listeners
-	// resolve accurately to "observed-protocol" or "tls-unknown-app".
+	// reuse observed HTTP/TLS metadata first, then queue remaining ports per host
+	// so bounded fallback banner/TLS probes run concurrently across hosts while
+	// keeping at most one active connection per host for IoT safety.
+	type fallbackHostJob struct {
+		idx   int
+		ip    string
+		name  string
+		ports []int
+	}
+	var fallbackJobs []fallbackHostJob
+	totalFallbacks := 0
 	for i := range profiles {
 		hp := &profiles[i]
 		targetIP := f.selectAllowedProbeIP(hp.Client)
@@ -161,12 +195,13 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 				covered[s.Port] = true
 			}
 		}
+		var pendingPorts []int
 		for _, port := range hp.OpenPorts {
 			if covered[port] || hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
 				continue
 			}
-			now := time.Now().UTC()
 			if b, ok := hp.HTTP[port]; ok {
+				now := time.Now().UTC()
 				proto := "http"
 				state := ServiceStateObservedProtocol
 				isTLS := b.Scheme == "https" || b.TLSVersion != ""
@@ -191,13 +226,61 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 				})
 				continue
 			}
-			if svc, ok := probeAlternatePortFallback(ctx, targetIP, port, nervaTimeout); ok {
-				hp.Services = append(hp.Services, svc)
-				if svc.Banner != "" && strings.HasPrefix(svc.Banner, "SSH-") && hp.SSHBanner == "" {
-					hp.SSHBanner = svc.Banner
-				}
-			}
+			pendingPorts = append(pendingPorts, port)
 		}
+		if len(pendingPorts) > 0 {
+			fallbackJobs = append(fallbackJobs, fallbackHostJob{
+				idx:   i,
+				ip:    targetIP,
+				name:  hp.Client.DisplayName(),
+				ports: pendingPorts,
+			})
+			totalFallbacks += len(pendingPorts)
+		}
+	}
+
+	if totalFallbacks > 0 && ctx.Err() == nil {
+		f.reportProgress("fingerprinting-fallback", 0, totalFallbacks, "")
+		workers := max(1, min(f.concurrency, len(fallbackJobs)))
+		jobCh := make(chan fallbackHostJob, len(fallbackJobs))
+		for _, job := range fallbackJobs {
+			jobCh <- job
+		}
+		close(jobCh)
+
+		var fbDoneMu sync.Mutex
+		fbDone := 0
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobCh {
+					hp := &profiles[job.idx]
+					for _, port := range job.ports {
+						if ctx.Err() != nil {
+							return
+						}
+						label := fmt.Sprintf("%s:%d", job.name, port)
+						if svc, ok := probeAlternatePortFallback(ctx, job.ip, port, nervaTimeout); ok {
+							hp.Services = append(hp.Services, svc)
+							if svc.Banner != "" && strings.HasPrefix(svc.Banner, "SSH-") && hp.SSHBanner == "" {
+								hp.SSHBanner = svc.Banner
+							}
+							if svc.Protocol != "" {
+								label += fmt.Sprintf(" (%s)", svc.Protocol)
+							}
+						}
+						fbDoneMu.Lock()
+						fbDone++
+						done := fbDone
+						fbDoneMu.Unlock()
+						f.reportProgress("fingerprinting-fallback", done, totalFallbacks, label)
+					}
+				}
+			}()
+		}
+		wg.Wait()
 	}
 
 	// Keep each host's Services sorted deterministically by port.

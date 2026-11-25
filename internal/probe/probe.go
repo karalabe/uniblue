@@ -678,7 +678,6 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 
 	// Enrich every discovered open port using Nerva's FastMode protocol
 	// fingerprinters (170+ protocols, MaxHostConn=1 for IoT safety).
-	f.reportProgress("fingerprinting", len(profiles), len(targets), "")
 	f.enrichWithNerva(ctx, profiles)
 	return profiles
 }

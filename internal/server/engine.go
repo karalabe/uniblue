@@ -240,19 +240,19 @@ type StateSnapshot struct {
 // manual rescan is executing so the UI can display an accurate progress bar.
 type ScanProgress struct {
 	// Phase identifies the active stage ("topology", "discovery", "probing",
-	// "fingerprinting", "checks", "evaluating").
+	// "fingerprinting", "fingerprinting-fallback", "checks", "evaluating").
 	Phase string `json:"phase"`
 
 	// Label is a plain-English description of the active stage.
 	Label string `json:"label"`
 
-	// Completed is the number of hosts finished in the current stage.
+	// Completed is the number of items (hosts or open ports) finished in the current stage.
 	Completed int `json:"completed"`
 
-	// Total is the total number of hosts in the current stage.
+	// Total is the total number of items (hosts or open ports) in the current stage.
 	Total int `json:"total"`
 
-	// CurrentHost is the most recently completed host name, if any.
+	// CurrentHost is the most recently completed host or host:port label, if any.
 	CurrentHost string `json:"current_host,omitempty"`
 
 	// Percent is the overall 0..100 completion estimate across all stages.
@@ -1612,7 +1612,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		case "probing":
 			pct := 14
 			if total > 0 {
-				pct = 14 + (done*48)/total
+				pct = 14 + (done*32)/total
 			}
 			e.setScanProgress(&ScanProgress{
 				Phase:       "probing",
@@ -1624,13 +1624,36 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 				Initial:     isInitial,
 			})
 		case "fingerprinting":
+			pct := 46
+			label := "Identifying services across discovered ports…"
+			if total > 0 {
+				pct = 46 + (done*18)/total
+				label = fmt.Sprintf("Identifying services across discovered ports (%d of %d)…", done, total)
+			}
 			e.setScanProgress(&ScanProgress{
-				Phase:     "fingerprinting",
-				Label:     "Identifying services across discovered ports…",
-				Completed: done,
-				Total:     total,
-				Percent:   65,
-				Initial:   isInitial,
+				Phase:       "fingerprinting",
+				Label:       label,
+				Completed:   done,
+				Total:       total,
+				CurrentHost: host,
+				Percent:     pct,
+				Initial:     isInitial,
+			})
+		case "fingerprinting-fallback":
+			pct := 64
+			label := "Checking unclassified open ports…"
+			if total > 0 {
+				pct = 64 + (done*4)/total
+				label = fmt.Sprintf("Checking unclassified open ports (%d of %d)…", done, total)
+			}
+			e.setScanProgress(&ScanProgress{
+				Phase:       "fingerprinting-fallback",
+				Label:       label,
+				Completed:   done,
+				Total:       total,
+				CurrentHost: host,
+				Percent:     pct,
+				Initial:     isInitial,
 			})
 		}
 	})
