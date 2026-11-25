@@ -755,9 +755,10 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 	}
 
 	var matches []Match
-	seen := make(map[string]struct{})
+	seenIdx := make(map[string]int)
 
 	for _, prod := range products {
+		hostKey := productHostKey(prod)
 		for _, vendor := range prod.Vendors {
 			recs := loaded[sanitizeVendor(vendor)]
 			for _, rec := range recs {
@@ -792,18 +793,23 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					continue
 				}
 
-				dedupKey := fmt.Sprintf("%s|%s|%s|%s", rec.ID, prod.HostIP, prod.Label, prod.Version)
-				if _, dup := seen[dedupKey]; dup {
-					continue
-				}
-				seen[dedupKey] = struct{}{}
-
-				matches = append(matches, Match{
+				// Deduplicate by (host, CVE ID) and keep Exact over Potential so one
+				// CVE on one host is never reported in both Exact and Potential buckets.
+				dedupKey := fmt.Sprintf("%s|%s", hostKey, strings.ToUpper(strings.TrimSpace(rec.ID)))
+				candidate := Match{
 					Record:     rec,
 					Product:    prod,
 					Confidence: bestConf,
 					MatchedCPE: bestCPE,
-				})
+				}
+				if idx, exists := seenIdx[dedupKey]; exists {
+					if matches[idx].Confidence == ConfidencePotential && bestConf == ConfidenceExact {
+						matches[idx] = candidate
+					}
+					continue
+				}
+				seenIdx[dedupKey] = len(matches)
+				matches = append(matches, candidate)
 			}
 		}
 	}
@@ -1242,7 +1248,7 @@ func ParseCPE23(criteria string) (CPEMatch, bool) {
 
 // joinCPEVersionUpdate folds a non-wildcard CPE 2.3 update field (parts[6])
 // into a concrete version string (e.g., "8.5"+"p1" -> "8.5p1", "2.0"+"rc1" ->
-// "2.0-rc1").
+// "2.0-rc1", "1.1"+"1" -> "1.1-1").
 func joinCPEVersionUpdate(version, update string) string {
 	version = strings.TrimSpace(version)
 	update = strings.TrimSpace(update)
@@ -1250,13 +1256,33 @@ func joinCPEVersionUpdate(version, update string) string {
 		return version
 	}
 	lower := strings.ToLower(update)
-	if strings.HasSuffix(strings.ToLower(version), lower) {
+	if hasUpdateSuffix(strings.ToLower(version), lower) {
 		return version
 	}
 	if isDirectCPEUpdate(lower) {
 		return version + update
 	}
 	return version + "-" + update
+}
+
+// hasUpdateSuffix reports whether lowerVer already terminates with a
+// non-numeric update token (such as "p1" in "8.5p1" or "rc1" in "2.0-rc1")
+// separated from the preceding version characters by a non-letter boundary.
+// Numeric update tokens (such as "1" on "1.1" or "0" on "2.0") are never
+// skipped so distinct patch updates are preserved.
+func hasUpdateSuffix(lowerVer, lowerUpdate string) bool {
+	if len(lowerUpdate) == 0 || !strings.HasSuffix(lowerVer, lowerUpdate) {
+		return false
+	}
+	if lowerUpdate[0] >= '0' && lowerUpdate[0] <= '9' {
+		return false
+	}
+	prefixLen := len(lowerVer) - len(lowerUpdate)
+	if prefixLen == 0 {
+		return false
+	}
+	prev := lowerVer[prefixLen-1]
+	return !(prev >= 'a' && prev <= 'z')
 }
 
 // isDirectCPEUpdate reports whether a CPE update token attaches directly to the

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/karalabe/uniblue/internal/probe"
@@ -214,7 +215,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 				Label:    fmt.Sprintf("UniFi %s (%s)", dev.Name, dev.Model),
 				Vendors:  []string{"ui"},
 				Products: cpeProducts,
-				Version:  dev.Version,
+				Version:  normalizeUniFiFirmwareVersion(dev.Version),
 				Source:   "unifi-firmware",
 				HostName: dev.Name,
 				HostIP:   dev.IP,
@@ -311,6 +312,11 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 		}
 	}
 
+	// Drop any versionless Product on a host when the same (vendor, product) is
+	// already represented by a concrete versioned Product on that host (for
+	// example, a versionless HTTP-title rule alongside a versioned Nerva CPE).
+	products = dropSupersededVersionlessProducts(products)
+
 	sort.Slice(products, func(i, j int) bool {
 		if products[i].HostIP != products[j].HostIP {
 			return products[i].HostIP < products[j].HostIP
@@ -321,6 +327,115 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 		return products[i].Version < products[j].Version
 	})
 	return products
+}
+
+// productHostKey returns the canonical lowercase host identifier used to
+// group and deduplicate products and CVE matches belonging to the same host.
+func productHostKey(p Product) string {
+	if ip := strings.ToLower(strings.TrimSpace(p.HostIP)); ip != "" {
+		return ip
+	}
+	return strings.ToLower(strings.TrimSpace(p.HostName))
+}
+
+// dropSupersededVersionlessProducts removes versionless Products whose
+// (host, vendor, product) is already covered by a versioned Product on the
+// same host so one service never emits both Exact and Potential rollups.
+func dropSupersededVersionlessProducts(products []Product) []Product {
+	type vendorProductPair struct {
+		vendor  string
+		product string
+	}
+	versionedByHost := make(map[string][]vendorProductPair)
+	for _, p := range products {
+		if strings.TrimSpace(p.Version) == "" {
+			continue
+		}
+		hk := productHostKey(p)
+		for _, v := range p.Vendors {
+			v = strings.ToLower(strings.TrimSpace(v))
+			if v == "" {
+				continue
+			}
+			for _, prod := range p.Products {
+				prod = strings.ToLower(strings.TrimSpace(prod))
+				if prod == "" {
+					continue
+				}
+				versionedByHost[hk] = append(versionedByHost[hk], vendorProductPair{vendor: v, product: prod})
+			}
+		}
+	}
+	if len(versionedByHost) == 0 {
+		return products
+	}
+	out := make([]Product, 0, len(products))
+	for _, p := range products {
+		if strings.TrimSpace(p.Version) != "" {
+			out = append(out, p)
+			continue
+		}
+		covered := versionedByHost[productHostKey(p)]
+		if len(covered) == 0 {
+			out = append(out, p)
+			continue
+		}
+		superseded := false
+		for _, v := range p.Vendors {
+			v = strings.ToLower(strings.TrimSpace(v))
+			if v == "" {
+				continue
+			}
+			for _, c := range covered {
+				if c.vendor == v && matchesAnyPattern(p.Products, c.product) {
+					superseded = true
+					break
+				}
+			}
+			if superseded {
+				break
+			}
+		}
+		if !superseded {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// normalizeUniFiFirmwareVersion strips UniFi's trailing 4th numeric build
+// suffix (such as "6.6.55.15189" -> "6.6.55" or "4.4.57.5578372" -> "4.4.57")
+// when the version consists of a 3-part major.minor.patch release plus a build
+// number >= 1000. This allows UniFi stat/device strings to match 3-part NVD
+// inclusive bounds and exact versions without weakening CompareVersions.
+func normalizeUniFiFirmwareVersion(raw string) string {
+	v := strings.TrimSpace(raw)
+	parts := strings.Split(v, ".")
+	if len(parts) != 4 {
+		return v
+	}
+	for _, part := range parts {
+		if !isASCIIUnsignedInt(part) {
+			return v
+		}
+	}
+	build, err := strconv.Atoi(parts[3])
+	if err != nil || build < 1000 {
+		return v
+	}
+	return parts[0] + "." + parts[1] + "." + parts[2]
+}
+
+func isASCIIUnsignedInt(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ruleHit records one deterministic match emitted by FingerprintRule.matchAll.
@@ -525,8 +640,11 @@ func mapUniFiDeviceProducts(dev unifi.Device) []string {
 	model := strings.ToLower(strings.TrimSpace(dev.Model))
 	compact := strings.NewReplacer("-", "", "_", "", " ", "").Replace(model)
 
-	// 1. Discriminate on controller-reported dev.Type first so APs, switches,
-	// and gateways are never misclassified by model suffixes like "Pro Max".
+	// 1. Discriminate on unambiguous controller-reported dev.Type values first
+	// so APs, switches, UXG gateways, and Cloud Keys are never misclassified by
+	// model suffixes like "Pro Max". Do NOT short-circuit "ugw" or "udm" here:
+	// integration-only snapshots infer "ugw" for UXG/UX models as well as USG,
+	// and "udm" spans several console families.
 	switch typ {
 	case "uap":
 		return []string{"unifi_uap_firmware"}
@@ -542,14 +660,13 @@ func mapUniFiDeviceProducts(dev unifi.Device) []string {
 			return []string{"unifi_next-generation_gateway_pro_firmware", "unifi_gateway_firmware"}
 		}
 		return []string{"unifi_gateway_firmware"}
-	case "ugw":
-		return []string{"unifi_security_gateway_firmware"}
 	case "uck":
 		return []string{"unifi_cloudkey_firmware", "unifi_cloud_key_plus_firmware"}
 	}
 
-	// 2. Discriminate on model codes when dev.Type is "udm" or omitted.
-	// Order AP, switch, and gateway cases before UDM/Pro Max console patterns.
+	// 2. Discriminate on model codes before falling back to generic "ugw"/"udm"
+	// types. Order AP, switch, UXG, and UniFi Express cases before USG/UDM
+	// patterns so next-gen gateways never map to legacy USG firmware.
 	switch {
 	// Access points (UAP, UAL6, U6-*, U7-*, U7 Pro Max, UK-Ultra, etc.).
 	case strings.HasPrefix(compact, "uap") ||
@@ -572,21 +689,29 @@ func mapUniFiDeviceProducts(dev unifi.Device) []string {
 		strings.Contains(model, "switch"):
 		return []string{"unifi_switch_firmware"}
 
-	// Standalone gateways (UXGPRO, UXG-Lite, USG, UGW).
+	// Standalone next-gen gateways and UniFi Express (UXGPRO, UXG-Lite, UX, UX7).
 	case strings.HasPrefix(compact, "uxg"):
 		if strings.Contains(compact, "pro") {
 			return []string{"unifi_next-generation_gateway_pro_firmware", "unifi_gateway_firmware"}
 		}
 		return []string{"unifi_gateway_firmware"}
+	case compact == "ux" ||
+		strings.HasPrefix(compact, "ux7") ||
+		strings.HasPrefix(model, "ux-") ||
+		strings.HasPrefix(model, "ux ") ||
+		strings.Contains(compact, "unifiexpress") ||
+		strings.Contains(model, "express"):
+		return []string{"unifi_express_firmware", "unifi_gateway_firmware", "unifi_os"}
 	case strings.HasPrefix(compact, "ugw") || strings.HasPrefix(compact, "usg"):
 		return []string{"unifi_security_gateway_firmware"}
 
-	// UniFi OS consoles (UDM Pro Max, UDM SE, UDM Pro, UDM, UDR, UCG, UDW).
+	// UniFi OS consoles (UDM Pro Max, UDM SE / UDMPROSE, UDM Pro, UDM, UDR, UCG, UDW).
 	case strings.Contains(compact, "udmpromax") ||
 		strings.Contains(compact, "dreammachinepromax") ||
 		(typ == "udm" && strings.Contains(compact, "promax")):
 		return []string{"unifi_dream_machine_pro_max_firmware", "unifi_os"}
 	case strings.Contains(compact, "udmse") ||
+		strings.Contains(compact, "udmprose") ||
 		strings.Contains(compact, "dreammachinese") ||
 		strings.Contains(compact, "specialedition"):
 		return []string{"unifi_dream_machine_special_edition_firmware", "unifi_os"}
@@ -602,6 +727,8 @@ func mapUniFiDeviceProducts(dev unifi.Device) []string {
 		return []string{"unifi_dream_wall_firmware", "unifi_os"}
 	case strings.HasPrefix(compact, "uck") || strings.Contains(compact, "cloudkey"):
 		return []string{"unifi_cloudkey_firmware", "unifi_cloud_key_plus_firmware"}
+	case typ == "ugw":
+		return []string{"unifi_security_gateway_firmware"}
 	case typ == "udm":
 		return []string{"unifi_os"}
 	default:

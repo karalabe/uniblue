@@ -949,3 +949,370 @@ func TestIdentifyIPv6OnlyHostPopulatesHostIP(t *testing.T) {
 		}
 	}
 }
+
+// TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder verifies that UniFi
+// 4-part firmware versions with a trailing numeric build number match 3-part
+// inclusive and exact NVD bounds as Exact matches, while CompareVersions keeps
+// strict transitivity and antisymmetry for general versions.
+func TestUniFiFirmwareBuildSuffixNormalizationAndTotalOrder(t *testing.T) {
+	normCases := []struct {
+		in   string
+		want string
+	}{
+		{"6.6.55.15189", "6.6.55"},
+		{"6.5.53.14768", "6.5.53"},
+		{"4.4.57.5578372", "4.4.57"},
+		{"6.6.55", "6.6.55"},
+		{"6.6.55.1", "6.6.55.1"},
+		{"4.0.6", "4.0.6"},
+		{"", ""},
+	}
+	for _, tc := range normCases {
+		if got := normalizeUniFiFirmwareVersion(tc.in); got != tc.want {
+			t.Fatalf("normalizeUniFiFirmwareVersion(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	// Verify CompareVersions remains a strict total order (antisymmetric and transitive)
+	// and keeps 6.6.55.15189 > 6.6.55 for general version comparison.
+	if CompareVersions("6.6.55.15189", "6.6.55") <= 0 {
+		t.Fatal("expected CompareVersions(6.6.55.15189, 6.6.55) > 0")
+	}
+	corpus := []string{
+		"1.1.1-alpha1", "1.1.1-rc1", "1.1.1", "1.1.1a", "1.1.2",
+		"2.4", "2.4.0", "2.4.7", "6.0", "6.0.17",
+		"6.6.55", "6.6.55.1", "6.6.55.15189", "8.0", "8.0.3",
+	}
+	for _, a := range corpus {
+		if CompareVersions(a, a) != 0 {
+			t.Fatalf("non-reflexive CompareVersions(%q, %q)", a, a)
+		}
+		for _, b := range corpus {
+			ab := CompareVersions(a, b)
+			ba := CompareVersions(b, a)
+			if ab != -ba {
+				t.Fatalf("antisymmetry violated for (%q, %q): %d vs %d", a, b, ab, ba)
+			}
+			for _, c := range corpus {
+				bc := CompareVersions(b, c)
+				ac := CompareVersions(a, c)
+				if ab <= 0 && bc <= 0 && ac > 0 {
+					t.Fatalf("transitivity violated: %q <= %q <= %q but %q > %q", a, b, c, a, c)
+				}
+			}
+		}
+	}
+
+	// End-to-end: Identify + MatchProducts against a local ui vendor shard.
+	cacheDir := t.TempDir()
+	vendorsDir := filepath.Join(cacheDir, "vendors")
+	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	uiRecords := []Record{
+		{
+			ID:        "CVE-2026-5001",
+			Published: "2026-01-10",
+			Severity:  checks.SeverityHigh,
+			CVSS:      8.1,
+			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_uap_firmware", EndIncl: "6.6.55"}},
+		},
+		{
+			ID:        "CVE-2026-5002",
+			Published: "2026-01-10",
+			Severity:  checks.SeverityHigh,
+			CVSS:      7.8,
+			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_uap_firmware", Version: "6.6.55"}},
+		},
+		{
+			ID:        "CVE-2026-5003",
+			Published: "2026-01-10",
+			Severity:  checks.SeverityHigh,
+			CVSS:      7.5,
+			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_uap_firmware", EndExcl: "6.6.55"}},
+		},
+		{
+			ID:        "CVE-2026-5004",
+			Published: "2026-01-10",
+			Severity:  checks.SeverityHigh,
+			CVSS:      7.5,
+			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_uap_firmware", EndIncl: "6.6.54"}},
+		},
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(vendorsDir, "ui.json.gz"), uiRecords); err != nil {
+		t.Fatal(err)
+	}
+
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := &unifi.Snapshot{
+		Devices: []unifi.Device{
+			{Name: "Hallway AP", Model: "U6-Lite", Type: "uap", IP: "192.168.1.10", Version: "6.6.55.15189"},
+		},
+	}
+	prods := fp.Identify(snap, nil)
+	if len(prods) != 1 || prods[0].Version != "6.6.55" {
+		t.Fatalf("expected normalized UniFi version 6.6.55, got %+v", prods)
+	}
+	matches, err := NewCache(cacheDir).MatchProducts(prods, MatchOptions{MinSeverity: checks.SeverityMedium})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 exact matches (EndIncl 6.6.55 and exact 6.6.55), got %d: %+v", len(matches), matches)
+	}
+	gotIDs := map[string]Confidence{}
+	for _, m := range matches {
+		gotIDs[m.Record.ID] = m.Confidence
+	}
+	if gotIDs["CVE-2026-5001"] != ConfidenceExact || gotIDs["CVE-2026-5002"] != ConfidenceExact {
+		t.Fatalf("expected exact matches for CVE-2026-5001 and CVE-2026-5002, got %+v", gotIDs)
+	}
+}
+
+// TestMapUniFiDeviceProductsInferredUGWAndUDMProSE verifies that UXG and UniFi
+// Express devices never map to legacy USG firmware even when dev.Type is "ugw"
+// (inferred in integration-only snapshots), and that UDMPROSE maps to UDM SE.
+func TestMapUniFiDeviceProductsInferredUGWAndUDMProSE(t *testing.T) {
+	tests := []struct {
+		name string
+		dev  unifi.Device
+		want []string
+	}{
+		{
+			name: "UXGPRO with inferred ugw type maps to UXG Pro",
+			dev:  unifi.Device{Type: "ugw", Model: "UXGPRO", Name: "Edge", Version: "4.0.6"},
+			want: []string{"unifi_next-generation_gateway_pro_firmware", "unifi_gateway_firmware"},
+		},
+		{
+			name: "UXG-Lite with inferred ugw type maps to gateway firmware",
+			dev:  unifi.Device{Type: "ugw", Model: "UXG-Lite", Name: "Edge", Version: "4.0.6"},
+			want: []string{"unifi_gateway_firmware"},
+		},
+		{
+			name: "UniFi Express UX with inferred ugw type never maps to USG",
+			dev:  unifi.Device{Type: "ugw", Model: "UX", Name: "Express", Version: "4.0.9"},
+			want: []string{"unifi_express_firmware", "unifi_gateway_firmware", "unifi_os"},
+		},
+		{
+			name: "UniFi Express 7 UX7 with inferred ugw type never maps to USG",
+			dev:  unifi.Device{Type: "ugw", Model: "UX7", Name: "Express 7", Version: "4.1.0"},
+			want: []string{"unifi_express_firmware", "unifi_gateway_firmware", "unifi_os"},
+		},
+		{
+			name: "classic USG-3P with ugw type maps to USG firmware",
+			dev:  unifi.Device{Type: "ugw", Model: "USG-3P", Name: "Legacy GW", Version: "4.4.57.5578372"},
+			want: []string{"unifi_security_gateway_firmware"},
+		},
+		{
+			name: "UDMPROSE maps to UDM Special Edition firmware",
+			dev:  unifi.Device{Type: "udm", Model: "UDMPROSE", Name: "Rack GW", Version: "4.0.21"},
+			want: []string{"unifi_dream_machine_special_edition_firmware", "unifi_os"},
+		},
+		{
+			name: "UDMPROSE without type maps to UDM Special Edition firmware",
+			dev:  unifi.Device{Model: "UDMPROSE", Name: "Rack GW", Version: "4.0.21"},
+			want: []string{"unifi_dream_machine_special_edition_firmware", "unifi_os"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mapUniFiDeviceProducts(tc.dev)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("mapUniFiDeviceProducts(%+v) = %v, want %v", tc.dev, got, tc.want)
+			}
+		})
+	}
+
+	// End-to-end: UXG-Pro with Type="ugw" must not match USG-only CVEs.
+	cacheDir := t.TempDir()
+	vendorsDir := filepath.Join(cacheDir, "vendors")
+	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	uiRecords := []Record{
+		{
+			ID:        "CVE-2025-1111",
+			Published: "2025-02-01",
+			Severity:  checks.SeverityCritical,
+			CVSS:      9.8,
+			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_security_gateway_firmware", EndIncl: "4.4.57"}},
+		},
+		{
+			ID:        "CVE-2025-2222",
+			Published: "2025-02-01",
+			Severity:  checks.SeverityHigh,
+			CVSS:      8.2,
+			Matches:   []CPEMatch{{Vendor: "ui", Product: "unifi_next-generation_gateway_pro_firmware", EndExcl: "4.1.0"}},
+		},
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(vendorsDir, "ui.json.gz"), uiRecords); err != nil {
+		t.Fatal(err)
+	}
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prods := fp.Identify(&unifi.Snapshot{
+		Devices: []unifi.Device{{Name: "Edge UXG", Model: "UXGPRO", Type: "ugw", IP: "192.168.1.1", Version: "4.0.6"}},
+	}, nil)
+	matches, err := NewCache(cacheDir).MatchProducts(prods, MatchOptions{MinSeverity: checks.SeverityMedium})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Record.ID != "CVE-2025-2222" || matches[0].Confidence != ConfidenceExact {
+		t.Fatalf("expected only UXG-Pro CVE-2025-2222, got %+v", matches)
+	}
+}
+
+// TestVersionlessRuleSupersededByVersionedCPEAndMatchDedup verifies that a
+// host matched by both a versionless built-in rule and a versioned Nerva CPE
+// emits only the versioned product, and that MatchProducts deduplicates
+// (host, CVE) pairs preferring Exact over Potential regardless of input order.
+func TestVersionlessRuleSupersededByVersionedCPEAndMatchDedup(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	profiles := []probe.HostProfile{
+		{
+			Client: unifi.Client{IP: "10.0.1.10", MAC: "aa:bb:cc:00:01:01", Name: "metrics"},
+			HTTP:   map[int]probe.HTTPBanner{3000: {Title: "Grafana"}},
+			Services: []probe.Service{
+				{Port: 3000, CPEs: []string{"cpe:2.3:a:grafana:grafana:10.2.3:*:*:*:*:*:*:*"}},
+			},
+		},
+		{
+			Client: unifi.Client{IP: "10.0.1.11", MAC: "aa:bb:cc:00:01:02", Name: "proxy"},
+			HTTP:   map[int]probe.HTTPBanner{8080: {Title: "Traefik"}},
+			Services: []probe.Service{
+				{Port: 8080, CPEs: []string{"cpe:2.3:a:traefik:traefik:2.10.5:*:*:*:*:*:*:*"}},
+			},
+		},
+		{
+			Client: unifi.Client{IP: "10.0.1.12", MAC: "aa:bb:cc:00:01:03", Name: "homeassistant"},
+			HTTP:   map[int]probe.HTTPBanner{8123: {Title: "Home Assistant"}},
+			Services: []probe.Service{
+				{Port: 8123, CPEs: []string{"cpe:2.3:a:home-assistant:home-assistant:2024.1.0:*:*:*:*:*:*:*"}},
+			},
+		},
+		{
+			Client: unifi.Client{IP: "10.0.1.13", MAC: "aa:bb:cc:00:01:04", Name: "ollama"},
+			HTTP:   map[int]probe.HTTPBanner{11434: {Title: "Ollama"}},
+			Services: []probe.Service{
+				{Port: 11434, CPEs: []string{"cpe:2.3:a:ollama:ollama:0.1.30:*:*:*:*:*:*:*"}},
+			},
+		},
+	}
+
+	prods := fp.Identify(nil, profiles)
+	if len(prods) != 4 {
+		t.Fatalf("expected exactly 4 versioned products with versionless duplicates dropped, got %d: %+v", len(prods), prods)
+	}
+	for _, p := range prods {
+		if p.Version == "" {
+			t.Fatalf("unexpected surviving versionless product: %+v", p)
+		}
+	}
+
+	// Verify end-to-end Grafana matching produces only the exact CVE affecting 10.2.3
+	// and never leaks unrelated Grafana CVEs via a versionless potential rollup.
+	cacheDir := t.TempDir()
+	vendorsDir := filepath.Join(cacheDir, "vendors")
+	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	grafanaRecs := []Record{
+		{
+			ID:        "CVE-2026-3001",
+			Published: "2026-02-01",
+			Severity:  checks.SeverityHigh,
+			CVSS:      8.5,
+			Matches:   []CPEMatch{{Vendor: "grafana", Product: "grafana", StartIncl: "10.0.0", EndExcl: "10.2.4"}},
+		},
+		{
+			ID:        "CVE-2026-3002",
+			Published: "2026-02-01",
+			Severity:  checks.SeverityCritical,
+			CVSS:      9.1,
+			Matches:   []CPEMatch{{Vendor: "grafana", Product: "grafana", StartIncl: "11.0.0", EndExcl: "11.1.0"}},
+		},
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(vendorsDir, "grafana.json.gz"), grafanaRecs); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewCache(cacheDir)
+	matches, err := cache.MatchProducts(prods, MatchOptions{MinSeverity: checks.SeverityMedium})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Record.ID != "CVE-2026-3001" || matches[0].Confidence != ConfidenceExact {
+		t.Fatalf("expected single Exact match CVE-2026-3001, got %+v", matches)
+	}
+
+	// Also verify MatchProducts itself deduplicates (host, CVE) preferring Exact
+	// over Potential even when a caller supplies both versionless and versioned
+	// products directly (in either order).
+	versionless := Product{Label: "Grafana", Vendors: []string{"grafana"}, Products: []string{"grafana"}, Version: "", HostIP: "10.0.1.10", HostName: "metrics"}
+	versioned := Product{Label: "Grafana", Vendors: []string{"grafana"}, Products: []string{"grafana"}, Version: "10.2.3", HostIP: "10.0.1.10", HostName: "metrics"}
+	for _, pair := range [][]Product{{versionless, versioned}, {versioned, versionless}} {
+		m, err := cache.MatchProducts(pair, MatchOptions{MinSeverity: checks.SeverityMedium})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var seen3001 []Match
+		for _, hit := range m {
+			if hit.Record.ID == "CVE-2026-3001" {
+				seen3001 = append(seen3001, hit)
+			}
+		}
+		if len(seen3001) != 1 || seen3001[0].Confidence != ConfidenceExact {
+			t.Fatalf("expected CVE-2026-3001 once with ConfidenceExact, got %+v", seen3001)
+		}
+	}
+}
+
+// TestJoinCPEVersionUpdatePreservesNumericUpdates verifies that numeric CPE
+// update tokens matching the final digit of the base version (such as 1.1:1 or
+// 2.0:0) are preserved rather than dropped, while already-embedded non-numeric
+// update suffixes (such as 8.5p1:p1 or 2.0-rc1:rc1) are not duplicated.
+func TestJoinCPEVersionUpdatePreservesNumericUpdates(t *testing.T) {
+	cases := []struct {
+		cpe     string
+		wantVer string
+	}{
+		{"cpe:2.3:a:vendor:app:1.1:1:*:*:*:*:*:*", "1.1-1"},
+		{"cpe:2.3:a:vendor:app:2.0:0:*:*:*:*:*:*", "2.0-0"},
+		{"cpe:2.3:a:vendor:app:1.10:0:*:*:*:*:*:*", "1.10-0"},
+		{"cpe:2.3:a:openbsd:openssh:8.5:p1:*:*:*:*:*:*", "8.5p1"},
+		{"cpe:2.3:a:openbsd:openssh:8.5p1:p1:*:*:*:*:*:*", "8.5p1"},
+		{"cpe:2.3:a:example:app:2.0-rc1:rc1:*:*:*:*:*:*", "2.0-rc1"},
+		{"cpe:2.3:a:openssl:openssl:1.1.1a:a:*:*:*:*:*:*", "1.1.1a"},
+	}
+	for _, tc := range cases {
+		m, ok := ParseCPE23(tc.cpe)
+		if !ok || m.Version != tc.wantVer {
+			t.Fatalf("ParseCPE23(%q) = (%q, %v), want %q", tc.cpe, m.Version, ok, tc.wantVer)
+		}
+		_, _, ver, ok := parseVersionedCPE23(tc.cpe)
+		if !ok || ver != tc.wantVer {
+			t.Fatalf("parseVersionedCPE23(%q) = (%q, %v), want %q", tc.cpe, ver, ok, tc.wantVer)
+		}
+	}
+
+	m11, _ := ParseCPE23("cpe:2.3:a:vendor:app:1.1:1:*:*:*:*:*:*")
+	if matched, conf := MatchesRange("1.1", m11); matched && conf == ConfidenceExact {
+		t.Fatal("observed version 1.1 must not match CPE 1.1 update 1 as Exact")
+	}
+	if matched, _ := MatchesRange("1.1.0", m11); matched {
+		t.Fatal("observed version 1.1.0 must not match CPE 1.1 update 1")
+	}
+	if matched, conf := MatchesRange("1.1-1", m11); !matched || conf != ConfidenceExact {
+		t.Fatalf("observed version 1.1-1 should match CPE 1.1 update 1 exact, got (%v, %v)", matched, conf)
+	}
+}

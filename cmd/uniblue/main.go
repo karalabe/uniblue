@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,6 +41,7 @@ import (
 	"github.com/karalabe/uniblue/internal/server"
 	"github.com/karalabe/uniblue/internal/topology"
 	"github.com/karalabe/uniblue/internal/unifi"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -131,8 +133,10 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
-	if err := verifyStatePathWritable(cfg.State.Path); err != nil {
-		return fmt.Errorf("state path %q is not writable (set state.path to a writable file): %w", cfg.State.Path, err)
+	if *saveState {
+		if err := verifyStatePathWritable(cfg.State.Path); err != nil {
+			return fmt.Errorf("state path %q is not writable (set state.path to a writable file): %w", cfg.State.Path, err)
+		}
 	}
 	checkList, err := loadAllChecks(cfg.Scan.ChecksDir)
 	if err != nil {
@@ -213,48 +217,18 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		"state_path", cfg.State.Path,
 	)
 
-	// Run one pass immediately, then repeat on a ticker until cancelled.
-	runOnce := func() {
-		prev, err := risk.LoadState(cfg.State.Path)
-		if err != nil {
-			logger.Error("failed to load previous state", "err", err)
-			return
-		}
-
-		snap, profiles, report, err := executeCycle(ctx, cfg, checkList)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			logger.Error("scan cycle failed", "err", err)
-			return
-		}
-
-		diff := risk.ComputeDiff(prev, snap, report, cfg.Network)
-		logger.Info("scan cycle complete",
-			"clients", report.ClientCount,
-			"findings", len(report.Findings),
-			"new", len(diff.NewFindings),
-			"escalated", len(diff.EscalatedFindings),
-			"resolved", len(diff.ResolvedKeys),
-			"new_trusted_clients", len(diff.NewTrustedClients),
-			"new_port_forwards", len(diff.NewPortForwards),
-		)
-
-		if diff.HasAlerts(minSev) {
-			if err := notifier.Send(ctx, snap.Site, diff); err != nil {
-				logger.Error("failed to send notification; preserving previous baseline for retry", "err", err)
-				return
-			}
-		}
-
-		nextState := risk.BuildStateWithPrev(prev, snap, report, cfg.Network, probedHostKeys(profiles))
-		if err := risk.SaveState(cfg.State.Path, nextState); err != nil {
-			logger.Error("failed to save state", "err", err)
-		}
+	session := &watchSession{
+		cfg:     cfg,
+		minSev:  minSev,
+		logger:  logger,
+		scanFn:  func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) { return executeCycle(ctx, cfg, checkList) },
+		sendFn:  notifier.Send,
+		loadFn:  risk.LoadState,
+		saveFn:  risk.SaveState,
 	}
 
-	runOnce()
+	// Run one pass immediately, then repeat on a ticker until cancelled.
+	session.runCycle(ctx)
 
 	ticker := time.NewTicker(cfg.Scan.Interval)
 	defer ticker.Stop()
@@ -265,8 +239,71 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			logger.Info("stopping uniblue watch")
 			return nil
 		case <-ticker.C:
-			runOnce()
+			session.runCycle(ctx)
 		}
+	}
+}
+
+// watchSession holds in-memory baseline state across `uniblue watch` cycles so
+// a runtime SaveState failure (such as a read-only remount or full disk) never
+// reloads stale on-disk state and re-sends identical alerts on every interval.
+type watchSession struct {
+	cfg         *config.Config
+	minSev      checks.Severity
+	logger      *slog.Logger
+	prevState   *risk.State
+	stateLoaded bool
+
+	scanFn func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
+	sendFn func(ctx context.Context, site string, diff risk.Diff) error
+	loadFn func(path string) (*risk.State, error)
+	saveFn func(path string, st *risk.State) error
+}
+
+func (w *watchSession) runCycle(ctx context.Context) {
+	if !w.stateLoaded {
+		prev, err := w.loadFn(w.cfg.State.Path)
+		if err != nil {
+			w.logger.Error("failed to load previous state", "err", err)
+			return
+		}
+		w.prevState = prev
+		w.stateLoaded = true
+	}
+
+	snap, profiles, report, err := w.scanFn(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		w.logger.Error("scan cycle failed", "err", err)
+		return
+	}
+
+	diff := risk.ComputeDiff(w.prevState, snap, report, w.cfg.Network)
+	w.logger.Info("scan cycle complete",
+		"clients", report.ClientCount,
+		"findings", len(report.Findings),
+		"new", len(diff.NewFindings),
+		"escalated", len(diff.EscalatedFindings),
+		"resolved", len(diff.ResolvedKeys),
+		"new_trusted_clients", len(diff.NewTrustedClients),
+		"new_port_forwards", len(diff.NewPortForwards),
+	)
+
+	if diff.HasAlerts(w.minSev) {
+		if err := w.sendFn(ctx, snap.Site, diff); err != nil {
+			w.logger.Error("failed to send notification; preserving previous baseline for retry", "err", err)
+			return
+		}
+	}
+
+	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedHostKeys(profiles))
+	// Always advance the in-memory baseline after notifications succeed so a
+	// runtime persistence error does not trigger duplicate alerts every cycle.
+	w.prevState = nextState
+	if err := w.saveFn(w.cfg.State.Path, nextState); err != nil {
+		w.logger.Error("failed to persist state; retaining updated baseline in memory", "path", w.cfg.State.Path, "err", err)
 	}
 }
 
@@ -305,7 +342,7 @@ func runInventory(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			return err
 		}
 		scanPorts := mergePorts(cfg.Scan.Ports, checkList)
-		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+		fp := newSiteFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
 		fp.SetHostPortHints(snap.PortHintsByIP())
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
 	} else {
@@ -382,6 +419,7 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	target := fs.String("target", "", "target LAN IP address to test")
 	hostname := fs.String("hostname", "", "optional target hostname for hostname-gated checks")
 	mac := fs.String("mac", "", "optional target MAC address for MAC/OUI-gated checks")
+	ouiVendor := fs.String("oui", "", "optional target hardware OUI vendor string for oui_contains checks")
 	dir := fs.String("dir", "", "optional directory of extra YAML checks")
 	checkID := fs.String("check", "", "optional single check ID to run (e.g., UB-0003)")
 	timeout := fs.Duration("timeout", 3*time.Second, "per-probe timeout")
@@ -431,22 +469,22 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		ports = append(ports, p)
 	}
 
-	targetCl := unifi.Client{
-		IP:       strings.TrimSpace(*target),
-		Hostname: strings.TrimSpace(*hostname),
-		MAC:      config.CanonicalMAC(*mac),
-	}
+	targetCl := buildCheckTestClient(*target, *hostname, *mac, *ouiVendor)
 	fp := probe.NewFingerprinter(ports, 1, *timeout, nil)
+	// Keep single-target `check test` strictly scoped to the target IP: inject
+	// an empty discovery snapshot so FingerprintAll still runs TCP/HTTP/SSH and
+	// Nerva protocol fingerprinting on the target without broadcasting LAN-wide
+	// mDNS/SSDP/WSD sweeps or sending UPnP HTTP GETs to unrelated LAN hosts.
+	fp.SetCachedDiscovery(&probe.LANDiscovery{})
 	profiles := fp.FingerprintAll(ctx, []unifi.Client{targetCl})
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	var profile probe.HostProfile
-	if len(profiles) > 0 {
-		profile = profiles[0]
-	} else {
-		profile = probe.HostProfile{Client: targetCl}
+	if len(profiles) == 0 {
+		fmt.Fprintf(stderr, "Warning: target %q was refused by the local-IP probe guard (must be a private, ULA, CGNAT, link-local, or loopback IP address).\n", targetCl.IP)
+		return fmt.Errorf("check test: target %q is not an allowed local/private IP address", targetCl.IP)
 	}
+	profile := profiles[0]
 
 	fmt.Fprintf(stdout, "Target: %s | Open ports: %v\n", *target, profile.OpenPorts)
 	for port, banner := range profile.HTTP {
@@ -458,24 +496,99 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	singleCheck := *checkID != "" && len(list) == 1
 	if len(findings) == 0 {
 		fmt.Fprintln(stdout, "No findings matched.")
-		if *checkID != "" && len(list) == 1 {
-			chk := list[0]
-			if chk.Preconditions.HostnameRegex != "" && targetCl.Hostname == "" {
-				fmt.Fprintln(stderr, "Note: this check requires hostname_regex; pass -hostname <name> to evaluate it.")
-			}
-			if (len(chk.Preconditions.MACPrefix) > 0 || len(chk.Preconditions.OUIContains) > 0) && targetCl.MAC == "" {
-				fmt.Fprintln(stderr, "Note: this check requires MAC/OUI metadata; pass -mac <mac> to evaluate it.")
-			}
-		}
+		reportUnevaluableCheckHints(stderr, list, targetCl, singleCheck)
 		return nil
 	}
 	for _, f := range findings {
 		fmt.Fprintf(stdout, "[%s] %s (%s) on port %d: %s\n",
 			strings.ToUpper(f.EffectiveSeverity.String()), f.CheckID, f.Title, f.Port, f.Evidence)
 	}
+	if !singleCheck {
+		reportUnevaluableCheckHints(stderr, list, targetCl, false)
+	}
 	return nil
+}
+
+// buildCheckTestClient constructs the target Client for `check test`, resolving
+// hardware OUI vendor metadata from the local IEEE/built-in OUI database when
+// -mac is supplied so oui_contains preconditions can be evaluated.
+func buildCheckTestClient(target, hostname, mac, ouiOverride string) unifi.Client {
+	cl := unifi.Client{
+		IP:       strings.TrimSpace(target),
+		Hostname: strings.TrimSpace(hostname),
+		MAC:      config.CanonicalMAC(mac),
+		OUI:      strings.TrimSpace(ouiOverride),
+	}
+	if cl.OUI == "" && cl.MAC != "" {
+		ouiDB := oui.New("")
+		_ = ouiDB.Load()
+		cl.OUI = ouiDB.Lookup(cl.MAC).Vendor
+	}
+	return cl
+}
+
+// reportUnevaluableCheckHints writes concise stderr guidance whenever selected
+// checks require metadata (hostname, MAC, OUI, or LAN multicast discovery) that
+// is unavailable in the current single-target `check test` invocation.
+func reportUnevaluableCheckHints(stderr io.Writer, list []*checks.Check, target unifi.Client, singleCheck bool) {
+	var needHostname, needMAC, needOUI, needDiscovery int
+	for _, chk := range list {
+		if chk.Preconditions.HostnameRegex != "" && target.Hostname == "" {
+			needHostname++
+		}
+		if len(chk.Preconditions.MACPrefix) > 0 && target.MAC == "" {
+			needMAC++
+		}
+		if len(chk.Preconditions.OUIContains) > 0 && target.OUI == "" {
+			needOUI++
+		}
+		if len(chk.Preconditions.MDNSTypeAny) > 0 ||
+			chk.Preconditions.UPnPDeviceRegex != "" ||
+			chk.Preconditions.UPnPServiceRegex != "" ||
+			chk.Preconditions.WSTypeRegex != "" {
+			needDiscovery++
+		}
+	}
+
+	if singleCheck {
+		if needHostname > 0 {
+			fmt.Fprintln(stderr, "Note: this check requires hostname_regex; pass -hostname <name> to evaluate it.")
+		}
+		if needMAC > 0 {
+			fmt.Fprintln(stderr, "Note: this check requires mac_prefix; pass -mac <mac> to evaluate it.")
+		}
+		if needOUI > 0 {
+			if target.MAC == "" {
+				fmt.Fprintln(stderr, "Note: this check requires oui_contains; pass -mac <mac> (with synced OUI cache) or -oui <vendor> to evaluate it.")
+			} else {
+				fmt.Fprintln(stderr, "Note: this check requires oui_contains, but no OUI vendor was resolved for -mac; run `uniblue oui sync` or pass -oui <vendor>.")
+			}
+		}
+		if needDiscovery > 0 {
+			fmt.Fprintln(stderr, "Note: this check requires LAN multicast discovery (mDNS/UPnP/WS-Discovery), which single-target `check test` does not broadcast.")
+		}
+		return
+	}
+
+	var notes []string
+	if needHostname > 0 {
+		notes = append(notes, fmt.Sprintf("%d hostname-gated (pass -hostname <name>)", needHostname))
+	}
+	if needMAC > 0 {
+		notes = append(notes, fmt.Sprintf("%d MAC-gated (pass -mac <mac>)", needMAC))
+	}
+	if needOUI > 0 {
+		notes = append(notes, fmt.Sprintf("%d OUI-gated (pass -mac <mac> or -oui <vendor>)", needOUI))
+	}
+	if needDiscovery > 0 {
+		notes = append(notes, fmt.Sprintf("%d LAN-discovery-gated (mDNS/UPnP/WS-Discovery skipped in single-target mode)", needDiscovery))
+	}
+	if len(notes) > 0 {
+		fmt.Fprintf(stderr, "Note: unevaluable checks skipped due to missing metadata: %s.\n", strings.Join(notes, "; "))
+	}
 }
 
 // executeCycle runs one end-to-end UniFi snapshot, host fingerprinting pass,
@@ -497,7 +610,7 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 	// community checks so dropping a YAML check into checks/ works automatically.
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
-	fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+	fp := newSiteFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
 	// Seed per-host port hints from UniFi port forwards, firewall policies, and
 	// identity-gated checks (MAC/hostname) so specialty ports are only dialed on
 	// matching hosts instead of every host on the LAN.
@@ -524,6 +637,32 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 
 	report := risk.Evaluate(snap, rawFindings, cfg.Network)
 	return snap, profiles, report, nil
+}
+
+// siteSubnets parses all configured IPv4 and IPv6 network prefixes from snap so
+// CLI scans permit probing hosts on routed public LAN blocks and site IPv6 GUAs.
+func siteSubnets(snap *unifi.Snapshot) []netip.Prefix {
+	if snap == nil {
+		return nil
+	}
+	var out []netip.Prefix
+	for _, n := range snap.Networks {
+		if p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil {
+			out = append(out, p.Masked())
+		}
+		if p, err := netip.ParsePrefix(strings.TrimSpace(n.IPv6Subnet)); err == nil {
+			out = append(out, p.Masked())
+		}
+	}
+	return out
+}
+
+// newSiteFingerprinter constructs a Fingerprinter pre-populated with all site
+// IPv4/IPv6 subnets from snap.
+func newSiteFingerprinter(ports []int, concurrency int, timeout time.Duration, excluded map[string]struct{}, snap *unifi.Snapshot) *probe.Fingerprinter {
+	fp := probe.NewFingerprinter(ports, concurrency, timeout, excluded)
+	fp.SetAllowedSubnets(siteSubnets(snap))
+	return fp
 }
 
 // verifyStatePathWritable creates parent directories if needed and writes+removes
@@ -806,11 +945,8 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, profiles
 	if skippedCount < 0 {
 		skippedCount = 0
 	}
-	cleanProbed := report.CleanClients - skippedCount
-	if cleanProbed < 0 {
-		cleanProbed = 0
-	}
 	if skippedCount > 0 {
+		cleanProbed := countCleanProbedHosts(profiles, report.Findings)
 		fmt.Fprintf(w, "  - [OK] LAN Clients:          %d/%d probed host(s) passed (%d skipped/excluded)\n", cleanProbed, probedCount, skippedCount)
 	} else {
 		fmt.Fprintf(w, "  - [OK] LAN Clients:          %d/%d active host(s) passed with zero unauthenticated services exposed\n", report.CleanClients, report.ClientCount)
@@ -818,6 +954,46 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, profiles
 	if !cveLoaded {
 		fmt.Fprintln(w, "  - [TIP] Run `uniblue cve sync` once to include offline NVD+KEV correlation in `uniblue scan`.")
 	}
+}
+
+// countCleanProbedHosts counts how many actually probed hosts in profiles have
+// zero non-inventory findings in findings, avoiding distortion when skipped or
+// excluded hosts carry UniFi-derived findings such as WAN port forwards.
+func countCleanProbedHosts(profiles []probe.HostProfile, findings []checks.Finding) int {
+	affectedIPs := make(map[string]struct{})
+	affectedMACs := make(map[string]struct{})
+	for _, f := range findings {
+		if f.IsInventoryOnly() {
+			continue
+		}
+		for _, ip := range f.Client.AllIPs() {
+			affectedIPs[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
+		}
+		if m := strings.ToLower(strings.TrimSpace(f.Client.MAC)); m != "" && !strings.HasPrefix(m, "fw:") && !strings.HasPrefix(m, "gw:") {
+			affectedMACs[m] = struct{}{}
+		}
+	}
+	clean := 0
+	for _, hp := range profiles {
+		bad := false
+		for _, ip := range hp.Client.AllIPs() {
+			if _, ok := affectedIPs[strings.ToLower(strings.TrimSpace(ip))]; ok {
+				bad = true
+				break
+			}
+		}
+		if !bad {
+			if m := strings.ToLower(strings.TrimSpace(hp.Client.MAC)); m != "" {
+				if _, ok := affectedMACs[m]; ok {
+					bad = true
+				}
+			}
+		}
+		if !bad {
+			clean++
+		}
+	}
+	return clean
 }
 
 // printInventory renders the UniFi snapshot tables cleanly for `uniblue inventory`.
@@ -945,19 +1121,48 @@ func runCVE(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 }
 
+// flagPassed reports whether the named flag was explicitly supplied on the
+// command line to fs.
+func flagPassed(fs *flag.FlagSet, name string) bool {
+	passed := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			passed = true
+		}
+	})
+	return passed
+}
+
 // resolveCVECacheDir resolves the local CVE cache directory, honoring an
-// explicit -cache flag first, then cve.cache_dir from config.yaml when present,
-// and finally cve.DefaultCacheDir().
-func resolveCVECacheDir(flagDir, cfgPath string) string {
+// explicit -cache flag first, then cve.cache_dir from config.yaml (parsed
+// without requiring UniFi credentials or validating unrelated fields), and
+// finally cve.DefaultCacheDir(). If configExplicit is true and cfgPath cannot
+// be read or parsed, an error is returned instead of silently falling back.
+func resolveCVECacheDir(flagDir, cfgPath string, configExplicit bool) (string, error) {
 	if strings.TrimSpace(flagDir) != "" {
-		return strings.TrimSpace(flagDir)
+		return strings.TrimSpace(flagDir), nil
 	}
-	if strings.TrimSpace(cfgPath) != "" {
-		if cfg, err := config.Load(cfgPath); err == nil && strings.TrimSpace(cfg.CVE.CacheDir) != "" {
-			return strings.TrimSpace(cfg.CVE.CacheDir)
+	if trimmed := strings.TrimSpace(cfgPath); trimmed != "" {
+		raw, err := os.ReadFile(trimmed)
+		if err != nil {
+			if configExplicit || !errors.Is(err, os.ErrNotExist) {
+				return "", fmt.Errorf("read config %q: %w", trimmed, err)
+			}
+			return cve.DefaultCacheDir(), nil
+		}
+		var partial struct {
+			CVE struct {
+				CacheDir string `yaml:"cache_dir"`
+			} `yaml:"cve"`
+		}
+		if err := yaml.Unmarshal(raw, &partial); err != nil {
+			return "", fmt.Errorf("parse config %q: %w", trimmed, err)
+		}
+		if dir := strings.TrimSpace(partial.CVE.CacheDir); dir != "" {
+			return dir, nil
 		}
 	}
-	return cve.DefaultCacheDir()
+	return cve.DefaultCacheDir(), nil
 }
 
 // runCVESync downloads CISA KEV and NVD JSON 2.0 yearly feeds into the local
@@ -973,7 +1178,11 @@ func runCVESync(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return err
 	}
 
-	cache := cve.NewCache(resolveCVECacheDir(*cacheDir, *cfgPath))
+	resolvedDir, err := resolveCVECacheDir(*cacheDir, *cfgPath, flagPassed(fs, "config"))
+	if err != nil {
+		return err
+	}
+	cache := cve.NewCache(resolvedDir)
 	stats, err := cache.Sync(ctx, cve.SyncOptions{
 		SinceYear: *since,
 		Force:     *force,
@@ -1043,7 +1252,7 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return err
 	}
 
-	fp := probe.NewFingerprinter(cfg.Scan.Ports, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+	fp := newSiteFingerprinter(cfg.Scan.Ports, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
 	identifier, err := cve.LoadFingerprinter(fingerprints.BuiltinFS)
@@ -1140,7 +1349,11 @@ func runCVESearch(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return errors.New("cve search requires a query, -vendor, or -kev")
 	}
 
-	cache := cve.NewCache(resolveCVECacheDir(*cacheDir, *cfgPath))
+	resolvedDir, err := resolveCVECacheDir(*cacheDir, *cfgPath, flagPassed(fs, "config"))
+	if err != nil {
+		return err
+	}
+	cache := cve.NewCache(resolvedDir)
 	recs, err := cache.Search(ctx, query, cve.SearchOptions{
 		Vendor:      *vendor,
 		KEVOnly:     *kevOnly,
@@ -1184,7 +1397,11 @@ func runCVEShow(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		return errors.New("usage: uniblue cve show [-cache <dir>] <CVE-ID>")
 	}
 
-	cache := cve.NewCache(resolveCVECacheDir(*cacheDir, *cfgPath))
+	resolvedDir, err := resolveCVECacheDir(*cacheDir, *cfgPath, flagPassed(fs, "config"))
+	if err != nil {
+		return err
+	}
+	cache := cve.NewCache(resolvedDir)
 	rec, err := cache.LookupCVE(ctx, fs.Arg(0))
 	if err != nil {
 		return err
@@ -1369,7 +1586,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			return err
 		}
 		scanPorts := mergePorts(cfg.Scan.Ports, checkList)
-		fp := probe.NewFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet())
+		fp := newSiteFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
 		fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
 		if err := ctx.Err(); err != nil {

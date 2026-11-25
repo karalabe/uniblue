@@ -9,6 +9,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -113,5 +114,114 @@ notify:
 	}
 	if cfg.State.Path != filepath.Join(dir, "uniblue-state.json") {
 		t.Fatalf("expected relative state path resolved under config dir, got %q", cfg.State.Path)
+	}
+}
+
+// TestValidateDoesNotEchoWebhookURLSecret verifies that invalid notify.webhook_url
+// validation errors never print the raw webhook URL or embedded tokens.
+func TestValidateDoesNotEchoWebhookURLSecret(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name      string
+		rawURL    string
+		forbidden []string
+	}{
+		{
+			name:      "schemeless discord webhook",
+			rawURL:    "discord.com/api/webhooks/123456789/SUPER_SECRET_TOKEN_ABC",
+			forbidden: []string{"SUPER_SECRET_TOKEN_ABC", "123456789", "discord.com"},
+		},
+		{
+			name:      "unsupported scheme slack webhook",
+			rawURL:    "ftp://hooks.slack.com/services/T000/B000/SLACK_SECRET_XYZ",
+			forbidden: []string{"SLACK_SECRET_XYZ", "hooks.slack.com"},
+		},
+		{
+			name:      "userinfo secret with missing host",
+			rawURL:    "https://bot:MY_PASSWORD_999@",
+			forbidden: []string{"MY_PASSWORD_999"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name+".yaml")
+			content := "unifi:\n  url: https://192.0.2.1\n  api_key: k\nnotify:\n  webhook_url: " + tc.rawURL + "\n"
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("expected validation error for webhook_url %q", tc.rawURL)
+			}
+			msg := err.Error()
+			for _, secret := range tc.forbidden {
+				if strings.Contains(msg, secret) {
+					t.Fatalf("validation error leaked secret %q: %s", secret, msg)
+				}
+			}
+		})
+	}
+}
+
+// TestStatePathPreservesLegacyCWDBaselineOnUpgrade verifies that relative state
+// paths resolve next to config.yaml on fresh installs while preserving an
+// existing working-directory baseline file across upgrades.
+func TestStatePathPreservesLegacyCWDBaselineOnUpgrade(t *testing.T) {
+	cfgDir := t.TempDir()
+	workDir := t.TempDir()
+	cfgPath := filepath.Join(cfgDir, "config.yaml")
+	cfgYAML := "unifi:\n  url: https://192.0.2.1\n  api_key: k\n"
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(workDir)
+
+	// Fresh install: no state file in cfgDir or workDir -> resolve under cfgDir.
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load (fresh): %v", err)
+	}
+	wantCfgState := filepath.Join(cfgDir, "uniblue-state.json")
+	if cfg.State.Path != wantCfgState {
+		t.Fatalf("fresh install state.path = %q, want %q", cfg.State.Path, wantCfgState)
+	}
+
+	// Upgrade with legacy working-directory state file -> preserve workDir baseline
+	// even if config dir is read-only.
+	legacyState := filepath.Join(workDir, "uniblue-state.json")
+	if err := os.WriteFile(legacyState, []byte(`{"findings":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfgDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(cfgDir, 0o755) }()
+
+	cfgUpgrade, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load (upgrade): %v", err)
+	}
+	gotEval, _ := filepath.EvalSymlinks(cfgUpgrade.State.Path)
+	wantEval, _ := filepath.EvalSymlinks(legacyState)
+	if gotEval != wantEval {
+		t.Fatalf("upgrade state.path = %q (eval %q), want legacy CWD %q (eval %q)",
+			cfgUpgrade.State.Path, gotEval, legacyState, wantEval)
+	}
+
+	// Once a state file exists in cfgDir, cfgDir takes precedence.
+	if err := os.Chmod(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wantCfgState, []byte(`{"findings":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgMigrated, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load (migrated): %v", err)
+	}
+	if cfgMigrated.State.Path != wantCfgState {
+		t.Fatalf("migrated state.path = %q, want %q", cfgMigrated.State.Path, wantCfgState)
 	}
 }
