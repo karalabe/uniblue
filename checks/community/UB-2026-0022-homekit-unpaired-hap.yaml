@@ -8,6 +8,7 @@ id: UB-2026-0022
 title: Unpaired HomeKit HAP Accessory Advertised
 cve: null
 category: unauth-control
+claim: service-advertised
 severity: high
 safety: read-only
 

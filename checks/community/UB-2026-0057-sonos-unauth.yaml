@@ -5,9 +5,10 @@
 # license that can be found in the LICENSE file.
 
 id: UB-2026-0057
-title: Unauthenticated Sonos Speaker Diagnostics & UPnP Control
+title: Sonos Speaker Diagnostics Exposed (Port 1400)
 cve: null
 category: unauth-control
+claim: service-observed
 severity: medium
 safety: read-only
 

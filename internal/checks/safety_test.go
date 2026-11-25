@@ -217,3 +217,26 @@ func TestPropertyKeyedNervaDeduplicationPreservesIndependentFindings(t *testing.
 		t.Fatalf("expected smb-signing and tls-weak-key to survive dedup while suppressing smb-v1 and tls-10, got %+v", got)
 	}
 }
+
+// TestObserveAndDiagnosticsClaimLevels verifies that passive observe checks
+// (including HomeKit HAP pairing advertisements) and read-only diagnostics
+// checks (including Sonos /status/zp) never overclaim confirmed-permission.
+func TestObserveAndDiagnosticsClaimLevels(t *testing.T) {
+	all, err := LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatalf("LoadFromFS: %v", err)
+	}
+	byID := make(map[string]*Check, len(all))
+	for _, c := range all {
+		byID[c.ID] = c
+		if c.Probe.Type == "observe" && c.Claim == ClaimConfirmedPermission {
+			t.Fatalf("passive observe check %s (%s) must never claim confirmed-permission", c.ID, c.Title)
+		}
+	}
+	if hk := byID["UB-2026-0022"]; hk == nil || hk.Claim != ClaimServiceAdvertised {
+		t.Fatalf("expected UB-2026-0022 HomeKit HAP check to have claim=service-advertised, got %+v", hk)
+	}
+	if sonos := byID["UB-2026-0057"]; sonos == nil || sonos.Claim != ClaimServiceObserved {
+		t.Fatalf("expected UB-2026-0057 Sonos diagnostics check to have claim=service-observed, got %+v", sonos)
+	}
+}

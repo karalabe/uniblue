@@ -693,13 +693,18 @@ func inferDefaultClaim(c *Check) ClaimKind {
 	cat := strings.ToLower(strings.TrimSpace(c.Category))
 	pt := strings.ToLower(strings.TrimSpace(c.Probe.Type))
 	switch {
-	case cat == "service-inventory" || cat == "device-inventory":
-		if pt == "observe" {
-			if len(c.Preconditions.MDNSTypeAny) > 0 {
-				return ClaimServiceAdvertised
-			}
+	case pt == "observe":
+		// Passive observation checks never execute an active auth/permission
+		// transaction, so they establish advertisement or service visibility
+		// rather than confirmed control permission.
+		if len(c.Preconditions.MDNSTypeAny) > 0 || c.Preconditions.UPnPDeviceRegex != "" || c.Preconditions.UPnPServiceRegex != "" || c.Preconditions.WSTypeRegex != "" {
+			return ClaimServiceAdvertised
+		}
+		if cat == "device-inventory" {
 			return ClaimAssetIdentity
 		}
+		return ClaimServiceObserved
+	case cat == "service-inventory" || cat == "device-inventory":
 		return ClaimServiceObserved
 	case cat == "firewall-policy" || cat == "isolation-policy":
 		return ClaimConfiguredAccess
