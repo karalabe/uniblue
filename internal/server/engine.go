@@ -41,8 +41,13 @@ const (
 	// DHCP and bring up listening services before UniBlue probes them.
 	defaultJoinDebounce = 3 * time.Second
 
+	// defaultBootRetryDelay schedules one quiet follow-up probe for newly joined
+	// or replugged hosts that initially show zero open ports while still booting.
+	defaultBootRetryDelay = 15 * time.Second
+
 	// defaultLeaveGrace avoids flapping offline/online alerts when Wi-Fi clients
-	// briefly sleep or roam between APs.
+	// briefly sleep or roam between APs. Wired clients evict immediately on leave
+	// or physical switch port link-down.
 	defaultLeaveGrace = 60 * time.Second
 )
 
@@ -175,9 +180,18 @@ type missingClient struct {
 	since  time.Time
 }
 
+// hostScanTask describes a targeted single-host probe queued on client join,
+// physical port link-up, policy change, or manual UI rescan.
+type hostScanTask struct {
+	client       unifi.Client
+	retryOnEmpty bool
+	quietOnEmpty bool
+}
+
 // portLiveState captures the previous link and security configuration of a
 // single physical switch port so pollDelta can emit real-time link/config events.
 type portLiveState struct {
+	DeviceMAC     string
 	DeviceName    string
 	DeviceIP      string
 	PortIdx       int
@@ -229,7 +243,7 @@ type Engine struct {
 	current        StateSnapshot
 	activeScans    atomic.Int32
 	fullRescanCh   chan string
-	hostScanCh     chan unifi.Client
+	hostScanCh     chan hostScanTask
 	subMu          sync.Mutex
 	subscribers    map[chan LiveEvent]struct{}
 }
@@ -302,7 +316,7 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 		lastClasses:    make(map[string]classify.Result),
 		prevRiskState:  prevState,
 		fullRescanCh:   make(chan string, 1),
-		hostScanCh:     make(chan unifi.Client, 64),
+		hostScanCh:     make(chan hostScanTask, 64),
 		subscribers:    make(map[chan LiveEvent]struct{}),
 	}, nil
 }
@@ -334,14 +348,16 @@ func (e *Engine) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	initPorts := snapshotPortStates(snap, e.cfg.Network)
+	snap.Clients = filterOfflineWiredClients(snap.Clients, initPorts)
 	e.mu.Lock()
 	e.snap = snap
 	e.lastFwdSig = portForwardSignature(snap.PortForwards)
 	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
-	e.lastPorts = snapshotPortStates(snap, e.cfg.Network)
+	e.lastPorts = initPorts
 	e.anomalies.Seed(snap, e.lastPorts, time.Now().UTC())
 	e.mu.Unlock()
-	e.recomputeAndPublish(ctx, false)
+	e.recomputeAndPublish(ctx, false, nil)
 
 	// Start single-host live scan worker pool (bounded by 2 workers to stay gentle).
 	for range 2 {
@@ -417,7 +433,15 @@ func (e *Engine) TriggerHostRescan(ip string) bool {
 		return true
 	}
 	select {
-	case e.hostScanCh <- *target:
+	case e.hostScanCh <- hostScanTask{client: *target}:
+		e.emit(LiveEvent{
+			Type:      "host_scanning",
+			Severity:  "info",
+			Host:      target.DisplayName(),
+			IP:        target.IP,
+			SubjectID: hostEntityID(*target),
+			Summary:   fmt.Sprintf("Rescanning %s (%s)...", target.DisplayName(), target.IP),
+		})
 		return true
 	default:
 		return false
@@ -506,8 +530,8 @@ func (e *Engine) websocketLoop(ctx context.Context) {
 }
 
 // pollDelta fetches a fresh UniFi topology snapshot (no LAN probing) and reacts
-// immediately to newly appearing clients, IP/VLAN changes, departures, or
-// firewall/port-forward changes.
+// immediately to newly appearing clients, IP/VLAN changes, departures, physical
+// switch port link transitions, or firewall/port-forward changes.
 func (e *Engine) pollDelta(ctx context.Context) {
 	pollCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -520,8 +544,51 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
-	var toScan []unifi.Client
+	toScan := e.applySnapshotDelta(ctx, snap, time.Now().UTC())
+	// Debounce newly joined or replugged hosts briefly so DHCP & daemons finish starting before probing.
+	if len(toScan) > 0 {
+		go func(targets []hostScanTask) {
+			timer := time.NewTimer(defaultJoinDebounce)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			for _, task := range targets {
+				select {
+				case e.hostScanCh <- task:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(toScan)
+	}
+}
+
+// applySnapshotDelta diffs a newly fetched UniFi snapshot against the engine's
+// live state, evicting disconnected wired clients immediately on switch link-down
+// (even while UniFi still caches them), publishing the refreshed StateSnapshot
+// before broadcasting SSE events, and returning any hosts queued for rescanning.
+func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, now time.Time) []hostScanTask {
+	currPorts := snapshotPortStates(snap, e.cfg.Network)
+	snap.Clients = filterOfflineWiredClients(snap.Clients, currPorts)
+
+	var toScan []hostScanTask
+	queuedScan := make(map[string]struct{})
+	queueScan := func(cl unifi.Client, retryOnEmpty bool) {
+		if cl.IP == "" {
+			return
+		}
+		k := clientKey(cl)
+		if _, dup := queuedScan[k]; dup {
+			return
+		}
+		queuedScan[k] = struct{}{}
+		toScan = append(toScan, hostScanTask{client: cl, retryOnEmpty: retryOnEmpty})
+	}
+
+	var pendingEvents []LiveEvent
 	changed := false
 
 	e.mu.Lock()
@@ -538,7 +605,7 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		k := clientKey(cl)
 		seenNow[k] = struct{}{}
 
-		// Check whether the client was merely sleeping within the leave grace window.
+		// Check whether a Wi-Fi client was merely sleeping within the leave grace window.
 		prev, existed := prevClients[k]
 		if !existed {
 			if mc, wasMissing := e.missingClients[k]; wasMissing {
@@ -551,31 +618,39 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		switch {
 		case !existed:
 			changed = true
-			e.emitLocked(LiveEvent{
-				Type:     "client_joined",
-				Severity: "info",
-				Host:     cl.DisplayName(),
-				IP:       cl.IP,
-				Summary:  fmt.Sprintf("%s joined %s (%s)", cl.DisplayName(), fallbackVLAN(cl.NetworkName), cl.IP),
-			})
-			for _, aev := range e.anomalies.EvaluateClientJoinAnomalies(cl, now) {
-				e.emitLocked(aev)
-			}
+			summary := fmt.Sprintf("%s joined %s (waiting for IP)", cl.DisplayName(), fallbackVLAN(cl.NetworkName))
 			if cl.IP != "" {
-				toScan = append(toScan, cl)
+				summary = fmt.Sprintf("%s joined %s (%s); queuing security scan", cl.DisplayName(), fallbackVLAN(cl.NetworkName), cl.IP)
 			}
+			pendingEvents = append(pendingEvents, LiveEvent{
+				Type:      "client_joined",
+				Severity:  "info",
+				Host:      cl.DisplayName(),
+				IP:        cl.IP,
+				SubjectID: hostEntityID(cl),
+				Summary:   summary,
+			})
+			if e.anomalies != nil {
+				pendingEvents = append(pendingEvents, e.anomalies.EvaluateClientJoinAnomalies(cl, now)...)
+			}
+			queueScan(cl, true)
 		case prev.IP != cl.IP || prev.NetworkName != cl.NetworkName:
 			changed = true
-			e.emitLocked(LiveEvent{
-				Type:     "client_moved",
-				Severity: "medium",
-				Host:     cl.DisplayName(),
-				IP:       cl.IP,
-				Summary:  fmt.Sprintf("%s changed (%s/%s -> %s/%s)", cl.DisplayName(), prev.IP, fallbackVLAN(prev.NetworkName), cl.IP, fallbackVLAN(cl.NetworkName)),
-			})
+			delete(e.profilesByMAC, k)
+			delete(e.findingsByMAC, k)
+			summary := fmt.Sprintf("%s changed (%s/%s -> %s/%s)", cl.DisplayName(), prev.IP, fallbackVLAN(prev.NetworkName), cl.IP, fallbackVLAN(cl.NetworkName))
 			if cl.IP != "" {
-				toScan = append(toScan, cl)
+				summary += "; queuing security scan"
 			}
+			pendingEvents = append(pendingEvents, LiveEvent{
+				Type:      "client_moved",
+				Severity:  "medium",
+				Host:      cl.DisplayName(),
+				IP:        cl.IP,
+				SubjectID: hostEntityID(cl),
+				Summary:   summary,
+			})
+			queueScan(cl, true)
 		default:
 			// Update stored profile client metadata in case alias changed.
 			if hp, ok := e.profilesByMAC[k]; ok {
@@ -585,9 +660,25 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		}
 	}
 
-	// Track newly disappeared clients with a grace window so Wi-Fi sleep doesn't flap alerts.
+	// Evict wired clients immediately on disconnect (they do not Wi-Fi sleep);
+	// hold wireless clients briefly in missingClients to avoid sleep/roam flapping.
 	for k, prev := range prevClients {
 		if _, active := seenNow[k]; active {
+			continue
+		}
+		if prev.IsWired {
+			delete(e.missingClients, k)
+			delete(e.profilesByMAC, k)
+			delete(e.findingsByMAC, k)
+			changed = true
+			pendingEvents = append(pendingEvents, LiveEvent{
+				Type:      "client_left",
+				Severity:  "info",
+				Host:      prev.DisplayName(),
+				IP:        prev.IP,
+				SubjectID: hostEntityID(prev),
+				Summary:   fmt.Sprintf("%s left %s (%s)", prev.DisplayName(), fallbackVLAN(prev.NetworkName), prev.IP),
+			})
 			continue
 		}
 		if _, tracked := e.missingClients[k]; !tracked {
@@ -595,18 +686,20 @@ func (e *Engine) pollDelta(ctx context.Context) {
 		}
 	}
 
-	// Evict any client that has stayed absent past defaultLeaveGrace.
+	// Evict any wireless client that has stayed absent past defaultLeaveGrace.
 	for k, mc := range e.missingClients {
 		if now.Sub(mc.since) >= defaultLeaveGrace {
 			delete(e.missingClients, k)
 			delete(e.profilesByMAC, k)
+			delete(e.findingsByMAC, k)
 			changed = true
-			e.emitLocked(LiveEvent{
-				Type:     "client_left",
-				Severity: "info",
-				Host:     mc.client.DisplayName(),
-				IP:       mc.client.IP,
-				Summary:  fmt.Sprintf("%s left %s (%s)", mc.client.DisplayName(), fallbackVLAN(mc.client.NetworkName), mc.client.IP),
+			pendingEvents = append(pendingEvents, LiveEvent{
+				Type:      "client_left",
+				Severity:  "info",
+				Host:      mc.client.DisplayName(),
+				IP:        mc.client.IP,
+				SubjectID: hostEntityID(mc.client),
+				Summary:   fmt.Sprintf("%s left %s (%s)", mc.client.DisplayName(), fallbackVLAN(mc.client.NetworkName), mc.client.IP),
 			})
 		}
 	}
@@ -616,7 +709,7 @@ func (e *Engine) pollDelta(ctx context.Context) {
 	polSig := firewallPolicySignature(snap.FirewallPolicies)
 	if e.lastFwdSig != "" && fwdSig != e.lastFwdSig {
 		changed = true
-		e.emitLocked(LiveEvent{
+		pendingEvents = append(pendingEvents, LiveEvent{
 			Type:     "policy_changed",
 			Severity: "high",
 			Summary:  "WAN port-forwarding rules changed; re-evaluating exposure surface",
@@ -628,7 +721,7 @@ func (e *Engine) pollDelta(ctx context.Context) {
 			}
 			for _, cl := range snap.Clients {
 				if cl.IP == pf.FwdIP {
-					toScan = append(toScan, cl)
+					queueScan(cl, false)
 					break
 				}
 			}
@@ -636,7 +729,7 @@ func (e *Engine) pollDelta(ctx context.Context) {
 	}
 	if e.lastPolicySig != "" && polSig != e.lastPolicySig {
 		changed = true
-		e.emitLocked(LiveEvent{
+		pendingEvents = append(pendingEvents, LiveEvent{
 			Type:     "policy_changed",
 			Severity: "high",
 			Summary:  "UniFi firewall policies changed; re-auditing zone rules",
@@ -644,7 +737,6 @@ func (e *Engine) pollDelta(ctx context.Context) {
 	}
 
 	// Detect live physical switch port link & security configuration changes.
-	currPorts := snapshotPortStates(snap, e.cfg.Network)
 	if len(e.lastPorts) > 0 {
 		for pk, curr := range currPorts {
 			prev, existed := e.lastPorts[pk]
@@ -652,31 +744,62 @@ func (e *Engine) pollDelta(ctx context.Context) {
 				continue
 			}
 			isSensitive := curr.Zone == "external" || curr.Zone == "external_uplink" || curr.Zone == "unused"
+			pid := portEntityID(curr.DeviceMAC, curr.PortIdx)
 			if !prev.Up && curr.Up {
 				changed = true
 				sev := "info"
 				if isSensitive {
 					sev = "critical"
 				}
-				e.emitLocked(LiveEvent{
-					Type:     "port_link_up",
-					Severity: sev,
-					Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
-					IP:       curr.DeviceIP,
-					Summary:  fmt.Sprintf("Physical link UP on %s Port %d (%s, zone=%s, VLAN=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone, fallbackVLAN(curr.NativeVLAN)),
+				pendingEvents = append(pendingEvents, LiveEvent{
+					Type:      "port_link_up",
+					Severity:  sev,
+					Host:      fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
+					IP:        curr.DeviceIP,
+					SubjectID: pid,
+					Summary:   fmt.Sprintf("Physical link UP on %s Port %d (%s, zone=%s, VLAN=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone, fallbackVLAN(curr.NativeVLAN)),
 				})
+				// If a wired client on this access port was never evicted (e.g. a quick
+				// unplug/replug between polls), clear its stale profile/findings and
+				// queue a fresh scan so patched or swapped hardware is re-verified.
+				if isAccessPortZone(curr.Zone) {
+					for _, cl := range snap.Clients {
+						if !cl.IsWired || cl.SwitchMAC == "" || cl.SwitchPort <= 0 || cl.IP == "" {
+							continue
+						}
+						if portKey(cl.SwitchMAC, cl.SwitchPort) != pk {
+							continue
+						}
+						k := clientKey(cl)
+						if _, already := queuedScan[k]; already {
+							continue
+						}
+						delete(e.profilesByMAC, k)
+						delete(e.findingsByMAC, k)
+						pendingEvents = append(pendingEvents, LiveEvent{
+							Type:      "host_scanning",
+							Severity:  "info",
+							Host:      cl.DisplayName(),
+							IP:        cl.IP,
+							SubjectID: hostEntityID(cl),
+							Summary:   fmt.Sprintf("Cable reconnected on %s Port %d; queuing security scan for %s (%s)", curr.DeviceName, curr.PortIdx, cl.DisplayName(), cl.IP),
+						})
+						queueScan(cl, true)
+					}
+				}
 			} else if prev.Up && !curr.Up {
 				changed = true
 				sev := "info"
 				if curr.Zone == "external" || curr.Zone == "external_uplink" {
 					sev = "high"
 				}
-				e.emitLocked(LiveEvent{
-					Type:     "port_link_down",
-					Severity: sev,
-					Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
-					IP:       curr.DeviceIP,
-					Summary:  fmt.Sprintf("Physical link DOWN on %s Port %d (%s, zone=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone),
+				pendingEvents = append(pendingEvents, LiveEvent{
+					Type:      "port_link_down",
+					Severity:  sev,
+					Host:      fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
+					IP:        curr.DeviceIP,
+					SubjectID: pid,
+					Summary:   fmt.Sprintf("Physical link DOWN on %s Port %d (%s, zone=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone),
 				})
 			}
 			if prev.Enabled != curr.Enabled || prev.NativeVLAN != curr.NativeVLAN || prev.TaggedPolicy != curr.TaggedPolicy || prev.PortSecurity != curr.PortSecurity {
@@ -685,11 +808,12 @@ func (e *Engine) pollDelta(ctx context.Context) {
 				if isSensitive {
 					sev = "high"
 				}
-				e.emitLocked(LiveEvent{
-					Type:     "port_config_changed",
-					Severity: sev,
-					Host:     fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
-					IP:       curr.DeviceIP,
+				pendingEvents = append(pendingEvents, LiveEvent{
+					Type:      "port_config_changed",
+					Severity:  sev,
+					Host:      fmt.Sprintf("%s Port %d", curr.DeviceName, curr.PortIdx),
+					IP:        curr.DeviceIP,
+					SubjectID: pid,
 					Summary: fmt.Sprintf("Port config changed on %s Port %d (zone=%s): enabled=%v->%v, VLAN=%s->%s, tagged=%s->%s, mac_lock=%v->%v",
 						curr.DeviceName, curr.PortIdx, curr.Zone,
 						prev.Enabled, curr.Enabled,
@@ -704,17 +828,19 @@ func (e *Engine) pollDelta(ctx context.Context) {
 	// Evaluate physical-layer tamper anomalies (PoE drop cable swap, inline hub
 	// MAC surge, STP blocking), IoT upload spikes, and site security telemetry
 	// (IDS/IPS/Honeypot/Admin logs, Evil-Twin APs, VPN/WAN transitions, config drift).
-	for _, aev := range e.anomalies.EvaluatePortAnomalies(e.lastPorts, currPorts) {
-		changed = true
-		e.emitLocked(aev)
-	}
-	for _, aev := range e.anomalies.EvaluateIoTUploadSpikes(snap.Clients, e.lastClasses, now) {
-		changed = true
-		e.emitLocked(aev)
-	}
-	for _, aev := range e.anomalies.EvaluateSiteTelemetry(snap, snap.RecentLogs) {
-		changed = true
-		e.emitLocked(aev)
+	if e.anomalies != nil {
+		for _, aev := range e.anomalies.EvaluatePortAnomalies(e.lastPorts, currPorts) {
+			changed = true
+			pendingEvents = append(pendingEvents, aev)
+		}
+		for _, aev := range e.anomalies.EvaluateIoTUploadSpikes(snap.Clients, e.lastClasses, now) {
+			changed = true
+			pendingEvents = append(pendingEvents, aev)
+		}
+		for _, aev := range e.anomalies.EvaluateSiteTelemetry(snap, snap.RecentLogs) {
+			changed = true
+			pendingEvents = append(pendingEvents, aev)
+		}
 	}
 
 	e.snap = snap
@@ -724,46 +850,35 @@ func (e *Engine) pollDelta(ctx context.Context) {
 	e.mu.Unlock()
 
 	if changed {
-		e.recomputeAndPublish(ctx, false)
+		e.recomputeAndPublish(ctx, false, pendingEvents)
+	} else if len(pendingEvents) > 0 {
+		e.mu.Lock()
+		for _, ev := range pendingEvents {
+			e.emitLocked(ev)
+		}
+		e.mu.Unlock()
 	}
 
-	// Debounce newly joined hosts briefly so DHCP & daemons finish starting before probing.
-	if len(toScan) > 0 {
-		go func(targets []unifi.Client) {
-			timer := time.NewTimer(defaultJoinDebounce)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
-			for _, cl := range targets {
-				select {
-				case e.hostScanCh <- cl:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(toScan)
-	}
+	return toScan
 }
 
 // hostScanWorker processes targeted single-host live probes queued when a
-// client joins, changes IP/VLAN, or is rescanned manually from the UI.
+// client joins, reconnects on a switch port, changes IP/VLAN, or is rescanned manually.
 func (e *Engine) hostScanWorker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case cl := <-e.hostScanCh:
-			e.scanSingleHost(ctx, cl)
+		case task := <-e.hostScanCh:
+			e.scanSingleHost(ctx, task)
 		}
 	}
 }
 
 // scanSingleHost runs gentle port probing + Nerva + YAML checks against a single
 // host and updates the live state snapshot immediately.
-func (e *Engine) scanSingleHost(ctx context.Context, cl unifi.Client) {
+func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
+	cl := task.client
 	if cl.IP == "" {
 		return
 	}
@@ -790,12 +905,26 @@ func (e *Engine) scanSingleHost(ctx context.Context, cl unifi.Client) {
 	runner := checks.NewRunner(e.checkList, 1)
 	hostCheckFindings := runner.RunHost(ctx, enrichedSingle[0])
 
+	k := clientKey(cl)
 	e.mu.Lock()
-	e.profilesByMAC[clientKey(cl)] = hp
-	e.findingsByMAC[clientKey(cl)] = hostCheckFindings
+	stillActive := false
+	if e.snap != nil {
+		for _, cur := range e.snap.Clients {
+			if clientKey(cur) == k {
+				stillActive = true
+				break
+			}
+		}
+	}
+	if !stillActive {
+		e.mu.Unlock()
+		return
+	}
+	e.profilesByMAC[k] = hp
+	e.findingsByMAC[k] = hostCheckFindings
 	e.mu.Unlock()
 
-	e.recomputeAndPublish(ctx, false)
+	e.recomputeAndPublish(ctx, false, nil)
 
 	// Emit a crisp scan-result event using the freshly evaluated findings
 	// (avoids issuing duplicate check probes against the host).
@@ -810,20 +939,57 @@ func (e *Engine) scanSingleHost(ctx context.Context, cl unifi.Client) {
 			}
 		}
 	}
-	sev := "info"
-	summary := fmt.Sprintf("Scanned %s (%s): %d open port(s), clean", cl.DisplayName(), cl.IP, len(hp.OpenPorts))
-	if hostFindings > 0 {
-		sev = maxSev.String()
-		summary = fmt.Sprintf("Scanned %s (%s): %d open port(s), %d exposure(s) detected!",
-			cl.DisplayName(), cl.IP, len(hp.OpenPorts), hostFindings)
+	if !task.quietOnEmpty || len(hp.OpenPorts) > 0 || hostFindings > 0 {
+		sev := "info"
+		summary := fmt.Sprintf("Scanned %s (%s): %d open port(s), clean", cl.DisplayName(), cl.IP, len(hp.OpenPorts))
+		if hostFindings > 0 {
+			sev = maxSev.String()
+			summary = fmt.Sprintf("Scanned %s (%s): %d open port(s), %d exposure(s) detected!",
+				cl.DisplayName(), cl.IP, len(hp.OpenPorts), hostFindings)
+		}
+		e.emit(LiveEvent{
+			Type:      "host_scanned",
+			Severity:  sev,
+			Host:      cl.DisplayName(),
+			IP:        cl.IP,
+			SubjectID: hostEntityID(cl),
+			Summary:   summary,
+		})
 	}
-	e.emit(LiveEvent{
-		Type:     "host_scanned",
-		Severity: sev,
-		Host:     cl.DisplayName(),
-		IP:       cl.IP,
-		Summary:  summary,
-	})
+
+	// Slow-booting embedded or PoE devices often bring up Ethernet link seconds
+	// before their application daemons listen. Schedule one quiet follow-up probe
+	// when a newly joined or replugged host initially reports zero open ports.
+	if task.retryOnEmpty && len(hp.OpenPorts) == 0 && hostFindings == 0 {
+		go func(target unifi.Client) {
+			timer := time.NewTimer(defaultBootRetryDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			e.mu.RLock()
+			active := false
+			if e.snap != nil {
+				for _, cur := range e.snap.Clients {
+					if clientKey(cur) == clientKey(target) && cur.IP == target.IP {
+						active = true
+						target = cur
+						break
+					}
+				}
+			}
+			e.mu.RUnlock()
+			if !active {
+				return
+			}
+			select {
+			case e.hostScanCh <- hostScanTask{client: target, quietOnEmpty: true}:
+			case <-ctx.Done():
+			}
+		}(cl)
+	}
 }
 
 // runFullScan executes a complete UniFi snapshot + uniform LAN probe sweep and
@@ -837,6 +1003,8 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	if err != nil {
 		return err
 	}
+	currPorts := snapshotPortStates(snap, e.cfg.Network)
+	snap.Clients = filterOfflineWiredClients(snap.Clients, currPorts)
 
 	fp := probe.NewFingerprinter(e.scanPorts, e.cfg.Scan.Concurrency, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
@@ -862,7 +1030,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	e.snap = snap
 	e.lastFwdSig = portForwardSignature(snap.PortForwards)
 	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
-	e.lastPorts = snapshotPortStates(snap, e.cfg.Network)
+	e.lastPorts = currPorts
 	e.profilesByMAC = make(map[string]probe.HostProfile, len(profiles))
 	for _, hp := range profiles {
 		e.profilesByMAC[clientKey(hp.Client)] = hp
@@ -871,7 +1039,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	e.missingClients = make(map[string]missingClient)
 	e.mu.Unlock()
 
-	e.recomputeAndPublish(ctx, true)
+	e.recomputeAndPublish(ctx, true, nil)
 
 	snapView := e.Snapshot()
 	e.emit(LiveEvent{
@@ -885,8 +1053,10 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 
 // recomputeAndPublish runs checks, blast-radius risk evaluation, CVE rollup,
 // topology construction, and webhook diffing against the current in-memory
-// snapshot and host profiles.
-func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
+// snapshot and host profiles. Any extraEvents (and newly detected findings) are
+// broadcast over SSE only after e.current is atomically updated so UI clients
+// immediately fetch the fresh snapshot.
+func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extraEvents []LiveEvent) {
 	e.mu.RLock()
 	snapPtr := e.snap
 	if snapPtr == nil {
@@ -941,7 +1111,12 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 		}
 	}
 
-	classes := e.classifier.ClassifyAll(snap, profiles)
+	var classes map[string]classify.Result
+	if e.classifier != nil {
+		classes = e.classifier.ClassifyAll(snap, profiles)
+	} else {
+		classes = make(map[string]classify.Result)
+	}
 	topoModel := topology.Build(snap, classes, e.cfg.Network)
 
 	// Build enriched per-client views for the dashboard.
@@ -993,18 +1168,20 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 	})
 
 	// Diff against previous baseline for webhook alerting and live finding events.
+	postEvents := append([]LiveEvent(nil), extraEvents...)
 	diff := risk.ComputeDiff(prevRisk, snap, report, e.cfg.Network)
 	if prevRisk != nil {
 		for _, nf := range diff.NewFindings {
-			e.emit(LiveEvent{
-				Type:     "finding_new",
-				Severity: nf.EffectiveSeverity.String(),
-				Host:     nf.Client.DisplayName(),
-				IP:       nf.Client.IP,
-				Summary:  fmt.Sprintf("New [%s] %s: %s", strings.ToUpper(nf.EffectiveSeverity.String()), nf.CheckID, nf.Title),
+			postEvents = append(postEvents, LiveEvent{
+				Type:      "finding_new",
+				Severity:  nf.EffectiveSeverity.String(),
+				Host:      nf.Client.DisplayName(),
+				IP:        nf.Client.IP,
+				SubjectID: hostEntityID(nf.Client),
+				Summary:   fmt.Sprintf("New [%s] %s: %s", strings.ToUpper(nf.EffectiveSeverity.String()), nf.CheckID, nf.Title),
 			})
 		}
-		if diff.HasAlerts(e.minNotify) {
+		if diff.HasAlerts(e.minNotify) && e.notifier != nil {
 			if err := e.notifier.Send(ctx, snap.Site, diff); err != nil {
 				e.logger.Error("webhook notification failed", "err", err)
 			}
@@ -1012,7 +1189,9 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 	}
 
 	nextState := risk.BuildState(snap, report, e.cfg.Network)
-	_ = risk.SaveState(e.cfg.State.Path, nextState)
+	if e.cfg != nil && e.cfg.State.Path != "" {
+		_ = risk.SaveState(e.cfg.State.Path, nextState)
+	}
 	viewModel := BuildPresentationModel(snap, report, topoModel, clientViews, exactCVEs, potentialCVEs, profiles)
 
 	now := time.Now().UTC()
@@ -1040,6 +1219,9 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool) {
 		Clients:        clientViews,
 		Events:         eventsCopy,
 		View:           viewModel,
+	}
+	for _, ev := range postEvents {
+		e.emitLocked(ev)
 	}
 	e.mu.Unlock()
 }
@@ -1147,13 +1329,47 @@ func firewallPolicySignature(pols []unifi.FirewallPolicy) string {
 	return strings.Join(parts, ";")
 }
 
+func portKey(mac string, portIdx int) string {
+	return fmt.Sprintf("%s|%d", strings.ToLower(strings.TrimSpace(mac)), portIdx)
+}
+
+func isAccessPortZone(zone string) bool {
+	switch strings.ToLower(strings.TrimSpace(zone)) {
+	case "wan", "uplink", "external_uplink":
+		return false
+	default:
+		return true
+	}
+}
+
+// filterOfflineWiredClients removes wired clients whose physical switch access
+// port currently reports link DOWN. UniFi often keeps unplugged wired clients in
+// its active client list for several minutes after the Ethernet cable is pulled.
+func filterOfflineWiredClients(clients []unifi.Client, ports map[string]portLiveState) []unifi.Client {
+	if len(clients) == 0 || len(ports) == 0 {
+		return clients
+	}
+	out := make([]unifi.Client, 0, len(clients))
+	for _, cl := range clients {
+		if cl.IsWired && cl.SwitchMAC != "" && cl.SwitchPort > 0 {
+			if p, known := ports[portKey(cl.SwitchMAC, cl.SwitchPort)]; known && !p.Up && isAccessPortZone(p.Zone) {
+				continue
+			}
+		}
+		out = append(out, cl)
+	}
+	return out
+}
+
 func snapshotPortStates(snap *unifi.Snapshot, netCfg config.NetworkConfig) map[string]portLiveState {
 	views, _, _ := risk.AnalyzeSwitchPorts(snap, netCfg, nil, nil)
 	out := make(map[string]portLiveState)
 	for _, sw := range views {
+		swMAC := strings.ToLower(strings.TrimSpace(sw.MAC))
 		for _, p := range sw.Ports {
-			key := fmt.Sprintf("%s|%d", sw.MAC, p.PortIdx)
+			key := portKey(swMAC, p.PortIdx)
 			out[key] = portLiveState{
+				DeviceMAC:     swMAC,
 				DeviceName:    sw.Name,
 				DeviceIP:      sw.IP,
 				PortIdx:       p.PortIdx,

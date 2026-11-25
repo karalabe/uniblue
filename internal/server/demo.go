@@ -120,7 +120,7 @@ func NewDemoEngine(opts Options) (*Engine, error) {
 		findingsByMAC: make(map[string][]checks.Finding),
 		events:        events,
 		fullRescanCh:  make(chan string, 1),
-		hostScanCh:    make(chan unifi.Client, 8),
+		hostScanCh:    make(chan hostScanTask, 8),
 		subscribers:   make(map[chan LiveEvent]struct{}),
 		current: StateSnapshot{
 			StartedAt:      now.Add(-4 * time.Minute),

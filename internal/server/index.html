@@ -934,6 +934,57 @@
   }
   footer a { color: var(--text-2); text-decoration: none; font-weight: 600; }
   footer a:hover { color: var(--blue); text-decoration: underline; }
+
+  /* Live toast notifications */
+  .toast-stack {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 44;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 380px;
+    width: calc(100vw - 40px);
+    pointer-events: none;
+  }
+  .toast {
+    pointer-events: auto;
+    display: flex;
+    align-items: flex-start;
+    gap: 11px;
+    padding: 12px 14px;
+    border-radius: 13px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--blue);
+    box-shadow: var(--shadow-lg);
+    cursor: pointer;
+    animation: toastIn .18s cubic-bezier(.16, 1, .3, 1);
+  }
+  .toast.crit { border-left-color: var(--crit-solid); }
+  .toast.warn { border-left-color: var(--warn-solid); }
+  .toast.ok { border-left-color: var(--ok-solid); }
+  .toast.blue { border-left-color: var(--blue); }
+  .toast.neutral { border-left-color: var(--border-strong); }
+  .toast-body { flex: 1; min-width: 0; }
+  .toast-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
+  .toast-msg { font-size: 13px; color: var(--text); line-height: 1.4; word-break: break-word; }
+  .toast-x {
+    background: transparent;
+    border: 0;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    font-size: 13px;
+    line-height: 1;
+    border-radius: 6px;
+  }
+  .toast-x:hover { color: var(--text); background: var(--surface-2); }
+  @keyframes toastIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
 </style>
 </head>
 <body>
@@ -991,6 +1042,8 @@
   </div>
   <div id="drawer-body" class="drawer-body"></div>
 </aside>
+
+<div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
 <footer>
   <div class="ft-inner" id="app-footer">
@@ -1374,12 +1427,14 @@ function humanEventType(t) {
   if (l.includes("honeypot")) return { label: "Intruder trap", tone: "crit" };
   if (l.includes("evil")) return { label: "Fake Wi-Fi", tone: "crit" };
   if (l.includes("tamper")) return { label: "Cable swapped", tone: "crit" };
-  if (l.includes("port_down")) return { label: "Cable unplugged", tone: "warn" };
-  if (l.includes("port_up")) return { label: "Cable plugged in", tone: "blue" };
+  if (l.includes("port_link_down") || l.includes("port_down")) return { label: "Cable unplugged", tone: "warn" };
+  if (l.includes("port_link_up") || l.includes("port_up")) return { label: "Cable plugged in", tone: "blue" };
   if (l.startsWith("port_")) return { label: "Cable change", tone: "neutral" };
   if (l.includes("admin")) return { label: "Admin login", tone: "blue" };
   if (l.includes("client_joined")) return { label: "Device joined", tone: "ok" };
+  if (l.includes("client_moved")) return { label: "Device moved", tone: "warn" };
   if (l.includes("client_left")) return { label: "Device left", tone: "neutral" };
+  if (l.includes("host_scanning")) return { label: "Rescanning", tone: "blue" };
   if (l.includes("host_scanned")) return { label: "Device checked", tone: "neutral" };
   if (l.includes("vpn")) return { label: "Remote VPN", tone: "blue" };
   if (l.includes("finding")) return { label: "New alert", tone: "warn" };
@@ -2410,7 +2465,7 @@ function renderActivity() {
     const t = ev.type.toLowerCase();
     if (activityFilter === "threats") return t.includes("threat") || t.includes("honeypot") || t.includes("evil") || t.includes("tamper") || t.includes("surge") || t.includes("spike") || t.includes("finding");
     if (activityFilter === "ports") return t.startsWith("port_");
-    if (activityFilter === "clients") return t.startsWith("client_") || t.startsWith("vpn_") || t.includes("host_scanned");
+    if (activityFilter === "clients") return t.startsWith("client_") || t.startsWith("vpn_") || t.includes("host_scan");
     if (activityFilter === "admin") return t.includes("admin") || t.includes("policy") || t.includes("config") || t.includes("wan_");
     return true;
   });
@@ -2845,10 +2900,72 @@ async function triggerRescan(ip) {
   setTimeout(fetchState, 600);
 }
 
+function resolveEventSubject(ev) {
+  const ents = state?.view?.entities || {};
+  if (ev.subject_id && ents[ev.subject_id]) return ev.subject_id;
+  if (ev.ip) {
+    for (const e of Object.values(ents)) {
+      if (e.ip === ev.ip && (e.kind === "host" || e.kind === "device")) return e.id;
+    }
+  }
+  return "";
+}
+
+function showToast(ev) {
+  if (!ev || !ev.summary) return;
+  const t = (ev.type || "").toLowerCase();
+  if (t === "startup") return;
+  const stack = document.getElementById("toast-stack");
+  if (!stack) return;
+
+  const info = humanEventType(ev.type);
+  const sev = (ev.severity || "info").toLowerCase();
+  let tone = info.tone;
+  if (sev === "critical") tone = "crit";
+  else if (sev === "high" || sev === "medium") tone = "warn";
+
+  const el = document.createElement("div");
+  el.className = "toast " + tone;
+  el.innerHTML = `
+    <div class="toast-body">
+      <div class="toast-hd">
+        <span class="tag ${tone}">${esc(info.label)}</span>
+        <span class="small">${esc(fmtTime(ev.time))}</span>
+      </div>
+      <div class="toast-msg">${esc(ev.summary)}</div>
+    </div>
+    <button class="toast-x" type="button" title="Dismiss">✕</button>`;
+
+  const dismiss = () => { if (el.parentNode) el.parentNode.removeChild(el); };
+  el.querySelector(".toast-x").addEventListener("click", (e) => {
+    e.stopPropagation();
+    dismiss();
+  });
+  el.addEventListener("click", () => {
+    const sid = resolveEventSubject(ev);
+    dismiss();
+    if (sid) openEntity(sid);
+    else switchTab("activity");
+  });
+
+  stack.prepend(el);
+  while (stack.children.length > 4) {
+    stack.removeChild(stack.lastElementChild);
+  }
+  const ttl = (tone === "crit" || tone === "warn") ? 10000 : 6000;
+  setTimeout(dismiss, ttl);
+}
+
 function connectSSE() {
   if (isStaticMode) return;
   const es = new EventSource("/api/events");
-  es.addEventListener("uniblue", () => fetchState());
+  es.addEventListener("uniblue", (msg) => {
+    let ev = null;
+    try { ev = JSON.parse(msg.data); } catch (_) {}
+    fetchState().then(() => {
+      if (ev) showToast(ev);
+    });
+  });
   es.onerror = () => { document.getElementById("status-lbl").textContent = "Reconnecting…"; };
   es.onopen = () => fetchState();
 }
