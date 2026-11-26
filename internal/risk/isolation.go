@@ -9,6 +9,7 @@ package risk
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 
@@ -169,13 +170,14 @@ func EvaluateIsolation(
 		if isManagementNetwork(n, intent) {
 			continue
 		}
-		if isNetworkInSet(n.Name, isolatedSet) || isGuestNetwork(n, intent) || isCameraNetwork(n, intent) ||
-			(intendedIsoZones[z] && !isNetworkInSet(n.Name, trustedSet)) {
+		vlan := unifi.Client{NetworkName: n.Name, VLAN: n.VLAN}
+		if matchesVLAN(vlan, isolatedSet) || isGuestNetwork(n, intent) || isCameraNetwork(n, intent) ||
+			(intendedIsoZones[z] && !matchesVLAN(vlan, trustedSet)) {
 			untrustedNets = append(untrustedNets, n)
 			if !targeted {
 				containmentNets = append(containmentNets, n)
 			}
-		} else if isNetworkInSet(n.Name, trustedSet) {
+		} else if matchesVLAN(vlan, trustedSet) {
 			trustedNets = append(trustedNets, n)
 		}
 	}
@@ -2737,25 +2739,14 @@ func (o *Oracle) evaluateBoundary(
 	if viol, ok := evalOne("tcp", 443, 49152, srcIPSample, fixedSrcMAC, baseDstIP("tcp", 443), fixedDstMAC, false); ok {
 		return viol
 	}
-	isGatewayOnly := strings.EqualFold(srcZone, "External") || strings.EqualFold(dstZone, "External") || strings.EqualFold(dstZone, "Gateway")
-	if !isGatewayOnly && (srcNet.RouterUnresolved || dstNet.RouterUnresolved) {
-		return firstCell
-	}
-	l3SwitchMAC := ""
-	if !isGatewayOnly {
-		l3SwitchMAC = firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC)
-	}
-	if !o.gwPoliciesAvailable && l3SwitchMAC == "" {
+	path := routingOwners(srcNet, dstNet, srcZone, dstZone)
+	useGateway := slices.Contains(path, gatewayOwner) && o.gwPoliciesAvailable && strings.TrimSpace(srcZone) != "" && strings.TrimSpace(dstZone) != ""
+	useSwitch := len(path) > 0 && path[0] != gatewayOwner && o.switchACLStatus == "complete"
+	if !useGateway && !useSwitch {
 		return firstCell
 	}
 	if viol, ok := evalOne("udp", 53, 49152, srcIPSample, fixedSrcMAC, baseDstIP("udp", 53), fixedDstMAC, true); ok {
 		return viol
-	}
-	if l3SwitchMAC != "" && o.switchACLStatus != "complete" {
-		return firstCell
-	}
-	if l3SwitchMAC == "" && (strings.TrimSpace(srcZone) == "" || strings.TrimSpace(dstZone) == "") {
-		return firstCell
 	}
 
 	// Partition on every named selector, including blocks. All remaining IP
@@ -2778,14 +2769,15 @@ func (o *Oracle) evaluateBoundary(
 	}
 
 	var sortedACLs []unifi.SwitchACL
-	if l3SwitchMAC != "" {
+	if useSwitch {
 		sortedACLs = o.sortedACLs
 		for _, acl := range sortedACLs {
-			if acl.Enabled && matchesIPFamily(acl.IPVersion, fam) {
+			if acl.Enabled && matchesIPFamily(acl.IPVersion, fam) && path.includesACL(acl.DeviceMACs) {
 				addProto(acl.Protocol)
 			}
 		}
-	} else {
+	}
+	if useGateway {
 		for _, pol := range o.sortedPolicies {
 			if pol.Enabled && matchesIPFamily(pol.IPVersion, fam) {
 				addProto(pol.Protocol)
@@ -2816,7 +2808,7 @@ func (o *Oracle) evaluateBoundary(
 	prefDst, _ := netip.ParseAddr(strings.TrimSpace(dstIPSample))
 	prefDst = prefDst.Unmap()
 
-	defaultAllows := l3SwitchMAC != "" ||
+	defaultAllows := useSwitch ||
 		strings.EqualFold(strings.TrimSpace(srcZone), strings.TrimSpace(dstZone)) ||
 		strings.EqualFold(strings.TrimSpace(srcZone), "internal")
 
@@ -2887,7 +2879,11 @@ func (o *Oracle) evaluateBoundary(
 			if indeterminate {
 				allow = true
 			}
-			if !allow {
+			switch {
+			case len(path) > 1:
+				// Rules on distinct enforcers cannot shadow one another; collect
+				// every selector and evaluate their joint partitions below.
+			case !allow:
 				// Record unconditional whole-network BLOCK port intervals so
 				// strictly later shadowed ALLOW rules skip already-blocked port
 				// ranges without quadratic scanning, unless an earlier rule was
@@ -2908,7 +2904,7 @@ func (o *Oracle) evaluateBoundary(
 					}
 					sawIndeterminateRule = true
 				}
-			} else {
+			default:
 				mergePending()
 				// Skip an ALLOW rule completely shadowed on every port by
 				// earlier unconditional whole-network BLOCK rules.
@@ -2960,34 +2956,32 @@ func (o *Oracle) evaluateBoundary(
 			}
 		}
 
-		if l3SwitchMAC != "" {
-			swLower := strings.ToLower(strings.TrimSpace(l3SwitchMAC))
-			for _, acl := range sortedACLs {
-				if !acl.Enabled || !matchesIPFamily(acl.IPVersion, fam) || !matchesProtocol(acl.Protocol, pr) {
-					continue
-				}
-				if len(acl.DeviceMACs) > 0 && !containsFold(acl.DeviceMACs, swLower) {
-					continue
-				}
-				if len(acl.NetworkIDs) > 0 {
-					netHit := (srcNet.ID != "" && containsFold(acl.NetworkIDs, srcNet.ID)) ||
-						(srcNet.Name != "" && containsFold(acl.NetworkIDs, srcNet.Name)) ||
-						(dstNet.ID != "" && containsFold(acl.NetworkIDs, dstNet.ID)) ||
-						(dstNet.Name != "" && containsFold(acl.NetworkIDs, dstNet.Name))
-					if !netHit {
-						continue
-					}
-				}
-				if acl.Source.ZoneName != "" && !strings.EqualFold(acl.Source.ZoneName, srcZone) {
-					continue
-				}
-				if acl.Destination.ZoneName != "" && !strings.EqualFold(acl.Destination.ZoneName, dstZone) {
-					continue
-				}
-				indet := acl.Source.UnsupportedSelector != "" || acl.Destination.UnsupportedSelector != ""
-				recordRuleEndpoints(strings.EqualFold(acl.Action, "ALLOW"), acl.Source, acl.Destination, indet)
+		for _, acl := range sortedACLs {
+			if !acl.Enabled || !matchesIPFamily(acl.IPVersion, fam) || !matchesProtocol(acl.Protocol, pr) {
+				continue
 			}
-		} else {
+			if !path.includesACL(acl.DeviceMACs) {
+				continue
+			}
+			if len(acl.NetworkIDs) > 0 {
+				netHit := (srcNet.ID != "" && containsFold(acl.NetworkIDs, srcNet.ID)) ||
+					(srcNet.Name != "" && containsFold(acl.NetworkIDs, srcNet.Name)) ||
+					(dstNet.ID != "" && containsFold(acl.NetworkIDs, dstNet.ID)) ||
+					(dstNet.Name != "" && containsFold(acl.NetworkIDs, dstNet.Name))
+				if !netHit {
+					continue
+				}
+			}
+			if acl.Source.ZoneName != "" && !strings.EqualFold(acl.Source.ZoneName, srcZone) {
+				continue
+			}
+			if acl.Destination.ZoneName != "" && !strings.EqualFold(acl.Destination.ZoneName, dstZone) {
+				continue
+			}
+			indet := acl.Source.UnsupportedSelector != "" || acl.Destination.UnsupportedSelector != ""
+			recordRuleEndpoints(strings.EqualFold(acl.Action, "ALLOW"), acl.Source, acl.Destination, indet)
+		}
+		if useGateway {
 			deferBlocks = true
 			for i := 0; i < len(o.sortedPolicies); {
 				idx := o.sortedPolicies[i].Index
@@ -3020,7 +3014,7 @@ func (o *Oracle) evaluateBoundary(
 		}
 
 		mergePending()
-		if defaultAllows && (sawIndeterminateRule || !isFullPortBlock(uncondBlockedMerged)) {
+		if len(path) > 1 || (defaultAllows && (sawIndeterminateRule || !isFullPortBlock(uncondBlockedMerged))) {
 			anyEP := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
 			var priorCopy []portInterval
 			if !sawIndeterminateRule && len(uncondBlockedMerged) > 0 {

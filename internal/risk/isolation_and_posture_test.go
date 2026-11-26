@@ -434,7 +434,7 @@ func TestTransitProbeUnrestrictedNegatedAndExcludedCases(t *testing.T) {
 				},
 			},
 			SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
-			Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+			Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true, SwitchACLsAvailable: true},
 		}
 		mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{TrustedVLANs: []string{"LAN"}, IsolatedVLANs: []string{"IoT"}})
 		cell := findTransitCell(t, mat, "ipv4")
@@ -494,8 +494,8 @@ func TestIsolatedZonePinholesAndLeakingCustomZones(t *testing.T) {
 		raw := []checks.Finding{{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: snap.Clients[0], Port: 23}}
 		rep := Evaluate(snap, raw, config.NetworkConfig{})
 		for _, f := range rep.Findings {
-			if f.CheckID == "UB-0001" && f.EffectiveSeverity != checks.SeverityMedium {
-				t.Fatalf("expected isolated IoT finding to downgrade High->Medium, got %v (%+v)", f.EffectiveSeverity, f.RiskReasons)
+			if f.CheckID == "UB-0001" && f.EffectiveSeverity != checks.SeverityHigh {
+				t.Fatalf("expected IoT finding with a LAN pinhole to retain high severity, got %v (%+v)", f.EffectiveSeverity, f.RiskReasons)
 			}
 		}
 		// New IoT device must NOT trigger NewTrustedClients alert.

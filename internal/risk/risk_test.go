@@ -18,7 +18,7 @@ import (
 )
 
 // TestEvaluateBlastRadiusScoring verifies severity escalation on trusted VLANs,
-// de-escalation on isolated VLANs, and Critical promotion on WAN port forwards.
+// base severity on an unverified VLAN, and Critical promotion on WAN port forwards.
 func TestEvaluateBlastRadiusScoring(t *testing.T) {
 	netCfg := config.NetworkConfig{
 		TrustedVLANs:  []string{"Default"},
@@ -53,9 +53,9 @@ func TestEvaluateBlastRadiusScoring(t *testing.T) {
 	if got["UB-0003|aa:01|502"] != checks.SeverityCritical {
 		t.Fatalf("trusted VLAN finding = %v, want critical", got["UB-0003|aa:01|502"])
 	}
-	// Isolated VLAN lowers high -> medium.
-	if got["UB-0003|aa:02|502"] != checks.SeverityMedium {
-		t.Fatalf("isolated VLAN finding = %v, want medium", got["UB-0003|aa:02|502"])
+	// A configured VLAN name supplies no containment evidence.
+	if got["UB-0003|aa:02|502"] != checks.SeverityHigh {
+		t.Fatalf("unverified VLAN finding = %v, want high", got["UB-0003|aa:02|502"])
 	}
 	// WAN port forward forces medium -> critical even on IoT VLAN.
 	if got["UB-0004|aa:03|554"] != checks.SeverityCritical {
@@ -218,11 +218,11 @@ func TestStructuralZoneIsolationAndFlatTopology(t *testing.T) {
 	if got["UB-0001|aa:01|23"] != checks.SeverityCritical {
 		t.Fatalf("expected Internal-zone VLAN to bump high->critical, got %v", got["UB-0001|aa:01|23"])
 	}
-	if got["UB-0001|aa:02|23"] != checks.SeverityMedium {
-		t.Fatalf("expected Hotspot-zone VLAN to lower high->medium, got %v", got["UB-0001|aa:02|23"])
+	if got["UB-0001|aa:02|23"] != checks.SeverityHigh {
+		t.Fatalf("expected Hotspot VLAN with unverified peers to retain high severity, got %v", got["UB-0001|aa:02|23"])
 	}
-	if got["UB-0001|aa:03|23"] != checks.SeverityMedium {
-		t.Fatalf("expected custom policy-blocked zone to lower high->medium, got %v", got["UB-0001|aa:03|23"])
+	if got["UB-0001|aa:03|23"] != checks.SeverityHigh {
+		t.Fatalf("expected policy-blocked zone with unverified peers to retain high severity, got %v", got["UB-0001|aa:03|23"])
 	}
 
 	// Flat network (no isolated VLANs at all) should emit a flat-topology posture note.
@@ -517,8 +517,8 @@ func TestIsolatedZoneSetThoroughBoundaryChecks(t *testing.T) {
 		raw := []checks.Finding{{CheckID: "UB-0001", BaseSeverity: checks.SeverityHigh, Client: client, Port: 23}}
 		rep := Evaluate(snap, raw, config.NetworkConfig{})
 		for _, f := range rep.Findings {
-			if f.CheckID == "UB-0001" && f.EffectiveSeverity != checks.SeverityMedium {
-				t.Fatalf("expected isolated IoTZone finding to downgrade High->Medium, got %v", f.EffectiveSeverity)
+			if f.CheckID == "UB-0001" && f.EffectiveSeverity != checks.SeverityHigh {
+				t.Fatalf("expected IoTZone finding with a LAN pinhole to retain high severity, got %v", f.EffectiveSeverity)
 			}
 		}
 	})
@@ -619,13 +619,12 @@ func TestLegacyThreePartStateKeyMigration(t *testing.T) {
 	newKey := "NERVA-SMB-V1-ENABLED|aa:bb:cc:dd:ee:30|445|smb-v1"
 	prev := &State{
 		UpdatedAt:      time.Now().UTC().Add(-10 * time.Minute),
-		Findings:       map[string]checks.Severity{legacyKey: checks.SeverityMedium},
+		Findings:       map[string]checks.Severity{legacyKey: checks.SeverityHigh},
 		TrustedClients: map[string]string{},
 		PortForwards:   map[string]string{},
 	}
 
-	// Same effective severity (High base downgraded to Medium on isolated IoT):
-	// zero NewFindings, zero EscalatedFindings, zero ResolvedKeys.
+	// An unchanged severity must migrate without a new, escalated, or resolved alert.
 	raw := []checks.Finding{
 		{CheckID: "NERVA-SMB-V1-ENABLED", Property: "smb-v1", BaseSeverity: checks.SeverityHigh, Client: host, Port: 445},
 	}
@@ -653,5 +652,57 @@ func TestLegacyThreePartStateKeyMigration(t *testing.T) {
 	diffEsc := ComputeDiff(prev, snap, repEsc, netCfg)
 	if len(diffEsc.NewFindings) != 0 || len(diffEsc.ResolvedKeys) != 0 || len(diffEsc.EscalatedFindings) != 1 {
 		t.Fatalf("expected 1 escalated finding and 0 new/resolved on legacy key escalation, got %+v", diffEsc)
+	}
+}
+
+// TestVerifiedContainmentDiscount checks the scored finding against the two
+// containment axes computed from the same controller snapshot.
+func TestVerifiedContainmentDiscount(t *testing.T) {
+	for _, tt := range []struct {
+		name, peers, egress string
+		want                checks.Severity
+	}{
+		{"contained", "isolated", "blocked", checks.SeverityMedium},
+		{"open peers", "open", "blocked", checks.SeverityHigh},
+		{"LAN leak", "isolated", "open", checks.SeverityHigh},
+		{"missing ACL", "unknown", "blocked", checks.SeverityHigh},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := wiredPeerSite(2)
+			s.Networks[0].ZoneName, s.Networks[0].VLAN = "Hotspot", "20"
+			s.Networks = append(s.Networks, unifi.Network{ID: "lan", Name: "Office", VLAN: "10", ZoneName: "Internal", Subnet: "198.51.100.1/24"})
+			s.Visibility = &unifi.SiteVisibility{GatewayPoliciesAvailable: true, SwitchACLsAvailable: tt.peers != "unknown"}
+			for i := range s.Devices[0].Ports {
+				s.Devices[0].Ports[i].Isolation = tt.peers == "isolated"
+			}
+			if tt.peers == "unknown" {
+				s.SwitchACLCoverage = nil
+			}
+			if tt.egress == "open" {
+				s.FirewallPolicies = []unifi.FirewallPolicy{{ID: "leak", Name: "Sensors to Office", Enabled: true, Action: "ALLOW",
+					Source: unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true}, Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true}}}
+			}
+			cl := s.Clients[0]
+			cl.NetworkID, cl.VLAN = s.Networks[0].ID, s.Networks[0].VLAN
+			finding := checks.Finding{CheckID: "service", Client: cl, BaseSeverity: checks.SeverityHigh, Port: 23}
+			r := Evaluate(s, []checks.Finding{finding}, config.NetworkConfig{IsolatedVLANs: []string{"20"}, TrustedVLANs: []string{"10"}})
+			if len(r.Isolation.Containment) != 1 {
+				t.Fatalf("unexpected containment entries: %+v", r.Isolation.Containment)
+			}
+			n := r.Isolation.Containment[0]
+			if n.Peers.State != tt.peers || n.LANEgress.State != tt.egress {
+				t.Fatalf("expected peers=%s egress=%s, got %+v", tt.peers, tt.egress, n)
+			}
+			for _, f := range r.Findings {
+				if f.CheckID == finding.CheckID {
+					discount := strings.Contains(strings.Join(f.RiskReasons, " "), "mitigated on isolated VLAN")
+					if f.EffectiveSeverity != tt.want || discount != (tt.want < f.BaseSeverity) {
+						t.Fatalf("got %s %v, want %s", f.EffectiveSeverity, f.RiskReasons, tt.want)
+					}
+					return
+				}
+			}
+			t.Fatal("missing scored finding")
+		})
 	}
 }

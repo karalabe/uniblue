@@ -116,7 +116,7 @@ func TestTransitEvaluationCatchesL3SwitchACLException(t *testing.T) {
 			},
 		},
 		SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
-		Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+		Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true, SwitchACLsAvailable: true},
 	}
 
 	mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{
@@ -643,7 +643,7 @@ func TestNegatedTargetAllowWithUnparseableSelectorReturnsUnknown(t *testing.T) {
 				},
 			},
 			SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"},
-			Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+			Visibility:        &unifi.SiteVisibility{GatewayPoliciesAvailable: true, SwitchACLsAvailable: true},
 		}
 		mat, _, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{TrustedVLANs: []string{"LAN"}, IsolatedVLANs: []string{"IoT"}})
 		var cell *IsolationCell
@@ -1356,7 +1356,7 @@ func TestControllerPortFilterDoesNotBlockAllTraffic(t *testing.T) {
 		base:                            page(1, `[{"id":"site-1","name":"Default","internalReference":"default"}]`),
 		site + "clients":                empty,
 		site + "devices":                page(1, `[{"id":"switch-a","name":"Switch","macAddress":"00:00:5e:00:53:01","model":"USW"}]`),
-		site + "networks":               page(2, `[{"id":"`+sensorID+`","name":"Sensors","vlanId":20,"isolationEnabled":true,"zoneId":"z-hot","routerDeviceMac":"00:00:5e:00:53:01","subnet":"198.51.100.1/24"},{"id":"office","name":"Office","vlanId":10,"zoneId":"z-lan","subnet":"192.0.2.1/24"}]`),
+		site + "networks":               page(2, `[{"id":"`+sensorID+`","name":"Sensors","vlanId":20,"isolationEnabled":true,"zoneId":"z-hot","routerDeviceMac":"00:00:5e:00:53:01","subnet":"198.51.100.1/24"},{"id":"office","name":"Office","vlanId":10,"zoneId":"z-lan","routerDeviceMac":"00:00:5e:00:53:01","subnet":"192.0.2.1/24"}]`),
 		site + "firewall/zones":         page(2, `[{"id":"z-hot","name":"Hotspot","networkIds":["`+sensorID+`"]},{"id":"z-lan","name":"Internal","networkIds":["office"]}]`),
 		site + "firewall/policies":      empty,
 		site + "traffic-matching-lists": empty,
@@ -1771,5 +1771,168 @@ func TestOracleInternet(t *testing.T) {
 	}
 	if got := NewOracle(noWANSnap, config.NetworkConfig{}).Internet(dst, "tcp", 8443, "ipv4"); len(got) != 1 || got[0].Verdict != IsolationUnknown {
 		t.Fatalf("WAN-scoped rule without WAN inventory must resolve unknown, got %+v", got)
+	}
+}
+
+// mixedRoutingSite places a gateway-routed LAN behind a switch-routed source.
+// An empty action represents a controller feed that could not be collected.
+func mixedRoutingSite(switchAction, gatewayAction string) *unifi.Snapshot {
+	const sw = "00:00:5e:00:53:01"
+	s := &unifi.Snapshot{
+		Devices: []unifi.Device{
+			{Name: "Switch", MAC: sw, Type: "usw"},
+			{Name: "Gateway", MAC: "00:00:5e:00:53:02", Type: "ugw"},
+		},
+		Networks: []unifi.Network{
+			{ID: "s", Name: "Sensors", ZoneName: "Hotspot", Subnet: "198.51.100.1/24", RouterDeviceMAC: sw},
+			{ID: "o", Name: "Office", ZoneName: "Internal", Subnet: "192.0.2.1/24"},
+		},
+		Zones:      []unifi.FirewallZone{{Name: "Hotspot"}, {Name: "Internal"}},
+		Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: gatewayAction != "", SwitchACLsAvailable: switchAction != ""},
+	}
+	any := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
+	if gatewayAction != "" {
+		s.FirewallPolicies = []unifi.FirewallPolicy{{ID: "gw-rule", Name: "Gateway policy", Enabled: true, Action: gatewayAction, Source: any, Destination: any}}
+	}
+	if switchAction != "" {
+		s.SwitchACLCoverage = &unifi.SwitchACLCoverage{Status: "complete"}
+		s.SwitchACLs = []unifi.SwitchACL{{ID: "sw-rule", Name: "Switch policy", Enabled: true, Action: switchAction, DeviceMACs: []string{sw}, Source: any, Destination: any}}
+	}
+	return s
+}
+
+// TestMixedRoutingDecisions checks per-packet and whole-boundary decisions,
+// including attribution when a missing feed precedes a mandatory block.
+func TestMixedRoutingDecisions(t *testing.T) {
+	for _, tt := range []struct {
+		sw, gw            string
+		want, id, missing string
+	}{
+		{"ALLOW", "BLOCK", "deny", "gw-rule", ""},
+		{"BLOCK", "ALLOW", "deny", "sw-rule", ""},
+		{"ALLOW", "ALLOW", "allow", "", ""},
+		{"ALLOW", "", "unknown", "", "Gateway firewall policy telemetry is unavailable"},
+		{"", "BLOCK", "deny", "gw-rule", ""},
+		{"", "ALLOW", "unknown", "", "Switch ACL unavailable"},
+	} {
+		t.Run(tt.sw+"/"+tt.gw, func(t *testing.T) {
+			s := mixedRoutingSite(tt.sw, tt.gw)
+			o := NewOracle(s, config.NetworkConfig{})
+			for _, pair := range [][2]string{{"s", "o"}, {"o", "s"}} {
+				src, dst := Position{NetworkID: pair[0]}, unifi.Client{NetworkID: pair[1]}
+				for _, got := range []IsolationCell{o.Service(src, dst, "tcp", 443, "ipv4"), o.AnyPort(src, dst, "ipv4")} {
+					if got.Effective != tt.want || !strings.Contains(got.MissingInput, tt.missing) {
+						t.Fatalf("%v: got %+v, want %s %s", pair, got, tt.want, tt.missing)
+					}
+					switch tt.want {
+					case "deny":
+						device := s.Devices[0]
+						if tt.id == "gw-rule" {
+							device = s.Devices[1]
+						}
+						if got.Verdict != IsolationBlockedOK || got.DecisiveRuleID != tt.id || got.DecisiveRuleName != device.Name+" policy" ||
+							got.DecisiveReason == "" || !strings.HasPrefix(got.Enforcer, device.Name+" (") || !slices.Equal(got.EnforcerMACs, []string{device.MAC}) {
+							t.Fatalf("lost denying rule or owner: %+v", got)
+						}
+					case "allow":
+						if !slices.Equal(got.EnforcerMACs, []string{s.Devices[0].MAC, s.Devices[1].MAC}) {
+							t.Fatalf("missing mandatory enforcer: %+v", got)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestMixedRoutingPacketPartitions requires a single packet to pass both sets
+// of rules, including narrow exceptions away from the baseline probes.
+func TestMixedRoutingPacketPartitions(t *testing.T) {
+	s := mixedRoutingSite("ALLOW", "ALLOW")
+	sw, gw := &s.SwitchACLs[0], &s.FirewallPolicies[0]
+	sw.Protocol, gw.Protocol = "tcp", "tcp"
+	sw.Source = unifi.PolicyEndpoint{IPs: []string{"198.51.100.77"}, AnyPort: true}
+	sw.Destination = unifi.PolicyEndpoint{AnyTarget: true, Ports: []int{8443}}
+	gw.Source = unifi.PolicyEndpoint{AnyTarget: true, Ports: []int{62000}}
+	gw.Destination = unifi.PolicyEndpoint{AnyTarget: true, Ports: []int{8443}}
+	any := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
+	s.SwitchACLs = append(s.SwitchACLs, unifi.SwitchACL{Enabled: true, Index: 1, Action: "BLOCK", Source: any, Destination: any})
+	src, dst := Position{NetworkID: "s"}, unifi.Client{NetworkID: "o", IP: "192.0.2.22"}
+	check := func(want string) {
+		t.Helper()
+		o := NewOracle(s, config.NetworkConfig{})
+		for _, c := range []IsolationCell{o.Service(src, dst, "tcp", 8443, "ipv4"), o.AnyPort(src, dst, "ipv4"),
+			o.evaluateBoundary(nil, config.IsolationIntent{}, s.Networks[0], s.Networks[1], "Hotspot", "Internal", "ipv4", "deny", nil)} {
+			if c.Effective != want || (want == "allow" && c.Port != 8443) {
+				t.Fatalf("want %s on the joint packet partition, got %+v", want, c)
+			}
+		}
+	}
+	check("allow")
+	s.SwitchACLs[0].Destination.Ports = []int{8444}
+	check("deny")
+	s.SwitchACLCoverage.Status = "partial"
+	check("unknown")
+}
+
+// TestCrossSwitchRouting requires a block on a mandatory endpoint switch or
+// explicit knowledge of the transit route before deciding a cross-switch path.
+func TestCrossSwitchRouting(t *testing.T) {
+	s := mixedRoutingSite("ALLOW", "BLOCK")
+	dstMAC := "00:00:5e:00:53:03"
+	s.Networks[1].RouterDeviceMAC = dstMAC
+	s.SwitchACLs = append(s.SwitchACLs, unifi.SwitchACL{ID: "dst-block", Enabled: true, Action: "BLOCK", DeviceMACs: []string{dstMAC},
+		Source: s.SwitchACLs[0].Source, Destination: s.SwitchACLs[0].Destination})
+	check := func(want string, macs []string, missing string) {
+		t.Helper()
+		o := NewOracle(s, config.NetworkConfig{})
+		src, dst := Position{NetworkID: "s"}, unifi.Client{NetworkID: "o"}
+		for _, c := range []IsolationCell{o.Service(src, dst, "tcp", 443, "ipv4"), o.AnyPort(src, dst, "ipv4")} {
+			if c.Effective != want || !slices.Equal(c.EnforcerMACs, macs) || !strings.Contains(c.MissingInput, missing) || (want == "deny" && c.DecisiveRuleID != "dst-block") {
+				t.Fatalf("want %s %v %q, got %+v", want, macs, missing, c)
+			}
+		}
+	}
+	check("deny", []string{dstMAC}, "")
+	s.Networks[0].RouterUnresolved = true
+	check("unknown", nil, "Switch routing owner")
+	s.Networks[0].RouterUnresolved = false
+	s.SwitchACLs[1].Action = "ALLOW"
+	check("unknown", nil, "transit route")
+}
+
+// TestMixedRoutingTelemetryLoss checks every combination of omitted feeds and
+// collection metadata. The remaining evidence cannot establish a new block.
+func TestMixedRoutingTelemetryLoss(t *testing.T) {
+	for mask := range 32 {
+		s := mixedRoutingSite("ALLOW", "ALLOW")
+		s.WLANs = []unifi.WLANConfig{{Name: "Sensors", NetworkName: "Sensors", Enabled: true}}
+		s.Visibility.WLANsAvailable = true
+		if mask&1 != 0 {
+			s.FirewallPolicies, s.Visibility.GatewayPoliciesAvailable = nil, false
+		}
+		if mask&2 != 0 {
+			s.SwitchACLs, s.SwitchACLCoverage, s.Visibility.SwitchACLsAvailable = nil, nil, false
+		}
+		if mask&4 != 0 {
+			s.WLANs, s.Visibility.WLANsAvailable = nil, false
+		}
+		if mask&8 != 0 {
+			s.Visibility = &unifi.SiteVisibility{}
+		}
+		if mask&16 != 0 {
+			s.Visibility = nil
+		}
+		want := "allow"
+		if mask&3 != 0 || (mask&8 != 0 && s.Visibility != nil) {
+			want = "unknown"
+		}
+		o := NewOracle(s, config.NetworkConfig{})
+		src, dst := Position{NetworkID: "s"}, unifi.Client{NetworkID: "o"}
+		for _, c := range []IsolationCell{o.Service(src, dst, "tcp", 443, "ipv4"), o.AnyPort(src, dst, "ipv4")} {
+			if c.Effective != want {
+				t.Fatalf("omission mask %05b: want %s, got %+v", mask, want, c)
+			}
+		}
 	}
 }

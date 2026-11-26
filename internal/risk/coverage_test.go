@@ -161,7 +161,9 @@ func TestProtocolCoverageIPv6(t *testing.T) {
 func TestSwitchProtocolComplement(t *testing.T) {
 	snap, cfg := coverageSite()
 	snap.Networks[0].RouterDeviceMAC = "00:00:5e:00:53:01"
+	snap.Networks[1].RouterDeviceMAC = snap.Networks[0].RouterDeviceMAC
 	snap.SwitchACLCoverage = &unifi.SwitchACLCoverage{Status: "complete"}
+	snap.Visibility.SwitchACLsAvailable = true
 	// Switch routing defaults to allow. These denies leave ICMP blocked but
 	// permit other protocols such as GRE, even without an explicit ALLOW.
 	for i, proto := range []string{"tcp_udp", "icmp"} {

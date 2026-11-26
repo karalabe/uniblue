@@ -124,9 +124,9 @@ func newPolicyOracle(snap *unifi.Snapshot) *Oracle {
 				}
 			}
 		}
-	} else if len(snap.Zones) == 0 && len(snap.FirewallPolicies) == 0 {
+	} else if len(snap.FirewallPolicies) == 0 {
 		o.gwPoliciesAvailable = false
-		o.gwMissingReason = "snapshot includes no firewall zones or policies"
+		o.gwMissingReason = "snapshot omits firewall policies and their collection status"
 	}
 
 	o.switchACLStatus = "unavailable"
@@ -139,6 +139,10 @@ func newPolicyOracle(snap *unifi.Snapshot) *Oracle {
 	} else if len(snap.SwitchACLs) > 0 {
 		o.switchACLStatus = "complete"
 		o.switchACLReason = ""
+	}
+	if snap.Visibility != nil && !snap.Visibility.SwitchACLsAvailable && o.switchACLStatus == "complete" {
+		o.switchACLStatus = "unavailable"
+		o.switchACLReason = "switch ACL feed unavailable from the controller"
 	}
 
 	return o
@@ -924,8 +928,8 @@ func enforcerMACs(raw string) []string {
 	return nil
 }
 
-// evaluateRoutedPath resolves the enforcement owner (Gateway vs L3 Switch) and
-// computes the effective allow/deny/unknown decision for a single routed path.
+// evaluateRoutedPath evaluates a routed service across the source addresses
+// and MACs covered by the query.
 func (o *Oracle) evaluateRoutedPath(
 	srcNet, dstNet unifi.Network,
 	q pathQuery,
@@ -948,14 +952,48 @@ func (o *Oracle) evaluateRoutedPath(
 	return o.routedCell(srcNet, dstNet, q, destHost, destFunction, expected)
 }
 
-// routedCell applies the policy at the routing owner for one packet class.
-func (o *Oracle) routedCell(srcNet, dstNet unifi.Network, q pathQuery, destHost, destFunction, expected string) IsolationCell {
-	isGatewayLocal := strings.EqualFold(q.dstZone, "gateway")
-	pathKind := "gateway-routed"
-	if isGatewayLocal {
-		pathKind = "gateway-local"
-	}
+// routingPath lists the ordered policy enforcers along an L3 path. An empty
+// MAC denotes the UniFi gateway (matching Network.RouterDeviceMAC), and a nil
+// path signals that at least one routing owner is unresolved.
+type routingPath []string
 
+const gatewayOwner = ""
+
+// routingOwners resolves the mandatory enforcers for a routed crossing.
+// Same-switch VLANs stay on that switch, while mixed switch/gateway crossings
+// require both the L3 switch ACL and the gateway zone firewall to permit traffic.
+func routingOwners(src, dst unifi.Network, srcZone, dstZone string) routingPath {
+	if strings.EqualFold(dstZone, "Gateway") || strings.EqualFold(srcZone, "External") || strings.EqualFold(dstZone, "External") {
+		return routingPath{gatewayOwner}
+	}
+	if src.RouterUnresolved || dst.RouterUnresolved {
+		return nil
+	}
+	a, b := strings.TrimSpace(src.RouterDeviceMAC), strings.TrimSpace(dst.RouterDeviceMAC)
+	switch {
+	case strings.EqualFold(a, b):
+		return routingPath{a}
+	case a == "":
+		return routingPath{b, gatewayOwner}
+	default:
+		return routingPath{a, b}
+	}
+}
+
+// includesACL reports whether a switch on the path is in the rule's device scope.
+func (path routingPath) includesACL(deviceMACs []string) bool {
+	for _, mac := range path {
+		if mac != gatewayOwner && (len(deviceMACs) == 0 || containsFold(deviceMACs, mac)) {
+			return true
+		}
+	}
+	return false
+}
+
+// routedCell evaluates one packet class across every mandatory enforcer on the
+// path: any verified deny settles the path immediately, while an allow requires
+// every enforcer to permit the packet.
+func (o *Oracle) routedCell(srcNet, dstNet unifi.Network, q pathQuery, destHost, destFunction, expected string) IsolationCell {
 	cell := IsolationCell{
 		SourceZone:    firstNonEmptyStr(q.srcZone, srcNet.Name),
 		SourceNetwork: srcNet.Name,
@@ -967,71 +1005,74 @@ func (o *Oracle) routedCell(srcNet, dstNet unifi.Network, q pathQuery, destHost,
 		Transport:     q.proto,
 		Port:          q.port,
 		IPFamily:      q.ipFamily,
-		PathKind:      pathKind,
-		Enforcer:      o.gwName + " (Zone Firewall)",
-		EnforcerMACs:  enforcerMACs(o.gwMAC),
+		PathKind:      "gateway-routed",
 		Expected:      expected,
 	}
-
-	// Gateway-local and External-zone traffic are always evaluated by the
-	// UniFi gateway rather than an L3 switch ACL.
-	isGatewayOnly := isGatewayLocal || strings.EqualFold(q.srcZone, "External") || strings.EqualFold(q.dstZone, "External")
-	if !isGatewayOnly && (srcNet.RouterUnresolved || dstNet.RouterUnresolved) {
-		cell.Effective = "unknown"
-		cell.Verdict = IsolationUnknown
-		cell.EnforcerMACs = nil
-		cell.MissingInput = "Switch routing owner could not be resolved"
+	path := routingOwners(srcNet, dstNet, q.srcZone, q.dstZone)
+	if len(path) == 0 {
+		applyDecisionToCell(&cell, policyDecision{action: "unknown", missingInput: "Switch routing owner could not be resolved"})
 		return cell
 	}
-	if !isGatewayOnly {
-		l3SwitchMAC := firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC)
-		if l3SwitchMAC != "" {
-			cell.PathKind = "switch-routed"
-			swName := deviceNameByMAC(o.snap, l3SwitchMAC)
-			cell.Enforcer = swName + " (L3 Switch ACL)"
-			cell.EnforcerMACs = enforcerMACs(l3SwitchMAC)
-			if o.switchACLStatus != "complete" {
-				cell.Effective = "unknown"
-				cell.Verdict = IsolationUnknown
-				cell.MissingInput = fmt.Sprintf(
-					"Switch ACL unavailable for L3 switch %s (%s); gateway firewall rules do not govern switch-routed inter-VLAN traffic.",
-					swName, o.switchACLReason,
-				)
-				cell.RecommendedFix = fmt.Sprintf(
-					"Collect switch ACL configuration from %s (or move routing for %s to the UniFi gateway) to verify effective isolation.",
-					swName, firstNonEmptyStr(srcNet.Name, dstNet.Name),
-				)
-				return cell
-			}
-			dec := evaluateSwitchACLs(o.sortedACLs, l3SwitchMAC, q)
-			applyDecisionToCell(&cell, dec)
-			return cell
+	var result IsolationCell
+	var macs []string
+	for _, owner := range path {
+		hop := o.enforcerCell(cell, owner, q)
+		if len(path) == 1 || hop.Effective == "deny" {
+			return hop
+		}
+		macs = append(macs, hop.EnforcerMACs...)
+		// Retain the first missing input, or a named permit over default forwarding.
+		if result.Effective == "" || (result.Effective == "allow" && (hop.Effective == "unknown" || result.DecisiveRuleID == "")) {
+			result = hop
 		}
 	}
+	if result.Effective == "unknown" {
+		return result
+	}
+	if !slices.Contains(path, gatewayOwner) {
+		// Distinct L3 switches cross a transit VLAN, and controller snapshots do
+		// not include next-hop route tables showing whether the gateway enforces it.
+		cell.PathKind, cell.Enforcer = "switch-routed", "Inter-VLAN routing network"
+		applyDecisionToCell(&cell, policyDecision{action: "unknown", missingInput: "Inter-switch transit route is unavailable"})
+		return cell
+	}
+	result.EnforcerMACs = macs
+	return result
+}
 
-	// Gateway-routed or gateway-local path: require real gateway firewall policy telemetry.
-	if !o.gwPoliciesAvailable {
-		cell.Effective = "unknown"
-		cell.Verdict = IsolationUnknown
-		cell.MissingInput = fmt.Sprintf(
+// enforcerCell attributes a packet decision and its evidence to one routing owner.
+func (o *Oracle) enforcerCell(cell IsolationCell, owner string, q pathQuery) IsolationCell {
+	if owner != "" {
+		name := deviceNameByMAC(o.snap, owner)
+		cell.PathKind, cell.Enforcer = "switch-routed", name+" (L3 Switch ACL)"
+		cell.EnforcerMACs = enforcerMACs(owner)
+		if o.switchACLStatus != "complete" {
+			applyDecisionToCell(&cell, policyDecision{action: "unknown", missingInput: fmt.Sprintf("Switch ACL unavailable for L3 switch %s (%s).", name, o.switchACLReason)})
+			cell.RecommendedFix = fmt.Sprintf("Collect switch ACL configuration from %s to verify effective isolation.", name)
+		} else {
+			applyDecisionToCell(&cell, evaluateSwitchACLs(o.sortedACLs, owner, q))
+		}
+		return cell
+	}
+	cell.Enforcer, cell.EnforcerMACs = o.gwName+" (Zone Firewall)", enforcerMACs(o.gwMAC)
+	if strings.EqualFold(q.dstZone, "Gateway") {
+		cell.PathKind = "gateway-local"
+	}
+	switch {
+	case !o.gwPoliciesAvailable:
+		applyDecisionToCell(&cell, policyDecision{action: "unknown", missingInput: fmt.Sprintf(
 			"Gateway firewall policy telemetry is unavailable (%s); isolation cannot be verified without controller firewall rules.",
 			firstNonEmptyStr(o.gwMissingReason, "firewall policy feed missing"),
-		)
+		)})
 		cell.RecommendedFix = "Grant the configured account read access to the site firewall zones and policies to verify gateway isolation."
-		return cell
-	}
-	if strings.TrimSpace(q.srcZone) == "" || strings.TrimSpace(q.dstZone) == "" {
-		cell.Effective = "unknown"
-		cell.Verdict = IsolationUnknown
-		cell.MissingInput = fmt.Sprintf(
+	case strings.TrimSpace(q.srcZone) == "" || strings.TrimSpace(q.dstZone) == "":
+		applyDecisionToCell(&cell, policyDecision{action: "unknown", missingInput: fmt.Sprintf(
 			"Unresolved firewall zone for %s -> %s; controller did not map one or both networks to a Zone-Based Firewall zone.",
-			srcNet.Name, dstNet.Name,
-		)
-		return cell
+			cell.SourceNetwork, cell.DestNetwork,
+		)})
+	default:
+		applyDecisionToCell(&cell, evaluateGatewayPolicies(o.sortedPolicies, q))
 	}
-
-	dec := evaluateGatewayPolicies(o.sortedPolicies, q)
-	applyDecisionToCell(&cell, dec)
 	return cell
 }
 
@@ -1065,21 +1106,20 @@ func (o *Oracle) sourceRepresentatives(srcNet, dstNet unifi.Network, q pathQuery
 		}
 	}
 
-	for _, pol := range o.sortedPolicies {
-		if !pol.Enabled || !matchesIPFamily(pol.IPVersion, q.ipFamily) || !matchesConnState(pol.ConnectionStates, q.state) {
-			continue
-		}
-		if pol.Destination.ZoneName != "" && q.dstZone != "" && !strings.EqualFold(pol.Destination.ZoneName, q.dstZone) {
-			continue
-		}
-		collectEndpoint(pol.Source)
-	}
-	isGatewayOnly := strings.EqualFold(q.dstZone, "gateway") || strings.EqualFold(q.srcZone, "External") || strings.EqualFold(q.dstZone, "External")
-	if !isGatewayOnly && firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC) != "" {
-		for _, acl := range o.snap.SwitchACLs {
-			if !acl.Enabled || !matchesIPFamily(acl.IPVersion, q.ipFamily) {
+	path := routingOwners(srcNet, dstNet, q.srcZone, q.dstZone)
+	if slices.Contains(path, gatewayOwner) && o.gwPoliciesAvailable {
+		for _, pol := range o.sortedPolicies {
+			if !pol.Enabled || !matchesIPFamily(pol.IPVersion, q.ipFamily) || !matchesConnState(pol.ConnectionStates, q.state) {
 				continue
 			}
+			if pol.Destination.ZoneName != "" && q.dstZone != "" && !strings.EqualFold(pol.Destination.ZoneName, q.dstZone) {
+				continue
+			}
+			collectEndpoint(pol.Source)
+		}
+	}
+	for _, acl := range o.sortedACLs {
+		if o.switchACLStatus == "complete" && acl.Enabled && matchesIPFamily(acl.IPVersion, q.ipFamily) && path.includesACL(acl.DeviceMACs) {
 			collectEndpoint(acl.Source)
 		}
 	}

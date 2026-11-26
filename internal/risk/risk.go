@@ -230,13 +230,18 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 
 	classifier, _ := LoadExposureClassifier(rules.BuiltinFS)
 
+	isoMatrix, isoFindings, isoNotes := EvaluateIsolation(snap, rawFindings, netCfg)
 	scored := make([]checks.Finding, 0, len(rawFindings)+len(snap.PortForwards))
 	for _, f := range rawFindings {
 		var forwards []unifi.PortForward
 		for _, ip := range f.EndpointIPs() {
 			forwards = append(forwards, forwardsByIP[canonicalIsolationIP(ip)]...)
 		}
-		f = scoreFinding(f, forwards, trustedSet, isolatedSet)
+		var containment []NetworkContainment
+		if matchesVLAN(f.Client, isolatedSet) {
+			containment = isoMatrix.Containment
+		}
+		f = scoreFinding(f, forwards, trustedSet, containment)
 		scored = append(scored, f)
 	}
 
@@ -322,9 +327,6 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 	unifiPosture, postureFindings, unifiNotes := AnalyzeUniFiPosture(snap, trustedSet, isolatedSet, netCfg.IsolationPolicy.ManagementVLANs...)
 	scored = append(scored, postureFindings...)
 
-	// Evaluate effective inter-zone, IPv4/IPv6, gateway/switch-routed, and L2
-	// isolation boundaries, plus extended infrastructure and health checks.
-	isoMatrix, isoFindings, isoNotes := EvaluateIsolation(snap, rawFindings, netCfg)
 	scored = append(scored, isoFindings...)
 	extFindings, extNotes := AnalyzeExtendedNetworkChecks(snap, netCfg)
 	scored = append(scored, extFindings...)
@@ -417,10 +419,10 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 
 // scoreFinding adjusts a finding's EffectiveSeverity based on whether the
 // vulnerable port is WAN-exposed (matching L4 transport, translated destination
-// port, and WAN source restrictions) or placed on a trusted vs. isolated VLAN.
+// port, and WAN source restrictions), on a trusted VLAN, or verifiably contained.
 // Pure inventory observations (asset-identity / service-advertised /
 // service-observed at Info severity) are preserved as Info without escalation.
-func scoreFinding(f checks.Finding, forwards []unifi.PortForward, trustedSet, isolatedSet map[string]struct{}) checks.Finding {
+func scoreFinding(f checks.Finding, forwards []unifi.PortForward, trustedSet map[string]struct{}, containment []NetworkContainment) checks.Finding {
 	f.EffectiveSeverity = f.BaseSeverity
 	f.RiskReasons = nil
 
@@ -477,11 +479,32 @@ func scoreFinding(f checks.Finding, forwards []unifi.PortForward, trustedSet, is
 	if matchesVLAN(f.Client, trustedSet) {
 		f.EffectiveSeverity = f.EffectiveSeverity.Bump(1)
 		f.RiskReasons = append(f.RiskReasons, fmt.Sprintf("hosted on trusted VLAN %q", vlanLabel(f.Client)))
-	} else if matchesVLAN(f.Client, isolatedSet) {
+	} else if verifiedContainment(f.Client, containment) {
 		f.EffectiveSeverity = f.EffectiveSeverity.Bump(-1)
 		f.RiskReasons = append(f.RiskReasons, fmt.Sprintf("mitigated on isolated VLAN %q", vlanLabel(f.Client)))
 	}
 	return f
+}
+
+// verifiedContainment reports whether cl's VLAN has verified peer isolation and
+// blocked LAN egress with no active violations, preferring NetworkID when set
+// so containment evidence never leaks across networks.
+func verifiedContainment(cl unifi.Client, containment []NetworkContainment) bool {
+	for _, n := range containment {
+		var match bool
+		switch {
+		case cl.NetworkID != "":
+			match = cl.NetworkID == n.NetworkID
+		case cl.NetworkName != "":
+			match = strings.EqualFold(cl.NetworkName, n.NetworkName)
+		default:
+			match = cl.VLAN != "" && cl.VLAN == n.VLAN
+		}
+		if match {
+			return n.Peers.State == "isolated" && !n.Peers.Violation && n.LANEgress.State == "blocked" && !n.LANEgress.Violation
+		}
+	}
+	return false
 }
 
 // BuildState extracts a compact State baseline from a UniFi snapshot and its
@@ -1204,20 +1227,7 @@ func lookupNetworkByIP(snap *unifi.Snapshot, rawIP string) (unifi.Network, bool)
 // matchesVLAN reports whether a client's resolved network name or numeric VLAN
 // tag appears in the configured lowercase set.
 func matchesVLAN(cl unifi.Client, set map[string]struct{}) bool {
-	if len(set) == 0 {
-		return false
-	}
-	if cl.NetworkName != "" {
-		if _, ok := set[strings.ToLower(cl.NetworkName)]; ok {
-			return true
-		}
-	}
-	if cl.VLAN != "" {
-		if _, ok := set[strings.ToLower(cl.VLAN)]; ok {
-			return true
-		}
-	}
-	return false
+	return isNetworkInSet(cl.NetworkName, set) || isNetworkInSet(cl.VLAN, set)
 }
 
 // vlanLabel returns a readable VLAN identifier for risk reason messages.
