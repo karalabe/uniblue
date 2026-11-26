@@ -3139,7 +3139,7 @@ function renderDeviceRow(vm, ent) {
       if (seenExposedLabels.has(chip)) continue;
       seenExposedLabels.add(chip);
       pills.push(`<span class="tag ${humanStateTone(svc.severity)}">${esc(chip)}</span>`);
-    } else if (svc.reachable === "wan" || svc.reachable === "wan-restricted" || svc.reachable === "wan-cgnat") {
+    } else if (svc.reachable === "wan" || svc.reachable === "wan-restricted" || svc.reachable === "wan-cgnat" || svc.reachable === "wan-unknown") {
       const colonIdx = (svc.label || "").indexOf(":");
       const labelPortPart = colonIdx >= 0 ? svc.label.slice(colonIdx + 1).trim().split(/\s+/)[0] : "";
       const portDisp = /^\d+-\d+$/.test(labelPortPart) ? labelPortPart : String(svc.port);
@@ -3148,6 +3148,7 @@ function renderDeviceRow(vm, ent) {
       seenWanPorts.add(wKey);
       if (svc.reachable === "wan") pills.push(`<span class="tag blue">Internet :${esc(portDisp)}</span>`);
       else if (svc.reachable === "wan-restricted") pills.push(`<span class="tag blue">Internet (restricted) :${esc(portDisp)}</span>`);
+      else if (svc.reachable === "wan-unknown") pills.push(`<span class="tag neutral">Forward (source unknown) :${esc(portDisp)}</span>`);
       else pills.push(`<span class="tag neutral">Forward (CGNAT) :${esc(portDisp)}</span>`);
     }
   }
@@ -3540,6 +3541,7 @@ function renderDrawer() {
     const reachMap = {
       wan: "Internet",
       "wan-restricted": "Internet (Restricted Source)",
+      "wan-unknown": "Configured Forward (Source Unknown)",
       "wan-cgnat": "Configured Forward (Behind CGNAT)",
       lan: "Whole Home",
       "vlan-only": "This Network Only",

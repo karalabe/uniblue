@@ -93,6 +93,8 @@ type Snapshot struct {
 
 // SwitchACL describes one L2/L3 switch access control rule enforced on a UniFi switch.
 type SwitchACL struct {
+	// RuleType preserves the hardware ACL class for MAC-before-IP evaluation.
+	RuleType    string         `json:"rule_type,omitempty" yaml:"rule_type,omitempty"`
 	ID          string         `json:"id" yaml:"id"`
 	Name        string         `json:"name" yaml:"name"`
 	Enabled     bool           `json:"enabled" yaml:"enabled"`
@@ -625,6 +627,8 @@ type ControllerLogEvent struct {
 // Network describes a UniFi LAN or VLAN segment along with its structural
 // isolation and firewall-zone placement reported by the controller.
 type Network struct {
+	// RouterUnresolved reports a switch-managed network whose router is missing from inventory.
+	RouterUnresolved bool `json:"router_unresolved,omitempty"`
 	// ID is the internal controller identifier referenced by clients and zones.
 	ID string `json:"id"`
 
@@ -806,6 +810,12 @@ type PolicyEndpoint struct {
 	UnsupportedSelector string `json:"unsupported_selector,omitempty" yaml:"unsupported_selector,omitempty"`
 }
 
+// HasCompoundTarget reports whether the endpoint restricts multiple independent
+// dimensions. The legacy NegateTarget field cannot identify which one is inverted.
+func (ep PolicyEndpoint) HasCompoundTarget() bool {
+	return len(ep.MACs) > 0 && (len(ep.IPs) > 0 || len(ep.NetworkIDs) > 0) || len(ep.IPs) > 0 && len(ep.NetworkIDs) > 0
+}
+
 // MatchesPort reports whether port matches either Ports or PortRanges (ignoring NegatePort).
 func (ep PolicyEndpoint) MatchesPort(port int) bool {
 	if port < 1 || port > 65535 {
@@ -847,6 +857,10 @@ func (ep PolicyEndpoint) CoversAllPorts() bool {
 // PortForward represents a gateway NAT rule exposing an internal host and port
 // to the public internet.
 type PortForward struct {
+	// DestinationIP selects the external address on which the rule listens.
+	DestinationIP string `json:"destination_ip,omitempty"`
+	// SourceUnknown reports an active source filter that could not be resolved.
+	SourceUnknown bool `json:"source_unknown,omitempty"`
 	// ID is the internal rule identifier on the controller.
 	ID string `json:"id"`
 
@@ -914,8 +928,17 @@ func (p PortForward) ExposesEndpoint(port int, transport string) bool {
 // IsSourceRestricted reports whether this port forward narrows allowed WAN
 // sources away from the open internet ("any", "0.0.0.0/0", "::/0").
 func (p PortForward) IsSourceRestricted() bool {
+	if p.SourceUnknown {
+		return false
+	}
 	s := strings.ToLower(strings.TrimSpace(p.Src))
-	return s != "" && s != "any" && s != "0.0.0.0/0" && s != "::/0"
+	for _, part := range strings.Split(s, ",") {
+		switch strings.TrimSpace(part) {
+		case "", "any", "0.0.0.0/0", "::/0":
+			return false
+		}
+	}
+	return true
 }
 
 // ExpandFwdPorts expands the rule's translated internal destination port spec
@@ -1020,6 +1043,12 @@ type rawClient struct {
 
 // rawDevice maps the wire fields returned by /api/s/<site>/stat/device.
 type rawDevice struct {
+	// ID is the local inventory identifier.
+	ID string `json:"_id"`
+	// ExternalID is the integration inventory identifier.
+	ExternalID string `json:"external_id"`
+	// DeviceID is an alternate controller device reference.
+	DeviceID   string `json:"device_id"`
 	MAC        string `json:"mac"`
 	IP         string `json:"ip"`
 	Name       string `json:"name"`
@@ -1117,6 +1146,10 @@ type rawPortConf struct {
 
 // rawNetwork maps the wire fields returned by /api/s/<site>/rest/networkconf.
 type rawNetwork struct {
+	// ExternalID is the integration network identifier.
+	ExternalID string `json:"external_id"`
+	// ZoneID references the local Network firewall zone.
+	ZoneID                  string     `json:"firewall_zone_id"`
 	ID                      string     `json:"_id"`
 	Name                    string     `json:"name"`
 	Purpose                 string     `json:"purpose"`
@@ -1140,6 +1173,14 @@ type rawNetwork struct {
 
 // rawPortForward maps the wire fields returned by /api/s/<site>/rest/portforward.
 type rawPortForward struct {
+	// SrcLimitingEnabled controls the active source restriction.
+	SrcLimitingEnabled *bool `json:"src_limiting_enabled"`
+	// SrcLimitingType selects an inline IP or firewall group.
+	SrcLimitingType string `json:"src_limiting_type"`
+	// SrcGroupID references the source address group.
+	SrcGroupID string `json:"src_firewall_group_id"`
+	// DestinationIP selects the external listening address.
+	DestinationIP string     `json:"destination_ip"`
 	ID            string     `json:"_id"`
 	Name          string     `json:"name"`
 	Enabled       bool       `json:"enabled"`
@@ -1155,11 +1196,11 @@ type rawPortForward struct {
 // integrationPage matches the standard pagination envelope returned by all
 // list endpoints in the official UniFi Network Integration API v1.
 type integrationPage[T any] struct {
-	Offset     int `json:"offset"`
-	Limit      int `json:"limit"`
-	Count      int `json:"count"`
-	TotalCount int `json:"totalCount"`
-	Data       []T `json:"data"`
+	Offset     int  `json:"offset"`
+	Limit      int  `json:"limit"`
+	Count      int  `json:"count"`
+	TotalCount *int `json:"totalCount"`
+	Data       []T  `json:"data"`
 }
 
 // integrationSite maps a site entry returned by GET /integration/v1/sites.
@@ -1171,12 +1212,14 @@ type integrationSite struct {
 
 // integrationClient maps a client entry returned by GET /integration/v1/sites/{id}/clients.
 type integrationClient struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Type          string   `json:"type"`
-	MACAddress    string   `json:"macAddress"`
-	IPAddress     string   `json:"ipAddress"`
-	IPv6Addresses []string `json:"ipv6Addresses"`
+	// UplinkDeviceID identifies the serving AP or switch.
+	UplinkDeviceID string   `json:"uplinkDeviceId"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Type           string   `json:"type"`
+	MACAddress     string   `json:"macAddress"`
+	IPAddress      string   `json:"ipAddress"`
+	IPv6Addresses  []string `json:"ipv6Addresses"`
 }
 
 // integrationDevice maps a device entry returned by GET /integration/v1/sites/{id}/devices.
@@ -1193,6 +1236,14 @@ type integrationDevice struct {
 
 // integrationNetwork maps a network/VLAN entry returned by GET /integration/v1/sites/{id}/networks.
 type integrationNetwork struct {
+	// DeviceID identifies the routing switch for a switch-managed network.
+	DeviceID string `json:"deviceId"`
+	// MDNSForwardingEnabled reports mDNS reflection on Network 11.
+	MDNSForwardingEnabled *bool `json:"mdnsForwardingEnabled"`
+	// DHCPGuarding is present when DHCP guarding is configured.
+	DHCPGuarding *struct {
+		Trusted []string `json:"trustedDhcpServerIpAddresses"`
+	} `json:"dhcpGuarding"`
 	ID                    string     `json:"id"`
 	Name                  string     `json:"name"`
 	Purpose               string     `json:"purpose"`
@@ -1223,6 +1274,8 @@ type integrationNetwork struct {
 				Start string `json:"start"`
 				Stop  string `json:"stop"`
 			} `json:"ipAddressRange"`
+			// DNSOverride contains explicit DNS server overrides.
+			DNSOverride          []string `json:"dnsServerIpAddressesOverride"`
 			DNSServerIPAddresses []string `json:"dnsServerIpAddresses"`
 		} `json:"dhcpConfiguration"`
 	} `json:"ipv4Configuration"`
@@ -1246,11 +1299,13 @@ type integrationFirewallZone struct {
 
 // integrationFirewallPolicy maps a policy entry returned by GET /integration/v1/sites/{id}/firewall/policies.
 type integrationFirewallPolicy struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Enabled bool   `json:"enabled"`
-	Index   int    `json:"index"`
-	Action  struct {
+	// IPSecFilter constrains IPsec traffic when present.
+	IPSecFilter string `json:"ipsecFilter"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Enabled     bool   `json:"enabled"`
+	Index       *int   `json:"index"`
+	Action      struct {
 		Type               string `json:"type"`
 		AllowReturnTraffic bool   `json:"allowReturnTraffic"`
 	} `json:"action"`
@@ -1302,6 +1357,10 @@ type integrationIPAddressFilter struct {
 }
 
 type integrationFilterValue struct {
+	// Start is the first IP in a range.
+	Start string `json:"start"`
+	// Stop is the last IP in a range.
+	Stop  string     `json:"stop"`
 	Type  string     `json:"type"`
 	Value flexString `json:"value"`
 }
@@ -1314,6 +1373,8 @@ type integrationPortFilter struct {
 }
 
 type integrationPortFilterItem struct {
+	// Stop is the inclusive end used by integration v1.
+	Stop  int        `json:"stop"`
 	Type  string     `json:"type"`
 	Value flexString `json:"value"`
 	Start int        `json:"start"`
@@ -1356,11 +1417,18 @@ func (f *flexMACFilter) UnmarshalJSON(data []byte) error {
 
 // integrationACLRule maps a switch ACL rule returned by GET /integration/v1/sites/{id}/acl-rules.
 type integrationACLRule struct {
+	// wireError records any strict schema validation error encountered while
+	// decoding this rule so coverage is marked partial even when disabled.
+	wireError string
+	// Description is descriptive metadata.
+	Description string `json:"description"`
+	// Metadata records provenance without selector semantics.
+	Metadata              json.RawMessage         `json:"metadata"`
 	ID                    string                  `json:"id"`
 	Type                  string                  `json:"type"` // "IPV4" | "IPV6" | "MAC"
 	Name                  string                  `json:"name"`
-	Enabled               bool                    `json:"enabled"`
-	Index                 int                     `json:"index"`
+	Enabled               *bool                   `json:"enabled"`
+	Index                 *int                    `json:"index"`
 	Action                string                  `json:"action"` // "ALLOW" | "BLOCK"
 	ProtocolFilter        []string                `json:"protocolFilter"`
 	NetworkIDFilter       string                  `json:"networkIdFilter"`
@@ -1393,6 +1461,7 @@ type integrationACLEndpoint struct {
 		Type  string     `json:"type"`
 		Value flexString `json:"value"`
 		Start int        `json:"start"`
+		Stop  int        `json:"stop"`
 		End   int        `json:"end"`
 	} `json:"items"`
 }
@@ -1410,4 +1479,16 @@ type integrationTrafficMatchingList struct {
 		Stop  flexString `json:"stop"`
 		End   int        `json:"end"`
 	} `json:"items"`
+}
+
+// UnmarshalJSON preserves malformed ACLs as evidence of partial table coverage.
+func (r *integrationACLRule) UnmarshalJSON(raw []byte) error {
+	type plain integrationACLRule
+	var v plain
+	err := decodeWireRow(raw, "acl", &v)
+	*r = integrationACLRule(v)
+	if err != nil {
+		r.wireError = err.Error()
+	}
+	return nil
 }

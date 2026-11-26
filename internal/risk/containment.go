@@ -1187,6 +1187,7 @@ func (e containmentEvaluator) evaluateInternetEgress(
 	anyEP := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
 	fallback := unifi.FirewallPolicy{
 		Enabled:     true,
+		Index:       1 << 30,
 		Name:        "External default",
 		Protocol:    "all",
 		Source:      anyEP,

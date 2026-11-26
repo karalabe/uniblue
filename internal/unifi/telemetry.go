@@ -14,8 +14,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -46,11 +46,13 @@ type rawRogueAP struct {
 	Band     string `json:"band"`
 	Security string `json:"security"`
 	OUI      string `json:"oui"`
-	RSSI     int    `json:"rssi"`
-	IsRogue  bool   `json:"is_rogue"`
-	IsUBNT   bool   `json:"is_ubnt"`
-	IsAdhoc  bool   `json:"is_adhoc"`
-	LastSeen int64  `json:"last_seen"`
+	// Signal is the signed dBm reading on recent controllers.
+	Signal   int   `json:"signal"`
+	RSSI     int   `json:"rssi"`
+	IsRogue  bool  `json:"is_rogue"`
+	IsUBNT   bool  `json:"is_ubnt"`
+	IsAdhoc  bool  `json:"is_adhoc"`
+	LastSeen int64 `json:"last_seen"`
 }
 
 // rawHealth maps /api/s/<site>/stat/health subsystem entries.
@@ -63,7 +65,9 @@ type rawHealth struct {
 
 // rawHistoricalUser maps /api/s/<site>/rest/user entries.
 type rawHistoricalUser struct {
-	MAC                     string `json:"mac"`
+	MAC string `json:"mac"`
+	// UseFixedIP indicates whether the stored fixed address is an active reservation.
+	UseFixedIP              bool   `json:"use_fixedip"`
 	FixedIP                 string `json:"fixed_ip"`
 	Name                    string `json:"name"`
 	Hostname                string `json:"hostname"`
@@ -77,7 +81,7 @@ type rawHistoricalUser struct {
 
 // rawVPNConnectionsResponse maps GET /v2/api/site/<site>/vpn/connections.
 type rawVPNConnectionsResponse struct {
-	Connections []struct {
+	Connections *[]struct {
 		ID       string `json:"id"`
 		Name     string `json:"name"`
 		User     string `json:"user"`
@@ -130,10 +134,12 @@ type rawAdminActivityEntry struct {
 // siteTelemetry bundles best-effort security posture & event data fetched
 // concurrently alongside core topology.
 type siteTelemetry struct {
+	missing      []string
 	wlans        []rawWLAN
 	wlansOK      bool
 	rogueAPs     []rawRogueAP
 	settings     *SiteSecuritySettings
+	guest        guestRestrictions
 	settingsOK   bool
 	health       *SystemHealth
 	vpnOK        bool
@@ -150,150 +156,54 @@ type siteTelemetry struct {
 // best-effort so older controllers or restricted permissions never break core
 // snapshot collection.
 func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
-	type wlanRes struct {
-		items []rawWLAN
-		ok    bool
+	prefix, site := c.sessionPrefixAndSite()
+	ref := url.PathEscape(site)
+	base := prefix + "/api/s/" + ref + "/"
+	wlans := asyncFeed(func() ([]rawWLAN, error) { return getLegacyRows[rawWLAN](ctx, c, base+"rest/wlanconf") })
+	aps := asyncFeed(func() ([]rawRogueAP, error) { return getLegacyRows[rawRogueAP](ctx, c, base+"stat/rogueap") })
+	users := asyncFeed(func() ([]rawHistoricalUser, error) { return getLegacyRows[rawHistoricalUser](ctx, c, base+"rest/user") })
+	profiles := asyncFeed(func() ([]rawPortConf, error) { return getLegacyRows[rawPortConf](ctx, c, base+"rest/portconf") })
+	settings := asyncFeed(func() ([]map[string]any, error) { return getLegacyRows[map[string]any](ctx, c, base+"rest/setting") })
+	health := asyncFeed(func() ([]rawHealth, error) { return getLegacyRows[rawHealth](ctx, c, base+"stat/health") })
+	logs := asyncFeed(func() ([]ControllerLogEvent, error) {
+		return c.FetchRecentLogs(ctx, time.Now().UTC().Add(-24*time.Hour))
+	})
+	var vpn rawVPNConnectionsResponse
+	vpnErr := c.getJSON(ctx, prefix+"/v2/api/site/"+ref+"/vpn/connections", &vpn)
+	if vpnErr == nil && vpn.Connections == nil {
+		vpnErr = errors.New("missing VPN connections array")
 	}
-	type settingRes struct {
-		settings *SiteSecuritySettings
-		ok       bool
+	w, r, u, p, s, h, l := <-wlans, <-aps, <-users, <-profiles, <-settings, <-health, <-logs
+	t := siteTelemetry{wlans: w.items, wlansOK: w.err == nil, rogueAPs: r.items, knownUsers: u.items, portConfs: p.items, portConfsOK: p.err == nil, portConfsErr: p.err, recentLogs: l.items, vpnOK: vpnErr == nil}
+	t.missing = appendFeedError(t.missing, "rogue-aps", r.err)
+	t.missing = appendFeedError(t.missing, "known-clients", u.err)
+	t.missing = appendFeedError(t.missing, "health", h.err)
+	t.missing = appendFeedError(t.missing, "vpn-connections", vpnErr)
+	t.missing = appendFeedError(t.missing, "system-logs", l.err)
+	if len(s.items) > 0 && s.err == nil {
+		t.settingsOK = true
+		t.settings = parseSecuritySettings(s.items)
+		t.guest = readGuestRestrictions(s.items)
 	}
-	type healthRes struct {
-		health *SystemHealth
-		vpnOK  bool
-	}
-	type portConfRes struct {
-		items []rawPortConf
-		ok    bool
-		err   error
-	}
-	var (
-		wlanCh     = make(chan wlanRes, 1)
-		rogueCh    = make(chan []rawRogueAP, 1)
-		settingCh  = make(chan settingRes, 1)
-		healthCh   = make(chan healthRes, 1)
-		usersCh    = make(chan []rawHistoricalUser, 1)
-		logsCh     = make(chan []ControllerLogEvent, 1)
-		portConfCh = make(chan portConfRes, 1)
-	)
-	apiPrefix, site := c.sessionPrefixAndSite()
-
-	go func() {
-		var env apiEnvelope[rawWLAN]
-		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/wlanconf", site), &env); err == nil {
-			wlanCh <- wlanRes{items: env.Data, ok: true}
-			return
-		}
-		wlanCh <- wlanRes{}
-	}()
-	go func() {
-		var env apiEnvelope[rawRogueAP]
-		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/rogueap", site), &env); err == nil {
-			rogueCh <- env.Data
-			return
-		}
-		rogueCh <- nil
-	}()
-	go func() {
-		var env apiEnvelope[map[string]any]
-		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/setting", site), &env); err == nil && len(env.Data) > 0 {
-			settingCh <- settingRes{settings: parseSecuritySettings(env.Data), ok: true}
-			return
-		}
-		settingCh <- settingRes{}
-	}()
-	go func() {
-		var env apiEnvelope[rawHealth]
-		var h SystemHealth
-		got := false
-		vpnOK := false
-		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/stat/health", site), &env); err == nil && len(env.Data) > 0 {
-			got = true
-			for _, item := range env.Data {
-				switch strings.ToLower(item.Subsystem) {
-				case "wan":
-					h.WANStatus = item.Status
-					h.WANIP = strings.TrimSpace(item.WANIP)
-				case "vpn":
-					h.ActiveVPNUsers = item.RemoteUserNumActive
-				}
+	if len(h.items) > 0 || t.vpnOK {
+		t.health = &SystemHealth{}
+		for _, row := range h.items {
+			switch strings.ToLower(row.Subsystem) {
+			case "wan":
+				t.health.WANStatus = row.Status
+				t.health.WANIP = strings.TrimSpace(row.WANIP)
+			case "vpn":
+				t.health.ActiveVPNUsers = row.RemoteUserNumActive
 			}
 		}
-		var vpn rawVPNConnectionsResponse
-		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/v2/api/site/%s/vpn/connections", site), &vpn); err == nil {
-			got = true
-			vpnOK = true
-			for _, vc := range vpn.Connections {
-				user := vc.User
-				if user == "" {
-					user = vc.Username
-				}
-				localIP := vc.LocalIP
-				if localIP == "" {
-					localIP = vc.ClientIP
-				}
-				if localIP == "" {
-					localIP = vc.IP
-				}
-				h.VPNConnections = append(h.VPNConnections, VPNConnection{
-					ID:       vc.ID,
-					Name:     vc.Name,
-					User:     user,
-					Type:     vc.Type,
-					RemoteIP: vc.RemoteIP,
-					LocalIP:  localIP,
-				})
-			}
-			if len(h.VPNConnections) > h.ActiveVPNUsers {
-				h.ActiveVPNUsers = len(h.VPNConnections)
+		if t.vpnOK {
+			for _, v := range *vpn.Connections {
+				t.health.VPNConnections = append(t.health.VPNConnections, VPNConnection{ID: v.ID, Name: v.Name, User: firstNonEmpty(v.User, v.Username), Type: v.Type, RemoteIP: v.RemoteIP, LocalIP: firstNonEmpty(v.LocalIP, v.ClientIP, v.IP)})
 			}
 		}
-		if got {
-			healthCh <- healthRes{health: &h, vpnOK: vpnOK}
-			return
-		}
-		healthCh <- healthRes{}
-	}()
-	go func() {
-		var env apiEnvelope[rawHistoricalUser]
-		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/user", site), &env); err == nil {
-			usersCh <- env.Data
-			return
-		}
-		usersCh <- nil
-	}()
-	go func() {
-		var env apiEnvelope[rawPortConf]
-		if err := c.getJSON(ctx, apiPrefix+fmt.Sprintf("/api/s/%s/rest/portconf", site), &env); err == nil {
-			portConfCh <- portConfRes{items: env.Data, ok: true}
-			return
-		} else {
-			portConfCh <- portConfRes{err: err}
-		}
-	}()
-	go func() {
-		logs, _ := c.FetchRecentLogs(ctx, time.Now().UTC().Add(-24*time.Hour))
-		logsCh <- logs
-	}()
-
-	wr := <-wlanCh
-	sr := <-settingCh
-	hr := <-healthCh
-	pcr := <-portConfCh
-	return siteTelemetry{
-		wlans:        wr.items,
-		wlansOK:      wr.ok,
-		rogueAPs:     <-rogueCh,
-		settings:     sr.settings,
-		settingsOK:   sr.ok,
-		health:       hr.health,
-		vpnOK:        hr.vpnOK,
-		knownUsers:   <-usersCh,
-		recentLogs:   <-logsCh,
-		portConfs:    pcr.items,
-		portConfsOK:  pcr.ok,
-		portConfsErr: pcr.err,
+		t.health.ActiveVPNUsers = max(t.health.ActiveVPNUsers, len(t.health.VPNConnections))
 	}
+	return t
 }
 
 // FetchRecentLogs queries UniFi's v2 System Log (security threats, critical
@@ -306,51 +216,21 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		}
 	}
 	apiPrefix, site := c.sessionPrefixAndSite()
+	site = url.PathEscape(site)
 	nowMs := time.Now().UTC().UnixMilli()
 	fromMs := since.UTC().UnixMilli()
 	if fromMs <= 0 || fromMs > nowMs {
 		fromMs = nowMs - int64((10 * time.Minute).Milliseconds())
 	}
 
-	payload := map[string]any{
-		"timestampFrom": fromMs,
-		"timestampTo":   nowMs,
-		"pageNumber":    0,
-		"pageSize":      50,
-	}
-
-	type allRes struct {
-		items []rawSystemLogEntry
-	}
-	type adminRes struct {
-		items []rawAdminActivityEntry
-	}
-	allCh := make(chan allRes, 1)
-	adminCh := make(chan adminRes, 1)
-
-	go func() {
-		var resp struct {
-			Data []rawSystemLogEntry `json:"data"`
-		}
-		if err := c.postJSON(ctx, apiPrefix+fmt.Sprintf("/v2/api/site/%s/system-log/all", site), payload, &resp); err == nil {
-			allCh <- allRes{items: resp.Data}
-			return
-		}
-		allCh <- allRes{}
-	}()
-	go func() {
-		var resp struct {
-			Data []rawAdminActivityEntry `json:"data"`
-		}
-		if err := c.postJSON(ctx, apiPrefix+fmt.Sprintf("/v2/api/site/%s/system-log/admin-activity", site), payload, &resp); err == nil {
-			adminCh <- adminRes{items: resp.Data}
-			return
-		}
-		adminCh <- adminRes{}
-	}()
-
-	ar := <-allCh
-	admr := <-adminCh
+	base := apiPrefix + fmt.Sprintf("/v2/api/site/%s/system-log/", site)
+	all := asyncFeed(func() ([]rawSystemLogEntry, error) {
+		return fetchLogPages[rawSystemLogEntry](ctx, c, base+"all", fromMs, nowMs)
+	})
+	admin := asyncFeed(func() ([]rawAdminActivityEntry, error) {
+		return fetchLogPages[rawAdminActivityEntry](ctx, c, base+"admin-activity", fromMs, nowMs)
+	})
+	ar, admr := <-all, <-admin
 
 	var events []ControllerLogEvent
 	for _, entry := range ar.items {
@@ -453,7 +333,7 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 	sort.Slice(events, func(i, j int) bool {
 		return events[i].Timestamp.After(events[j].Timestamp)
 	})
-	return events, nil
+	return events, errors.Join(ar.err, admr.err)
 }
 
 func stableHashID(s string) string {
@@ -540,12 +420,12 @@ func (c *Controller) postJSONOnce(ctx context.Context, fullPath string, raw []by
 		c.setCSRFToken(tok)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxControllerBodyBytes))
+	body, err := readControllerBody(resp.Body)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", fullPath, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &httpStatusError{path: fullPath, status: resp.StatusCode, apiMsg: extractAPIErrorMsg(body)}
+		return &httpStatusError{method: http.MethodPost, path: fullPath, status: resp.StatusCode, apiMsg: extractAPIErrorMsg(body)}
 	}
 	if err := checkAPIEnvelopeError(fullPath, body); err != nil {
 		return err
@@ -602,9 +482,9 @@ func convertWLANs(raw []rawWLAN, netByID map[string]Network) []WLANConfig {
 	}
 	out := make([]WLANConfig, 0, len(raw))
 	for _, w := range raw {
-		netName := ""
+		netID, netName := w.NetworkConfID, ""
 		if n, ok := netByID[w.NetworkConfID]; ok {
-			netName = n.Name
+			netID, netName = n.ID, n.Name
 		}
 		out = append(out, WLANConfig{
 			ID:          w.ID,
@@ -616,7 +496,7 @@ func convertWLANs(raw []rawWLAN, netByID map[string]Network) []WLANConfig {
 			PMFMode:     strings.ToLower(strings.TrimSpace(w.PMFMode)),
 			L2Isolation: w.L2Isolation,
 			IsGuest:     w.IsGuest,
-			NetworkID:   w.NetworkConfID,
+			NetworkID:   netID,
 			NetworkName: netName,
 		})
 	}
@@ -638,7 +518,7 @@ func convertRogueAPs(raw []rawRogueAP) []RogueAP {
 			Band:     r.Band,
 			Security: r.Security,
 			OUI:      r.OUI,
-			RSSI:     r.RSSI,
+			RSSI:     signalDBM(r.Signal, r.RSSI),
 			IsRogue:  r.IsRogue,
 			IsUBNT:   r.IsUBNT,
 			IsAdhoc:  r.IsAdhoc,

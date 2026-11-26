@@ -361,7 +361,7 @@ func AnalyzePosture(snap *unifi.Snapshot, findings []checks.Finding, netCfg conf
 // to catch high-risk user-defined ALLOW rules (such as WAN-to-Gateway access,
 // broad WAN-to-LAN allows, or unrestricted isolated-zone-to-Internal leaks).
 func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
-	if snap == nil || len(snap.FirewallPolicies) == 0 {
+	if snap == nil || len(snap.FirewallPolicies) == 0 || (snap.Visibility != nil && !snap.Visibility.GatewayPoliciesAvailable) {
 		return nil
 	}
 
@@ -385,7 +385,10 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 	isShadowedByEarlierDeny := func(pos int, pol unifi.FirewallPolicy) bool {
 		for k := 0; k < pos; k++ {
 			earlier := sorted[k]
-			if !earlier.Enabled {
+			if earlier.Index >= pol.Index {
+				continue
+			}
+			if !earlier.Enabled || earlier.UnsupportedReason != "" || earlier.Source.UnsupportedSelector != "" || earlier.Destination.UnsupportedSelector != "" || !earlier.Source.CoversAllPorts() || earlier.Source.NegatePort {
 				continue
 			}
 			act := strings.ToUpper(strings.TrimSpace(earlier.Action))
@@ -415,6 +418,11 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
 			continue
 		}
+		// Skip response-only / established-only ALLOW rules that never permit
+		// inbound NEW connections.
+		if !matchesConnState(pol.ConnectionStates, "new") {
+			continue
+		}
 		// Skip UniFi built-in system policies (port-forward auto-rules, DHCPv6,
 		// WireGuard listener, etc.); port forwards are audited separately via WANSurface.
 		if strings.EqualFold(pol.Origin, "SYSTEM_DEFINED") {
@@ -433,14 +441,23 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 		zonePath := fmt.Sprintf("%s -> %s", pol.Source.ZoneName, pol.Destination.ZoneName)
 		portDesc := formatPolicyPorts(pol.Destination)
 		protoDesc := formatPolicyProtocol(pol.Protocol, pol.ProtocolNegated)
+		partialReason := firstNonEmptyStr(pol.UnsupportedReason, pol.Source.UnsupportedSelector, pol.Destination.UnsupportedSelector)
+		partialNote := ""
+		if partialReason != "" {
+			partialNote = fmt.Sprintf("; partially evaluated (%s)", partialReason)
+		}
 
 		switch {
 		case srcZone == "external" && dstZone == "gateway":
 			sev := checks.SeverityHigh
 			title := fmt.Sprintf("WAN-to-Gateway Firewall Policy Allows Direct Access (%s)", pol.Name)
-			if pol.Destination.AnyPort || pol.Destination.CoversAllPorts() || (!pol.ProtocolNegated && strings.EqualFold(protoDesc, "all")) {
+			if partialReason == "" && pol.Source.AnyTarget && pol.Destination.AnyTarget && pol.Source.CoversAllPorts() && !pol.Source.NegatePort && pol.Destination.CoversAllPorts() && !pol.Destination.NegatePort {
 				sev = checks.SeverityCritical
 				title = fmt.Sprintf("Unrestricted WAN-to-Gateway Firewall Policy (%s)", pol.Name)
+			}
+			reasons := []string{fmt.Sprintf("user-defined ALLOW policy on %s", zonePath)}
+			if partialReason != "" {
+				reasons = append(reasons, fmt.Sprintf("partially evaluated selector (%s)", partialReason))
 			}
 			findings = append(findings, checks.Finding{
 				CheckID:           "UB-UNIFI-FW-WAN-GW",
@@ -448,15 +465,15 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 				Category:          "firewall-policy",
 				BaseSeverity:      sev,
 				EffectiveSeverity: sev,
-				RiskReasons:       []string{fmt.Sprintf("user-defined ALLOW policy on %s", zonePath)},
+				RiskReasons:       reasons,
 				Client: unifi.Client{
 					MAC:         "fw:" + pol.ID,
 					IP:          gwIP,
 					Name:        gwName,
 					NetworkName: zonePath,
 				},
-				Evidence: fmt.Sprintf("enabled policy %q allows %s (protocol=%s, ports=%s, src=%s)",
-					pol.Name, zonePath, protoDesc, portDesc, formatPolicyTarget(pol.Source)),
+				Evidence: fmt.Sprintf("enabled policy %q allows %s (protocol=%s, ports=%s, src=%s%s)",
+					pol.Name, zonePath, protoDesc, portDesc, formatPolicyTarget(pol.Source), partialNote),
 				Remediation: checks.Remediation{
 					Summary:      "Remove or restrict this WAN-to-Gateway ALLOW rule. Never expose gateway management services (SSH/HTTPS) or unrestricted ports directly to the public internet; use VPN access instead.",
 					UniFiActions: []string{"disable_or_restrict_firewall_policy", "use_wireguard_vpn"},
@@ -466,9 +483,13 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 		case srcZone == "external" && dstZone != "external":
 			sev := checks.SeverityHigh
 			title := fmt.Sprintf("WAN-to-LAN Firewall Policy Allows Inbound Traffic (%s)", pol.Name)
-			if pol.Destination.AnyPort || pol.Destination.CoversAllPorts() || pol.Destination.AnyTarget {
+			if partialReason == "" && (pol.Destination.AnyPort || pol.Destination.CoversAllPorts() || pol.Destination.AnyTarget) {
 				sev = checks.SeverityCritical
 				title = fmt.Sprintf("Broad WAN-to-LAN Firewall Policy (%s)", pol.Name)
+			}
+			reasons := []string{fmt.Sprintf("user-defined ALLOW policy on %s", zonePath)}
+			if partialReason != "" {
+				reasons = append(reasons, fmt.Sprintf("partially evaluated selector (%s)", partialReason))
 			}
 			findings = append(findings, checks.Finding{
 				CheckID:           "UB-UNIFI-FW-WAN-LAN",
@@ -476,15 +497,15 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 				Category:          "firewall-policy",
 				BaseSeverity:      sev,
 				EffectiveSeverity: sev,
-				RiskReasons:       []string{fmt.Sprintf("user-defined ALLOW policy on %s", zonePath)},
+				RiskReasons:       reasons,
 				Client: unifi.Client{
 					MAC:         "fw:" + pol.ID,
 					IP:          firstOrFallback(pol.Destination.IPs, gwIP),
 					Name:        fmt.Sprintf("Firewall Policy (%s)", pol.Name),
 					NetworkName: zonePath,
 				},
-				Evidence: fmt.Sprintf("enabled policy %q allows %s (protocol=%s, target=%s, ports=%s)",
-					pol.Name, zonePath, protoDesc, formatPolicyTarget(pol.Destination), portDesc),
+				Evidence: fmt.Sprintf("enabled policy %q allows %s (protocol=%s, target=%s, ports=%s%s)",
+					pol.Name, zonePath, protoDesc, formatPolicyTarget(pol.Destination), portDesc, partialNote),
 				Remediation: checks.Remediation{
 					Summary:      "Verify whether inbound WAN traffic to this internal zone is strictly required. Scope destination IPs, ports, and allowed WAN source IPs, or replace with VPN access.",
 					UniFiActions: []string{"restrict_firewall_policy", "use_wireguard_vpn"},

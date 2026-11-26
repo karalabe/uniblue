@@ -298,7 +298,8 @@ func TestEngineBaselinePreservationFirstForwardDetectionAndConcurrency(t *testin
 	eng.snap = snap
 	eng.lastFwdSig = portForwardSignature(nil)
 	eng.lastPolicySig = firewallPolicySignature(nil)
-	eng.sigsInitialized = true
+	eng.fwdSigInit = true
+	eng.policySigInit = true
 	eng.mu.Unlock()
 
 	// Pre-baseline recompute must not wipe uniblue-state.json or send alerts.

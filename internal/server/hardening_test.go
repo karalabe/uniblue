@@ -520,3 +520,39 @@ func TestScanProgressRetainsCompletedStageTotals(t *testing.T) {
 		t.Fatalf("second scan inherited stale StageTotals: %+v", next)
 	}
 }
+
+// TestTemporaryFeedDenialDoesNotEmitPolicyChanged verifies that losing access
+// to port-forwards or firewall policies for one poll and recovering with the
+// identical table emits zero spurious policy_changed alerts.
+func TestTemporaryFeedDenialDoesNotEmitPolicyChanged(t *testing.T) {
+	e := NewDemoEngineForTest(t)
+	fwds := []unifi.PortForward{{ID: "pf1", Name: "Web", Enabled: true, Proto: "tcp", DstPort: "443", FwdIP: "192.0.2.10", FwdPort: "443", Src: "any"}}
+	e.mu.Lock()
+	if e.missingClients == nil {
+		e.missingClients = make(map[string]missingClient)
+	}
+	e.lastFwdSig = portForwardSignature(fwds)
+	e.fwdSigInit = true
+	e.lastPolicySig = firewallPolicySignature(nil)
+	e.policySigInit = true
+	e.events = nil
+	e.mu.Unlock()
+
+	// Poll 1: port-forwards temporarily unavailable (empty slice, PortForwardsAvailable=false).
+	e.applySnapshotDelta(context.Background(), &unifi.Snapshot{
+		Visibility: &unifi.SiteVisibility{PortForwardsAvailable: false, GatewayPoliciesAvailable: true},
+	}, time.Now().UTC())
+	// Poll 2: port-forwards recovered with the exact same table.
+	e.applySnapshotDelta(context.Background(), &unifi.Snapshot{
+		PortForwards: fwds,
+		Visibility:   &unifi.SiteVisibility{PortForwardsAvailable: true, GatewayPoliciesAvailable: true},
+	}, time.Now().UTC())
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, ev := range e.events {
+		if ev.Type == "policy_changed" {
+			t.Fatalf("unexpected policy_changed event across temporary feed outage: %+v", ev)
+		}
+	}
+}

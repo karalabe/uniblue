@@ -260,7 +260,9 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 
 		assessment := classifier.Classify(pf, cl)
 		var reasons []string
-		if pf.Src == "" || strings.EqualFold(pf.Src, "any") {
+		if pf.SourceUnknown {
+			reasons = append(reasons, "WAN source filter unresolved")
+		} else if !pf.IsSourceRestricted() {
 			reasons = append(reasons, "open to any source IP on WAN")
 		}
 		// Only escalate non-P2P/VPN forwards that punch directly into a trusted VLAN.
@@ -436,6 +438,20 @@ func scoreFinding(f checks.Finding, forwards []unifi.PortForward, trustedSet, is
 			continue
 		}
 		matchedWAN = true
+		if pf.SourceUnknown {
+			// Treat an unresolved WAN source filter at least as severely as a
+			// source-restricted WAN forward so exposure is never scored below
+			// an unforwarded trusted-VLAN host.
+			cand := f.BaseSeverity.Bump(1)
+			if cand > bestSev {
+				bestSev = cand
+			}
+			f.RiskReasons = append(f.RiskReasons, fmt.Sprintf(
+				"exposed via %s WAN forward %q with unresolved source filter (WAN:%s -> %s:%s)",
+				strings.ToUpper(transport), pf.Name, pf.DstPort, pf.FwdIP, pf.FwdPort,
+			))
+			continue
+		}
 		if pf.IsSourceRestricted() {
 			cand := f.BaseSeverity.Bump(1)
 			if cand > bestSev {

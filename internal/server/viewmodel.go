@@ -62,7 +62,7 @@ type ServiceView struct {
 	Proto            string `json:"proto"` // "tcp" | "udp"
 	AddressFamily    string `json:"address_family,omitempty"`
 	Name             string `json:"name,omitempty"`
-	Reachable        string `json:"reachable"` // "wan" | "wan-restricted" | "wan-cgnat" | "lan" | "vlan-only" | "advertised" | "unknown"
+	Reachable        string `json:"reachable"` // "wan" | "wan-restricted" | "wan-unknown" | "wan-cgnat" | "lan" | "vlan-only" | "advertised" | "unknown"
 	State            string `json:"state,omitempty"`
 	SourceRestricted bool   `json:"source_restricted,omitempty"`
 	Exposed          bool   `json:"exposed,omitempty"`
@@ -2259,37 +2259,62 @@ func hasOpenPort(ports []int, target int) bool {
 	return false
 }
 
+// wanSourceScope aggregates overlapping forwards in increasing order of reach.
+type wanSourceScope uint8
+
+const (
+	wanRestricted wanSourceScope = iota
+	wanUnresolved
+	wanOpen
+)
+
+// forwardSourceScope distinguishes an unresolved controller object from an open rule.
+func forwardSourceScope(p unifi.PortForward) wanSourceScope {
+	if p.SourceUnknown {
+		return wanUnresolved
+	}
+	if p.IsSourceRestricted() {
+		return wanRestricted
+	}
+	return wanOpen
+}
+
+// reachLabel describes configured WAN reachability for the available source evidence.
+func (s wanSourceScope) reachLabel(cgnat bool) string {
+	switch {
+	case cgnat:
+		return "wan-cgnat"
+	case s == wanUnresolved:
+		return "wan-unknown"
+	case s == wanRestricted:
+		return "wan-restricted"
+	default:
+		return "wan"
+	}
+}
+
+// buildHostServices builds the deduplicated per-host service rows with computed
+// WAN, LAN, and VLAN reachability labels.
 func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureAssessment, vlanIsolated, behindCGNAT bool) []ServiceView {
-	type wanPortInfo struct {
-		restricted bool
-	}
-	wanUDPPorts := make(map[int]wanPortInfo)
-	recordWAN := func(m map[int]wanPortInfo, port int, restricted bool) {
-		if cur, exists := m[port]; exists {
-			// If ANY matching forward is unrestricted (src=any), the endpoint is unrestricted.
-			m[port] = wanPortInfo{restricted: cur.restricted && restricted}
-		} else {
-			m[port] = wanPortInfo{restricted: restricted}
-		}
-	}
+	wanUDPPorts := make(map[int]wanSourceScope)
 	type wideUDPForward struct {
-		spec       string
-		startPort  int
-		endPort    int
-		restricted bool
+		spec      string
+		startPort int
+		endPort   int
+		scope     wanSourceScope
 	}
 	wideUDPBySpec := make(map[string]wideUDPForward)
-	recordWideUDP := func(start, end int, restricted bool) {
+	recordWideUDP := func(start, end int, scope wanSourceScope) {
 		spec := fmt.Sprintf("%d-%d", start, end)
 		if cur, exists := wideUDPBySpec[spec]; exists {
-			cur.restricted = cur.restricted && restricted
+			cur.scope = max(cur.scope, scope)
 			wideUDPBySpec[spec] = cur
 		} else {
 			wideUDPBySpec[spec] = wideUDPForward{
-				spec:       spec,
-				startPort:  start,
-				endPort:    end,
-				restricted: restricted,
+				spec:      spec,
+				startPort: start,
+				endPort:   end,
+				scope:     scope,
 			}
 		}
 	}
@@ -2300,7 +2325,7 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		}
 		if a.Forward.MatchesTransport("udp") {
 			spec := strings.TrimSpace(firstStr(a.Forward.FwdPort, a.Forward.DstPort))
-			restricted := a.Forward.IsSourceRestricted()
+			scope := forwardSourceScope(a.Forward)
 			for _, seg := range strings.Split(spec, ",") {
 				seg = strings.TrimSpace(seg)
 				if seg == "" {
@@ -2314,34 +2339,25 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 					}
 					if end-start+1 <= maxExpandedUDPPorts {
 						for p := start; p <= end; p++ {
-							recordWAN(wanUDPPorts, p, restricted)
+							wanUDPPorts[p] = max(wanUDPPorts[p], scope)
 						}
 					} else {
-						recordWideUDP(start, end, restricted)
+						recordWideUDP(start, end, scope)
 					}
 					continue
 				}
 				if single, err := strconv.Atoi(seg); err == nil && single >= 1 && single <= 65535 {
-					recordWAN(wanUDPPorts, single, restricted)
+					wanUDPPorts[single] = max(wanUDPPorts[single], scope)
 				}
 			}
 		}
-	}
-	wanReachLabel := func(info wanPortInfo) string {
-		if behindCGNAT {
-			return "wan-cgnat"
-		}
-		if info.restricted {
-			return "wan-restricted"
-		}
-		return "wan"
 	}
 	// Decide WAN reachability for any observed (port, transport, addressFamily)
 	// directly via Forward.ExposesEndpoint and address-family matching so an
 	// IPv4-only port forward never marks an IPv6 service row as WAN-reachable.
 	wanReachForEndpoint := func(port int, transport, addrFamily string) (string, bool, bool) {
 		matched := false
-		allRestricted := true
+		scope := wanRestricted
 		for _, a := range wan {
 			if !a.Forward.ExposesEndpoint(port, transport) {
 				continue
@@ -2350,14 +2366,12 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 				continue
 			}
 			matched = true
-			if !a.Forward.IsSourceRestricted() {
-				allRestricted = false
-			}
+			scope = max(scope, forwardSourceScope(a.Forward))
 		}
 		if !matched {
 			return "", false, false
 		}
-		return wanReachLabel(wanPortInfo{restricted: allRestricted}), allRestricted, true
+		return scope.reachLabel(behindCGNAT), scope == wanRestricted, true
 	}
 
 	// Group observed services by (transport, port), preserving distinct protocols
@@ -2557,9 +2571,9 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			Port:             p,
 			Proto:            "udp",
 			Name:             name,
-			Reachable:        wanReachLabel(info),
+			Reachable:        info.reachLabel(behindCGNAT),
 			State:            "configured-forward",
-			SourceRestricted: info.restricted,
+			SourceRestricted: info == wanRestricted,
 			Label:            fmt.Sprintf("%s :%d", strings.ToUpper(name), p),
 		})
 	}
@@ -2595,9 +2609,9 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 				Port:             wf.startPort,
 				Proto:            "udp",
 				Name:             "udp",
-				Reachable:        wanReachLabel(wanPortInfo{restricted: wf.restricted}),
+				Reachable:        wf.scope.reachLabel(behindCGNAT),
 				State:            "configured-forward",
-				SourceRestricted: wf.restricted,
+				SourceRestricted: wf.scope == wanRestricted,
 				Label:            fmt.Sprintf("UDP :%s", wf.spec),
 			})
 		}
@@ -2725,26 +2739,17 @@ func markServiceExposed(ent *Entity, f checks.Finding, endpointWAN []risk.Exposu
 	}
 	srcRestricted := false
 	matchedWAN := false
-	allRestricted := true
+	scope := wanRestricted
 	for _, a := range endpointWAN {
 		if !a.Forward.ExposesEndpoint(f.Port, proto) {
 			continue
 		}
 		matchedWAN = true
-		if !a.Forward.IsSourceRestricted() {
-			allRestricted = false
-		}
+		scope = max(scope, forwardSourceScope(a.Forward))
 	}
 	if matchedWAN {
-		srcRestricted = allRestricted
-		switch {
-		case behindCGNAT:
-			reach = "wan-cgnat"
-		case allRestricted:
-			reach = "wan-restricted"
-		default:
-			reach = "wan"
-		}
+		srcRestricted = scope == wanRestricted
+		reach = scope.reachLabel(behindCGNAT)
 	}
 	ent.Services = append(ent.Services, ServiceView{
 		Port:             f.Port,

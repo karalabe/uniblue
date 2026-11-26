@@ -429,8 +429,13 @@ func TestControllerReloginEnvelopeErrorsAndWSTLS(t *testing.T) {
 
 	// HTTP 200 with meta.rc=error (NoPermission) must return an error, not empty data.
 	returnPermErr.Store(true)
-	if _, err := ctrl.FetchSnapshot(context.Background()); err == nil {
-		t.Fatal("expected HTTP 200 meta.rc=error NoPermission to fail FetchSnapshot")
+	snap, err := ctrl.FetchSnapshot(context.Background())
+	if err != nil || snap.Visibility.PortForwardsAvailable || !strings.Contains(strings.Join(snap.Visibility.MissingFeeds, " "), "port-forwards") {
+		t.Fatalf("optional feed failure: %v", err)
+	}
+	var direct apiEnvelope[rawPortForward]
+	if err := ctrl.getJSON(context.Background(), "/proxy/network/api/s/default/rest/portforward", &direct); err == nil {
+		t.Fatal("expected NoPermission envelope error")
 	}
 
 	// WebSocket must reject untrusted self-signed cert when insecure_skip_verify is false.

@@ -840,6 +840,12 @@ func evaluateRoutedPath(
 
 	// Gateway-local traffic is ALWAYS evaluated by the UniFi Gateway itself,
 	// never by an L3 switch ACL.
+	if !isGatewayLocal && (srcNet.RouterUnresolved || dstNet.RouterUnresolved) {
+		cell.Effective = "unknown"
+		cell.Verdict = IsolationUnknown
+		cell.MissingInput = "Switch routing owner could not be resolved"
+		return cell
+	}
 	if !isGatewayLocal {
 		l3SwitchMAC := firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC)
 		if l3SwitchMAC != "" {
@@ -873,7 +879,7 @@ func evaluateRoutedPath(
 			"Gateway firewall policy telemetry is unavailable (%s); isolation cannot be verified without controller firewall rules.",
 			firstNonEmptyStr(gwMissingReason, "firewall policy feed missing"),
 		)
-		cell.RecommendedFix = "Grant read access to UniFi firewall zones and policies (Integration API v1) to verify effective gateway isolation."
+		cell.RecommendedFix = "Grant the configured account read access to the site firewall zones and policies to verify gateway isolation."
 		return cell
 	}
 	if strings.TrimSpace(q.srcZone) == "" || strings.TrimSpace(q.dstZone) == "" {
@@ -1072,34 +1078,39 @@ func applyDecisionToCell(cell *IsolationCell, dec policyDecision) {
 // evaluateGatewayPolicies walks ordered UniFi Zone-Based Firewall policies
 // respecting Index order, IP family (IPv4 vs IPv6), connection state (new vs
 // established/return), schedules, protocol, zone, network ID, IP/CIDR, MAC,
-// negation, and port selectors.
+// negation, and port selectors. When multiple enabled policies share the same
+// Index and produce conflicting or unknown outcomes for q, the verdict degrades
+// conservatively to unknown rather than depending on response order.
 func evaluateGatewayPolicies(policies []unifi.FirewallPolicy, q pathQuery) policyDecision {
-	for _, pol := range policies {
+	evalPolicy := func(pol unifi.FirewallPolicy) (policyDecision, bool) {
 		if !pol.Enabled {
-			continue
+			return policyDecision{}, false
 		}
 		if !matchesIPFamily(pol.IPVersion, q.ipFamily) {
-			continue
+			return policyDecision{}, false
 		}
 
 		// Handle automatic stateful return traffic for ALLOW rules in the reverse direction.
 		if strings.EqualFold(q.state, "established") && pol.MatchReturnTraffic && strings.EqualFold(pol.Action, "ALLOW") {
 			if matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, q.proto) {
-				revSrc, _ := matchesEndpoint(pol.Source, q.dstZone, q.dstNetID, q.dstNetName, q.dstIP, q.dstMAC, 0, q.ipFamily)
+				revSrc, _ := matchesEndpoint(pol.Source, q.dstZone, q.dstNetID, q.dstNetName, q.dstIP, q.dstMAC, q.port, q.ipFamily)
 				revDst, _ := matchesEndpoint(pol.Destination, q.srcZone, q.srcNetID, q.srcNetName, q.srcIP, q.srcMAC, q.srcPort, q.ipFamily)
+				if revSrc != matchNo && revDst != matchNo && (pol.UnsupportedReason != "" || pol.Schedule != "" || revSrc == matchUnknown || revDst == matchUnknown) {
+					return policyDecision{action: "unknown", ruleID: pol.ID, ruleName: pol.Name, missingInput: "conditional automatic return traffic"}, true
+				}
 				if revSrc == matchYes && revDst == matchYes {
 					return policyDecision{
 						action:   "allow",
 						ruleID:   pol.ID,
 						ruleName: pol.Name,
 						reason:   fmt.Sprintf("matched automatic return traffic for ALLOW rule %q (index=%d)", pol.Name, pol.Index),
-					}
+					}, true
 				}
 			}
 		}
 
 		if !matchesConnState(pol.ConnectionStates, q.state) {
-			continue
+			return policyDecision{}, false
 		}
 		if pol.UnsupportedReason != "" {
 			if (pol.Source.ZoneName == "" || strings.EqualFold(pol.Source.ZoneName, q.srcZone)) &&
@@ -1109,21 +1120,21 @@ func evaluateGatewayPolicies(policies []unifi.FirewallPolicy, q pathQuery) polic
 					ruleID:       pol.ID,
 					ruleName:     pol.Name,
 					missingInput: fmt.Sprintf("Policy %q uses an unsupported construct (%s)", pol.Name, pol.UnsupportedReason),
-				}
+				}, true
 			}
-			continue
+			return policyDecision{}, false
 		}
 		if !matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, q.proto) {
-			continue
+			return policyDecision{}, false
 		}
 
 		srcMatch, srcReason := matchesEndpoint(pol.Source, q.srcZone, q.srcNetID, q.srcNetName, q.srcIP, q.srcMAC, q.srcPort, q.ipFamily)
 		if srcMatch == matchNo {
-			continue
+			return policyDecision{}, false
 		}
 		dstMatch, dstReason := matchesEndpoint(pol.Destination, q.dstZone, q.dstNetID, q.dstNetName, q.dstIP, q.dstMAC, q.port, q.ipFamily)
 		if dstMatch == matchNo {
-			continue
+			return policyDecision{}, false
 		}
 
 		if pol.Schedule != "" {
@@ -1132,7 +1143,7 @@ func evaluateGatewayPolicies(policies []unifi.FirewallPolicy, q pathQuery) polic
 				ruleID:       pol.ID,
 				ruleName:     pol.Name,
 				missingInput: fmt.Sprintf("Policy %q is conditional on schedule %q", pol.Name, pol.Schedule),
-			}
+			}, true
 		}
 		if srcMatch == matchUnknown || dstMatch == matchUnknown {
 			reason := firstNonEmptyStr(srcReason, dstReason)
@@ -1141,7 +1152,7 @@ func evaluateGatewayPolicies(policies []unifi.FirewallPolicy, q pathQuery) polic
 				ruleID:       pol.ID,
 				ruleName:     pol.Name,
 				missingInput: fmt.Sprintf("Policy %q uses an unsupported or unresolved selector (%s)", pol.Name, reason),
-			}
+			}, true
 		}
 
 		act := strings.ToUpper(strings.TrimSpace(pol.Action))
@@ -1151,7 +1162,7 @@ func evaluateGatewayPolicies(policies []unifi.FirewallPolicy, q pathQuery) polic
 				ruleID:   pol.ID,
 				ruleName: pol.Name,
 				reason:   fmt.Sprintf("matched ALLOW rule %q (index=%d, family=%s, proto=%s)", pol.Name, pol.Index, firstNonEmptyStr(pol.IPVersion, "both"), formatPolicyProtocol(pol.Protocol, pol.ProtocolNegated)),
-			}
+			}, true
 		}
 		if act == "BLOCK" || act == "REJECT" || act == "DROP" {
 			return policyDecision{
@@ -1159,8 +1170,46 @@ func evaluateGatewayPolicies(policies []unifi.FirewallPolicy, q pathQuery) polic
 				ruleID:   pol.ID,
 				ruleName: pol.Name,
 				reason:   fmt.Sprintf("matched %s rule %q (index=%d, family=%s)", act, pol.Name, pol.Index, firstNonEmptyStr(pol.IPVersion, "both")),
+			}, true
+		}
+		return policyDecision{}, false
+	}
+
+	// Evaluate in ascending Index groups so conflicting enabled rules sharing
+	// the same Index cannot produce an order-dependent definitive verdict.
+	for i := 0; i < len(policies); {
+		idx := policies[i].Index
+		j := i + 1
+		for j < len(policies) && policies[j].Index == idx {
+			j++
+		}
+		var (
+			matched bool
+			dec     policyDecision
+		)
+		for k := i; k < j; k++ {
+			d, ok := evalPolicy(policies[k])
+			if !ok {
+				continue
+			}
+			if !matched {
+				matched = true
+				dec = d
+				continue
+			}
+			if d.action == "unknown" || dec.action == "unknown" || d.action != dec.action {
+				return policyDecision{
+					action:       "unknown",
+					ruleID:       dec.ruleID,
+					ruleName:     dec.ruleName,
+					missingInput: fmt.Sprintf("Ambiguous firewall policy priority: conflicting rules share index %d", idx),
+				}
 			}
 		}
+		if matched {
+			return dec
+		}
+		i = j
 	}
 
 	// Default UniFi Zone-Based Firewall disposition when controller policies were
@@ -1180,15 +1229,26 @@ func evaluateGatewayPolicies(policies []unifi.FirewallPolicy, q pathQuery) polic
 	}
 }
 
-func evaluateSwitchACLs(acls []unifi.SwitchACL, switchMAC string, q pathQuery) policyDecision {
-	sorted := make([]unifi.SwitchACL, len(acls))
-	copy(sorted, acls)
+// orderedSwitchACLs orders switch ACLs according to UniFi switch processing
+// precedence (MAC ACLs before IP ACLs, then ascending Index within each class),
+// preserving wire order on ties.
+func orderedSwitchACLs(acls []unifi.SwitchACL) []unifi.SwitchACL {
+	sorted := append([]unifi.SwitchACL(nil), acls...)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		if sorted[i].Index != sorted[j].Index {
-			return sorted[i].Index < sorted[j].Index
+		a, b := strings.EqualFold(sorted[i].RuleType, "MAC"), strings.EqualFold(sorted[j].RuleType, "MAC")
+		if a != b {
+			return a
 		}
-		return i < j
+		return sorted[i].Index < sorted[j].Index
 	})
+	return sorted
+}
+
+// evaluateSwitchACLs evaluates ordered UniFi switch ACL rules scoped to
+// switchMAC for the directed query q, returning the first matching verdict or
+// the default switch forwarding allow when no rule matches.
+func evaluateSwitchACLs(acls []unifi.SwitchACL, switchMAC string, q pathQuery) policyDecision {
+	sorted := orderedSwitchACLs(acls)
 	swLower := strings.ToLower(strings.TrimSpace(switchMAC))
 	for _, acl := range sorted {
 		if !acl.Enabled {
@@ -1274,45 +1334,54 @@ func matchesEndpoint(ep unifi.PolicyEndpoint, zone, netID, netName, ip, mac stri
 	}
 
 	if !ep.AnyTarget {
+		if ep.NegateTarget && ep.HasCompoundTarget() {
+			return matchUnknown, "ambiguous compound target negation"
+		}
 		hasSelector := len(ep.IPs) > 0 || len(ep.NetworkIDs) > 0 || len(ep.MACs) > 0
 		if !hasSelector {
 			return matchUnknown, "opaque target filter without IP/network/MAC details"
 		}
-		targetState := matchNo
+		targetState := matchYes
+		// Independent dimensions are conjunctive. A definitive mismatch
+		// dominates missing evidence in another dimension.
+		combine := func(m triMatch) {
+			if m == matchNo || targetState == matchYes {
+				targetState = m
+			}
+		}
 		if len(ep.NetworkIDs) > 0 {
-			if (netID != "" && containsFold(ep.NetworkIDs, netID)) || (netName != "" && containsFold(ep.NetworkIDs, netName)) {
-				targetState = matchYes
+			switch {
+			case netID == "" && netName == "":
+				combine(matchUnknown)
+			case !containsFold(ep.NetworkIDs, netID) && !containsFold(ep.NetworkIDs, netName):
+				combine(matchNo)
 			}
 		}
-		if targetState != matchYes && len(ep.MACs) > 0 {
-			if mac == "" {
-				targetState = matchUnknown
-			} else if containsFold(ep.MACs, mac) {
-				targetState = matchYes
+		if len(ep.MACs) > 0 {
+			switch {
+			case mac == "":
+				combine(matchUnknown)
+			case !containsFold(ep.MACs, mac):
+				combine(matchNo)
 			}
 		}
-		if targetState != matchYes && len(ep.IPs) > 0 {
-			if ip == "" {
-				// If every IP selector in the rule belongs strictly to the
-				// opposite IP family (e.g., an IPv4-only selector evaluated
-				// against an IPv6 query), no address of ipFamily can match.
-				if ipFamily != "" && allSelectorsOppositeFamily(ep.IPs, ipFamily) {
-					// targetState stays matchNo (and NegateTarget below will invert if set).
-				} else {
-					targetState = matchUnknown
-				}
-			} else {
-				for _, candidate := range ep.IPs {
-					m := ipMatchesSelectorTri(ip, candidate)
-					if m == matchYes {
-						targetState = matchYes
+		if len(ep.IPs) > 0 {
+			m := matchNo
+			if ip == "" && !allSelectorsOppositeFamily(ep.IPs, ipFamily) {
+				m = matchUnknown
+			} else if ip != "" {
+				for _, v := range ep.IPs {
+					r := ipMatchesSelectorTri(ip, v)
+					if r == matchYes {
+						m = r
 						break
 					}
-					if m == matchUnknown && targetState == matchNo {
-						targetState = matchUnknown
+					if r == matchUnknown {
+						m = r
 					}
 				}
 			}
+			combine(m)
 		}
 		if targetState == matchUnknown {
 			return matchUnknown, "policy targets specific or unparsed IP/MAC not resolved in query"
@@ -2083,7 +2152,7 @@ func approvedHostIPsFor(
 // endpointMatchesNetworkSelector reports whether ep's NetworkIDs filter can
 // match net (respecting AnyTarget and NegateTarget).
 func endpointMatchesNetworkSelector(ep unifi.PolicyEndpoint, net unifi.Network) bool {
-	if ep.AnyTarget || len(ep.NetworkIDs) == 0 {
+	if ep.AnyTarget || ep.UnsupportedSelector != "" || (ep.NegateTarget && ep.HasCompoundTarget()) || len(ep.NetworkIDs) == 0 {
 		return true
 	}
 	hit := (net.ID != "" && containsFold(ep.NetworkIDs, net.ID)) ||
@@ -2986,6 +3055,9 @@ func evaluateBoundary(
 	if viol, ok := evalOne("tcp", 443, 49152, srcIPSample, fixedSrcMAC, baseDstIP("tcp", 443), fixedDstMAC, false); ok {
 		return viol
 	}
+	if srcNet.RouterUnresolved || dstNet.RouterUnresolved {
+		return firstCell
+	}
 	if !gwPoliciesAvailable && firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC) == "" {
 		return firstCell
 	}
@@ -3022,14 +3094,7 @@ func evaluateBoundary(
 
 	var sortedACLs []unifi.SwitchACL
 	if l3SwitchMAC != "" {
-		sortedACLs = make([]unifi.SwitchACL, len(snap.SwitchACLs))
-		copy(sortedACLs, snap.SwitchACLs)
-		sort.SliceStable(sortedACLs, func(i, j int) bool {
-			if sortedACLs[i].Index != sortedACLs[j].Index {
-				return sortedACLs[i].Index < sortedACLs[j].Index
-			}
-			return i < j
-		})
+		sortedACLs = orderedSwitchACLs(snap.SwitchACLs)
 		for _, acl := range sortedACLs {
 			if acl.Enabled && matchesIPFamily(acl.IPVersion, fam) {
 				addProto(acl.Protocol)
@@ -3103,6 +3168,25 @@ func evaluateBoundary(
 			return len(merged) == 1 && merged[0].lo == 1 && merged[0].hi == 65535
 		}
 
+		var groupBlocked []portInterval
+		deferBlocks := false
+		flushGroupBlocked := func() {
+			if len(groupBlocked) == 0 {
+				return
+			}
+			for _, iv := range groupBlocked {
+				if iv.lo == 1 && iv.hi == 65535 {
+					uncondBlockedMerged = []portInterval{iv}
+					pendingIntervals = pendingIntervals[:0]
+					break
+				}
+				if !isFullPortBlock(uncondBlockedMerged) {
+					pendingIntervals = append(pendingIntervals, iv)
+				}
+			}
+			groupBlocked = groupBlocked[:0]
+		}
+
 		recordRuleEndpoints := func(allow bool, srcEP, dstEP unifi.PolicyEndpoint, indeterminate bool) {
 			if expected == "allow" {
 				allow = !allow
@@ -3120,14 +3204,16 @@ func evaluateBoundary(
 			}
 			if !allow {
 				// Record unconditional whole-network BLOCK port intervals so
-				// later shadowed ALLOW rules skip already-blocked port ranges
-				// without quadratic scanning, unless an earlier rule was
+				// strictly later shadowed ALLOW rules skip already-blocked port
+				// ranges without quadratic scanning, unless an earlier rule was
 				// indeterminate (scheduled/unsupported) and must stay observable.
 				if !sawIndeterminateRule && (pr == "tcp" || pr == "udp" || dstEP.AnyPort) &&
 					endpointUnconditionallyMatchesNetwork(srcEP, srcZone, srcNet, true) &&
 					endpointUnconditionallyMatchesNetwork(dstEP, dstZone, dstNet, false) {
 					if ivs, ok := endpointPortIntervals(dstEP); ok {
-						if isFullPortBlock(ivs) {
+						if deferBlocks {
+							groupBlocked = append(groupBlocked, ivs...)
+						} else if isFullPortBlock(ivs) {
 							uncondBlockedMerged = ivs
 							pendingIntervals = pendingIntervals[:0]
 						} else if !isFullPortBlock(uncondBlockedMerged) {
@@ -3217,23 +3303,35 @@ func evaluateBoundary(
 				recordRuleEndpoints(strings.EqualFold(acl.Action, "ALLOW"), acl.Source, acl.Destination, indet)
 			}
 		} else {
-			for _, pol := range sortedPolicies {
-				if !pol.Enabled || !matchesIPFamily(pol.IPVersion, fam) || !matchesConnState(pol.ConnectionStates, "new") {
-					continue
+			deferBlocks = true
+			for i := 0; i < len(sortedPolicies); {
+				idx := sortedPolicies[i].Index
+				j := i + 1
+				for j < len(sortedPolicies) && sortedPolicies[j].Index == idx {
+					j++
 				}
-				if !matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, pr) {
-					continue
+				for k := i; k < j; k++ {
+					pol := sortedPolicies[k]
+					if !pol.Enabled || !matchesIPFamily(pol.IPVersion, fam) || !matchesConnState(pol.ConnectionStates, "new") {
+						continue
+					}
+					if !matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, pr) {
+						continue
+					}
+					if pol.Source.ZoneName != "" && !strings.EqualFold(pol.Source.ZoneName, srcZone) {
+						continue
+					}
+					if pol.Destination.ZoneName != "" && !strings.EqualFold(pol.Destination.ZoneName, dstZone) {
+						continue
+					}
+					indet := pol.UnsupportedReason != "" || pol.Schedule != "" ||
+						pol.Source.UnsupportedSelector != "" || pol.Destination.UnsupportedSelector != ""
+					recordRuleEndpoints(strings.EqualFold(pol.Action, "ALLOW"), pol.Source, pol.Destination, indet)
 				}
-				if pol.Source.ZoneName != "" && !strings.EqualFold(pol.Source.ZoneName, srcZone) {
-					continue
-				}
-				if pol.Destination.ZoneName != "" && !strings.EqualFold(pol.Destination.ZoneName, dstZone) {
-					continue
-				}
-				indet := pol.UnsupportedReason != "" || pol.Schedule != "" ||
-					pol.Source.UnsupportedSelector != "" || pol.Destination.UnsupportedSelector != ""
-				recordRuleEndpoints(strings.EqualFold(pol.Action, "ALLOW"), pol.Source, pol.Destination, indet)
+				flushGroupBlocked()
+				i = j
 			}
+			deferBlocks = false
 		}
 
 		mergePending()

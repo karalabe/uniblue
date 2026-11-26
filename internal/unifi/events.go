@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -76,13 +77,17 @@ func (c *Controller) SubscribeEvents(ctx context.Context, out chan<- Event) erro
 		hostHeader = dialAddr
 	}
 
-	basePath := strings.TrimRight(parsed.Path, "/")
-	wsPath := fmt.Sprintf("%s%s/wss/s/%s/events", basePath, apiPrefix, site)
+	basePath := strings.TrimRight(parsed.EscapedPath(), "/")
+	wsPath := fmt.Sprintf("%s%s/wss/s/%s/events", basePath, apiPrefix, url.PathEscape(site))
+	upgradeURL, err := url.Parse(parsed.Scheme + "://" + parsed.Host + wsPath)
+	if err != nil {
+		return err
+	}
 
 	// Collect active session cookies from the controller's cookie jar.
 	var cookiePairs []string
 	if c.httpClient.Jar != nil {
-		for _, ck := range c.httpClient.Jar.Cookies(parsed) {
+		for _, ck := range c.httpClient.Jar.Cookies(upgradeURL) {
 			cookiePairs = append(cookiePairs, ck.Name+"="+ck.Value)
 		}
 	}
@@ -156,6 +161,11 @@ func (c *Controller) SubscribeEvents(ctx context.Context, out chan<- Event) erro
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		_ = resp.Body.Close()
 		return fmt.Errorf("websocket upgrade rejected: HTTP %d", resp.StatusCode)
+	}
+	// RFC 6455 binds the response to this handshake's random challenge.
+	sum := sha1.Sum([]byte(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") || !hasHeaderToken(resp.Header.Values("Connection"), "upgrade") || resp.Header.Get("Sec-WebSocket-Accept") != base64.StdEncoding.EncodeToString(sum[:]) {
+		return fmt.Errorf("invalid websocket upgrade response")
 	}
 	c.clearWSReloginSuppressed()
 	_ = conn.SetDeadline(time.Time{})
@@ -296,4 +306,16 @@ func writeWSPong(w io.Writer, payload []byte) error {
 	}
 	_, err := w.Write(frame)
 	return err
+}
+
+// hasHeaderToken recognizes case-insensitive comma-separated HTTP connection options.
+func hasHeaderToken(values []string, want string) bool {
+	for _, v := range values {
+		for _, token := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), want) {
+				return true
+			}
+		}
+	}
+	return false
 }

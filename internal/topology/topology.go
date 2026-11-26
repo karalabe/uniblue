@@ -443,12 +443,26 @@ func isManagementVLAN(name, zone string, configured []string) bool {
 	return false
 }
 
+// policyMatchesNewConn reports whether a policy with explicit connection states
+// matches NEW connections (excluding return-traffic-only rules).
+func policyMatchesNewConn(states []string) bool {
+	for _, s := range states {
+		if strings.EqualFold(strings.TrimSpace(s), "new") {
+			return true
+		}
+	}
+	return false
+}
+
 // buildWANRoutes extracts concise, operator-readable WAN ingress summaries from
 // enabled port forwards, WireGuard/VPN rules, and user-defined External ALLOW policies.
 func buildWANRoutes(snap *unifi.Snapshot) []WANRoute {
 	var routes []WANRoute
 	for _, pol := range snap.FirewallPolicies {
 		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") {
+			continue
+		}
+		if len(pol.ConnectionStates) > 0 && !policyMatchesNewConn(pol.ConnectionStates) {
 			continue
 		}
 		if !strings.EqualFold(pol.Source.ZoneName, "external") {

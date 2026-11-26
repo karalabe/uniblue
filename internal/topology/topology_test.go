@@ -203,3 +203,38 @@ func TestBuildZoneIsolationMatchesEffectivePolicyOrder(t *testing.T) {
 		t.Fatalf("expected IoTZone with single-host DNS pinhole before BLOCK to remain isolated, vlan=%v zone=%v", vlanIso["IoT"], zoneIso["IoTZone"])
 	}
 }
+
+// TestBuildWANRoutesSkipsReturnOnlyPolicies verifies that External ALLOW rules
+// restricted to established/related return traffic are not flagged as inbound
+// reviewable WAN routes.
+func TestBuildWANRoutesSkipsReturnOnlyPolicies(t *testing.T) {
+	snap := &unifi.Snapshot{
+		FirewallPolicies: []unifi.FirewallPolicy{
+			{
+				ID:               "ret-only",
+				Name:             "Allow Return Traffic",
+				Enabled:          true,
+				Action:           "ALLOW",
+				Origin:           "USER_DEFINED",
+				Protocol:         "all",
+				ConnectionStates: []string{"established", "related"},
+				Source:           unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true},
+				Destination:      unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, AnyPort: true},
+			},
+			{
+				ID:          "inbound-ssh",
+				Name:        "Allow SSH",
+				Enabled:     true,
+				Action:      "ALLOW",
+				Origin:      "USER_DEFINED",
+				Protocol:    "tcp",
+				Source:      unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", AnyTarget: true, Ports: []int{22}},
+			},
+		},
+	}
+	routes := buildWANRoutes(snap)
+	if len(routes) != 1 || routes[0].Kind != "firewall-policy" || routes[0].Label != `Policy "Allow SSH": External -> Gateway (tcp)` {
+		t.Fatalf("expected only inbound NEW policy route, got %+v", routes)
+	}
+}

@@ -401,7 +401,8 @@ type Engine struct {
 	lastClasses      map[string]classify.Result
 	lastPolicySig    string
 	lastFwdSig       string
-	sigsInitialized  bool
+	fwdSigInit       bool
+	policySigInit    bool
 	baselineComplete bool
 	lastScanError    string
 	lastDiscovery    *probe.LANDiscovery
@@ -523,9 +524,14 @@ func (e *Engine) Start(ctx context.Context) error {
 	snap.Clients = filterOfflineWiredClients(snap.Clients, initPorts)
 	e.mu.Lock()
 	e.snap = snap
-	e.lastFwdSig = portForwardSignature(snap.PortForwards)
-	e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
-	e.sigsInitialized = true
+	if snap.Visibility == nil || snap.Visibility.PortForwardsAvailable {
+		e.lastFwdSig = portForwardSignature(snap.PortForwards)
+		e.fwdSigInit = true
+	}
+	if snap.Visibility == nil || snap.Visibility.GatewayPoliciesAvailable {
+		e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
+		e.policySigInit = true
+	}
 	e.lastPorts = initPorts
 	e.anomalies.Seed(snap, e.lastPorts, time.Now().UTC())
 	e.mu.Unlock()
@@ -1207,11 +1213,14 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 		}
 	}
 
-	// Detect WAN port-forward or user firewall policy changes (including the
-	// transition from 0 rules to the first rule once signatures are seeded).
+	// Detect WAN port-forward or user firewall policy changes only when the
+	// respective feed was actually retrieved (so temporary feed denials never
+	// emit false policy_changed alerts when the feed disappears and returns).
+	fwdOK := snap.Visibility == nil || snap.Visibility.PortForwardsAvailable
+	polOK := snap.Visibility == nil || snap.Visibility.GatewayPoliciesAvailable
 	fwdSig := portForwardSignature(snap.PortForwards)
 	polSig := firewallPolicySignature(snap.FirewallPolicies)
-	if e.sigsInitialized && fwdSig != e.lastFwdSig {
+	if fwdOK && e.fwdSigInit && fwdSig != e.lastFwdSig {
 		changed = true
 		pendingEvents = append(pendingEvents, LiveEvent{
 			Type:     "policy_changed",
@@ -1231,7 +1240,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 			}
 		}
 	}
-	if e.sigsInitialized && polSig != e.lastPolicySig {
+	if polOK && e.policySigInit && polSig != e.lastPolicySig {
 		changed = true
 		pendingEvents = append(pendingEvents, LiveEvent{
 			Type:     "policy_changed",
@@ -1355,9 +1364,14 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 
 	e.snap = snap
 	e.deltaGen++
-	e.lastFwdSig = fwdSig
-	e.lastPolicySig = polSig
-	e.sigsInitialized = true
+	if fwdOK {
+		e.lastFwdSig = fwdSig
+		e.fwdSigInit = true
+	}
+	if polOK {
+		e.lastPolicySig = polSig
+		e.policySigInit = true
+	}
 	e.lastPorts = currPorts
 	e.mu.Unlock()
 
@@ -1748,9 +1762,14 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		// feeds that transiently failed and adopt the full snapshot cleanly.
 		preserveUnavailableTelemetry(e.snap, snap)
 		e.snap = snap
-		e.lastFwdSig = portForwardSignature(snap.PortForwards)
-		e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
-		e.sigsInitialized = true
+		if snap.Visibility == nil || snap.Visibility.PortForwardsAvailable {
+			e.lastFwdSig = portForwardSignature(snap.PortForwards)
+			e.fwdSigInit = true
+		}
+		if snap.Visibility == nil || snap.Visibility.GatewayPoliciesAvailable {
+			e.lastPolicySig = firewallPolicySignature(snap.FirewallPolicies)
+			e.policySigInit = true
+		}
 		e.lastPorts = currPorts
 	}
 	// Merge scanned host profiles/findings carefully: keep only hosts still active
