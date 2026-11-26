@@ -2799,6 +2799,7 @@ function renderHouse() {
           const tone = g.state === "exposed" ? humanStateTone(pe) : (g.state === "review" ? "warn" : "");
           const plainFact = pe?.tagged_policy === "all"
             ? "Carries all home networks"
+            : pe?.port_security_unknown ? "Device lock setting unknown"
             : (pe?.port_security ? `Locked to ${pe.native_vlan || "1 network"}` : `${pe?.native_vlan || "Network"} · no device lock`);
           return `<div class="cable-pill ${tone} ${g.inferred ? "inferred" : ""}" data-entity-id="${esc(g.port_id)}">
             <span style="color:${isRisk ? "var(--" + (tone === "crit" ? "crit" : "warn") + ")" : "var(--ok)"}">${isRisk ? ICONS.unlock : ICONS.lock}</span>
@@ -3525,7 +3526,7 @@ function renderDrawer() {
     b += `<div class="kv"><div class="k">Link State</div><div class="v">${esc(ent.port_state)} ${fmtSpeed(ent.speed)}</div></div>
       <div class="kv"><div class="k">Native VLAN</div><div class="v">${esc(ent.native_vlan || "-")}</div></div>
       <div class="kv"><div class="k">Tagged VLANs</div><div class="v mono">${esc(ent.tagged_policy || "-")}</div></div>
-      <div class="kv"><div class="k">MAC Security</div><div class="v">${ent.port_security ? "Enabled" : "Off"} (${ent.mac_table_count || 0} MACs)</div></div>
+      <div class="kv"><div class="k">MAC Security</div><div class="v">${ent.port_security_unknown ? "Unknown" : ent.port_security ? "Enabled" : "Off"} (${ent.mac_table_count || 0} MACs)</div></div>
       <div class="kv"><div class="k">Port Isolation</div><div class="v">${ent.port_isolation_unknown ? "Unknown" : (ent.port_isolation ? "Enabled" : "Off")}</div></div>
       <div class="kv"><div class="k">PoE Power</div><div class="v mono">${ent.poe_enabled ? "⚡ " + esc(ent.poe_power || "ON") + "W" : "Off"}</div></div>
       <div class="kv"><div class="k">STP State</div><div class="v mono">${esc(ent.stp_state || "-")}</div></div>`;

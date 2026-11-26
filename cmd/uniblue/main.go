@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -196,6 +197,7 @@ func runBlast(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	path := fs.String("config", "config.yaml", "path to the UniBlue configuration")
 	asJSON := fs.Bool("json", false, "print the full report as JSON")
 	noProbe := fs.Bool("no-probe", false, "use controller and passive inventory only")
+	compromise := fs.String("compromise", "", "assess loss of an AP, switch, gateway, or controller by name or MAC")
 	noCVE := fs.Bool("no-cve", false, "skip the local vulnerability cache")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -223,10 +225,17 @@ func runBlast(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 
+	prev, _ := risk.LoadState(cfg.State.Path)
 	activeChecks := list
 	var profiles []probe.HostProfile
 	if !*noProbe {
 		fp := newSiteFingerprinter(mergePorts(cfg.Scan.Ports, list), cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+		if err := fp.SetSSHKeyAudit(cfg.Scan.SSHKeyAudit); err != nil {
+			return err
+		}
+		if prev != nil {
+			fp.SetPreviousSSHHostKeys(prev.SSHHostKeys)
+		}
 		fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, list, snap.PortHintsByIP()))
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
 	} else {
@@ -247,6 +256,25 @@ func runBlast(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			profiles = append(profiles, probe.HostProfile{Client: unifi.Client{ID: d.ID, MAC: d.MAC, IP: d.IP, Name: d.Name}, Children: ch})
 		}
 	}
+	if *compromise != "" {
+		ctrlURL, err := url.Parse(cfg.UniFi.URL)
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result, err := blast.EvaluateInfraCompromise(blast.Input{Snapshot: snap, Profiles: profiles, NetCfg: cfg.Network, ControllerHost: ctrlURL.Hostname()}, *compromise)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return writeJSON(stdout, result)
+		}
+		printInfraBlast(stdout, result)
+		return nil
+	}
+	prev.CompareSSHHostKeys(profiles)
 	findings := checks.NewRunner(activeChecks, cfg.Scan.Concurrency).RunAll(ctx, profiles)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -269,7 +297,132 @@ func runBlast(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return writeJSON(stdout, result)
 	}
 	printBlast(stdout, result)
+	printLocalSSHKeyAudit(stdout, profiles)
 	return nil
+}
+
+// printLocalSSHKeyAudit displays opt-in SSH PK_OK audit details only when
+// writing to an interactive terminal. Redirected pipes/logs receive only a
+// privacy-safe summary count so key-to-host maps are never captured in logs.
+func printLocalSSHKeyAudit(w io.Writer, profiles []probe.HostProfile) {
+	isTTY := false
+	if f, ok := w.(*os.File); ok {
+		if st, err := f.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
+			isTTY = true
+		}
+	}
+	if !isTTY {
+		invitedHosts, noneHosts := 0, 0
+		for _, hp := range profiles {
+			if hp.SSH == nil || hp.SSH.CanaryFalsePositive {
+				continue
+			}
+			if hp.SSH.NoneAuthAccepted {
+				noneHosts++
+			} else if len(hp.SSH.AcceptedKeys) > 0 {
+				invitedHosts++
+			}
+		}
+		if noneHosts > 0 || invitedHosts > 0 {
+			fmt.Fprintf(w, "\nSSH key audit summary: %d host(s) accepted 'none' auth, %d host(s) invited configured public keys (run in an interactive terminal to view key details).\n", noneHosts, invitedHosts)
+		}
+		return
+	}
+	headerPrinted := false
+	ensureHeader := func() {
+		if !headerPrinted {
+			fmt.Fprintln(w, "\nSSH key audit (local only, omitted from JSON and webhooks)")
+			headerPrinted = true
+		}
+	}
+	for _, hp := range profiles {
+		s := hp.SSH
+		if s == nil {
+			continue
+		}
+		name := hp.Client.DisplayName()
+		if s.CanaryFalsePositive {
+			ensureHeader()
+			fmt.Fprintf(w, "  %s (port %d): server accepted a random canary key; key matches discarded.\n", name, s.Port)
+			continue
+		}
+		for _, k := range s.AcceptedKeys {
+			ensureHeader()
+			if k.Method == "none" {
+				fmt.Fprintf(w, "  %s (port %d): accepted unauthenticated 'none' login for user %q.\n", name, s.Port, k.Username)
+			} else {
+				fmt.Fprintf(w, "  %s (port %d): user %q invited %s (%s, %s) - %s\n", name, s.Port, k.Username, k.KeyLabel, k.Fingerprint, k.Algorithm, k.Note)
+			}
+		}
+		if s.BruteForceProtected {
+			ensureHeader()
+			fmt.Fprintf(w, "  %s (port %d): connection rate-limited or dropped during audit (stopped early).\n", name, s.Port)
+		}
+	}
+}
+
+// printInfraBlast prints the direction and three properties of each leg. All
+// resilient rows share the same six limitations, printed together below them.
+func printInfraBlast(w io.Writer, r blast.InfraReport) {
+	fmt.Fprintf(w, "%s compromise: %s\n", r.Scope, r.Target)
+	for _, effect := range r.Effects {
+		fmt.Fprintln(w, effect)
+	}
+	if r.HostedOn != "" {
+		fmt.Fprintln(w, "Controller runs on:", r.HostedOn)
+	}
+	for _, row := range []struct {
+		label  string
+		values []string
+	}{
+		{"Controller manages", r.Manages}, {"Downstream devices", r.Downstream}, {"Routed VLANs", r.RoutedVLANs}, {"Affected clients", r.Clients},
+	} {
+		if len(row.values) > 0 {
+			fmt.Fprintf(w, "%s: %s\n", row.label, strings.Join(row.values, ", "))
+		}
+	}
+	if len(r.Ports) > 0 {
+		fmt.Fprintln(w, "Switch ports:", r.Ports)
+	}
+	if r.Scope == "AP" || r.Scope == "Switch" {
+		nets := strings.Join(r.UplinkVLANs, ", ")
+		if r.UplinkUnknown {
+			if nets != "" {
+				nets += ", other VLANs unknown"
+			} else {
+				nets = "unknown"
+			}
+		} else if nets == "" {
+			nets = "none"
+		}
+		fmt.Fprintf(w, "%s uplink carries VLANs: %s\n", r.Scope, nets)
+	}
+	if len(r.Legs) == 0 {
+		fmt.Fprintln(w, "No service observations were available on the affected paths.")
+	}
+	var blindSpots []string
+	for _, l := range r.Legs {
+		endpoint := l.Address
+		if l.Port > 0 {
+			endpoint = strings.TrimSpace(fmt.Sprintf("%s %s/%d", endpoint, l.Transport, l.Port))
+		}
+		fmt.Fprintf(w, "\n%s -> %s (%s) %s\n  %s. Reachability: %s. Transport: %s.\n", l.From, l.To, l.Protocol, endpoint, l.Path, l.Reachability, l.Class)
+		fmt.Fprintf(w, "  Confidentiality: %s. Integrity: %s. Availability: %s.\n  %s\n", l.Confidentiality, l.Integrity, l.Availability, l.Note)
+		if l.Wireless != "" {
+			fmt.Fprintln(w, " ", l.Wireless)
+		}
+		for _, v := range []blast.TransportVerdict{l.Confidentiality, l.Integrity, l.Availability} {
+			if spots := v.BlindSpots(); len(spots) != 0 {
+				blindSpots = spots
+			}
+		}
+	}
+	if len(blindSpots) != 0 {
+		fmt.Fprintln(w, "\nLimits of every resilient verdict above")
+		for _, item := range blindSpots {
+			fmt.Fprintln(w, "-", item)
+		}
+	}
 }
 
 // printBlast prints a compact summary of each lane; use -json for the full queue.
@@ -387,7 +540,7 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		minSev: minSev,
 		logger: logger,
 		scanFn: func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
-			return executeCycleWithPrev(ctx, cfg, checkList, session.lastSnap)
+			return executeCycleWithPrev(ctx, cfg, checkList, session.lastSnap, session.prevState)
 		},
 		sendFn:       notifier.Send,
 		sendWithIDFn: notifier.SendWithID,
@@ -984,10 +1137,16 @@ func reportUnevaluableCheckHints(stderr io.Writer, list []*checks.Check, target 
 // executeCycle runs one end-to-end UniFi snapshot, host fingerprinting pass,
 // declarative check sweep, and blast-radius risk evaluation.
 func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.Check) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
-	return executeCycleWithPrev(ctx, cfg, checkList, nil)
+	prev, _ := risk.LoadState(cfg.State.Path)
+	return executeCycleWithPrev(ctx, cfg, checkList, nil, prev)
 }
 
-func executeCycleWithPrev(ctx context.Context, cfg *config.Config, checkList []*checks.Check, prevSnap *unifi.Snapshot) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
+// watchAuditedSSHHostKeys caches opt-in SSH key audit outcomes for unchanged
+// host keys during this process so periodic watch scans replay findings without
+// sending repeat PK_OK queries.
+var watchAuditedSSHHostKeys = map[string]probe.SSHKeyAuditCacheEntry{}
+
+func executeCycleWithPrev(ctx context.Context, cfg *config.Config, checkList []*checks.Check, prevSnap *unifi.Snapshot, prev *risk.State) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
 	ctrl, err := unifi.New(cfg.UniFi)
 	if err != nil {
 		return nil, nil, risk.Report{}, err
@@ -1006,6 +1165,13 @@ func executeCycleWithPrev(ctx context.Context, cfg *config.Config, checkList []*
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
 	fp := newSiteFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+	if err := fp.SetSSHKeyAudit(cfg.Scan.SSHKeyAudit); err != nil {
+		return nil, nil, risk.Report{}, err
+	}
+	if prev != nil {
+		fp.SetPreviousSSHHostKeys(prev.SSHHostKeys)
+	}
+	fp.SetAuditedSSHHostKeys(watchAuditedSSHHostKeys)
 	// Seed per-host port hints from UniFi port forwards, firewall policies, and
 	// identity-gated checks (MAC/hostname) so specialty ports are only dialed on
 	// matching hosts instead of every host on the LAN.
@@ -1028,9 +1194,11 @@ func executeCycleWithPrev(ctx context.Context, cfg *config.Config, checkList []*
 	// Merge noise-filtered Nerva protocol findings (e.g., legacy protocols,
 	// anonymous service access, expired TLS certs) so they receive UniFi
 	// blast-radius scoring, state diffing, and watch alerting alongside YAML checks.
+	keys := prev.CompareSSHHostKeys(profiles)
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 
 	report := risk.Evaluate(snap, rawFindings, cfg.Network)
+	report.SSHHostKeys = keys
 	return snap, profiles, report, nil
 }
 
@@ -1097,6 +1265,9 @@ func siteGatewayReflectorIPs(snap *unifi.Snapshot) []string {
 // IPv4/IPv6 subnets and gateway mDNS reflector IPs from snap.
 func newSiteFingerprinter(ports []int, concurrency int, timeout time.Duration, excluded map[string]struct{}, snap *unifi.Snapshot) *probe.Fingerprinter {
 	fp := probe.NewFingerprinter(ports, concurrency, timeout, excluded)
+	if snap != nil {
+		fp.SetInfrastructure(snap.Devices)
+	}
 	fp.SetAllowedSubnets(siteSubnets(snap))
 	fp.SetTrustedReflectors(siteGatewayReflectorIPs(snap))
 	return fp

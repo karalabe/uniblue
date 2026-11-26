@@ -78,7 +78,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 			// Hard zero-byte sink safety guard: NEVER send application-layer probe
 			// bytes to JetDirect (9100), LPD (515), or any raw print or serial-bridge
 			// port (including reflected Zigbee UART coordinators).
-			if hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
+			if hp.sshPort(port) || port == 445 || hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
 				continue
 			}
 			targets = append(targets, plugins.Target{
@@ -191,7 +191,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 		}
 		var pendingPorts []int
 		for _, port := range hp.OpenPorts {
-			if covered[port] || hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
+			if hp.sshPort(port) || port == 445 || covered[port] || hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
 				continue
 			}
 			if b, ok := hp.HTTP[port]; ok {
@@ -257,6 +257,20 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 						}
 						label := fmt.Sprintf("%s:%d", job.name, port)
 						if svc, ok := probeAlternatePortFallback(ctx, job.ip, port, nervaTimeout); ok {
+							// A greeting on an alternate port identifies a listener for the same pre-authentication exchange.
+							if svc.Protocol == "ssh" && !f.isInfrastructure(*hp) {
+								dialer := net.Dialer{Timeout: nervaTimeout}
+								conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(job.ip, strconv.Itoa(port)))
+								if err == nil {
+									if obs := observeSSH(conn, port, nervaTimeout); obs != nil {
+										if hp.SSH == nil {
+											hp.SSH = obs
+										}
+										svc.Findings = append(svc.Findings, sshWeakAlgorithmFindings(obs)...)
+									}
+									conn.Close()
+								}
+							}
 							hp.Services = append(hp.Services, svc)
 							if svc.Banner != "" && strings.HasPrefix(svc.Banner, "SSH-") && hp.SSHBanner == "" {
 								hp.SSHBanner = svc.Banner

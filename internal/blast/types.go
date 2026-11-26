@@ -19,6 +19,9 @@ import (
 
 // Input holds the inventory and evidence from one scan. Evaluate borrows all fields.
 type Input struct {
+	// ControllerHost is the configured controller address without credentials or a port.
+	ControllerHost string
+
 	// Snapshot describes the site's inventory, policies and publications.
 	Snapshot *unifi.Snapshot
 	// Profiles holds observations made on individual hosts.

@@ -41,6 +41,9 @@ const (
 // OutboundDependency represents an external internet service contacted by a
 // local LAN device, kept strictly distinct from services hosted by that device.
 type OutboundDependency struct {
+	// Protocol names the application protocol identified in the flow record, when available.
+	Protocol string `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+
 	// Category classifies the dependency ("vendor-control", "firmware-updates",
 	// "dns-time", "identity-signin", "push-notifications", "voice-video-relay",
 	// "cloud-storage", "productivity-saas", "shared-cdn", "vpn-tunnel",
@@ -381,6 +384,7 @@ func buildOutboundDependency(rec PassiveFlowRecord, transport string) OutboundDe
 	}
 
 	return OutboundDependency{
+		Protocol:         proto,
 		Category:         cat,
 		ServiceName:      svcName,
 		DestinationHost:  rec.RemoteHost,

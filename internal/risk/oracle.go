@@ -9,6 +9,7 @@ package risk
 import (
 	"fmt"
 	"iter"
+	"maps"
 	"net/netip"
 	"slices"
 	"sort"
@@ -23,6 +24,7 @@ import (
 // UniFi snapshot. Queries do not mutate Oracle state and are safe to run
 // concurrently as long as the caller does not mutate the borrowed snapshot.
 type Oracle struct {
+	compromised         map[string]bool
 	snap                *unifi.Snapshot
 	intent              config.IsolationIntent
 	gwName, gwMAC, gwIP string
@@ -199,7 +201,7 @@ func (o *Oracle) InternetEgress(cl unifi.Client, fam string) IsolationCell {
 	n := o.network(cl.NetworkID, cl.NetworkName)
 	external := unifi.Network{Name: "Internet", ZoneName: "External", Subnet: "0.0.0.0/0", IPv6Subnet: "2000::/3"}
 	peers := peerEndpoints{src: cl}
-	if n.InternetAccessEnabled != nil && !*n.InternetAccessEnabled {
+	if n.InternetAccessEnabled != nil && !*n.InternetAccessEnabled && !o.compromised[config.CanonicalMAC(o.gwMAC)] {
 		return o.endpointPath(n, external, n.ZoneName, "External", peers, "", 0, fam)
 	}
 	if len(peerAddresses(cl, fam)) == 0 {
@@ -208,7 +210,13 @@ func (o *Oracle) InternetEgress(cl unifi.Client, fam string) IsolationCell {
 	if _, local := routableClient(cl, fam); local {
 		return o.nonRoutableCell(n, external, n.ZoneName, "External", cl, "", 0, fam)
 	}
-	n.RouterDeviceMAC, n.RouterUnresolved = "", false
+	// Keep L3 switch routing intact when switch ACLs are present or during
+	// infrastructure-compromise evaluation so switch egress blocks remain
+	// monotonic before and after gateway compromise. Preserve RouterUnresolved
+	// in all cases so unresolved routing owners never report allow then unknown.
+	if len(o.snap.SwitchACLs) == 0 && len(o.compromised) == 0 {
+		n.RouterDeviceMAC = ""
+	}
 	scoped := *o
 	scoped.sortedPolicies = o.policiesWithExternalDefault(n)
 	return scoped.evaluateBoundary(nil, config.IsolationIntent{}, n, external, n.ZoneName, "External", fam, "deny", &peers)
@@ -355,6 +363,30 @@ func (o *Oracle) Internet(dst unifi.Client, proto string, port int, fam string) 
 	return cells
 }
 
+// WithCompromised returns an independent scenario that bypasses only the named enforcers.
+func (o *Oracle) WithCompromised(enforcerMACs ...string) *Oracle {
+	cp := *o
+	cp.compromised = make(map[string]bool, len(o.compromised)+len(enforcerMACs))
+	maps.Copy(cp.compromised, o.compromised)
+	for _, raw := range enforcerMACs {
+		if mac, ok := config.ParseCanonicalMAC(raw); ok {
+			cp.compromised[mac] = true
+		}
+	}
+	return &cp
+}
+
+const compromiseReason = "Enforcer compromised in what-if scenario"
+
+// bypass marks a decision at one compromised hop so the other hops can still enforce their rules.
+func (o *Oracle) bypass(cell *IsolationCell, mac string) bool {
+	if len(o.compromised) == 0 || !o.compromised[config.CanonicalMAC(mac)] {
+		return false
+	}
+	applyDecisionToCell(cell, policyDecision{action: "allow", reason: compromiseReason})
+	return true
+}
+
 // WithoutPolicies returns a shallow copy of the Oracle with the specified
 // firewall policy IDs removed so callers can test whether a later rule still
 // allows traffic after removing the winning rule.
@@ -434,7 +466,7 @@ func (o *Oracle) firewallIngress(net unifi.Network, dst unifi.Client, proto stri
 	if dst, nonRoutable = routableClient(dst, fam); nonRoutable {
 		return nil
 	}
-	if o.gwPoliciesAvailable && net.ZoneName != "" && !slices.ContainsFunc(o.sortedPolicies, func(p unifi.FirewallPolicy) bool {
+	if !o.compromised[config.CanonicalMAC(o.gwMAC)] && o.gwPoliciesAvailable && net.ZoneName != "" && !slices.ContainsFunc(o.sortedPolicies, func(p unifi.FirewallPolicy) bool {
 		return p.Enabled && (p.Source.ZoneName == "" || strings.EqualFold(p.Source.ZoneName, "External")) &&
 			(p.Destination.ZoneName == "" || strings.EqualFold(p.Destination.ZoneName, net.ZoneName))
 	}) {
@@ -647,7 +679,7 @@ func (o *Oracle) nonRoutableCell(srcNet, dstNet unifi.Network, srcZone, dstZone 
 func (o *Oracle) endpointPath(srcNet, dstNet unifi.Network, srcZone, dstZone string, peers peerEndpoints, proto string, port int, fam string) IsolationCell {
 	eval := o
 	if strings.EqualFold(dstZone, "External") {
-		if srcNet.InternetAccessEnabled != nil && !*srcNet.InternetAccessEnabled {
+		if srcNet.InternetAccessEnabled != nil && !*srcNet.InternetAccessEnabled && !o.compromised[config.CanonicalMAC(o.gwMAC)] {
 			c := IsolationCell{
 				SourceZone:    firstNonEmptyStr(srcZone, srcNet.Name),
 				SourceNetwork: srcNet.Name,
@@ -814,6 +846,10 @@ func (o *Oracle) peerPath(n unifi.Network, peers peerEndpoints, proto string, po
 			MissingInput: "Controller did not resolve all peer attachments on " + n.Name}
 	}
 	if !a.IsWired && !b.IsWired && a.APMAC != "" && strings.EqualFold(a.APMAC, b.APMAC) {
+		cell := IsolationCell{PathKind: "same-ap-wifi", DestFunction: "same-vlan-wifi-peers", EnforcerMACs: enforcerMACs(a.APMAC), Transport: "all"}
+		if o.bypass(&cell, a.APMAC) {
+			return cell
+		}
 		for _, w := range o.snap.WLANs {
 			if w.Enabled && strings.EqualFold(w.NetworkName, n.Name) && a.ESSID != "" && a.ESSID == b.ESSID && w.Name == a.ESSID {
 				cell := o.sameAP(w)
@@ -970,6 +1006,9 @@ func (o *Oracle) peerPorts(a, b checks.SwitchPortRef, path string, single bool) 
 	c := IsolationCell{Enforcer: "Switch port isolation", Transport: "all", IPFamily: "both"}
 	if sameSwitch && (single || a != b) {
 		c.EnforcerMACs = enforcerMACs(a.SwitchMAC)
+		if o.bypass(&c, a.SwitchMAC) {
+			return c, ""
+		}
 	}
 	if sameSwitch && (single || a != b) && !pa.IsolationUnknown && !pb.IsolationUnknown && pa.Isolation && pb.Isolation {
 		c.Verdict, c.Effective = IsolationBlockedOK, "deny"
@@ -1072,7 +1111,16 @@ const gatewayOwner = ""
 // Same-switch VLANs stay on that switch, while mixed switch/gateway crossings
 // require both the L3 switch ACL and the gateway zone firewall to permit traffic.
 func routingOwners(src, dst unifi.Network, srcZone, dstZone string) routingPath {
-	if strings.EqualFold(dstZone, "Gateway") || strings.EqualFold(srcZone, "External") || strings.EqualFold(dstZone, "External") {
+	if strings.EqualFold(dstZone, "External") {
+		if src.RouterUnresolved {
+			return nil
+		}
+		if a := strings.TrimSpace(src.RouterDeviceMAC); a != "" {
+			return routingPath{a, gatewayOwner}
+		}
+		return routingPath{gatewayOwner}
+	}
+	if strings.EqualFold(dstZone, "Gateway") || strings.EqualFold(srcZone, "External") {
 		return routingPath{gatewayOwner}
 	}
 	if src.RouterUnresolved || dst.RouterUnresolved {
@@ -1130,8 +1178,10 @@ func (o *Oracle) routedCell(srcNet, dstNet unifi.Network, q pathQuery, destHost,
 			return hop
 		}
 		macs = append(macs, hop.EnforcerMACs...)
-		// Retain the first missing input, or a named permit over default forwarding.
-		if result.Effective == "" || (result.Effective == "allow" && (hop.Effective == "unknown" || result.DecisiveRuleID == "")) {
+		// An unresolved hop takes precedence. Among permits, keep evidence of a
+		// bypass or a named rule in preference to a default forwarding decision.
+		defaultPermit := result.DecisiveRuleID == "" && result.DecisiveReason != compromiseReason
+		if result.Effective == "" || result.Effective == "allow" && (hop.Effective == "unknown" || hop.DecisiveReason == compromiseReason || defaultPermit) {
 			result = hop
 		}
 	}
@@ -1155,6 +1205,9 @@ func (o *Oracle) enforcerCell(cell IsolationCell, owner string, q pathQuery) Iso
 		name := deviceNameByMAC(o.snap, owner)
 		cell.PathKind, cell.Enforcer = "switch-routed", name+" (L3 Switch ACL)"
 		cell.EnforcerMACs = enforcerMACs(owner)
+		if o.bypass(&cell, owner) {
+			return cell
+		}
 		if o.switchACLStatus != "complete" {
 			applyDecisionToCell(&cell, policyDecision{action: "unknown", missingInput: fmt.Sprintf("Switch ACL unavailable for L3 switch %s (%s).", name, o.switchACLReason)})
 			cell.RecommendedFix = fmt.Sprintf("Collect switch ACL configuration from %s to verify effective isolation.", name)
@@ -1166,6 +1219,9 @@ func (o *Oracle) enforcerCell(cell IsolationCell, owner string, q pathQuery) Iso
 	cell.Enforcer, cell.EnforcerMACs = o.gwName+" (Zone Firewall)", enforcerMACs(o.gwMAC)
 	if strings.EqualFold(q.dstZone, "Gateway") {
 		cell.PathKind = "gateway-local"
+	}
+	if o.bypass(&cell, o.gwMAC) {
+		return cell
 	}
 	switch {
 	case !o.gwPoliciesAvailable:

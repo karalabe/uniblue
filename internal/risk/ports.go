@@ -47,33 +47,35 @@ type PortPeer struct {
 // SwitchPortView merges live link state, VLAN/MAC configuration, physical
 // perimeter zoning, connected peers, and security status for one switch port.
 type SwitchPortView struct {
-	PortIdx          int        `json:"port_idx"`
-	Name             string     `json:"name"`
-	Label            string     `json:"label,omitempty"`
-	Zone             string     `json:"zone"`        // "external", "external_uplink", "internal", "uplink", "wan", "unused"
-	ZoneSource       string     `json:"zone_source"` // "config", "auto", "parent_link", "default"
-	State            string     `json:"state"`       // "active", "inactive_enabled", "disabled"
-	Enabled          bool       `json:"enabled"`
-	Up               bool       `json:"up"`
-	Speed            int        `json:"speed"`
-	Media            string     `json:"media,omitempty"`
-	PoEEnabled       bool       `json:"poe_enabled,omitempty"`
-	PoEMode          string     `json:"poe_mode,omitempty"`
-	PoEPower         string     `json:"poe_power,omitempty"`
-	PoEPowerWatts    float64    `json:"poe_power_watts,omitempty"`
-	NativeVLAN       string     `json:"native_vlan,omitempty"`
-	TaggedPolicy     string     `json:"tagged_policy"` // "all", "block_all", "custom", "disabled"
-	PortSecurity     bool       `json:"port_security"`
-	PortSecurityMACs []string   `json:"port_security_macs,omitempty"`
-	Isolation        bool       `json:"isolation,omitempty"`
-	IsolationUnknown bool       `json:"isolation_unknown,omitempty"`
-	MACTableCount    int        `json:"mac_table_count,omitempty"`
-	STPState         string     `json:"stp_state,omitempty"`
-	RXErrors         int64      `json:"rx_errors,omitempty"`
-	TXErrors         int64      `json:"tx_errors,omitempty"`
-	Peers            []PortPeer `json:"peers,omitempty"`
-	Status           string     `json:"status"` // "ok", "warn", "critical"
-	Issues           []string   `json:"issues,omitempty"`
+	PortIdx       int     `json:"port_idx"`
+	Name          string  `json:"name"`
+	Label         string  `json:"label,omitempty"`
+	Zone          string  `json:"zone"`        // "external", "external_uplink", "internal", "uplink", "wan", "unused"
+	ZoneSource    string  `json:"zone_source"` // "config", "auto", "parent_link", "default"
+	State         string  `json:"state"`       // "active", "inactive_enabled", "disabled"
+	Enabled       bool    `json:"enabled"`
+	Up            bool    `json:"up"`
+	Speed         int     `json:"speed"`
+	Media         string  `json:"media,omitempty"`
+	PoEEnabled    bool    `json:"poe_enabled,omitempty"`
+	PoEMode       string  `json:"poe_mode,omitempty"`
+	PoEPower      string  `json:"poe_power,omitempty"`
+	PoEPowerWatts float64 `json:"poe_power_watts,omitempty"`
+	NativeVLAN    string  `json:"native_vlan,omitempty"`
+	TaggedPolicy  string  `json:"tagged_policy"` // "all", "block_all", "custom", "disabled"
+	PortSecurity  bool    `json:"port_security"`
+	// PortSecurityUnknown reports when the controller omitted the effective setting.
+	PortSecurityUnknown bool       `json:"port_security_unknown,omitempty"`
+	PortSecurityMACs    []string   `json:"port_security_macs,omitempty"`
+	Isolation           bool       `json:"isolation,omitempty"`
+	IsolationUnknown    bool       `json:"isolation_unknown,omitempty"`
+	MACTableCount       int        `json:"mac_table_count,omitempty"`
+	STPState            string     `json:"stp_state,omitempty"`
+	RXErrors            int64      `json:"rx_errors,omitempty"`
+	TXErrors            int64      `json:"tx_errors,omitempty"`
+	Peers               []PortPeer `json:"peers,omitempty"`
+	Status              string     `json:"status"` // "ok", "warn", "critical"
+	Issues              []string   `json:"issues,omitempty"`
 }
 
 // SwitchDeviceView summarizes physical port allocation and perimeter security
@@ -234,7 +236,7 @@ func AnalyzeSwitchPorts(
 				dv.InactiveEnabledPorts++
 			}
 
-			taggedPolicy := normalizeTaggedPolicy(sp)
+			taggedPolicy := sp.TaggedPolicy()
 
 			// Resolve physical zone with clear precedence:
 			// 1. Explicit config physical_ports rule
@@ -288,32 +290,33 @@ func AnalyzeSwitchPorts(
 			isTrunkAll := taggedPolicy == "all"
 
 			pv := SwitchPortView{
-				PortIdx:          sp.PortIdx,
-				Name:             sp.Name,
-				Label:            label,
-				Zone:             zone,
-				ZoneSource:       zoneSrc,
-				State:            state,
-				Enabled:          sp.Enabled,
-				Up:               sp.Up,
-				Speed:            sp.Speed,
-				Media:            sp.Media,
-				PoEEnabled:       sp.PoEEnabled,
-				PoEMode:          sp.PoEMode,
-				PoEPower:         sp.PoEPower,
-				PoEPowerWatts:    sp.PoEPowerWatts,
-				NativeVLAN:       sp.NativeNetworkName,
-				TaggedPolicy:     taggedPolicy,
-				PortSecurity:     sp.PortSecurityEnabled,
-				PortSecurityMACs: sp.PortSecurityMACs,
-				Isolation:        sp.Isolation,
-				IsolationUnknown: sp.IsolationUnknown,
-				MACTableCount:    sp.MACTableCount,
-				STPState:         sp.STPState,
-				RXErrors:         sp.RXErrors,
-				TXErrors:         sp.TXErrors,
-				Peers:            peers,
-				Status:           "ok",
+				PortIdx:             sp.PortIdx,
+				Name:                sp.Name,
+				Label:               label,
+				Zone:                zone,
+				ZoneSource:          zoneSrc,
+				State:               state,
+				Enabled:             sp.Enabled,
+				Up:                  sp.Up,
+				Speed:               sp.Speed,
+				Media:               sp.Media,
+				PoEEnabled:          sp.PoEEnabled,
+				PoEMode:             sp.PoEMode,
+				PoEPower:            sp.PoEPower,
+				PoEPowerWatts:       sp.PoEPowerWatts,
+				NativeVLAN:          sp.NativeNetworkName,
+				TaggedPolicy:        taggedPolicy,
+				PortSecurity:        sp.PortSecurityEnabled,
+				PortSecurityUnknown: sp.PortSecurityUnknown,
+				PortSecurityMACs:    sp.PortSecurityMACs,
+				Isolation:           sp.Isolation,
+				IsolationUnknown:    sp.IsolationUnknown,
+				MACTableCount:       sp.MACTableCount,
+				STPState:            sp.STPState,
+				RXErrors:            sp.RXErrors,
+				TXErrors:            sp.TXErrors,
+				Peers:               peers,
+				Status:              "ok",
 			}
 
 			// Evaluate physical-layer security rules for this port.
@@ -344,7 +347,7 @@ func AnalyzeSwitchPorts(
 							NetworkName: sp.NativeNetworkName,
 						},
 						Port:     sp.PortIdx,
-						Evidence: fmt.Sprintf("%s Port %d (%s): %s; Port Security=%v", dev.Name, sp.PortIdx, label, strings.Join(problems, "; "), sp.PortSecurityEnabled),
+						Evidence: fmt.Sprintf("%s Port %d (%s): %s", dev.Name, sp.PortIdx, label, strings.Join(problems, "; ")),
 						Remediation: checks.Remediation{
 							Summary: fmt.Sprintf(
 								"This indoor switch port feeds physical equipment outside the secured perimeter (%s). Unplugging the outdoor switch grants direct Ethernet access to everything forwarded on this cable. Restrict Tagged VLAN Management to Custom (or Block All) carrying ONLY isolated external VLANs, move Native VLAN off %q, and enable MAC restriction where supported.",
@@ -357,6 +360,15 @@ func AnalyzeSwitchPorts(
 							},
 						},
 					})
+				} else if sp.Enabled && (taggedPolicy == "unknown" || sp.PortSecurityUnknown) {
+					pv.Status = "warn"
+					if taggedPolicy == "unknown" {
+						pv.Issues = append(pv.Issues, "Tagged VLAN membership unknown (verify port profile)")
+					}
+					if sp.PortSecurityUnknown {
+						pv.Issues = append(pv.Issues, "MAC Port Security setting unknown (verify port profile)")
+					}
+					dv.AtRiskPorts++
 				}
 
 			case "external":
@@ -380,7 +392,7 @@ func AnalyzeSwitchPorts(
 					if nativeIsTrusted {
 						problems = append(problems, fmt.Sprintf("Native VLAN %q is Trusted/Internal", sp.NativeNetworkName))
 					}
-					if !sp.PortSecurityEnabled {
+					if !sp.PortSecurityUnknown && !sp.PortSecurityEnabled {
 						problems = append(problems, "MAC Port Security disabled")
 					}
 					if len(problems) > 0 {
@@ -417,6 +429,15 @@ func AnalyzeSwitchPorts(
 								},
 							},
 						})
+					} else if taggedPolicy == "unknown" || sp.PortSecurityUnknown {
+						pv.Status = "warn"
+						if taggedPolicy == "unknown" {
+							pv.Issues = append(pv.Issues, "Tagged VLAN membership unknown (verify port profile)")
+						}
+						if sp.PortSecurityUnknown {
+							pv.Issues = append(pv.Issues, "MAC Port Security setting unknown (verify port profile)")
+						}
+						dv.AtRiskPorts++
 					}
 				}
 
@@ -641,34 +662,6 @@ func AnalyzeSwitchPorts(
 		return views[i].Name < views[j].Name
 	})
 	return views, findings, notes
-}
-
-func normalizeTaggedPolicy(sp unifi.SwitchPort) string {
-	if !sp.Enabled {
-		return "disabled"
-	}
-	switch strings.ToLower(sp.TaggedVLANMgmt) {
-	case "block_all":
-		return "block_all"
-	case "custom":
-		return "custom"
-	case "auto":
-		if strings.EqualFold(sp.Forward, "native") {
-			return "block_all"
-		}
-		return "all"
-	default:
-		switch strings.ToLower(sp.Forward) {
-		case "native":
-			return "block_all"
-		case "customize":
-			return "custom"
-		case "disabled":
-			return "disabled"
-		default:
-			return "all"
-		}
-	}
 }
 
 func hasUniFiDevicePeer(peers []PortPeer) bool {

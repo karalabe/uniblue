@@ -1936,3 +1936,45 @@ func TestMixedRoutingTelemetryLoss(t *testing.T) {
 		}
 	}
 }
+
+// TestCompromisedEnforcers checks two independent denials and an immutable base scenario.
+func TestCompromisedEnforcers(t *testing.T) {
+	const gw, sw, ap = "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"
+	any := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
+	s := &unifi.Snapshot{
+		Devices:          []unifi.Device{{MAC: gw, Type: "udm"}, {MAC: sw, Type: "usw", Ports: []unifi.SwitchPort{{PortIdx: 1, Isolation: true}, {PortIdx: 2, Isolation: true}}}},
+		Networks:         []unifi.Network{{ID: "a", Name: "a", ZoneName: "A", RouterDeviceMAC: sw}, {ID: "b", Name: "b", ZoneName: "B"}},
+		WLANs:            []unifi.WLANConfig{{Name: "wifi", NetworkName: "a", Enabled: true, L2Isolation: true}},
+		FirewallPolicies: []unifi.FirewallPolicy{{ID: "gateway", Enabled: true, Action: "BLOCK", Protocol: "all", Source: any, Destination: any}},
+		SwitchACLs:       []unifi.SwitchACL{{ID: "switch", Enabled: true, Action: "BLOCK", DeviceMACs: []string{sw}, Source: any, Destination: any}},
+	}
+	base := NewOracle(s, config.NetworkConfig{})
+	switchLost := base.WithCompromised("02-00-00-00-00-02")
+	both := switchLost.WithCompromised(gw)
+	for _, tc := range []struct {
+		o          *Oracle
+		want, rule string
+	}{
+		{both, "allow", ""}, {switchLost, "deny", "gateway"}, {base.WithCompromised(gw), "deny", "switch"}, {base, "deny", "switch"},
+	} {
+		c := tc.o.Service(Position{NetworkID: "a", IP: "192.0.2.1"}, unifi.Client{NetworkID: "b", IP: "198.51.100.2"}, "tcp", 443, "ipv4")
+		if c.Effective != tc.want || c.DecisiveRuleID != tc.rule || tc.want == "allow" && c.DecisiveReason != "Enforcer compromised in what-if scenario" {
+			t.Fatalf("want %s from %q, got %+v", tc.want, tc.rule, c)
+		}
+	}
+	for _, tc := range []struct {
+		mac string
+		a   Position
+		b   unifi.Client
+	}{
+		{ap, Position{NetworkID: "a", APMAC: ap, SSID: "wifi"}, unifi.Client{NetworkID: "a", APMAC: ap, ESSID: "wifi"}},
+		{sw, Position{NetworkID: "a", IsWired: true, SwitchMAC: sw, SwitchPort: 1}, unifi.Client{NetworkID: "a", IsWired: true, SwitchMAC: sw, SwitchPort: 2}},
+	} {
+		if c := base.WithCompromised(tc.mac).Service(tc.a, tc.b, "tcp", 22, "ipv4"); c.Effective != "allow" {
+			t.Fatal(c)
+		}
+		if c := base.Service(tc.a, tc.b, "tcp", 22, "ipv4"); c.Effective != "deny" {
+			t.Fatal(c)
+		}
+	}
+}

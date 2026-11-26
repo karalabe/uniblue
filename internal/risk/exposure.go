@@ -545,7 +545,7 @@ func findGatewayIdentity(snap *unifi.Snapshot) (name, mac, ip string) {
 		if strings.Contains(modelLower, "udm") || strings.Contains(modelLower, "ucg") ||
 			strings.Contains(modelLower, "uxg") || strings.Contains(modelLower, "usg") ||
 			strings.Contains(modelLower, "efg") || strings.EqualFold(d.Type, "ugw") ||
-			strings.EqualFold(d.Type, "udm") {
+			strings.EqualFold(d.Type, "udm") || strings.EqualFold(d.Type, "ucg") || strings.EqualFold(d.Type, "uxg") {
 			n := d.Name
 			if n == "" {
 				n = d.Model

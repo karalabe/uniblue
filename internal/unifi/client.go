@@ -1604,7 +1604,13 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			continue
 		}
 		// Merge any explicit port_override fields onto the live port_table record.
+		if rp.TaggedNetworkIDs == nil {
+			rp.TaggedNetworkIDs = rp.IncludedNetworkIDs
+		}
 		if ov, ok := ovByIdx[rp.PortIdx]; ok {
+			if ov.TaggedNetworkIDs == nil {
+				ov.TaggedNetworkIDs = ov.IncludedNetworkIDs
+			}
 			if ov.Name != "" {
 				rp.Name = ov.Name
 			}
@@ -1650,16 +1656,19 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 		pc, profileFound := portConfByID[rp.PortConfID]
 		if profileManaged {
 			if profileFound {
+				if pc.TaggedNetworkIDs == nil {
+					pc.TaggedNetworkIDs = pc.IncludedNetworkIDs
+				}
 				profileWins := pref == "auto"
 				if (profileWins || rp.OpMode == "") && pc.OpMode != "" {
 					rp.OpMode = pc.OpMode
 				}
-				if (profileWins || rp.Forward == "") && pc.Forward != "" {
+				if profileWins || rp.Forward == "" {
 					rp.Forward = pc.Forward
 				}
 				if pc.TaggedVLANMgmt != "" && (profileWins || rp.TaggedVLANMgmt == "") {
 					rp.TaggedVLANMgmt = pc.TaggedVLANMgmt
-				} else if profileWins && pc.Forward != "" {
+				} else if profileWins {
 					// Clear any stale per-port tagged_vlan_mgmt so the profile's
 					// forward setting ("native", "customize", "disabled") governs.
 					rp.TaggedVLANMgmt = ""
@@ -1673,7 +1682,7 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 				if (profileWins || rp.PoEMode == "") && pc.PoEMode != "" {
 					rp.PoEMode = pc.PoEMode
 				}
-				if (profileWins || rp.PortSecurityEnabled == nil) && pc.PortSecurityEnabled != nil {
+				if profileWins || rp.PortSecurityEnabled == nil {
 					rp.PortSecurityEnabled = pc.PortSecurityEnabled
 				}
 				if (profileWins || len(rp.PortSecurityMACs) == 0) && len(pc.PortSecurityMACs) > 0 {
@@ -1714,19 +1723,23 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			switch fwd {
 			case "native":
 				tagged = "block_all"
-			case "customize":
+			case "customize", "custom":
 				tagged = "custom"
 			case "disabled":
 				tagged = "disabled"
+			case "all":
+				tagged = "auto"
 			default:
-				if enabled {
-					tagged = "auto"
-				} else {
-					tagged = "disabled"
-				}
+				tagged = "unknown"
 			}
 		}
 
+		missingProfile := profileManaged && !profileFound
+		taggedUnknown := missingProfile || tagged == "unknown" || (tagged == "custom" && rp.TaggedNetworkIDs == nil && rp.ExcludedNetworkIDs == nil)
+		nativeID := rp.NativeNetworkConfID
+		if n, ok := netByID[nativeID]; ok {
+			nativeID = n.ID
+		}
 		psec := rp.PortSecurityEnabled != nil && *rp.PortSecurityEnabled
 		iso := rp.Isolation != nil && *rp.Isolation
 		var psecMACs []string
@@ -1751,9 +1764,10 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			OpMode:              opMode,
 			Forward:             fwd,
 			TaggedVLANMgmt:      tagged,
+			TaggedVLANUnknown:   taggedUnknown,
 			TaggedNetworkIDs:    portNetworkIDs(rp.TaggedNetworkIDs, netByID),
 			ExcludedNetworkIDs:  portNetworkIDs(rp.ExcludedNetworkIDs, netByID),
-			NativeNetworkID:     rp.NativeNetworkConfID,
+			NativeNetworkID:     nativeID,
 			NativeNetworkName:   nativeName,
 			PortConfID:          rp.PortConfID,
 			ProfileManaged:      profileManaged,
@@ -1762,6 +1776,7 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			PoEPower:            poeStr,
 			PoEPowerWatts:       poeWatts,
 			PortSecurityEnabled: psec,
+			PortSecurityUnknown: missingProfile,
 			PortSecurityMACs:    psecMACs,
 			Isolation:           iso,
 			IsolationUnknown:    profileManaged && !profileFound,

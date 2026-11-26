@@ -127,15 +127,17 @@ type Entity struct {
 	OutboundDependencies  []probe.OutboundDependency `json:"outbound_dependencies,omitempty"`
 
 	// Port telemetry (Kind == "port")
-	PortIdx              int      `json:"port_idx,omitempty"`
-	PortZone             string   `json:"port_zone,omitempty"`
-	PortState            string   `json:"port_state,omitempty"`
-	Speed                int      `json:"speed,omitempty"`
-	Media                string   `json:"media,omitempty"`
-	PoEEnabled           bool     `json:"poe_enabled,omitempty"`
-	PoEPower             string   `json:"poe_power,omitempty"`
-	NativeVLAN           string   `json:"native_vlan,omitempty"`
-	TaggedPolicy         string   `json:"tagged_policy,omitempty"`
+	PortIdx      int    `json:"port_idx,omitempty"`
+	PortZone     string `json:"port_zone,omitempty"`
+	PortState    string `json:"port_state,omitempty"`
+	Speed        int    `json:"speed,omitempty"`
+	Media        string `json:"media,omitempty"`
+	PoEEnabled   bool   `json:"poe_enabled,omitempty"`
+	PoEPower     string `json:"poe_power,omitempty"`
+	NativeVLAN   string `json:"native_vlan,omitempty"`
+	TaggedPolicy string `json:"tagged_policy,omitempty"`
+	// PortSecurityUnknown indicates missing MAC restriction settings.
+	PortSecurityUnknown  bool     `json:"port_security_unknown,omitempty"`
 	PortSecurity         bool     `json:"port_security,omitempty"`
 	PortIsolation        bool     `json:"port_isolation,omitempty"`
 	PortIsolationUnknown bool     `json:"port_isolation_unknown,omitempty"`
@@ -882,6 +884,7 @@ func BuildPresentationModel(
 				NativeVLAN:           p.NativeVLAN,
 				TaggedPolicy:         p.TaggedPolicy,
 				PortSecurity:         p.PortSecurity,
+				PortSecurityUnknown:  p.PortSecurityUnknown,
 				PortIsolation:        p.Isolation,
 				PortIsolationUnknown: p.IsolationUnknown,
 				MACTableCount:        p.MACTableCount,
@@ -924,7 +927,7 @@ func BuildPresentationModel(
 					kind = "feeder"
 				}
 				inlineFact := fmt.Sprintf("%s · %s", p.NativeVLAN, p.TaggedPolicy)
-				if p.PortSecurity {
+				if p.PortSecurity && !p.PortSecurityUnknown {
 					inlineFact += " · MAC lock"
 				}
 				pm.WallGates = append(pm.WallGates, WallGate{
@@ -1122,7 +1125,7 @@ func BuildPresentationModel(
 						Title:       f.Title,
 						Severity:    sev,
 						Expected:    expected,
-						Observed:    fmt.Sprintf("VLAN=%s, Tagged=%s, MAC-lock=%v", pe.NativeVLAN, pe.TaggedPolicy, pe.PortSecurity),
+						Observed:    fmt.Sprintf("VLAN=%s, Tagged=%s, MAC-lock=%s", pe.NativeVLAN, pe.TaggedPolicy, portSecurityLabel(pe.PortSecurity, pe.PortSecurityUnknown)),
 						Evidence:    f.Evidence,
 						Remediation: f.Remediation.Summary,
 						Source:      "unifi-port",
@@ -2899,4 +2902,12 @@ func pluralS(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// portSecurityLabel keeps missing controller settings visible in observations and change events.
+func portSecurityLabel(enabled, unknown bool) string {
+	if unknown {
+		return "unknown"
+	}
+	return strconv.FormatBool(enabled)
 }

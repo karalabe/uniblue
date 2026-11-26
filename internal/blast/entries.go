@@ -255,7 +255,7 @@ func (b *builder) outdoor() {
 			sp := raw[key]
 			name := fmt.Sprintf("port %d on %s", p.PortIdx, cmp.Or(sw.Name, sw.MAC))
 			reason := "Anyone who can unplug or tap this outdoor cable can reach the networks assigned to this port."
-			if p.PortSecurity || len(p.PortSecurityMACs) > 0 {
+			if !p.PortSecurityUnknown && (p.PortSecurity || len(p.PortSecurityMACs) > 0) {
 				reason += " MAC pinning is only a speed bump because the camera's MAC address can be copied."
 			}
 			secure := b.action("act:port-ext:"+key, "Secure outdoor "+name, reason, LaneReduceExposure, 3)
@@ -266,10 +266,10 @@ func (b *builder) outdoor() {
 			}
 			unresolved := func(id string) bool { return b.network(id, "").Name == "" }
 			missingMembers := slices.ContainsFunc(sp.TaggedNetworkIDs, unresolved) || slices.ContainsFunc(sp.ExcludedNetworkIDs, unresolved)
-			customUnknown := missingMembers || (p.TaggedPolicy == "custom" && sp.TaggedNetworkIDs == nil && sp.ExcludedNetworkIDs == nil)
+			customUnknown := sp.TaggedVLANUnknown || p.TaggedPolicy == "unknown" || missingMembers || (p.TaggedPolicy == "custom" && sp.TaggedNetworkIDs == nil && sp.ExcludedNetworkIDs == nil)
 			if customUnknown {
 				b.unknownPhysical = true
-				b.verify(root(Physical), "tagged-vlans", key, "Check allowed VLANs on "+name, "This port uses a custom tagged VLAN list, but its member networks are missing.")
+				b.verify(root(Physical), "tagged-vlans", key, "Check allowed VLANs on "+name, "The controller did not report the complete set of tagged VLANs on this port.")
 			}
 			for _, n := range b.Snapshot.Networks {
 				if strings.EqualFold(n.ZoneName, "External") || strings.HasPrefix(strings.ToLower(n.Purpose), "wan") {
@@ -282,10 +282,10 @@ func (b *builder) outdoor() {
 					level = unknown
 				}
 				if !isNative {
-					if p.TaggedPolicy != "all" && p.TaggedPolicy != "custom" {
+					if p.TaggedPolicy != "all" && p.TaggedPolicy != "custom" && p.TaggedPolicy != "unknown" {
 						continue
 					}
-					if slices.Contains(sp.ExcludedNetworkIDs, n.ID) || (!missingMembers && sp.TaggedNetworkIDs != nil && !slices.Contains(sp.TaggedNetworkIDs, n.ID)) {
+					if p.TaggedPolicy == "custom" && (slices.Contains(sp.ExcludedNetworkIDs, n.ID) || (!missingMembers && sp.TaggedNetworkIDs != nil && !slices.Contains(sp.TaggedNetworkIDs, n.ID))) {
 						continue
 					}
 					if customUnknown {

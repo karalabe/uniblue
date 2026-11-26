@@ -595,3 +595,130 @@ func TestShadowedWANRuleAndCacheDeterminism(t *testing.T) {
 		t.Fatalf("expected single merged action for wg-both, got %d in %+v", matches, rGW.Actions)
 	}
 }
+
+// TestInfraCompromiseScopes separates the uplink, the subtree and the controller host.
+func TestInfraCompromiseScopes(t *testing.T) {
+	const gw, sw, ap = "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"
+	phone := client("phone", "192.0.2.3", "iot")
+	phone.APMAC, phone.ESSID = ap, "wifi"
+	desk := client("desk", "198.51.100.2", "private")
+	desk.IsWired, desk.SwitchMAC, desk.SwitchPort = true, gw, 2
+	parentPort := unifi.SwitchPort{PortIdx: 1, Enabled: true, NativeNetworkID: "lan", TaggedVLANMgmt: "custom", ExcludedNetworkIDs: []string{"private"}}
+	s := &unifi.Snapshot{Devices: []unifi.Device{
+		{MAC: gw, Type: "udm", Name: "Console", Ports: []unifi.SwitchPort{parentPort}},
+		{MAC: sw, Type: "usw", Name: "Core", UplinkMAC: gw, UplinkPort: 1, Ports: []unifi.SwitchPort{parentPort}},
+		{MAC: ap, Type: "uap", Name: "Office AP", UplinkMAC: sw, UplinkPort: 1},
+	}, Clients: []unifi.Client{phone, desk}, Networks: []unifi.Network{network("iot"), network("lan"), network("private")},
+		WLANs: []unifi.WLANConfig{{Enabled: true, Name: "wifi", NetworkID: "iot", Security: "wpapsk", WPAMode: "wpa3", L2Isolation: true}}}
+	s.Networks[0].RouterDeviceMAC = sw
+	in := Input{Snapshot: s, Profiles: []probe.HostProfile{{Client: phone, Services: []probe.Service{{Protocol: "ssh", Port: 22}}}, {Client: desk, OpenPorts: []int{80}}}}
+	run := func(target string) InfraReport {
+		t.Helper()
+		r, err := EvaluateInfraCompromise(in, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	r := run("Office AP")
+	if r.UplinkUnknown || !slices.Equal(r.UplinkVLANs, []string{"iot", "lan"}) || !slices.Equal(r.Clients, []string{"phone"}) ||
+		len(r.Legs) != 1 || r.Legs[0].Reachability != "allow" || r.Legs[0].Confidentiality != conditional || !strings.Contains(r.Legs[0].Wireless, "WPA3-SAE") {
+		t.Fatal(r)
+	}
+	s.Devices[1].Ports[0].TaggedVLANUnknown = true
+	r = run(ap)
+	if !r.UplinkUnknown || !slices.Equal(r.UplinkVLANs, []string{"lan"}) {
+		t.Fatal(r)
+	}
+	r = run(sw)
+	if !slices.Equal(r.Downstream, []string{"Office AP"}) || !slices.Equal(r.RoutedVLANs, []string{"iot"}) || !slices.Equal(r.Ports, []int{1}) || !slices.Equal(r.Clients, []string{"phone"}) {
+		t.Fatal(r)
+	}
+	any := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
+	s.SwitchACLs = []unifi.SwitchACL{{Enabled: true, Action: "BLOCK", DeviceMACs: []string{sw}, Source: any, Destination: any}}
+	s.Health = &unifi.SystemHealth{VPNConnections: []unifi.VPNConnection{{Name: "Remote access", Type: "wireguard"}}}
+	// Integrated console hosts the controller, so losing it owns all managed switches/APs too.
+	r = run(gw)
+	if r.HostedOn != "Console" || len(r.Manages) != 2 || !slices.Equal(r.RoutedVLANs, []string{"iot", "lan", "private"}) {
+		t.Fatal(r)
+	}
+	if !slices.ContainsFunc(r.Legs, func(l TransportSurvival) bool { return l.To == "phone" && l.Reachability == "allow" }) ||
+		!slices.ContainsFunc(r.Legs, func(l TransportSurvival) bool {
+			return l.Protocol == "wireguard" && l.Confidentiality == exposed && l.Integrity == exposed
+		}) {
+		t.Fatalf("console reachability or VPN termination lost: %+v", r.Legs)
+	}
+	r = run("controller")
+	if r.HostedOn != "Console" || !slices.Equal(r.Manages, []string{"Console", "Core", "Office AP"}) || !slices.Contains(r.Clients, "desk") {
+		t.Fatal(r)
+	}
+	// Separate UXG gateway (not hosting controller): intact switch ACL still blocks phone!
+	s.Devices[0].Type = "uxg"
+	s.Devices = append(s.Devices, unifi.Device{Type: "uck", Name: "Cloud Key", MAC: "02:00:00:00:00:04"})
+	if r = run(gw); r.HostedOn != "" || len(r.Manages) != 0 || !slices.Equal(r.RoutedVLANs, []string{"lan", "private"}) {
+		t.Fatal(r)
+	}
+	if !slices.ContainsFunc(r.Legs, func(l TransportSurvival) bool { return l.To == "phone" && l.Reachability == "deny" }) {
+		t.Fatalf("standalone gateway compromise should still respect intact L3 switch ACL: %+v", r.Legs)
+	}
+	if r = run("Cloud Key"); r.HostedOn != "Cloud Key" || len(r.Manages) != 3 || !slices.Contains(r.Manages, "Console") {
+		t.Fatal(r)
+	}
+}
+
+// TestTransportDisclosure verifies the actual serialized verdict for every protected class.
+func TestTransportDisclosure(t *testing.T) {
+	for _, tc := range []struct {
+		protocol string
+		banner   probe.HTTPBanner
+		class    string
+		verdict  TransportVerdict
+	}{
+		{"ssh", probe.HTTPBanner{}, "e2e", conditional},
+		{"wireguard", probe.HTTPBanner{}, "e2e", resilient},
+		{"matter", probe.HTTPBanner{}, "e2e", resilient},
+		{"hap", probe.HTTPBanner{}, "e2e", resilient},
+		{"esphome-noise", probe.HTTPBanner{}, "e2e", resilient},
+		{"https", probe.HTTPBanner{TLSVerified: true}, "tls-ca", resilient},
+		{"https", probe.HTTPBanner{TLSSelfSigned: true}, "tls-unverifiable", conditional},
+		{"https", probe.HTTPBanner{TLSExpired: true}, "tls-unverifiable", conditional},
+		{"https", probe.HTTPBanner{}, "tls-unverifiable", conditional},
+		{"ftp", probe.HTTPBanner{}, "cleartext-auth", exposed},
+		{"dns", probe.HTTPBanner{}, "cleartext-noauth", exposed},
+		{"smb", probe.HTTPBanner{}, "unknown", unverified},
+	} {
+		l := assessTransport(probe.Service{Protocol: tc.protocol}, tc.banner)
+		if l.Class != tc.class || l.Confidentiality != tc.verdict || l.Integrity != tc.verdict || l.Availability != exposed {
+			t.Fatal(l)
+		}
+		if l.Confidentiality != resilient {
+			continue
+		}
+		raw, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err = json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"confidentiality", "integrity"} {
+			var v struct {
+				Verdict    string
+				BlindSpots []string `json:"blind_spots"`
+			}
+			if err = json.Unmarshal(fields[field], &v); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"unsigned firmware", "check TLS certificates", "first SSH connection", "DHCP option 121", "UDP services, and IPv6", "WPA3-SAE"}
+			if v.Verdict != "resilient (observed inbound surfaces)" || len(v.BlindSpots) != len(want) {
+				t.Fatal(v)
+			}
+			for i, w := range want {
+				if !strings.Contains(v.BlindSpots[i], w) {
+					t.Fatalf("missing %q: %+v", w, v)
+				}
+			}
+		}
+	}
+}

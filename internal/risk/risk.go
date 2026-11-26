@@ -23,6 +23,7 @@ import (
 
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
+	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
 	"github.com/karalabe/uniblue/rules"
 )
@@ -33,6 +34,9 @@ const offlineFindingTTL = 7 * 24 * time.Hour
 
 // Report holds the complete risk-scored output of a single UniBlue scan.
 type Report struct {
+	// SSHHostKeys carries the updated baseline to local state storage.
+	SSHHostKeys map[string]string `json:"-"`
+
 	// GeneratedAt records when the report was evaluated.
 	GeneratedAt time.Time `json:"generated_at"`
 
@@ -80,6 +84,9 @@ type Report struct {
 // State captures the minimal baseline persisted to disk between consecutive
 // scans so `uniblue watch` only alerts on new issues or posture regressions.
 type State struct {
+	// SSHHostKeys holds the last observed public host-key fingerprint for each device and port.
+	SSHHostKeys map[string]string `json:"ssh_host_keys,omitempty"`
+
 	// UpdatedAt records when the baseline was last saved.
 	UpdatedAt time.Time `json:"updated_at"`
 
@@ -507,6 +514,14 @@ func verifiedContainment(cl unifi.Client, containment []NetworkContainment) bool
 	return false
 }
 
+// CompareSSHHostKeys compares current observations with the last saved scan, if any.
+func (s *State) CompareSSHHostKeys(profiles []probe.HostProfile) map[string]string {
+	if s == nil {
+		return probe.CompareSSHHostKeys(profiles, nil)
+	}
+	return probe.CompareSSHHostKeys(profiles, s.SSHHostKeys)
+}
+
 // BuildState extracts a compact State baseline from a UniFi snapshot and its
 // evaluated Report, retaining the highest EffectiveSeverity whenever two
 // findings share a key.
@@ -528,6 +543,7 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 	now := time.Now().UTC()
 
 	st := &State{
+		SSHHostKeys:     report.SSHHostKeys,
 		UpdatedAt:       now,
 		Findings:        make(map[string]checks.Severity, len(report.Findings)),
 		FindingLastSeen: make(map[string]time.Time, len(report.Findings)),
@@ -538,6 +554,9 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 	// Carry forward previously known trusted clients so a household phone or
 	// rebooting NAS is never re-alerted as a brand-new trusted device.
 	if prev != nil {
+		if st.SSHHostKeys == nil {
+			st.SSHHostKeys = prev.SSHHostKeys
+		}
 		for mac, name := range prev.TrustedClients {
 			st.TrustedClients[mac] = name
 		}

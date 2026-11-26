@@ -473,6 +473,9 @@ type SwitchPort struct {
 	// TaggedVLANMgmt is UniFi's explicit tagged-VLAN mode ("auto", "block_all", "custom").
 	TaggedVLANMgmt string `json:"tagged_vlan_mgmt,omitempty"`
 
+	// TaggedVLANUnknown reports that the effective tagged VLAN set was unavailable.
+	TaggedVLANUnknown bool `json:"tagged_vlan_unknown,omitempty"`
+
 	// TaggedNetworkIDs lists networks included in a custom tagged VLAN list.
 	TaggedNetworkIDs []string `json:"-"`
 
@@ -508,6 +511,9 @@ type SwitchPort struct {
 	// PortSecurityEnabled reports whether MAC address allowlisting is enforced.
 	PortSecurityEnabled bool `json:"port_security_enabled,omitempty"`
 
+	// PortSecurityUnknown reports that the controller did not confirm the MAC restriction setting.
+	PortSecurityUnknown bool `json:"port_security_unknown,omitempty"`
+
 	// PortSecurityMACs lists explicitly allowed MAC addresses when port security is enabled.
 	PortSecurityMACs []string `json:"port_security_macs,omitempty"`
 
@@ -539,6 +545,36 @@ type SwitchPort struct {
 
 	// TXDropped counts dropped outbound packets on this port.
 	TXDropped int64 `json:"tx_dropped,omitempty"`
+}
+
+// TaggedPolicy returns the effective forwarding mode for the port.
+func (sp SwitchPort) TaggedPolicy() string {
+	if !sp.Enabled {
+		return "disabled"
+	}
+	if sp.TaggedVLANUnknown {
+		return "unknown"
+	}
+	mode := strings.ToLower(sp.TaggedVLANMgmt)
+	if mode == "" {
+		mode = strings.ToLower(sp.Forward)
+	}
+	switch mode {
+	case "block_all", "native":
+		return "block_all"
+	case "custom", "customize":
+		if sp.TaggedNetworkIDs != nil || sp.ExcludedNetworkIDs != nil {
+			return "custom"
+		}
+	case "disabled":
+		return "disabled"
+	case "auto", "all":
+		if strings.EqualFold(sp.Forward, "native") {
+			return "block_all"
+		}
+		return "all"
+	}
+	return "unknown"
 }
 
 // WLANConfig represents one UniFi Wi-Fi SSID and its encryption/isolation settings.
@@ -1117,6 +1153,8 @@ func (f *flexSTPCount) UnmarshalJSON(data []byte) error {
 
 // rawPort maps a single port entry in UniFi's port_table or port_overrides array.
 type rawPort struct {
+	// IncludedNetworkIDs is the alternate controller spelling for the inclusion list.
+	IncludedNetworkIDs []string `json:"included_networkconf_ids"`
 	// TaggedNetworkIDs holds the controller IDs included on this trunk.
 	TaggedNetworkIDs []string `json:"tagged_networkconf_ids"`
 	// ExcludedNetworkIDs holds the controller IDs omitted from this trunk.
@@ -1152,6 +1190,8 @@ type rawPort struct {
 
 // rawPortConf maps a UniFi switch port profile from /api/s/<site>/rest/portconf.
 type rawPortConf struct {
+	// IncludedNetworkIDs is the alternate controller spelling for the inclusion list.
+	IncludedNetworkIDs []string `json:"included_networkconf_ids"`
 	// TaggedNetworkIDs holds the controller IDs included on this trunk.
 	TaggedNetworkIDs []string `json:"tagged_networkconf_ids"`
 	// ExcludedNetworkIDs holds the controller IDs omitted from this trunk.

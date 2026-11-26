@@ -209,3 +209,35 @@ func TestDeviceSpecificACLWithMissingInventory(t *testing.T) {
 		t.Fatal("unresolved device-specific ACL decoded as unscoped rule")
 	}
 }
+
+// TestSwitchPortMembership preserves omitted, empty, and profile-supplied VLAN lists.
+func TestSwitchPortMembership(t *testing.T) {
+	var d rawDevice
+	err := json.Unmarshal([]byte(`{"port_table":[
+		{"port_idx":1},
+		{"port_idx":2,"forward":"all","port_security_enabled":false},
+		{"port_idx":3,"tagged_vlan_mgmt":"custom","tagged_networkconf_ids":[]},
+		{"port_idx":4,"tagged_vlan_mgmt":"custom"},
+		{"port_idx":5,"forward":"all","port_security_enabled":true,"portconf_id":"missing"},
+		{"port_idx":6,"portconf_id":"profile","setting_preference":"auto"},
+		{"port_idx":7,"tagged_vlan_mgmt":"custom","tagged_networkconf_ids":["old"]}
+	],"port_overrides":[{"port_idx":7,"included_networkconf_ids":["legacy"],"excluded_networkconf_ids":["guest"]}]}`), &d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile rawPortConf
+	if err := json.Unmarshal([]byte(`{"tagged_vlan_mgmt":"custom","included_networkconf_ids":["legacy"]}`), &profile); err != nil {
+		t.Fatal(err)
+	}
+	ports := convertSwitchPorts(d, map[string]Network{"legacy": {ID: "canonical"}}, map[string]rawPortConf{"profile": profile}, "LAN")
+	for i, want := range []string{"unknown", "all", "custom", "unknown", "unknown", "custom", "custom"} {
+		p := ports[i]
+		if p.TaggedPolicy() != want || p.TaggedVLANUnknown != (want == "unknown") || p.PortSecurityUnknown != (i == 4) {
+			t.Fatalf("port %d: %+v", i+1, p)
+		}
+	}
+	if ports[2].TaggedNetworkIDs == nil || !slices.Equal(ports[5].TaggedNetworkIDs, []string{"canonical"}) ||
+		!slices.Equal(ports[6].TaggedNetworkIDs, []string{"canonical"}) || !slices.Equal(ports[6].ExcludedNetworkIDs, []string{"guest"}) {
+		t.Fatalf("wrong effective lists: %+v", ports)
+	}
+}

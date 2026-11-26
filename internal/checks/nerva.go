@@ -44,6 +44,36 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 	bestIdxByKey := make(map[string]int)
 	var out []Finding
 	for _, hp := range profiles {
+		if s := hp.SSH; s != nil {
+			f := Finding{Category: "ssh", Client: hp.Client, ObservedIPs: []string{hp.EffectiveProbeIP()}, Port: s.Port,
+				Transport: "tcp", BaseSeverity: SeverityMedium, EffectiveSeverity: SeverityMedium}
+			if s.SharedHostKey {
+				f.CheckID, f.Property = "UB-SSH-SHARED-KEY", "ssh-shared-host-key"
+				f.Title = "Different devices presented the same SSH host key"
+				f.Evidence = "The host key fingerprints match. Check for a shared firmware key or a shared SSH endpoint."
+				out = append(out, f)
+			}
+			if s.HostKeyChanged {
+				f.CheckID, f.Property = "UB-SSH-KEY-CHANGE", "ssh-host-key-change"
+				f.Title = "The SSH host key changed"
+				f.Evidence = "This device and port presented a different key at the last scan. Check whether someone replaced or rotated it."
+				out = append(out, f)
+			}
+			if s.NoneAuthAccepted {
+				nf := f
+				nf.CheckID, nf.Property = "UB-SSH-NONE-AUTH", "ssh-none-auth"
+				nf.BaseSeverity, nf.EffectiveSeverity = SeverityCritical, SeverityCritical
+				nf.Title = "SSH server accepts unauthenticated login"
+				nf.Evidence = "During the opt-in SSH audit, this server accepted 'none' authentication without any password or key."
+				out = append(out, nf)
+			} else if len(s.AcceptedKeys) > 0 && !s.CanaryFalsePositive {
+				kf := f
+				kf.CheckID, kf.Property = "UB-SSH-KEY-ACCEPTED", "ssh-key-accepted"
+				kf.Title = "SSH server accepted configured public key(s) during opt-in audit"
+				kf.Evidence = fmt.Sprintf("The SSH server invited %d configured public key(s) (PK_OK) from the scanner IP; MFA, ForceCommand, or from= restrictions may still apply. Key identities are omitted from shared payloads.", len(s.AcceptedKeys))
+				out = append(out, kf)
+			}
+		}
 		for _, svc := range hp.Services {
 			if len(svc.Findings) == 0 {
 				continue

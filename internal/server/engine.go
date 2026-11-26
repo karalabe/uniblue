@@ -285,21 +285,23 @@ type hostScanTask struct {
 // portLiveState captures the previous link and security configuration of a
 // single physical switch port so pollDelta can emit real-time link/config events.
 type portLiveState struct {
-	DeviceMAC     string
-	DeviceName    string
-	DeviceIP      string
-	PortIdx       int
-	PortName      string
-	Zone          string
-	Up            bool
-	Enabled       bool
-	NativeVLAN    string
-	TaggedPolicy  string
-	PortSecurity  bool
-	PoEPowerWatts float64
-	MACTableCount int
-	STPState      string
-	HasUniFiPeer  bool
+	DeviceMAC    string
+	DeviceName   string
+	DeviceIP     string
+	PortIdx      int
+	PortName     string
+	Zone         string
+	Up           bool
+	Enabled      bool
+	NativeVLAN   string
+	TaggedPolicy string
+	PortSecurity bool
+	// PortSecurityUnknown suppresses change alerts until both scans have a confirmed setting.
+	PortSecurityUnknown bool
+	PoEPowerWatts       float64
+	MACTableCount       int
+	STPState            string
+	HasUniFiPeer        bool
 }
 
 type hostRescanStatus int
@@ -408,6 +410,7 @@ type Engine struct {
 	lastDiscovery    *probe.LANDiscovery
 	lastDiscoveryAt  time.Time
 	prevRiskState    *risk.State
+	auditedSSHHosts  map[string]probe.SSHKeyAuditCacheEntry
 	events           []LiveEvent
 	current          StateSnapshot
 	scanProgress     *ScanProgress
@@ -486,6 +489,7 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 		anomalies:             newAnomalyTracker(),
 		lastClasses:           make(map[string]classify.Result),
 		prevRiskState:         prevState,
+		auditedSSHHosts:       make(map[string]probe.SSHKeyAuditCacheEntry),
 		webhookCoalesceWindow: defaultWebhookCoalesceWindow,
 		fullRescanCh:          make(chan string, 1),
 		hostScanCh:            make(chan hostScanTask, 64),
@@ -1318,9 +1322,9 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 			}
 			portProfilesOK := snap.Visibility == nil || snap.Visibility.PortProfilesAvailable
 			directChanged := prev.Enabled != curr.Enabled ||
-				prev.PortSecurity != curr.PortSecurity ||
+				(!prev.PortSecurityUnknown && !curr.PortSecurityUnknown && prev.PortSecurity != curr.PortSecurity) ||
 				(curr.NativeVLAN != "" && prev.NativeVLAN != curr.NativeVLAN)
-			profileChanged := portProfilesOK && (prev.TaggedPolicy != curr.TaggedPolicy || (curr.NativeVLAN == "" && prev.NativeVLAN != curr.NativeVLAN))
+			profileChanged := portProfilesOK && ((prev.TaggedPolicy != "unknown" && curr.TaggedPolicy != "unknown" && prev.TaggedPolicy != curr.TaggedPolicy) || (curr.NativeVLAN == "" && prev.NativeVLAN != curr.NativeVLAN))
 			if directChanged || profileChanged {
 				changed = true
 				sev := "medium"
@@ -1338,7 +1342,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 						prev.Enabled, curr.Enabled,
 						fallbackVLAN(prev.NativeVLAN), fallbackVLAN(curr.NativeVLAN),
 						prev.TaggedPolicy, curr.TaggedPolicy,
-						prev.PortSecurity, curr.PortSecurity),
+						portSecurityLabel(prev.PortSecurity, prev.PortSecurityUnknown), portSecurityLabel(curr.PortSecurity, curr.PortSecurityUnknown)),
 				})
 			}
 		}
@@ -1418,6 +1422,10 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	e.mu.RLock()
 	hints := e.snap.PortHintsByIP()
 	sitePrefixes := snapshotSubnets(e.snap)
+	var devices []unifi.Device
+	if e.snap != nil {
+		devices = e.snap.Devices
+	}
 	reflectorIPs := snapshotReflectorIPs(e.snap)
 	cacheTTL := e.opts.ReconcileInterval
 	if cacheTTL <= 0 {
@@ -1430,6 +1438,7 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	e.mu.RUnlock()
 
 	fp := probe.NewFingerprinter(e.scanPorts, 1, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
+	fp.SetInfrastructure(devices)
 	fp.SetAllowedSubnets(sitePrefixes)
 	fp.SetTrustedReflectors(reflectorIPs)
 	if cachedDisc != nil {
@@ -1471,6 +1480,16 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	if !stillMatches {
 		e.mu.Unlock()
 		return
+	}
+	if prev, ok := e.profilesByMAC[k]; ok && prev.SSH != nil && hp.SSH != nil &&
+		prev.SSH.Port == hp.SSH.Port && prev.SSH.HostKeyFingerprint != "" &&
+		prev.SSH.HostKeyFingerprint == hp.SSH.HostKeyFingerprint {
+		// Preserve opt-in SSH audit outcomes across single-host rescans so
+		// confirmed findings are never dropped and re-alerted on the next full scan.
+		hp.SSH.NoneAuthAccepted = prev.SSH.NoneAuthAccepted
+		hp.SSH.BruteForceProtected = prev.SSH.BruteForceProtected
+		hp.SSH.CanaryFalsePositive = prev.SSH.CanaryFalsePositive
+		hp.SSH.AcceptedKeys = append([]probe.SSHAcceptedKey(nil), prev.SSH.AcceptedKeys...)
 	}
 	e.profilesByMAC[k] = hp
 	e.findingsByMAC[k] = hostCheckFindings
@@ -1626,6 +1645,10 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	e.mu.RLock()
 	startGen := e.deltaGen
 	prevSnapHint := e.snap
+	var prevSSHKeys map[string]string
+	if e.prevRiskState != nil {
+		prevSSHKeys = e.prevRiskState.SSHHostKeys
+	}
 	e.mu.RUnlock()
 
 	e.logger.Info("starting full scan", "reason", reason)
@@ -1640,6 +1663,12 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	totalClients := len(snap.Clients)
 
 	fp := probe.NewFingerprinter(e.scanPorts, e.cfg.Scan.Concurrency, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
+	if err := fp.SetSSHKeyAudit(e.cfg.Scan.SSHKeyAudit); err != nil {
+		e.logger.Warn("ssh key audit disabled due to key load error", "err", err)
+	}
+	fp.SetPreviousSSHHostKeys(prevSSHKeys)
+	fp.SetAuditedSSHHostKeys(e.auditedSSHHosts)
+	fp.SetInfrastructure(snap.Devices)
 	fp.SetAllowedSubnets(snapshotSubnets(snap))
 	fp.SetTrustedReflectors(snapshotReflectorIPs(snap))
 	fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, e.checkList, snap.PortHintsByIP()))
@@ -1926,9 +1955,11 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	})
 	devChildren := attachConfiguredEnrichments(snap, profiles, e.cfg.Network)
 
+	keys := prevRisk.CompareSSHHostKeys(profiles)
 	rawFindings := append([]checks.Finding(nil), cachedFindings...)
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 	report := risk.Evaluate(snap, rawFindings, e.cfg.Network)
+	report.SSHHostKeys = keys
 
 	var exactCVEs, potentialCVEs []cve.ProductSummary
 	var rawExactMatches []cve.Match
@@ -3340,21 +3371,22 @@ func snapshotPortStates(snap *unifi.Snapshot, netCfg config.NetworkConfig) map[s
 				}
 			}
 			out[key] = portLiveState{
-				DeviceMAC:     swMAC,
-				DeviceName:    sw.Name,
-				DeviceIP:      sw.IP,
-				PortIdx:       p.PortIdx,
-				PortName:      p.Name,
-				Zone:          p.Zone,
-				Up:            p.Up,
-				Enabled:       p.Enabled,
-				NativeVLAN:    p.NativeVLAN,
-				TaggedPolicy:  p.TaggedPolicy,
-				PortSecurity:  p.PortSecurity,
-				PoEPowerWatts: p.PoEPowerWatts,
-				MACTableCount: p.MACTableCount,
-				STPState:      p.STPState,
-				HasUniFiPeer:  hasUniFiPeer,
+				DeviceMAC:           swMAC,
+				DeviceName:          sw.Name,
+				DeviceIP:            sw.IP,
+				PortIdx:             p.PortIdx,
+				PortName:            p.Name,
+				Zone:                p.Zone,
+				Up:                  p.Up,
+				Enabled:             p.Enabled,
+				NativeVLAN:          p.NativeVLAN,
+				TaggedPolicy:        p.TaggedPolicy,
+				PortSecurity:        p.PortSecurity,
+				PortSecurityUnknown: p.PortSecurityUnknown,
+				PoEPowerWatts:       p.PoEPowerWatts,
+				MACTableCount:       p.MACTableCount,
+				STPState:            p.STPState,
+				HasUniFiPeer:        hasUniFiPeer,
 			}
 		}
 	}

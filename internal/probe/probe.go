@@ -10,7 +10,6 @@
 package probe
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -25,8 +24,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
@@ -98,6 +99,9 @@ type HTTPBanner struct {
 
 	// TLSExpired reports whether the leaf TLS certificate is past its NotAfter date.
 	TLSExpired bool `json:"tls_expired,omitempty"`
+
+	// TLSVerified reports that the scanner verified the certificate chain and the endpoint address.
+	TLSVerified bool `json:"tls_verified,omitempty"`
 
 	// TLSSelfSigned reports whether the leaf certificate is cryptographically self-signed.
 	TLSSelfSigned bool `json:"tls_self_signed,omitempty"`
@@ -190,6 +194,12 @@ type HostProfile struct {
 
 	// HTTP maps open HTTP/HTTPS port numbers to their observed landing-page banner.
 	HTTP map[int]HTTPBanner `json:"http,omitempty"`
+
+	// SMB holds server capabilities from one read-only negotiation on TCP 445.
+	SMB *SMBInfo `json:"smb,omitempty"`
+
+	// SSH holds the identification and host key offered before authentication.
+	SSH *SSHInfo `json:"ssh,omitempty"`
 
 	// SSHBanner stores the passive greeting line advertised on port 22 (e.g.,
 	// "SSH-2.0-OpenSSH_9.6p1"), read without attempting authentication.
@@ -297,6 +307,14 @@ func hostOwnsIP(cl unifi.Client, candidate string) bool {
 // publishing never mutate or race on shared slices or maps.
 func (h HostProfile) Clone() HostProfile {
 	cp := h
+	if h.SMB != nil {
+		info := *h.SMB
+		cp.SMB = &info
+	}
+	if h.SSH != nil {
+		info := *h.SSH
+		cp.SSH = &info
+	}
 	cp.ConnectOnlyPorts = slices.Clone(h.ConnectOnlyPorts)
 	if len(h.Client.IPv6) > 0 {
 		cp.Client.IPv6 = append([]string(nil), h.Client.IPv6...)
@@ -377,6 +395,7 @@ func (h HostProfile) HasPort(port int) bool {
 // Fingerprinter gently inspects a slice of LAN clients using a fixed-size
 // channel worker pool.
 type Fingerprinter struct {
+	infrastructure map[string]bool
 	// ports is the curated list of TCP ports checked on each host.
 	ports []int
 
@@ -416,6 +435,86 @@ type Fingerprinter struct {
 
 	// onProgress receives optional per-host progress updates during FingerprintAll.
 	onProgress func(phase string, done, total int, host string)
+
+	// sshKeyAudit holds optional opt-in SSH PK_OK audit settings, loaded keys,
+	// prior host-key fingerprints (to refuse auditing on changed keys), and a
+	// per-fingerprint result cache so repeated watch/serve scans replay findings
+	// without re-probing unchanged hosts.
+	sshKeyAudit     *config.SSHKeyAuditConfig
+	sshAuditKeys    []SSHPublicKey
+	prevSSHHostKeys map[string]string
+	auditedSSHHosts map[string]SSHKeyAuditCacheEntry
+	sshAuditMu      sync.Mutex
+}
+
+// SetPreviousSSHHostKeys provides saved host-key fingerprints from the prior
+// scan so opt-in SSH key audits refuse to send configured keys to any endpoint
+// whose host key changed.
+func (f *Fingerprinter) SetPreviousSSHHostKeys(prev map[string]string) {
+	f.prevSSHHostKeys = prev
+}
+
+// SetAuditedSSHHostKeys provides a caller-owned cache recording SSH key audit
+// outcomes by host/port so watch/serve cycles replay confirmed findings without
+// repeatedly querying an unchanged SSH server.
+func (f *Fingerprinter) SetAuditedSSHHostKeys(audited map[string]SSHKeyAuditCacheEntry) {
+	f.auditedSSHHosts = audited
+}
+
+// SetSSHKeyAudit enables the strictly opt-in Fail2ban-safe SSH public-key
+// reachability check when cfg is non-nil and cfg.Enabled is true. Returns an
+// error if any configured file contains a private key or fails to parse.
+func (f *Fingerprinter) SetSSHKeyAudit(cfg *config.SSHKeyAuditConfig) error {
+	if cfg == nil || !cfg.Enabled {
+		f.sshKeyAudit = nil
+		f.sshAuditKeys = nil
+		return nil
+	}
+	keys, err := LoadSSHPublicKeys(cfg.PublicKeyFiles)
+	if err != nil {
+		return err
+	}
+	f.sshKeyAudit = cfg
+	f.sshAuditKeys = keys
+	return nil
+}
+
+func (f *Fingerprinter) matchesSSHKeyAuditTarget(h HostProfile) bool {
+	if f.sshKeyAudit == nil || !f.sshKeyAudit.Enabled || len(f.sshAuditKeys) == 0 {
+		return false
+	}
+	if len(f.sshKeyAudit.TargetHosts) == 0 {
+		return true
+	}
+	mac := config.CanonicalMAC(h.Client.MAC)
+	for _, raw := range f.sshKeyAudit.TargetHosts {
+		t := strings.TrimSpace(raw)
+		if t == "" {
+			continue
+		}
+		if t == h.ProbeIP || strings.EqualFold(t, h.Client.Hostname) || strings.EqualFold(t, h.Client.Name) || (mac != "" && config.CanonicalMAC(t) == mac) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetInfrastructure identifies adopted devices whose SSH settings come from the controller.
+func (f *Fingerprinter) SetInfrastructure(devices []unifi.Device) {
+	f.infrastructure = make(map[string]bool, len(devices)*2)
+	for _, d := range devices {
+		if d.MAC != "" {
+			f.infrastructure[config.CanonicalMAC(d.MAC)] = true
+		}
+		if d.IP != "" {
+			f.infrastructure[d.IP] = true
+		}
+	}
+}
+
+// isInfrastructure also matches the probe address when the client record has no MAC.
+func (f *Fingerprinter) isInfrastructure(h HostProfile) bool {
+	return f.infrastructure[config.CanonicalMAC(h.Client.MAC)] || f.infrastructure[h.ProbeIP]
 }
 
 // SetHostPortHints attaches optional per-host TCP port hints (such as ports
@@ -679,6 +778,7 @@ func (f *Fingerprinter) collectProfiles(ctx context.Context, targets []unifi.Cli
 	// Enrich every discovered open port using Nerva's FastMode protocol
 	// fingerprinters (170+ protocols, MaxHostConn=1 for IoT safety).
 	f.enrichWithNerva(ctx, profiles)
+	CompareSSHHostKeys(profiles, nil)
 	return profiles
 }
 
@@ -792,18 +892,62 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		consecutiveTimeouts = 0
 
 		rawPrint := profile.recordOpenPort(port)
+		sshPort := profile.sshPort(port)
 
-		// On SSH (port 22), passively read the server's initial identification
-		// banner before closing so version-based CVE checks have exact OpenSSH
-		// or Dropbear versions without sending any auth packets.
-		if !rawPrint && port == 22 && profile.SSHBanner == "" {
-			profile.SSHBanner = readSSHBanner(conn, f.timeout)
+		if !rawPrint {
+			switch {
+			case sshPort:
+				if !f.isInfrastructure(profile) {
+					if obs := observeSSH(conn, port, f.timeout); obs != nil {
+						if profile.SSH == nil {
+							profile.SSH = obs
+							profile.SSHBanner = obs.Banner
+						}
+						svc := Service{Port: port, Transport: "tcp", Protocol: "ssh", State: ServiceStateObservedProtocol, AddressFamily: ipFamilyOf(targetIP), Banner: obs.Banner}
+						if len(obs.WeakKex) > 0 {
+							svc.Findings = append(svc.Findings, ServiceFinding{ID: "ssh-weak-kex", Severity: "medium", Evidence: "Weak SSH key exchange offered: " + strings.Join(obs.WeakKex, ", ")})
+						}
+						if len(obs.WeakCiphers) > 0 {
+							svc.Findings = append(svc.Findings, ServiceFinding{ID: "ssh-weak-cipher", Severity: "medium", Evidence: "Weak SSH cipher offered: " + strings.Join(obs.WeakCiphers, ", ")})
+						}
+						if len(obs.WeakMACs) > 0 {
+							svc.Findings = append(svc.Findings, ServiceFinding{ID: "ssh-weak-mac", Severity: "low", Evidence: "Weak SSH MAC offered: " + strings.Join(obs.WeakMACs, ", ")})
+						}
+						profile.Services = append(profile.Services, svc)
+					}
+				}
+			case port == 445:
+				profile.SMB = negotiateSMB(conn, f.timeout)
+				// Send one read-only SMBv1 NEGOTIATE on a fresh connection to retain
+				// SMBv1 detection without ever sending SESSION_SETUP.
+				v1, v1SignEn, v1SignReq := false, false, false
+				if c1, err := dialer.DialContext(ctx, "tcp", addr); err == nil {
+					v1, v1SignEn, v1SignReq = negotiateSMBv1(c1, f.timeout)
+					_ = c1.Close()
+				}
+				if v1 {
+					if profile.SMB == nil {
+						profile.SMB = &SMBInfo{Dialect: "1.0", SigningEnabled: v1SignEn, SigningRequired: v1SignReq}
+					}
+					profile.SMB.SMBv1Enabled = true
+				}
+				if profile.SMB != nil {
+					service := Service{Port: port, Transport: "tcp", Protocol: "smb", State: ServiceStateObservedProtocol, AddressFamily: ipFamilyOf(targetIP)}
+					if profile.SMB.SMBv1Enabled {
+						service.Findings = append(service.Findings, ServiceFinding{ID: "smb-v1-enabled", Severity: "high", Evidence: "The SMB server accepted legacy SMBv1 (NT LM 0.12) during protocol negotiation."})
+					}
+					if !profile.SMB.SigningRequired {
+						service.Findings = append(service.Findings, ServiceFinding{ID: "smb-signing-not-required", Severity: "medium", Evidence: "The SMB server did not require signing during negotiation."})
+					}
+					profile.Services = append(profile.Services, service)
+				}
+			}
 		}
 		_ = conn.Close()
 
 		// Hard raw-printer zero-byte safety guard: never send HTTP or other
 		// application bytes to a raw print sink even if it overlaps a web port.
-		if rawPrint {
+		if rawPrint || sshPort || port == 445 {
 			continue
 		}
 
@@ -823,6 +967,44 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	// extra probes to hosts that do not speak VNC.
 	if profile.HasPort(5900) || profile.HasPort(5901) {
 		f.walkVNCDisplays(ctx, dialer, targetIP, ports, &profile)
+	}
+
+	// Run strictly opt-in Fail2ban-safe SSH PK_OK audit sequentially per host
+	// after port observation and host-key fingerprinting complete. Never send
+	// configured usernames/keys if the host key changed since the prior scan,
+	// and skip unchanged host keys already audited in this process.
+	if profile.SSH != nil && !f.isInfrastructure(profile) && f.matchesSSHKeyAuditTarget(profile) {
+		bkey := sshBaselineKey(profile, profile.SSH.Port)
+		if bkey != "" && f.prevSSHHostKeys != nil && f.prevSSHHostKeys[bkey] != "" && f.prevSSHHostKeys[bkey] != profile.SSH.HostKeyFingerprint {
+			profile.SSH.HostKeyChanged = true
+		}
+		replayed := false
+		if bkey != "" && f.auditedSSHHosts != nil {
+			f.sshAuditMu.Lock()
+			if cached, ok := f.auditedSSHHosts[bkey]; ok && cached.HostKeyFingerprint == profile.SSH.HostKeyFingerprint {
+				profile.SSH.NoneAuthAccepted = cached.NoneAuthAccepted
+				profile.SSH.BruteForceProtected = cached.BruteForceProtected
+				profile.SSH.CanaryFalsePositive = cached.CanaryFalsePositive
+				profile.SSH.AcceptedKeys = slices.Clone(cached.AcceptedKeys)
+				replayed = true
+			}
+			f.sshAuditMu.Unlock()
+		}
+		if !profile.SSH.HostKeyChanged && !replayed {
+			addr := net.JoinHostPort(targetIP, strconv.Itoa(profile.SSH.Port))
+			AuditSSHKeys(ctx, addr, f.sshAuditKeys, f.sshKeyAudit.Usernames, f.sshKeyAudit.MaxProbesPerHost, f.timeout, profile.SSH)
+			if bkey != "" && f.auditedSSHHosts != nil && profile.SSH.HostKeyFingerprint != "" {
+				f.sshAuditMu.Lock()
+				f.auditedSSHHosts[bkey] = SSHKeyAuditCacheEntry{
+					HostKeyFingerprint:  profile.SSH.HostKeyFingerprint,
+					NoneAuthAccepted:    profile.SSH.NoneAuthAccepted,
+					BruteForceProtected: profile.SSH.BruteForceProtected,
+					CanaryFalsePositive: profile.SSH.CanaryFalsePositive,
+					AcceptedKeys:        slices.Clone(profile.SSH.AcceptedKeys),
+				}
+				f.sshAuditMu.Unlock()
+			}
+		}
 	}
 
 	sort.Ints(profile.OpenPorts)
@@ -928,21 +1110,6 @@ func (f *Fingerprinter) walkVNCDisplays(ctx context.Context, dialer net.Dialer, 
 	}
 }
 
-// readSSHBanner reads a single identification line (e.g., "SSH-2.0-OpenSSH_9.6p1")
-// sent by an SSH server immediately upon connection.
-func readSSHBanner(conn net.Conn, timeout time.Duration) string {
-	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	line, err := bufio.NewReader(io.LimitReader(conn, 256)).ReadString('\n')
-	if err != nil && !strings.HasPrefix(line, "SSH-") {
-		return ""
-	}
-	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "SSH-") {
-		return ""
-	}
-	return trimmed
-}
-
 // fetchHTTPBanner performs one bounded GET / request against a local host and
 // extracts its status code, Server/X-Powered-By headers, HTML title, and peer
 // TLS certificate subject metadata.
@@ -981,6 +1148,12 @@ func (f *Fingerprinter) fetchHTTPBanner(ctx context.Context, scheme, ip string, 
 			banner.TLSNotAfter = &exp
 			banner.TLSExpired = time.Now().UTC().After(exp)
 			banner.TLSSelfSigned = isSelfSignedCert(cert)
+			chain := x509.NewCertPool()
+			for _, intermediate := range resp.TLS.PeerCertificates[1:] {
+				chain.AddCert(intermediate)
+			}
+			_, err := cert.Verify(x509.VerifyOptions{DNSName: ip, Intermediates: chain})
+			banner.TLSVerified = err == nil
 		}
 	}
 	return banner, true

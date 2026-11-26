@@ -256,6 +256,32 @@ type ScanConfig struct {
 
 	// Interval sets the delay between consecutive scans in `uniblue watch`.
 	Interval time.Duration `yaml:"interval"`
+
+	// SSHKeyAudit configures the strictly opt-in, Fail2ban-safe SSH public-key
+	// reachability check (RFC 4252 section 7). Disabled by default.
+	SSHKeyAudit *SSHKeyAuditConfig `yaml:"ssh_key_audit,omitempty"`
+}
+
+// SSHKeyAuditConfig controls opt-in SSH "none" and public-key (PK_OK) checks.
+// It accepts only local OpenSSH .pub files, refuses private keys, and caps
+// probes per host to stay below Fail2ban and sshd MaxStartups thresholds.
+type SSHKeyAuditConfig struct {
+	// Enabled must be explicitly set to true to run any SSH authentication query.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// PublicKeyFiles lists local OpenSSH .pub file paths to test.
+	PublicKeyFiles []string `yaml:"public_key_files,omitempty"`
+
+	// Usernames lists local account names to query with the configured public keys.
+	Usernames []string `yaml:"usernames,omitempty"`
+
+	// TargetHosts optionally restricts the audit to specific IPs, MACs, or hostnames.
+	TargetHosts []string `yaml:"target_hosts,omitempty"`
+
+	// MaxProbesPerHost caps total SSH auth-attempting connections per host
+	// (including the canary check) to stay below Fail2ban and OpenSSH 9.8+
+	// PerSourcePenalties thresholds (default 3, hard max 3).
+	MaxProbesPerHost int `yaml:"max_probes_per_host,omitempty"`
 }
 
 // StateConfig controls local persistence between scans.
@@ -397,6 +423,9 @@ func Load(path string) (*Config, error) {
 	if cfg.Scan.Interval <= 0 {
 		cfg.Scan.Interval = 15 * time.Minute
 	}
+	if cfg.Scan.SSHKeyAudit != nil && cfg.Scan.SSHKeyAudit.Enabled && cfg.Scan.SSHKeyAudit.MaxProbesPerHost <= 0 {
+		cfg.Scan.SSHKeyAudit.MaxProbesPerHost = 3
+	}
 	if cfg.State.Path == "" {
 		cfg.State.Path = "uniblue-state.json"
 	}
@@ -513,6 +542,17 @@ func (c *Config) Validate() error {
 	for _, p := range c.Scan.Ports {
 		if p < 1 || p > 65535 {
 			return fmt.Errorf("config: invalid scan port %d", p)
+		}
+	}
+	if ka := c.Scan.SSHKeyAudit; ka != nil && ka.Enabled {
+		if ka.MaxProbesPerHost > 3 {
+			return fmt.Errorf("config: scan.ssh_key_audit.max_probes_per_host %d exceeds Fail2ban-safe hard cap 3", ka.MaxProbesPerHost)
+		}
+		if len(ka.PublicKeyFiles) == 0 {
+			return errors.New("config: scan.ssh_key_audit.public_key_files must list at least one .pub file when enabled")
+		}
+		if len(ka.Usernames) == 0 {
+			return errors.New("config: scan.ssh_key_audit.usernames must list at least one username when enabled")
 		}
 	}
 	switch strings.ToLower(c.Notify.Format) {
