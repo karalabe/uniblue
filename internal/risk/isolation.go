@@ -182,7 +182,7 @@ func EvaluateIsolation(
 		}
 	}
 
-	bmcClients := o.identifyBMCClients(rawFindings)
+	bmcClients := o.ManagementControllers(rawFindings)
 	printerClients := o.identifyPrinterClients(rawFindings)
 
 	addCell := func(cell IsolationCell) {
@@ -3735,8 +3735,8 @@ func isCameraNetwork(n unifi.Network, intent config.IsolationIntent) bool {
 	return strings.Contains(low, "camera") || strings.Contains(low, "cam") || strings.Contains(low, "nvr")
 }
 
-// identifyBMCClients resolves finding identities against the snapshot inventory.
-func (o *Oracle) identifyBMCClients(rawFindings []checks.Finding) []unifi.Client {
+// ManagementControllers resolves finding identities against the snapshot inventory.
+func (o *Oracle) ManagementControllers(rawFindings []checks.Finding) []unifi.Client {
 	bmcByKey := make(map[string]unifi.Client)
 	for _, f := range rawFindings {
 		if f.Category == "oob-bmc" || f.CheckID == "UB-0020" || f.CheckID == "UB-0019" {

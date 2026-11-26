@@ -1572,6 +1572,18 @@ func defaultLANName(networks []Network) string {
 	return "Default"
 }
 
+// portNetworkIDs resolves legacy profile references against this site's network
+// aliases. A missing list stays distinguishable from an explicitly empty list.
+func portNetworkIDs(ids []string, networks map[string]Network) []string {
+	result := slices.Clone(ids)
+	for i, id := range result {
+		if n, ok := networks[id]; ok {
+			result[i] = n.ID
+		}
+	}
+	return result
+}
+
 // convertSwitchPorts normalizes a UniFi device's port_table merged with
 // port_overrides and optional port profiles (rest/portconf) into sorted
 // SwitchPort entries with resolved native VLAN names.
@@ -1611,6 +1623,9 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			if ov.TaggedVLANMgmt != "" {
 				rp.TaggedVLANMgmt = ov.TaggedVLANMgmt
 			}
+			if ov.TaggedNetworkIDs != nil || ov.ExcludedNetworkIDs != nil {
+				rp.TaggedNetworkIDs, rp.ExcludedNetworkIDs = ov.TaggedNetworkIDs, ov.ExcludedNetworkIDs
+			}
 			if ov.NativeNetworkConfID != "" {
 				rp.NativeNetworkConfID = ov.NativeNetworkConfID
 			}
@@ -1648,6 +1663,9 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 					// Clear any stale per-port tagged_vlan_mgmt so the profile's
 					// forward setting ("native", "customize", "disabled") governs.
 					rp.TaggedVLANMgmt = ""
+				}
+				if profileWins || (rp.TaggedNetworkIDs == nil && rp.ExcludedNetworkIDs == nil) {
+					rp.TaggedNetworkIDs, rp.ExcludedNetworkIDs = pc.TaggedNetworkIDs, pc.ExcludedNetworkIDs
 				}
 				if (profileWins || rp.NativeNetworkConfID == "") && pc.NativeNetworkConfID != "" {
 					rp.NativeNetworkConfID = pc.NativeNetworkConfID
@@ -1733,6 +1751,8 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			OpMode:              opMode,
 			Forward:             fwd,
 			TaggedVLANMgmt:      tagged,
+			TaggedNetworkIDs:    portNetworkIDs(rp.TaggedNetworkIDs, netByID),
+			ExcludedNetworkIDs:  portNetworkIDs(rp.ExcludedNetworkIDs, netByID),
 			NativeNetworkID:     rp.NativeNetworkConfID,
 			NativeNetworkName:   nativeName,
 			PortConfID:          rp.PortConfID,

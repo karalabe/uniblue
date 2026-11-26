@@ -473,6 +473,12 @@ type SwitchPort struct {
 	// TaggedVLANMgmt is UniFi's explicit tagged-VLAN mode ("auto", "block_all", "custom").
 	TaggedVLANMgmt string `json:"tagged_vlan_mgmt,omitempty"`
 
+	// TaggedNetworkIDs lists networks included in a custom tagged VLAN list.
+	TaggedNetworkIDs []string `json:"-"`
+
+	// ExcludedNetworkIDs lists networks excluded from a tagged trunk.
+	ExcludedNetworkIDs []string `json:"-"`
+
 	// NativeNetworkID is the configured native/untagged network ID (empty = default LAN).
 	NativeNetworkID string `json:"native_network_id,omitempty"`
 
@@ -1111,6 +1117,10 @@ func (f *flexSTPCount) UnmarshalJSON(data []byte) error {
 
 // rawPort maps a single port entry in UniFi's port_table or port_overrides array.
 type rawPort struct {
+	// TaggedNetworkIDs holds the controller IDs included on this trunk.
+	TaggedNetworkIDs []string `json:"tagged_networkconf_ids"`
+	// ExcludedNetworkIDs holds the controller IDs omitted from this trunk.
+	ExcludedNetworkIDs  []string     `json:"excluded_networkconf_ids"`
 	PortIdx             int          `json:"port_idx"`
 	Name                string       `json:"name"`
 	Enable              *bool        `json:"enable"`
@@ -1142,6 +1152,10 @@ type rawPort struct {
 
 // rawPortConf maps a UniFi switch port profile from /api/s/<site>/rest/portconf.
 type rawPortConf struct {
+	// TaggedNetworkIDs holds the controller IDs included on this trunk.
+	TaggedNetworkIDs []string `json:"tagged_networkconf_ids"`
+	// ExcludedNetworkIDs holds the controller IDs omitted from this trunk.
+	ExcludedNetworkIDs  []string `json:"excluded_networkconf_ids"`
 	ID                  string   `json:"_id"`
 	Name                string   `json:"name"`
 	OpMode              string   `json:"op_mode"`

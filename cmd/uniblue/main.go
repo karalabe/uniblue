@@ -33,6 +33,7 @@ import (
 	builtinchecks "github.com/karalabe/uniblue/checks"
 	classifydata "github.com/karalabe/uniblue/classify"
 	"github.com/karalabe/uniblue/fingerprints"
+	"github.com/karalabe/uniblue/internal/blast"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
@@ -69,6 +70,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	defer stop()
 
 	switch args[0] {
+	case "blast":
+		return runBlast(ctx, args[1:], stdout, stderr)
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "watch":
@@ -106,6 +109,7 @@ Usage:
   uniblue <command> [flags]
 
 Commands:
+  blast       Show which network changes would reduce exposure
   scan        Run a single UniFi + LAN security scan and print prioritized findings
   watch       Continuously scan on an interval and notify only on new/escalated changes
   serve       Run live event-driven monitor (5s poll / WebSocket) with built-in web UI
@@ -182,6 +186,155 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	printReport(stdout, snap, report, profiles, exactCVEs, potentialCVEs, cveLoaded)
 	return nil
+}
+
+// runBlast evaluates reachability and ranks hypothetical network changes without
+// modifying scan state or controller settings.
+func runBlast(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("blast", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("config", "config.yaml", "path to the UniBlue configuration")
+	asJSON := fs.Bool("json", false, "print the full report as JSON")
+	noProbe := fs.Bool("no-probe", false, "use controller and passive inventory only")
+	noCVE := fs.Bool("no-cve", false, "skip the local vulnerability cache")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected blast argument %q", fs.Arg(0))
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		return err
+	}
+	list, err := loadAllChecks(cfg.Scan.ChecksDir)
+	if err != nil {
+		return err
+	}
+	ctrl, err := unifi.New(cfg.UniFi)
+	if err != nil {
+		return err
+	}
+	if err := ctrl.Login(ctx); err != nil {
+		return err
+	}
+	snap, err := ctrl.FetchSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
+	activeChecks := list
+	var profiles []probe.HostProfile
+	if !*noProbe {
+		fp := newSiteFingerprinter(mergePorts(cfg.Scan.Ports, list), cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+		fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, list, snap.PortHintsByIP()))
+		profiles = fp.FingerprintAll(ctx, snap.Clients)
+	} else {
+		// In -no-probe mode, skip active host probes and only run passive observation checks.
+		activeChecks = nil
+		for _, c := range list {
+			if c.Probe.Type == "observe" {
+				activeChecks = append(activeChecks, c)
+			}
+		}
+		for _, cl := range snap.Clients {
+			profiles = append(profiles, probe.HostProfile{Client: cl})
+		}
+	}
+	children := enrichSiteAndProfiles(snap, profiles, cfg.Network)
+	for _, d := range snap.Devices {
+		if ch := children[strings.ToLower(d.MAC)]; len(ch) > 0 {
+			profiles = append(profiles, probe.HostProfile{Client: unifi.Client{ID: d.ID, MAC: d.MAC, IP: d.IP, Name: d.Name}, Children: ch})
+		}
+	}
+	findings := checks.NewRunner(activeChecks, cfg.Scan.Concurrency).RunAll(ctx, profiles)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	findings = append(findings, checks.FindingsFromProfiles(profiles, findings)...)
+	base := risk.Evaluate(snap, findings, cfg.Network)
+	in := blast.Input{Snapshot: snap, Profiles: profiles, Findings: findings, Checks: list, NetCfg: cfg.Network, Isolation: base.Isolation, SwitchPorts: base.SwitchPorts}
+	if !*noCVE {
+		if in.CVEMatches, err = localCVEMatches(cfg, snap, profiles); err != nil {
+			fmt.Fprintln(stderr, "Local vulnerability cache unavailable; skipping CVE matches.")
+		}
+	}
+	var warnings []string
+	in.Assets, warnings = classify.ResolveAssets(snap, profiles, cfg.Network.Assets)
+	for _, msg := range warnings {
+		fmt.Fprintln(stderr, msg)
+	}
+	result := blast.Evaluate(in)
+	if *asJSON {
+		return writeJSON(stdout, result)
+	}
+	printBlast(stdout, result)
+	return nil
+}
+
+// printBlast prints a compact summary of each lane; use -json for the full queue.
+func printBlast(w io.Writer, r blast.Report) {
+	fmt.Fprintln(w, "Network exposure review")
+	var top []blast.Action
+	for _, a := range r.Actions {
+		if a.HighestTierReduced == "" {
+			continue
+		}
+		top = append(top, a)
+		if len(top) == 3 {
+			break
+		}
+	}
+	if len(top) > 0 {
+		fmt.Fprintln(w, "\nHighest-impact changes")
+		for _, a := range top {
+			if len(a.Benefits) > 0 {
+				fmt.Fprintf(w, "  %s  %s (helps protect %s)\n", a.HighestTierReduced, a.Title, strings.Join(a.Benefits, ", "))
+			} else {
+				fmt.Fprintf(w, "  %s  %s\n", a.HighestTierReduced, a.Title)
+			}
+		}
+	}
+	for _, group := range []struct {
+		lane blast.Lane
+		name string
+	}{{blast.LaneFixNow, "Fix now"}, {blast.LaneReduceExposure, "Reduce exposure"}, {blast.LaneVerify, "Verify"}} {
+		fmt.Fprintf(w, "\n%s\n", group.name)
+		n := 0
+		for _, a := range r.Actions {
+			if a.Lane != group.lane {
+				continue
+			}
+			n++
+			if n > 5 {
+				continue
+			}
+			if a.HighestTierReduced != "" {
+				fmt.Fprintf(w, "  [%s] %s", a.HighestTierReduced, a.Title)
+			} else {
+				fmt.Fprintf(w, "  - %s", a.Title)
+			}
+			if len(a.Benefits) > 0 {
+				fmt.Fprintf(w, " (%s)", strings.Join(a.Benefits, ", "))
+			}
+			fmt.Fprintf(w, "\n    %s\n", a.Reason)
+			if len(a.BreaksApproved) > 0 {
+				fmt.Fprintf(w, "    Note: would interrupt approved path(s): %s.\n", strings.Join(a.BreaksApproved, ", "))
+			}
+		}
+		if n == 0 {
+			fmt.Fprintln(w, "  None.")
+		} else if n > 5 {
+			fmt.Fprintf(w, "  ...and %d more (run with -json to inspect all).\n", n-5)
+		}
+	}
+	fmt.Fprintln(w, "\nDevice internet access")
+	if len(r.Cloud) == 0 {
+		fmt.Fprintln(w, "  No clients found.")
+	}
+	for _, c := range r.Cloud {
+		fmt.Fprintf(w, "  %s: %s - %s\n", c.Name, c.State, c.Reason)
+	}
 }
 
 // runWatch runs executeCycle immediately and then on cfg.Scan.Interval,
@@ -1107,19 +1260,7 @@ func enrichSiteAndProfiles(snap *unifi.Snapshot, profiles []probe.HostProfile, n
 // returns deterministic per-(host, product) rollups split into Exact version
 // matches and Potential (version-unknown) patch reminders.
 func correlateLocalCVEs(cfg *config.Config, snap *unifi.Snapshot, profiles []probe.HostProfile) (exact, potential []cve.ProductSummary, ok bool) {
-	cache := cve.NewCache(cfg.CVE.CacheDir)
-	if _, err := cache.Stats(); err != nil {
-		return nil, nil, false
-	}
-	identifier, err := cve.LoadFingerprinter(fingerprints.BuiltinFS)
-	if err != nil {
-		return nil, nil, false
-	}
-	products := identifier.Identify(snap, profiles)
-	matches, err := cache.MatchProducts(products, cve.MatchOptions{
-		MinSeverity:          checks.SeverityHigh,
-		PotentialMaxAgeYears: 2,
-	})
+	matches, err := localCVEMatches(cfg, snap, profiles)
 	if err != nil {
 		return nil, nil, false
 	}
@@ -1131,6 +1272,24 @@ func correlateLocalCVEs(cfg *config.Config, snap *unifi.Snapshot, profiles []pro
 		}
 	}
 	return exact, potential, true
+}
+
+// localCVEMatches preserves endpoint and version evidence for callers that need
+// individual matches before the scan summary groups them by product.
+func localCVEMatches(cfg *config.Config, snap *unifi.Snapshot, profiles []probe.HostProfile) ([]cve.Match, error) {
+	cache := cve.NewCache(cfg.CVE.CacheDir)
+	if _, err := cache.Stats(); err != nil {
+		return nil, err
+	}
+	identifier, err := cve.LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		return nil, err
+	}
+	products := identifier.Identify(snap, profiles)
+	return cache.MatchProducts(products, cve.MatchOptions{
+		MinSeverity:          checks.SeverityHigh,
+		PotentialMaxAgeYears: 2,
+	})
 }
 
 // mergePorts returns the bounded global baseline TCP port list combining

@@ -212,6 +212,18 @@ var assetClassifier = sync.OnceValue(func() *Classifier {
 	return c
 })
 
+// ClientRoles resolves the operational role of each client, keyed like ResolveAssets.
+func ClientRoles(snap *unifi.Snapshot, profiles []probe.HostProfile) map[string]Result {
+	roles := make(map[string]Result)
+	if snap == nil {
+		return roles
+	}
+	assetClassifier().classifyClients(snap, profiles, func(cl unifi.Client, info Result) {
+		roles[cmp.Or(config.CanonicalMAC(cl.MAC), cl.ID, cl.PrimaryIP())] = info
+	})
+	return roles
+}
+
 // assetIndex keeps one profile per host while allowing either selector to find it.
 type assetIndex struct {
 	profiles map[string]AssetProfile

@@ -10,11 +10,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -22,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/karalabe/uniblue/internal/blast"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/cve"
@@ -672,5 +676,56 @@ func TestCVEHistoryFromOfflineSync(t *testing.T) {
 	}
 	if _, err := os.Stat("uniblue-state.json.pending-webhooks.json"); !os.IsNotExist(err) {
 		t.Fatalf("unexpected alert queue after cache commands: %v", err)
+	}
+}
+
+// TestBlastShadowCommand exercises both output modes against a controller that
+// provides inventory while withholding firewall rules.
+func TestBlastShadowCommand(t *testing.T) {
+	ctrl := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" && !(r.Method == "POST" && strings.Contains(r.URL.Path, "/system-log/")) {
+			t.Errorf("unexpected controller write: %s %s", r.Method, r.URL.Path)
+		}
+		switch {
+		case r.URL.Path == "/proxy/network/integration/v1/sites":
+			io.WriteString(w, `{"count":1,"totalCount":1,"data":[{"id":"site","name":"Default","internalReference":"default"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/clients"):
+			io.WriteString(w, `{"count":1,"totalCount":1,"data":[{"id":"sensor","name":"Sensor","ipAddress":"192.0.2.9","networkId":"iot","type":"WIRED"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/networks"):
+			io.WriteString(w, `{"count":1,"totalCount":1,"data":[{"id":"iot","name":"IoT"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/firewall/policies"):
+			http.Error(w, "unavailable", http.StatusForbidden)
+		default:
+			io.WriteString(w, `{"count":0,"totalCount":0,"data":[]}`)
+		}
+	}))
+	defer ctrl.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "site.yaml")
+	state := filepath.Join(dir, "state.json")
+	cfg := "unifi:\n  url: " + ctrl.URL + "\n  api_key: example\n  insecure_skip_verify: true\nstate:\n  path: " + state + "\n"
+	if err := os.WriteFile(path, []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"blast", "-config", path, "-no-probe", "-no-cve"}
+	var out bytes.Buffer
+	if err := run(args, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Fix now", "Reduce exposure", "Verify", "Device internet access"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatal(out.String())
+		}
+	}
+	out.Reset()
+	if err := run(append(args, "-json"), &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var report blast.Report
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil || len(report.Actions) == 0 {
+		t.Fatalf("missing JSON assessment: %v %s", err, out.Bytes())
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("shadow command changed scan state: %v", err)
 	}
 }

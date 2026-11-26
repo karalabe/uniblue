@@ -191,6 +191,79 @@ func (o *Oracle) AnyPort(src Position, dst unifi.Client, fam string) IsolationCe
 	return o.reach(src, dst, "", 0, strings.ToLower(fam))
 }
 
+// InternetEgress searches public destinations for a permitted connection from
+// this particular client. The boundary solver pins the source while searching
+// destination addresses and ports on both sides of every policy selector.
+func (o *Oracle) InternetEgress(cl unifi.Client, fam string) IsolationCell {
+	cl = o.hydrateClient(cl, fam)
+	n := o.network(cl.NetworkID, cl.NetworkName)
+	external := unifi.Network{Name: "Internet", ZoneName: "External", Subnet: "0.0.0.0/0", IPv6Subnet: "2000::/3"}
+	peers := peerEndpoints{src: cl}
+	if n.InternetAccessEnabled != nil && !*n.InternetAccessEnabled {
+		return o.endpointPath(n, external, n.ZoneName, "External", peers, "", 0, fam)
+	}
+	if len(peerAddresses(cl, fam)) == 0 {
+		return IsolationCell{Effective: "unknown", Verdict: IsolationUnknown, MissingInput: "The client address is missing"}
+	}
+	if _, local := routableClient(cl, fam); local {
+		return o.nonRoutableCell(n, external, n.ZoneName, "External", cl, "", 0, fam)
+	}
+	n.RouterDeviceMAC, n.RouterUnresolved = "", false
+	scoped := *o
+	scoped.sortedPolicies = o.policiesWithExternalDefault(n)
+	return scoped.evaluateBoundary(nil, config.IsolationIntent{}, n, external, n.ZoneName, "External", fam, "deny", &peers)
+}
+
+// Families returns the address families modeled for this client and network.
+func (o *Oracle) Families(cl unifi.Client) []string {
+	n := o.network(cl.NetworkID, cl.NetworkName)
+	if siteHasIPv6Context(o.snap, n, n, cl) || strings.Contains(cl.IP, ":") {
+		return []string{"ipv4", "ipv6"}
+	}
+	return []string{"ipv4"}
+}
+
+// NetworkForAddress resolves inventory without network IDs through the most
+// specific configured LAN prefix, including an infrastructure management IP.
+func (o *Oracle) NetworkForAddress(ip string) unifi.Network {
+	n, _ := lookupNetworkByIP(o.snap, ip)
+	return n
+}
+
+// DeviceClient builds a query destination for UniFi infrastructure devices that
+// do not appear in the client inventory. Gateways use GatewayNetworkID so rules
+// targeting the Gateway zone apply even when the management IP lies in a LAN subnet.
+func (o *Oracle) DeviceClient(d unifi.Device) unifi.Client {
+	cl := unifi.Client{ID: d.ID, MAC: d.MAC, IP: d.IP, Name: d.Name, IsWired: true, SwitchMAC: d.UplinkMAC, SwitchPort: d.UplinkPort}
+	n := o.NetworkForAddress(d.IP)
+	cl.NetworkID, cl.NetworkName = n.ID, n.Name
+	switch strings.ToLower(d.Type) {
+	case "udm", "udr", "udw", "ucg", "uxg", "ugw", "usg", "gateway", "router":
+		cl.NetworkID, cl.NetworkName = GatewayNetworkID, "Gateway"
+	}
+	return cl
+}
+
+// GatewayNetworkID is the synthetic network ID assigned to UniFi gateways so
+// they stay distinct from any user-named VLAN called "Gateway".
+const GatewayNetworkID = "uniblue:gateway"
+
+// ApprovedServices resolves the owner's intended workflows for a concrete
+// source network and destination using the same role matching as isolation.
+func (o *Oracle) ApprovedServices(src Position, dst unifi.Client, findings []checks.Finding, fam string) []config.ApprovedPath {
+	n, d := o.network(src.NetworkID, src.NetworkName), o.network(dst.NetworkID, dst.NetworkName)
+	var paths []config.ApprovedPath
+	for _, ap := range o.intent.ApprovedPaths {
+		if ap.DestRole != "" && !clientMatchesApprovedRole(dst, findings, ap.DestRole, ap.Function) {
+			continue
+		}
+		if hasApprovedPath([]config.ApprovedPath{ap}, firstNonEmptyStr(src.Zone, n.ZoneName), n.Name, dst, d.ZoneName, "", firstNonEmptyStr(ap.Transport, "tcp"), ap.Port, fam) {
+			paths = append(paths, ap)
+		}
+	}
+	return paths
+}
+
 // Internet returns configured or unresolved WAN ingress paths reaching dst's
 // service in address family fam. Missing port-forward, firewall policy, or
 // zone telemetry produces explicit unknown cells rather than an empty result.
@@ -248,6 +321,7 @@ func (o *Oracle) Internet(dst unifi.Client, proto string, port int, fam string) 
 		}
 		c := ingress(m.InternalIP, "dynamic-mapping", o.gwName)
 		c.EnforcerMACs, c.DecisiveRuleName = enforcerMACs(o.gwMAC), m.Protocol
+		c.DecisiveRuleID = fmt.Sprintf("%s:%s:%d:%s:%d:%s", strings.ToLower(m.Protocol), proto, m.ExtPort, c.DestIP, port, m.Source)
 		c.DecisiveReason = fmt.Sprintf("%s maps WAN port %d to this service", m.Protocol, m.ExtPort)
 		if m.Source != "" {
 			c.SourceNetwork = m.Source
@@ -279,6 +353,31 @@ func (o *Oracle) Internet(dst unifi.Client, proto string, port int, fam string) 
 		cells = append(cells, o.firewallIngress(net, dst, proto, port, fam)...)
 	}
 	return cells
+}
+
+// WithoutPolicies returns a shallow copy of the Oracle with the specified
+// firewall policy IDs removed so callers can test whether a later rule still
+// allows traffic after removing the winning rule.
+func (o *Oracle) WithoutPolicies(excludeIDs map[string]bool) *Oracle {
+	if len(excludeIDs) == 0 {
+		return o
+	}
+	cp := *o
+	filtered := make([]unifi.FirewallPolicy, 0, len(o.sortedPolicies))
+	for _, p := range o.sortedPolicies {
+		if !excludeIDs[p.ID] {
+			filtered = append(filtered, p)
+		}
+	}
+	cp.sortedPolicies = filtered
+	return &cp
+}
+
+// InternetPolicy finds an inbound policy witness even when a host has no
+// observed services. Internet can then resolve all publications for that socket.
+func (o *Oracle) InternetPolicy(dst unifi.Client, fam string) []IsolationCell {
+	dst = o.hydrateClient(dst, fam)
+	return o.firewallIngress(o.network(dst.NetworkID, dst.NetworkName), dst, "", 0, fam)
 }
 
 // isNonRoutableIP reports addresses that cannot cross an L3 router or WAN gateway.
@@ -365,7 +464,13 @@ func (o *Oracle) firewallIngress(net unifi.Network, dst unifi.Client, proto stri
 	for _, wan := range wans {
 		wan.Subnet, wan.IPv6Subnet = "0.0.0.0/0", "2000::/3"
 		seenWAN := make(map[ingressKey]bool)
-		for c := range o.servicePaths(wan, net, "External", net.ZoneName, peerEndpoints{dst: dst}, proto, port, fam) {
+		paths := o.servicePaths(wan, net, "External", net.ZoneName, peerEndpoints{dst: dst}, proto, port, fam)
+		if port == 0 {
+			paths = func(yield func(IsolationCell) bool) {
+				yield(o.evaluateBoundary(nil, config.IsolationIntent{}, wan, net, "External", net.ZoneName, fam, "deny", &peerEndpoints{dst: dst, concrete: true}))
+			}
+		}
+		for c := range paths {
 			if c.Effective == "deny" {
 				continue
 			}
@@ -792,6 +897,9 @@ func (o *Oracle) inventoryClient(cl unifi.Client) unifi.Client {
 
 // network prefers the controller ID when a client also supplies a display name.
 func (o *Oracle) network(id, name string) unifi.Network {
+	if id == GatewayNetworkID {
+		return unifi.Network{ID: id, Name: "Gateway", ZoneName: "Gateway"}
+	}
 	if id != "" {
 		if n, ok := o.netByID[id]; ok {
 			return n
@@ -802,6 +910,7 @@ func (o *Oracle) network(id, name string) unifi.Network {
 			return n
 		}
 	}
+
 	return unifi.Network{Name: name}
 }
 
