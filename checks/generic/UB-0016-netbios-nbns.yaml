@@ -30,6 +30,11 @@ probe:
   port: 137
   timeout: 2s
 
+grants:
+  - effect: read
+    basis: implied
+    note: NetBIOS disclosed host name and advertised Windows services
+
 remediation:
   summary: >
     The host answered a read-only NetBIOS Node Status (NBSTAT) query on UDP 137,

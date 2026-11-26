@@ -11,10 +11,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"flag"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,18 +30,188 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
-// TestBuiltinChecksAreValid verifies that every embedded YAML check parses,
-// satisfies safety and schema validation, and merges with unique IDs.
-func TestBuiltinChecksAreValid(t *testing.T) {
-	list, err := LoadFromFS(builtinchecks.BuiltinFS)
+var updateGolden = flag.Bool("update-golden", false, "update the embedded check grant table")
+
+// TestCheckGrantsGolden pins the capabilities of every embedded check after merge validation.
+func TestCheckGrantsGolden(t *testing.T) {
+	checks, err := LoadFromFS(builtinchecks.BuiltinFS)
 	if err != nil {
-		t.Fatalf("LoadFromFS(BuiltinFS): %v", err)
+		t.Fatal(err)
 	}
-	if len(list) < 50 {
-		t.Fatalf("expected at least 50 built-in checks, got %d", len(list))
+	merged, err := Merge(checks)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := Merge(list); err != nil {
-		t.Fatalf("Merge(builtins): %v", err)
+	var table strings.Builder
+	for _, chk := range merged {
+		var grants []string
+		for _, g := range chk.Grants {
+			desc := fmt.Sprintf("%s/%s", g.Effect, g.Basis)
+			if g.WhenField != "" {
+				desc += " when " + g.WhenField
+			}
+			if g.Requires != "" {
+				desc += " requires " + g.Requires
+			}
+			if g.Note != "" {
+				desc += " (" + g.Note + ")"
+			}
+			grants = append(grants, desc)
+		}
+		slices.Sort(grants)
+		fmt.Fprintf(&table, "%s -> [%s]\n", chk.ID, strings.Join(grants, " | "))
+	}
+	const path = "testdata/check_grants.golden"
+	if *updateGolden {
+		if err := os.WriteFile(path, []byte(table.String()), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if table.String() != string(want) {
+		t.Errorf("check grants changed, review the table and regenerate with -update-golden:\n%s", table.String())
+	}
+}
+
+// TestGrantValidation checks the evidence ceiling and field vocabulary used for each grant.
+func TestGrantValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, probe string
+		grants      []GrantSpec
+		want        string
+	}{
+		{"missing grants", "tcp", nil, "grants required"},
+		{"unknown effect", "tcp", []GrantSpec{{Effect: "admin", Basis: BasisImplied}}, "effect"},
+		{"unknown basis", "tcp", []GrantSpec{{Effect: GrantControl, Basis: "likely"}}, "basis"},
+		{"missing prerequisite", "tcp", []GrantSpec{{Effect: GrantControl, Basis: BasisConditional, Requires: " "}}, "requires"},
+		{"tcp proof", "tcp", []GrantSpec{{Effect: GrantPivot, Basis: BasisProven}}, "at most implied"},
+		{"passive proof", "observe", []GrantSpec{{Effect: GrantSecrets, Basis: BasisProven}}, "at most implied"},
+		{"foreign field", "redis", []GrantSpec{{Effect: GrantRead, Basis: BasisImplied, WhenField: "connack"}}, "when_field"},
+		{"compound predicate", "mqtt", []GrantSpec{{Effect: GrantRead, Basis: BasisImplied, WhenField: "connack == 0 || true"}}, "when_field"},
+		{"unmatched JSON path", "http", []GrantSpec{{Effect: GrantRead, Basis: BasisImplied, WhenField: "$.unmatched"}}, "when_field"},
+		{"HTTP header alone", "http", []GrantSpec{{Effect: GrantRead, Basis: BasisProven}}, "cannot prove read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chk := Check{
+				ID: "UB-TEST", Title: "Grant test", Severity: SeverityHigh, Safety: "read-only",
+				Preconditions: Preconditions{PortsAny: []int{80}},
+				Probe:         ProbeSpec{Type: tc.probe, Path: "/", Match: MatchSpec{Status: []int{200}}},
+				Grants:        tc.grants,
+			}
+			if err := chk.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Validate() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	// Risk-bearing advertised checks (severity > info) are not inventory-only and require grants.
+	highAdv := Check{
+		ID: "UB-ADV", Title: "Advertised control", Claim: ClaimServiceAdvertised, Severity: SeverityHigh, Safety: "read-only",
+		Preconditions: Preconditions{MDNSTypeAny: []string{"_hap._tcp"}},
+		Probe:         ProbeSpec{Type: "observe"},
+	}
+	if err := highAdv.Validate(); err == nil || !strings.Contains(err.Error(), "grants required") {
+		t.Errorf("high-severity advertised check without grants: %v", err)
+	}
+	// Normalized TLS version and IPMI cipher_zero predicates validate cleanly.
+	for _, chk := range []Check{
+		{ID: "UB-TLS", Title: "TLS 1.0", Severity: SeverityMedium, Safety: "read-only", Preconditions: Preconditions{PortsAny: []int{443}}, Probe: ProbeSpec{Type: "tls-legacy"}, Grants: []GrantSpec{{Effect: GrantSecrets, Basis: BasisImplied, WhenField: "tls_version == 1.0"}}},
+		{ID: "UB-IPMI", Title: "IPMI", Severity: SeverityHigh, Safety: "read-only", Preconditions: Preconditions{PortsAny: []int{623}}, Probe: ProbeSpec{Type: "ipmi"}, Grants: []GrantSpec{{Effect: GrantControl, Basis: BasisImplied, WhenField: "cipher_zero"}}},
+	} {
+		if err := chk.Validate(); err != nil {
+			t.Errorf("%s Validate() = %v", chk.ID, err)
+		}
+	}
+}
+
+// TestSupersededGrants checks that suppression rejects cycles and preserves unconditional effects across check sources.
+func TestSupersededGrants(t *testing.T) {
+	generic := &Check{ID: "UB-GENERIC", Grants: []GrantSpec{{Effect: GrantRead, Basis: BasisImplied}, {Effect: GrantSecrets, Basis: BasisImplied}}}
+	specific := &Check{ID: "UB-SPECIFIC", Supersedes: []string{generic.ID}, Grants: []GrantSpec{{Effect: GrantRead, Basis: BasisImplied}}}
+	_, err := Merge([]*Check{specific}, []*Check{generic})
+	if err == nil || !strings.Contains(err.Error(), specific.ID) || !strings.Contains(err.Error(), generic.ID) || !strings.Contains(err.Error(), "secrets") {
+		t.Fatalf("missing superseded grant: %v", err)
+	}
+	// Self-supersession and mutual cycles must fail so RunHost never suppresses every finding.
+	selfSup := &Check{ID: "UB-SELF", Supersedes: []string{"UB-SELF"}, Grants: []GrantSpec{{Effect: GrantRead, Basis: BasisImplied}}}
+	if _, err := Merge([]*Check{selfSup}); err == nil || !strings.Contains(err.Error(), "itself") {
+		t.Fatalf("self-supersession should fail: %v", err)
+	}
+	cycA := &Check{ID: "UB-CYC-A", Supersedes: []string{"UB-CYC-B"}, Grants: []GrantSpec{{Effect: GrantRead, Basis: BasisImplied}}}
+	cycB := &Check{ID: "UB-CYC-B", Supersedes: []string{"UB-CYC-A"}, Grants: []GrantSpec{{Effect: GrantRead, Basis: BasisImplied}}}
+	if _, err := Merge([]*Check{cycA, cycB}); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("supersedes cycle should fail: %v", err)
+	}
+	// A conditional when_field grant cannot cover an unconditional superseded grant.
+	narrow := &Check{ID: "UB-NARROW", Supersedes: []string{"UB-GENERIC"}, Grants: []GrantSpec{
+		{Effect: GrantRead, Basis: BasisImplied},
+		{Effect: GrantSecrets, Basis: BasisImplied, WhenField: "$.x == 1"},
+	}}
+	if _, err := Merge([]*Check{narrow, generic}); err == nil || !strings.Contains(err.Error(), "unconditional") {
+		t.Fatalf("conditional grant should not cover unconditional superseded grant: %v", err)
+	}
+}
+
+// TestGrantObservations exercises multi-step data collection, filtering and transient serialization.
+func TestGrantObservations(t *testing.T) {
+	chk, err := Parse([]byte(`id: UB-OBS
+title: Feature settings
+safety: read-only
+preconditions: {ports_any: [80]}
+probe:
+  type: http
+  steps:
+    - paths: [/old, /settings]
+      match:
+        status: [200]
+        json_match: [{path: $.feature, exists: true}, {path: $.ready, equals: "true"}]
+    - path: /mode
+      match: {status: [200], json_match: [{path: $.admin, exists: true}]}
+grants:
+  - {effect: read, basis: proven}
+  - {effect: configure, basis: proven, when_field: $.admin == true}
+  - {effect: control, basis: implied, when_field: $.feature}
+`), "obs.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := runBuiltinHTTP(t, 80, func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]string{
+			"/old":      `{"feature":"discard","ready":false}`,
+			"/settings": `{"feature":{"private":"value"},"ready":true}`,
+			"/mode":     `{"admin":false,"unmatched":"private"}`,
+		}
+		fmt.Fprint(w, body[r.URL.Path])
+	}, chk)
+	if len(got) != 1 {
+		t.Fatalf("findings = %v", got)
+	}
+	obs := got[0].Observation
+	if obs.Level != ObsPrivilegeVerified || len(obs.Fields) != 4 || obs.Fields["$.ready"] != "true" || obs.Fields["$.admin"] != "false" || obs.Fields["status"] != "200" {
+		t.Fatalf("observation = %+v", obs)
+	}
+	if v, ok := obs.Fields["$.feature"]; !ok || v != "" {
+		t.Fatalf("object presence retained contents or failed to match: %q, %t", v, ok)
+	}
+	if grants := EffectiveGrants(chk, obs); !slices.Equal(grants, []GrantSpec{chk.Grants[0], chk.Grants[2]}) {
+		t.Errorf("effective grants = %v", grants)
+	}
+	if grants := EffectiveGrants(chk, Observation{Level: ObsService}); len(grants) != 0 {
+		t.Errorf("service observation yielded proven grants: %v", grants)
+	}
+	if grants := EffectiveGrants(chk, Observation{}); !slices.Equal(grants, chk.Grants[:1]) {
+		t.Errorf("grants without fields = %v", grants)
+	}
+	with, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got[0].Observation = Observation{}
+	without, err := json.Marshal(got[0])
+	if err != nil || !bytes.Equal(with, without) || bytes.Contains(bytes.ToLower(with), []byte("observation")) {
+		t.Fatalf("observation changed finding JSON: %s (%v)", with, err)
 	}
 }
 
@@ -135,6 +309,7 @@ func TestHTTPCheckExecution(t *testing.T) {
 	chk, err := Parse([]byte(`
 id: UB-HVAC-001
 title: Unauthenticated Ventilation API
+grants: [{effect: read, basis: proven}]
 category: unauth-control
 severity: high
 safety: read-only
@@ -182,7 +357,8 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		if _, ok := probeMQTT(context.Background(), "127.0.0.1", port); !ok {
+		var obs Observation
+		if _, ok := probeMQTT(context.Background(), "127.0.0.1", port, &obs); !ok || obs.Fields["connack"] != "0" {
 			t.Fatal("expected anonymous MQTT probe to match")
 		}
 	})
@@ -198,7 +374,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		if _, ok := probeModbus(context.Background(), "127.0.0.1", port); !ok {
+		if _, ok := probeModbus(context.Background(), "127.0.0.1", port, &Observation{}); !ok {
 			t.Fatal("expected Modbus probe to match")
 		}
 	})
@@ -227,7 +403,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeOpen()
 
-		if _, ok := probeRTSP(context.Background(), "127.0.0.1", portOpen); !ok {
+		if _, ok := probeRTSP(context.Background(), "127.0.0.1", portOpen, &Observation{}); !ok {
 			t.Fatal("expected unauthenticated RTSP DESCRIBE probe to match")
 		}
 
@@ -253,7 +429,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeAuth()
 
-		if ev, ok := probeRTSP(context.Background(), "127.0.0.1", portAuth); ok {
+		if ev, ok := probeRTSP(context.Background(), "127.0.0.1", portAuth, &Observation{}); ok {
 			t.Fatalf("expected password-protected RTSP camera (DESCRIBE 401) NOT to match, got ev=%q", ev)
 		}
 	})
@@ -288,7 +464,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		ev, ok := probeVNC(context.Background(), "127.0.0.1", port)
+		ev, ok := probeVNC(context.Background(), "127.0.0.1", port, &Observation{})
 		if !ok {
 			t.Fatal("expected VNC ServerInit probe to match")
 		}
@@ -310,7 +486,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		if _, ok := probeVNC(context.Background(), "127.0.0.1", port); ok {
+		if _, ok := probeVNC(context.Background(), "127.0.0.1", port, &Observation{}); ok {
 			t.Fatal("expected failed SecurityResult to reject VNC match")
 		}
 	})
@@ -325,7 +501,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		ev, ok := probeDenonMarantzAVR(context.Background(), "127.0.0.1", port)
+		ev, ok := probeDenonMarantzAVR(context.Background(), "127.0.0.1", port, &Observation{})
 		if !ok || !strings.Contains(ev, "PWSTANDBY") {
 			t.Fatalf("expected AVR probe match with PWSTANDBY, got ok=%v ev=%q", ok, ev)
 		}
@@ -341,8 +517,9 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		ev, ok := probeTelnet(context.Background(), "127.0.0.1", port)
-		if !ok || !strings.Contains(ev, "RouterOS login:") {
+		var obs Observation
+		ev, ok := probeTelnet(context.Background(), "127.0.0.1", port, &obs)
+		if !ok || obs.Fields["prompt"] != "login" || !strings.Contains(ev, "RouterOS login:") {
 			t.Fatalf("expected telnet login banner evidence, got ok=%v ev=%q", ok, ev)
 		}
 	})
@@ -358,7 +535,7 @@ func TestProtocolProbes(t *testing.T) {
 		port, _ := strconv.Atoi(portStr)
 
 		r := NewRunner(nil, 1)
-		ev, ok := r.probeEthereumRPC(context.Background(), "127.0.0.1", port)
+		ev, ok := r.probeEthereumRPC(context.Background(), "127.0.0.1", port, &Observation{})
 		if !ok || !strings.Contains(ev, "Geth/v1.15.0") {
 			t.Fatalf("expected eth-rpc probe match with Geth version, got ok=%v ev=%q", ok, ev)
 		}
@@ -393,7 +570,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		ev, ok := probeADB(context.Background(), "127.0.0.1", port)
+		ev, ok := probeADB(context.Background(), "127.0.0.1", port, &Observation{})
 		if !ok || !strings.Contains(ev, "SHIELD Android TV") {
 			t.Fatalf("expected ADB CNXN match with device model, got ok=%v ev=%q", ok, ev)
 		}
@@ -418,7 +595,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeFn()
 
-		if ev, ok := probeADB(context.Background(), "127.0.0.1", port); ok {
+		if ev, ok := probeADB(context.Background(), "127.0.0.1", port, &Observation{}); ok {
 			t.Fatalf("expected ADB AUTH challenge to NOT match unauth check, got ev=%q", ev)
 		}
 	})
@@ -439,7 +616,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeOpen()
 
-		if _, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portOpen); !ok {
+		if _, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portOpen, &Observation{}); !ok {
 			t.Fatal("expected RDP server with NLA disabled to match")
 		}
 
@@ -458,7 +635,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeNLA()
 
-		if ev, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portNLA); ok {
+		if ev, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portNLA, &Observation{}); ok {
 			t.Fatalf("expected NLA-enforced RDP server NOT to match, got ev=%q", ev)
 		}
 	})
@@ -474,7 +651,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeAnon()
 
-		if _, ok := probeFTPAnonymous(context.Background(), "127.0.0.1", portAnon); !ok {
+		if _, ok := probeFTPAnonymous(context.Background(), "127.0.0.1", portAnon, &Observation{}); !ok {
 			t.Fatal("expected anonymous FTP to match")
 		}
 
@@ -486,7 +663,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeAuth()
 
-		if ev, ok := probeFTPAnonymous(context.Background(), "127.0.0.1", portAuth); ok {
+		if ev, ok := probeFTPAnonymous(context.Background(), "127.0.0.1", portAuth, &Observation{}); ok {
 			t.Fatalf("expected auth-only FTP NOT to match, got ev=%q", ev)
 		}
 	})
@@ -499,7 +676,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeOpen()
 
-		if _, ok := probeRedisUnauth(context.Background(), "127.0.0.1", portOpen); !ok {
+		if _, ok := probeRedisUnauth(context.Background(), "127.0.0.1", portOpen, &Observation{}); !ok {
 			t.Fatal("expected unauth Redis +PONG to match")
 		}
 
@@ -510,7 +687,7 @@ func TestProtocolProbes(t *testing.T) {
 		})
 		defer closeAuth()
 
-		if ev, ok := probeRedisUnauth(context.Background(), "127.0.0.1", portAuth); ok {
+		if ev, ok := probeRedisUnauth(context.Background(), "127.0.0.1", portAuth, &Observation{}); ok {
 			t.Fatalf("expected auth-protected Redis NOT to match, got ev=%q", ev)
 		}
 	})
@@ -524,7 +701,7 @@ func TestProtocolProbes(t *testing.T) {
 		port, _ := strconv.Atoi(portStr)
 
 		r := NewRunner(nil, 1)
-		ev, ok := r.probeESFileExplorer(context.Background(), "127.0.0.1", port)
+		ev, ok := r.probeESFileExplorer(context.Background(), "127.0.0.1", port, &Observation{})
 		if !ok || !strings.Contains(ev, "SM-G950F") {
 			t.Fatalf("expected ES File Explorer match with SM-G950F, got ok=%v ev=%q", ok, ev)
 		}
@@ -735,7 +912,7 @@ func (f stepTransport) RoundTrip(r *http.Request) (*http.Response, error) { retu
 
 // TestHTTPStepValidation verifies read-only and schema guardrails for probe.steps.
 func TestHTTPStepValidation(t *testing.T) {
-	const header = "id: UB-TEST-HTTP\ntitle: HTTP step test\nsafety: read-only\npreconditions: {ports_any: [80]}\nprobe: "
+	const header = "id: UB-TEST-HTTP\ntitle: HTTP step test\ngrants: [{effect: read, basis: implied}]\nsafety: read-only\npreconditions: {ports_any: [80]}\nprobe: "
 	const valid = "{path: /info, match: {status: [200]}}"
 	inSteps := func(step string) string { return "{type: http, steps: [" + valid + ", " + step + "]}" }
 
@@ -767,7 +944,7 @@ func TestHTTPStepValidation(t *testing.T) {
 // TestHTTPStepExecutionAndLegacyFraming checks multi-step matching, body read errors,
 // and legacy single-request resilience against truncated embedded HTTP responses.
 func TestHTTPStepExecutionAndLegacyFraming(t *testing.T) {
-	const header = "id: UB-TEST-HTTP\ntitle: HTTP test\nsafety: read-only\npreconditions: {ports_any: [80]}\nprobe: "
+	const header = "id: UB-TEST-HTTP\ntitle: HTTP test\ngrants: [{effect: read, basis: implied}]\nsafety: read-only\npreconditions: {ports_any: [80]}\nprobe: "
 	multi, err := Parse([]byte(header+`{type: http, timeout: 100ms, steps: [
 		{paths: [/first, /alt], match: {status: [200], body_regex: '^ready', evidence_summary: ready}},
 		{method: HEAD, path: /second, match: {status: [200]}}

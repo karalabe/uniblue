@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -161,6 +162,140 @@ func ParseClaimKind(s string) (ClaimKind, error) {
 	}
 }
 
+// GrantEffect identifies a capability available through a matched service.
+type GrantEffect string
+
+const (
+	// GrantRead permits reading service data.
+	GrantRead GrantEffect = "read"
+	// GrantSecrets permits obtaining credentials or other secret material.
+	GrantSecrets GrantEffect = "secrets"
+	// GrantControl permits issuing operational commands.
+	GrantControl GrantEffect = "control"
+	// GrantConfigure permits changing settings or policy.
+	GrantConfigure GrantEffect = "configure"
+	// GrantPivot permits acting on other systems through this service.
+	GrantPivot GrantEffect = "pivot"
+	// GrantDisrupt permits interrupting service or device operation.
+	GrantDisrupt GrantEffect = "disrupt"
+)
+
+// Valid reports whether the capability belongs to the shared check and protocol vocabulary.
+func (e GrantEffect) Valid() bool {
+	switch e {
+	case GrantRead, GrantSecrets, GrantControl, GrantConfigure, GrantPivot, GrantDisrupt:
+		return true
+	}
+	return false
+}
+
+// GrantBasis records how directly a probe establishes a capability.
+type GrantBasis string
+
+const (
+	// BasisProven means the response directly demonstrates the permission.
+	BasisProven GrantBasis = "proven"
+	// BasisImplied means the observed behavior supports an inference.
+	BasisImplied GrantBasis = "implied"
+	// BasisConditional depends on an explicit, unverified prerequisite.
+	BasisConditional GrantBasis = "conditional"
+	// BasisAssumed records a capability based only on an assumption.
+	BasisAssumed GrantBasis = "assumed"
+)
+
+// strength orders the four bases for comparison with a probe's evidence ceiling.
+func (b GrantBasis) strength() int {
+	return slices.Index([]GrantBasis{BasisAssumed, BasisConditional, BasisImplied, BasisProven}, b)
+}
+
+// GrantSpec declares one capability yielded when a check matches.
+type GrantSpec struct {
+	// Effect identifies the available operation.
+	Effect GrantEffect `yaml:"effect"`
+	// Basis qualifies the evidence supporting Effect.
+	Basis GrantBasis `yaml:"basis"`
+	// WhenField optionally requires a field's presence or its equality to a literal.
+	WhenField string `yaml:"when_field,omitempty"`
+	// Requires names a prerequisite the probe left unverified.
+	Requires string `yaml:"requires,omitempty"`
+	// Note describes the scope of the capability.
+	Note string `yaml:"note,omitempty"`
+}
+
+// ObservationLevel describes the evidence collected by a successful probe.
+type ObservationLevel string
+
+const (
+	// ObsIdentity identifies an asset from its fingerprint.
+	ObsIdentity ObservationLevel = "identity"
+	// ObsService establishes service visibility or a protocol response.
+	ObsService ObservationLevel = "service"
+	// ObsAuthVerified establishes that the service accepted an anonymous session or command.
+	ObsAuthVerified ObservationLevel = "auth-verified"
+	// ObsPrivilegeVerified establishes a specific operation, such as a successful data read.
+	ObsPrivilegeVerified ObservationLevel = "privilege-verified"
+)
+
+// Observation carries transient facts from one successful check on one endpoint.
+type Observation struct {
+	// Level describes the most specific evidence from the match.
+	Level ObservationLevel
+	// Fields contains matched protocol values and HTTP JSON paths. A bare predicate tests presence.
+	Fields map[string]string
+}
+
+// ProbeCapability bounds the evidence available to a declarative check.
+type ProbeCapability struct {
+	// MaxLevel is the strongest observation the probe can make.
+	MaxLevel ObservationLevel
+	// EmittedFields names protocol fields available to grant predicates.
+	EmittedFields []string
+	// MaxBasis is the strongest basis a check can declare with this probe.
+	MaxBasis GrantBasis
+}
+
+// probeCapabilities is also the allowlist of supported probe types. HTTP adds
+// only the paths explicitly checked in the successful response to a step.
+var probeCapabilities = map[string]ProbeCapability{
+	"adb":           {ObsAuthVerified, []string{"command"}, BasisImplied},
+	"avr":           {ObsPrivilegeVerified, []string{"power_reply"}, BasisProven},
+	"bitcoin-p2p":   {ObsService, []string{"network", "version"}, BasisImplied},
+	"bitcoin-rpc":   {ObsPrivilegeVerified, []string{"subversion"}, BasisProven},
+	"coap":          {ObsPrivilegeVerified, []string{"response_code"}, BasisProven},
+	"comfoconnect":  {ObsService, []string{"discovery_reply"}, BasisImplied},
+	"dns-recursion": {ObsPrivilegeVerified, []string{"answers"}, BasisProven},
+	"esfile":        {ObsPrivilegeVerified, []string{"model", "sdk"}, BasisProven},
+	"eth-engine":    {ObsPrivilegeVerified, []string{"capability_count"}, BasisProven},
+	"eth-rpc":       {ObsPrivilegeVerified, []string{"client_version"}, BasisProven},
+	"ftp-anon":      {ObsAuthVerified, []string{"login_code"}, BasisImplied},
+	"http":          {ObsPrivilegeVerified, []string{"status"}, BasisProven},
+	"ipmi":          {ObsService, []string{"anonymous_login", "null_user", "cipher_zero"}, BasisImplied},
+	"ipp":           {ObsPrivilegeVerified, []string{"status"}, BasisProven},
+	"kasa":          {ObsPrivilegeVerified, []string{"model"}, BasisProven},
+	"lifx":          {ObsService, []string{"vendor_id", "product_id"}, BasisImplied},
+	"memcached":     {ObsPrivilegeVerified, []string{"version"}, BasisProven},
+	"modbus":        {ObsService, []string{"function_code"}, BasisImplied},
+	"mpd":           {ObsPrivilegeVerified, []string{"version"}, BasisProven},
+	"mqtt":          {ObsAuthVerified, []string{"connack"}, BasisImplied},
+	"natpmp":        {ObsPrivilegeVerified, []string{"result_code"}, BasisProven},
+	"nbns":          {ObsService, []string{"name_count"}, BasisImplied},
+	"ntp":           {ObsService, []string{"stratum"}, BasisImplied},
+	"nut":           {ObsService, []string{"listed_ups"}, BasisImplied},
+	"observe":       {ObsService, nil, BasisImplied},
+	"pcp":           {ObsService, []string{"epoch"}, BasisImplied},
+	"pjlink":        {ObsService, []string{"auth_required"}, BasisImplied},
+	"rdp-nla":       {ObsService, []string{"selected_protocol"}, BasisImplied},
+	"redis":         {ObsAuthVerified, []string{"reply"}, BasisImplied},
+	"rsync":         {ObsService, []string{"version"}, BasisImplied},
+	"rtsp":          {ObsPrivilegeVerified, []string{"describe_status"}, BasisProven},
+	"snmp":          {ObsPrivilegeVerified, []string{"sys_descr"}, BasisProven},
+	"stun":          {ObsService, []string{"binding_success"}, BasisImplied},
+	"tcp":           {ObsService, []string{"banner_matched"}, BasisImplied},
+	"telnet":        {ObsService, []string{"prompt"}, BasisImplied},
+	"tls-legacy":    {ObsService, []string{"tls_version"}, BasisImplied},
+	"vnc":           {ObsAuthVerified, []string{"security_type", "session_accepted"}, BasisImplied},
+}
+
 // Check defines a single declarative, community-submittable LAN/IoT check.
 type Check struct {
 	// ID uniquely identifies the check (e.g., "UB-0001" or "UB-2026-0042").
@@ -179,6 +314,9 @@ type Check struct {
 	// matches (asset-identity, service-advertised, service-observed,
 	// configured-access, or confirmed-permission).
 	Claim ClaimKind `yaml:"claim,omitempty"`
+
+	// Grants lists the capabilities supported by a successful match.
+	Grants []GrantSpec `yaml:"grants,omitempty"`
 
 	// Property optionally names the specific security property proven (e.g.,
 	// "tls-protocol", "auth-anon", "smb-v1") so independent properties on the
@@ -300,10 +438,7 @@ type Preconditions struct {
 // ProbeSpec defines the target-only verification probe executed when a host
 // satisfies a check's Preconditions.
 type ProbeSpec struct {
-	// Type selects the probe protocol: "observe", "tcp", "telnet", "http",
-	// "mqtt", "modbus", "rtsp", "vnc", "avr", "comfoconnect", "eth-rpc", "adb",
-	// "rdp-nla", "ftp-anon", "esfile", "redis", "snmp", "tls-legacy",
-	// "memcached", "rsync", "mpd", "kasa", "coap", "natpmp", or "ipp".
+	// Type selects a protocol from the probe capability contract.
 	Type string `yaml:"type"`
 
 	// Port optionally pins the target port. When 0, the runner tests whichever
@@ -492,23 +627,70 @@ func LoadFromDir(dir string) ([]*Check, error) {
 	return LoadFromFS(os.DirFS(dir))
 }
 
-// Merge combines multiple check slices, rejecting duplicate IDs so community
-// overrides or accidental duplicates fail loudly rather than silently masking.
+// Merge combines check groups in ID order, rejecting duplicate IDs,
+// self-references or cycles in supersedes chains, and superseding checks that
+// would drop or narrow a capability declared by the superseded check.
 func Merge(groups ...[]*Check) ([]*Check, error) {
-	seen := make(map[string]string)
+	seen := make(map[string]*Check)
 	var merged []*Check
 	for _, g := range groups {
 		for _, chk := range g {
 			if prev, exists := seen[chk.ID]; exists {
-				return nil, fmt.Errorf("duplicate check id %q in %q and %q", chk.ID, prev, chk.Source)
+				return nil, fmt.Errorf("duplicate check id %q in %q and %q", chk.ID, prev.Source, chk.Source)
 			}
-			seen[chk.ID] = chk.Source
+			seen[chk.ID] = chk
 			merged = append(merged, chk)
 		}
 	}
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].ID < merged[j].ID
 	})
+	// Reject self-supersession and cycles so RunHost suppression can never erase
+	// every finding in a mutual-supersedes loop.
+	state := make(map[string]uint8, len(merged)) // 1=visiting, 2=done
+	var checkCycle func(id string) error
+	checkCycle = func(id string) error {
+		state[id] = 1
+		for _, next := range seen[id].Supersedes {
+			if next == id {
+				return fmt.Errorf("check %s cannot supersede itself", id)
+			}
+			if seen[next] == nil {
+				continue
+			}
+			if state[next] == 1 {
+				return fmt.Errorf("supersedes cycle involving %s and %s", id, next)
+			}
+			if state[next] == 0 {
+				if err := checkCycle(next); err != nil {
+					return err
+				}
+			}
+		}
+		state[id] = 2
+		return nil
+	}
+	for _, chk := range merged {
+		if state[chk.ID] == 0 {
+			if err := checkCycle(chk.ID); err != nil {
+				return nil, err
+			}
+		}
+		for _, id := range chk.Supersedes {
+			prior := seen[id]
+			if prior == nil {
+				continue
+			}
+			for _, grant := range prior.Grants {
+				covered := slices.ContainsFunc(chk.Grants, func(g GrantSpec) bool {
+					return g.Effect == grant.Effect && g.WhenField == "" && (g.Basis != BasisProven || grant.Basis == BasisProven)
+				})
+				if !covered {
+					return nil, fmt.Errorf("check %s supersedes %s but omits unconditional grant effect %q", chk.ID, id, grant.Effect)
+				}
+			}
+		}
+	}
 	return merged, nil
 }
 
@@ -575,22 +757,15 @@ func (c *Check) Validate() error {
 	// target-only guardrails so community checks cannot exfiltrate LAN data or
 	// mutate device state.
 	c.Probe.Type = strings.ToLower(strings.TrimSpace(c.Probe.Type))
-	switch c.Probe.Type {
-	case "observe", "tcp", "telnet", "mqtt", "modbus", "rtsp", "vnc", "avr",
-		"comfoconnect", "eth-rpc", "adb", "rdp-nla", "ftp-anon", "esfile",
-		"redis", "snmp", "tls-legacy", "memcached", "rsync", "mpd", "kasa",
-		"coap", "natpmp", "ipp", "ipmi",
-		"bitcoin-p2p", "bitcoin-rpc", "eth-engine", "nut", "lifx",
-		"pjlink", "nbns", "pcp", "dns-recursion", "ntp", "stun":
-		if c.Probe.Steps != nil {
-			return errors.New("probe.steps requires probe.type http")
-		}
-	case "http":
+	if _, ok := probeCapabilities[c.Probe.Type]; !ok {
+		return fmt.Errorf("unsupported probe.type %q", c.Probe.Type)
+	}
+	if c.Probe.Type == "http" {
 		if c.Probe.Scheme != "" && c.Probe.Scheme != "http" && c.Probe.Scheme != "https" {
 			return fmt.Errorf("http probe scheme %q must be http or https", c.Probe.Scheme)
 		}
-	default:
-		return fmt.Errorf("unsupported probe.type %q", c.Probe.Type)
+	} else if c.Probe.Steps != nil {
+		return errors.New("probe.steps requires probe.type http")
 	}
 
 	if c.Probe.Port < 0 || c.Probe.Port > 65535 {
@@ -657,12 +832,165 @@ func (c *Check) Validate() error {
 				return fmt.Errorf("probe.steps[%d]: %w", i, err)
 			}
 		}
-		return nil
+	} else if c.Probe.Type == "http" {
+		if err := c.Probe.HTTPStepSpec.validateHTTP(); err != nil {
+			return err
+		}
+	} else if err := c.Probe.Match.compile(); err != nil {
+		return err
 	}
-	if c.Probe.Type == "http" {
-		return c.Probe.HTTPStepSpec.validateHTTP()
+	return c.validateGrants()
+}
+
+// IsInventoryOnly reports whether the check is a pure informational inventory
+// observation (matching Finding.IsInventoryOnly) rather than a risk finding.
+func (c *Check) IsInventoryOnly() bool {
+	return c.Severity == SeverityInfo && (c.Claim == ClaimAssetIdentity || c.Claim == ClaimServiceAdvertised || c.Claim == ClaimServiceObserved)
+}
+
+// grantPredicate accepts field presence or equality with one literal token.
+// The length limit bounds both parsing work and the size of a literal in YAML.
+var grantPredicate = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*|\$(?:\[[0-9]+\])?(?:\.[A-Za-z0-9_-]+(?:\[[0-9]+\])?)*)(?:[ \t]*==[ \t]*([A-Za-z0-9_.*:/+-]+))?$`)
+
+// parseGrantPredicate is shared by validation and evaluation so both interpret literals identically.
+func parseGrantPredicate(expr string) (field, value string, ok bool) {
+	if len(expr) > 256 {
+		return "", "", false
 	}
-	return c.Probe.Match.compile()
+	m := grantPredicate.FindStringSubmatch(strings.TrimSpace(expr))
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+// emitsField reports whether the probe can populate field during execution,
+// allowing JSONPath selectors only when a matching HTTP step verifies presence.
+func (p *ProbeSpec) emitsField(field string) bool {
+	if slices.Contains(probeCapabilities[p.Type].EmittedFields, field) {
+		return true
+	}
+	if p.Type != "http" {
+		return false
+	}
+	for _, step := range p.httpSteps() {
+		if step.Match.observesPath(field) {
+			return true
+		}
+	}
+	return false
+}
+
+// observesPath excludes absence predicates, which cannot supply a value for a grant.
+func (m *MatchSpec) observesPath(field string) bool {
+	return slices.ContainsFunc(m.JSONMatch, func(p JSONPredicate) bool {
+		return p.Path == field && (p.Exists == nil || *p.Exists)
+	})
+}
+
+// httpSteps presents the single-request and sequential forms in wire order.
+func (p *ProbeSpec) httpSteps() []HTTPStepSpec {
+	if p.Steps != nil {
+		return p.Steps
+	}
+	return []HTTPStepSpec{p.HTTPStepSpec}
+}
+
+// verifiesRead identifies GET payload checks that can demonstrate a successful
+// read. The runner uses the actual status when the YAML leaves it open.
+func (s HTTPStepSpec) verifiesRead() bool {
+	if s.Method != "GET" || (len(s.Match.Status) > 0 && !slices.ContainsFunc(s.Match.Status, func(code int) bool { return code >= 200 && code < 300 })) {
+		return false
+	}
+	return len(s.Match.BodyContainsAll) > 0 || len(s.Match.BodyContainsAny) > 0 || s.Match.BodyRegex != "" ||
+		slices.ContainsFunc(s.Match.JSONMatch, func(p JSONPredicate) bool { return p.Exists == nil || *p.Exists })
+}
+
+// validateGrants bounds declarations by the operations the runner actually performs.
+func (c *Check) validateGrants() error {
+	if len(c.Grants) == 0 && !c.IsInventoryOnly() {
+		return errors.New("grants required for a non-inventory check")
+	}
+	capability := probeCapabilities[c.Probe.Type]
+	for i, g := range c.Grants {
+		strength := g.Basis.strength()
+		switch {
+		case !g.Effect.Valid():
+			return fmt.Errorf("grants[%d]: unknown effect %q", i, g.Effect)
+		case strength < 0:
+			return fmt.Errorf("grants[%d]: unknown basis %q", i, g.Basis)
+		case g.Basis == BasisConditional && strings.TrimSpace(g.Requires) == "":
+			return fmt.Errorf("grants[%d]: conditional basis requires a prerequisite in requires", i)
+		case strength > capability.MaxBasis.strength():
+			return fmt.Errorf("grants[%d]: %s probe supports at most %s basis", i, c.Probe.Type, capability.MaxBasis)
+		}
+		var field, value string
+		if g.WhenField != "" {
+			var ok bool
+			field, value, ok = parseGrantPredicate(g.WhenField)
+			if !ok || !c.Probe.emitsField(field) {
+				return fmt.Errorf("grants[%d]: invalid or unemitted when_field %q for %s probe", i, g.WhenField, c.Probe.Type)
+			}
+		}
+		if g.Basis == BasisProven && !c.canProve(g.Effect, field, value) {
+			return fmt.Errorf("grants[%d]: %s probe with claim %s cannot prove %s from this response", i, c.Probe.Type, c.Claim, g.Effect)
+		}
+	}
+	return nil
+}
+
+// canProve reports whether the check's probe and claim establish a proven grant
+// rather than a service banner or error page.
+func (c *Check) canProve(effect GrantEffect, field, value string) bool {
+	if c.Claim != ClaimConfirmedPermission {
+		return false
+	}
+	if c.Probe.Type != "http" {
+		// SNMP can match a response carrying a varbind exception in place of sysDescr.
+		return effect == GrantRead && (c.Probe.Type != "snmp" || field == "sys_descr")
+	}
+	steps := c.Probe.httpSteps()
+	if effect == GrantRead {
+		return slices.ContainsFunc(steps, HTTPStepSpec.verifiesRead)
+	}
+	if effect != GrantSecrets && value == "" {
+		return false
+	}
+	// The last step that supplies a field owns its value. In a sequence its
+	// successful status must be explicit, since another step can prove a read.
+	for i := len(steps) - 1; i >= 0; i-- {
+		step := &steps[i]
+		if step.Match.observesPath(field) {
+			statuses := step.Match.Status
+			if len(steps) > 1 && (len(statuses) == 0 || slices.ContainsFunc(statuses, func(code int) bool { return code < 200 || code >= 300 })) {
+				return false
+			}
+			return step.verifiesRead()
+		}
+	}
+	return false
+}
+
+// EffectiveGrants returns the grants supported by a matched check and its
+// transient fields. Conditional grants retain their external prerequisites.
+func EffectiveGrants(chk *Check, obs Observation) []GrantSpec {
+	var grants []GrantSpec
+	for _, g := range chk.Grants {
+		// A matched error response can identify the service without establishing
+		// the read permission available on a successful response.
+		if g.Basis == BasisProven && obs.Level != "" && obs.Level != ObsPrivilegeVerified {
+			continue
+		}
+		if g.WhenField != "" {
+			field, want, valid := parseGrantPredicate(g.WhenField)
+			got, present := obs.Fields[field]
+			if !valid || !present || (want != "" && got != want) {
+				continue
+			}
+		}
+		grants = append(grants, g)
+	}
+	return grants
 }
 
 // isZero reports whether all top-level HTTP step fields are unset.

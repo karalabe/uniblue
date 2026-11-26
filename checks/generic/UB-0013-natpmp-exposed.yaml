@@ -27,6 +27,14 @@ probe:
   port: 5351
   timeout: 2s
 
+grants:
+  - effect: read
+    basis: proven
+    note: "NAT-PMP returned the gateway's external IP address"
+  - effect: configure
+    basis: conditional
+    requires: the gateway allows creating port forwards via NAT-PMP
+
 remediation:
   summary: >
     Gateway responded to a read-only NAT-PMP v0 external-address query on UDP

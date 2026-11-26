@@ -29,6 +29,11 @@ probe:
   type: pjlink
   timeout: 3s
 
+grants:
+  - effect: control
+    basis: implied
+    note: PJLink advertised unauthenticated projector control (PJLINK 0)
+
 remediation:
   summary: >
     A networked projector advertised PJLink mode 0 (no authentication) on TCP

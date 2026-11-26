@@ -96,6 +96,9 @@ type Finding struct {
 	// Port is the TCP port where the issue was observed (0 for pure posture findings).
 	Port int `json:"port,omitempty"`
 
+	// Observation carries probe fields for evaluation during this scan.
+	Observation Observation `json:"-"`
+
 	// Evidence summarizes what the probe observed without leaking redacted secrets.
 	Evidence string `json:"evidence"`
 
@@ -309,10 +312,14 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 			if ctx.Err() != nil {
 				break
 			}
+			obs := Observation{Level: probeCapabilities[chk.Probe.Type].MaxLevel}
 			var evidence string
 			var matched bool
 			if chk.Probe.Type == "observe" {
 				evidence, matched = probeObserve(chk, hp, port)
+				if chk.Claim == ClaimAssetIdentity {
+					obs.Level = ObsIdentity
+				}
 			} else {
 				// Hard raw-printer safety guard: never send active bytes to raw print sinks.
 				if hp.IsRawPrintPort(port) {
@@ -322,7 +329,7 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 				if targetIP == "" {
 					continue
 				}
-				evidence, matched = r.executeProbeProfile(ctx, chk, hp, targetIP, port)
+				evidence, matched = r.executeProbeProfile(ctx, chk, hp, targetIP, port, &obs)
 			}
 			if matched {
 				for _, supID := range chk.Supersedes {
@@ -343,6 +350,7 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 						Client:            hp.Client,
 						Port:              port,
 						Evidence:          evidence,
+						Observation:       obs,
 						Remediation:       chk.Remediation,
 					})
 				}
@@ -645,88 +653,88 @@ func matchesWSRecord(chk *Check, rec probe.WSDiscoveryRecord) bool {
 
 // executeProbe runs the verification probe for a single check against ip:port.
 func (r *Runner) executeProbe(ctx context.Context, chk *Check, ip string, port int) (string, bool) {
-	return r.executeProbeProfile(ctx, chk, probe.HostProfile{}, ip, port)
+	return r.executeProbeProfile(ctx, chk, probe.HostProfile{}, ip, port, &Observation{})
 }
 
 // executeProbeProfile runs the verification probe for a single check against
 // ip:port with access to already-fingerprinted host metadata (such as TLS state).
-func (r *Runner) executeProbeProfile(ctx context.Context, chk *Check, hp probe.HostProfile, ip string, port int) (string, bool) {
+func (r *Runner) executeProbeProfile(ctx context.Context, chk *Check, hp probe.HostProfile, ip string, port int, obs *Observation) (string, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, chk.Probe.Timeout)
 	defer cancel()
 
 	switch chk.Probe.Type {
 	case "tcp":
-		return probeTCP(probeCtx, ip, port, chk)
+		return probeTCP(probeCtx, ip, port, chk, obs)
 	case "telnet":
-		return probeTelnet(probeCtx, ip, port)
+		return probeTelnet(probeCtx, ip, port, obs)
 	case "http":
-		return r.probeHTTP(probeCtx, hp, ip, port, chk)
+		return r.probeHTTP(probeCtx, hp, ip, port, chk, obs)
 	case "mqtt":
-		return probeMQTT(probeCtx, ip, port)
+		return probeMQTT(probeCtx, ip, port, obs)
 	case "modbus":
-		return probeModbus(probeCtx, ip, port)
+		return probeModbus(probeCtx, ip, port, obs)
 	case "rtsp":
-		return probeRTSP(probeCtx, ip, port)
+		return probeRTSP(probeCtx, ip, port, obs)
 	case "vnc":
-		return probeVNC(probeCtx, ip, port)
+		return probeVNC(probeCtx, ip, port, obs)
 	case "avr":
-		return probeDenonMarantzAVR(probeCtx, ip, port)
+		return probeDenonMarantzAVR(probeCtx, ip, port, obs)
 	case "comfoconnect":
-		return probeComfoConnect(probeCtx, ip, port)
+		return probeComfoConnect(probeCtx, ip, port, obs)
 	case "eth-rpc":
-		return r.probeEthereumRPC(probeCtx, ip, port)
+		return r.probeEthereumRPC(probeCtx, ip, port, obs)
 	case "adb":
-		return probeADB(probeCtx, ip, port)
+		return probeADB(probeCtx, ip, port, obs)
 	case "rdp-nla":
-		return probeRDPNoNLA(probeCtx, ip, port)
+		return probeRDPNoNLA(probeCtx, ip, port, obs)
 	case "ftp-anon":
-		return probeFTPAnonymous(probeCtx, ip, port)
+		return probeFTPAnonymous(probeCtx, ip, port, obs)
 	case "esfile":
-		return r.probeESFileExplorer(probeCtx, ip, port)
+		return r.probeESFileExplorer(probeCtx, ip, port, obs)
 	case "redis":
-		return probeRedisUnauth(probeCtx, ip, port)
+		return probeRedisUnauth(probeCtx, ip, port, obs)
 	case "snmp":
-		return probeSNMPReadOnly(probeCtx, ip, port, chk.Probe.Community)
+		return probeSNMPReadOnly(probeCtx, ip, port, chk.Probe.Community, obs)
 	case "tls-legacy":
-		return probeTLSLegacy(probeCtx, ip, port)
+		return probeTLSLegacy(probeCtx, ip, port, obs)
 	case "memcached":
-		return probeMemcached(probeCtx, ip, port)
+		return probeMemcached(probeCtx, ip, port, obs)
 	case "rsync":
-		return probeRsync(probeCtx, ip, port)
+		return probeRsync(probeCtx, ip, port, obs)
 	case "mpd":
-		return probeMPD(probeCtx, ip, port)
+		return probeMPD(probeCtx, ip, port, obs)
 	case "kasa":
-		return probeKasa(probeCtx, ip, port)
+		return probeKasa(probeCtx, ip, port, obs)
 	case "coap":
-		return probeCoAP(probeCtx, ip, port)
+		return probeCoAP(probeCtx, ip, port, obs)
 	case "natpmp":
-		return probeNATPMP(probeCtx, ip, port)
+		return probeNATPMP(probeCtx, ip, port, obs)
 	case "ipp":
-		return r.probeIPP(probeCtx, ip, port)
+		return r.probeIPP(probeCtx, ip, port, obs)
 	case "ipmi":
-		return probeIPMI(probeCtx, ip, port)
+		return probeIPMI(probeCtx, ip, port, obs)
 	case "bitcoin-p2p":
-		return probeBitcoinP2P(probeCtx, ip, port)
+		return probeBitcoinP2P(probeCtx, ip, port, obs)
 	case "bitcoin-rpc":
-		return r.probeBitcoinRPC(probeCtx, ip, port)
+		return r.probeBitcoinRPC(probeCtx, ip, port, obs)
 	case "eth-engine":
-		return r.probeEthEngineAPI(probeCtx, ip, port)
+		return r.probeEthEngineAPI(probeCtx, ip, port, obs)
 	case "nut":
-		return probeNUT(probeCtx, ip, port)
+		return probeNUT(probeCtx, ip, port, obs)
 	case "lifx":
-		return probeLIFX(probeCtx, ip, port)
+		return probeLIFX(probeCtx, ip, port, obs)
 	case "pjlink":
-		return probePJLink(probeCtx, ip, port)
+		return probePJLink(probeCtx, ip, port, obs)
 	case "nbns":
-		return probeNBNS(probeCtx, ip, port)
+		return probeNBNS(probeCtx, ip, port, obs)
 	case "pcp":
-		return probePCP(probeCtx, ip, port)
+		return probePCP(probeCtx, ip, port, obs)
 	case "dns-recursion":
-		return probeDNSRecursion(probeCtx, ip, port)
+		return probeDNSRecursion(probeCtx, ip, port, obs)
 	case "ntp":
-		return probeNTP(probeCtx, ip, port)
+		return probeNTP(probeCtx, ip, port, obs)
 	case "stun":
-		return probeSTUN(probeCtx, ip, port)
+		return probeSTUN(probeCtx, ip, port, obs)
 	default:
 		return "", false
 	}
@@ -841,7 +849,7 @@ func findingEndpoints(chk *Check, hp probe.HostProfile, port int) []findingEndpo
 
 // probeTCP confirms that ip:port accepts a TCP connection and optionally
 // verifies a read-only server banner against probe.match.banner_regex.
-func probeTCP(ctx context.Context, ip string, port int, chk *Check) (string, bool) {
+func probeTCP(ctx context.Context, ip string, port int, chk *Check, obs *Observation) (string, bool) {
 	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -862,24 +870,23 @@ func probeTCP(ctx context.Context, ip string, port int, chk *Check) (string, boo
 	if n == 0 || !chk.Probe.Match.bannerPattern.Match(buf[:n]) {
 		return "", false
 	}
+	obs.Fields = map[string]string{"banner_matched": "true"}
 	return fmt.Sprintf("TCP port %d banner matched check signature", port), true
 }
 
 // probeHTTP executes strictly read-only, target-IP-only HTTP request(s) against
 // ip:port. Multi-step probes require every step to match sequentially under the
 // check's shared context deadline.
-func (r *Runner) probeHTTP(ctx context.Context, hp probe.HostProfile, ip string, port int, chk *Check) (string, bool) {
+func (r *Runner) probeHTTP(ctx context.Context, hp probe.HostProfile, ip string, port int, chk *Check, obs *Observation) (string, bool) {
 	endpoint := inferHTTPScheme(hp, port, chk) + "://" + net.JoinHostPort(ip, strconv.Itoa(port))
-	if chk.Probe.Steps == nil {
-		return r.probeHTTPStep(ctx, endpoint, &chk.Probe.HTTPStepSpec, chk)
-	}
-	if len(chk.Probe.Steps) == 0 {
+	obs.Level = ObsService
+	var evidence []string
+	steps := chk.Probe.httpSteps()
+	if len(steps) == 0 {
 		return "", false
 	}
-
-	var evidence []string
-	for i := range chk.Probe.Steps {
-		ev, matched := r.probeHTTPStep(ctx, endpoint, &chk.Probe.Steps[i], chk)
+	for i := range steps {
+		ev, matched := r.probeHTTPStep(ctx, endpoint, &steps[i], chk, obs)
 		if !matched {
 			return "", false
 		}
@@ -890,7 +897,7 @@ func (r *Runner) probeHTTP(ctx context.Context, hp probe.HostProfile, ip string,
 
 // probeHTTPStep evaluates one HTTP step across its configured path candidates,
 // aborting immediately on transport errors or unexpected 401/403 challenges.
-func (r *Runner) probeHTTPStep(ctx context.Context, endpoint string, step *HTTPStepSpec, chk *Check) (string, bool) {
+func (r *Runner) probeHTTPStep(ctx context.Context, endpoint string, step *HTTPStepSpec, chk *Check, obs *Observation) (string, bool) {
 	// Multi-step regex, JSON, and negative body assertions read one lookahead
 	// byte past maxProbeBodyBytes so truncated bodies cannot spoof full-body
 	// matches. Single-request checks keep bounded prefix matching so embedded
@@ -936,12 +943,30 @@ func (r *Runner) probeHTTPStep(ctx context.Context, endpoint string, step *HTTPS
 				continue
 			}
 		}
-		matched := m.matchesHTTP(resp, bodyBytes)
+		// Keep fallback candidates separate until all predicates on one response match.
+		fields := make(map[string]string)
+		matched := m.matchesHTTP(resp, bodyBytes, fields)
 		if isMultiStep && ctx.Err() != nil {
 			return "", false
 		}
 		if !matched {
 			continue
+		}
+		if obs.Fields == nil {
+			obs.Fields = make(map[string]string)
+		}
+		obs.Fields["status"] = strconv.Itoa(resp.StatusCode)
+		// When successive steps inspect the same path, its last observation wins,
+		// including a successful check that the path has disappeared.
+		for _, pred := range m.JSONMatch {
+			if value, found := fields[pred.Path]; found {
+				obs.Fields[pred.Path] = value
+			} else {
+				delete(obs.Fields, pred.Path)
+			}
+		}
+		if chk.Claim == ClaimConfirmedPermission && resp.StatusCode >= 200 && resp.StatusCode < 300 && step.verifiesRead() {
+			obs.Level = ObsPrivilegeVerified
 		}
 		if m.EvidenceSummary != "" {
 			return fmt.Sprintf("%s (%s %s -> HTTP %d)", m.EvidenceSummary, step.Method, path, resp.StatusCode), true
@@ -983,7 +1008,7 @@ func inferHTTPScheme(hp probe.HostProfile, port int, chk *Check) string {
 }
 
 // matchesHTTP evaluates the signature against the bounded response without retaining body content.
-func (m *MatchSpec) matchesHTTP(resp *http.Response, bodyBytes []byte) bool {
+func (m *MatchSpec) matchesHTTP(resp *http.Response, bodyBytes []byte, fields map[string]string) bool {
 	body := string(bodyBytes)
 
 	if len(m.Status) > 0 && !intInSlice(resp.StatusCode, m.Status) {
@@ -1032,10 +1057,7 @@ func (m *MatchSpec) matchesHTTP(resp *http.Response, bodyBytes []byte) bool {
 	if m.bodyNotPattern != nil && m.bodyNotPattern.MatchString(body) {
 		return false
 	}
-	if !matchJSONPredicates(bodyBytes, m.JSONMatch) {
-		return false
-	}
-	return true
+	return matchJSONPredicates(bodyBytes, m.JSONMatch, fields)
 }
 
 func hostHasObservedPort(hp probe.HostProfile, port int, allowUDP bool) bool {
@@ -1061,7 +1083,7 @@ func hostHasObservedPort(hp probe.HostProfile, port int, allowUDP bool) bool {
 // probeMQTT sends a minimal MQTT 3.1.1 CONNECT packet with no credentials and
 // checks whether the broker responds with CONNACK return code 0 (Accepted).
 // It immediately sends DISCONNECT to leave the broker in a clean state.
-func probeMQTT(ctx context.Context, ip string, port int) (string, bool) {
+func probeMQTT(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1097,6 +1119,7 @@ func probeMQTT(ctx context.Context, ip string, port int) (string, bool) {
 
 	// Gracefully disconnect so the broker does not keep a stale client session.
 	_, _ = conn.Write([]byte{0xE0, 0x00})
+	obs.Fields = map[string]string{"connack": strconv.Itoa(int(resp[3]))}
 	return "MQTT broker accepted anonymous CONNECT (CONNACK code 0)", true
 }
 
@@ -1104,7 +1127,7 @@ func probeMQTT(ctx context.Context, ip string, port int) (string, bool) {
 // (FC 43 / MEI 14) request and verifies that the device replies with a valid
 // Modbus TCP header (matching transaction ID and protocol ID 0x0000). Even a
 // Modbus exception response proves an unauthenticated Modbus slave is active.
-func probeModbus(ctx context.Context, ip string, port int) (string, bool) {
+func probeModbus(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1149,6 +1172,7 @@ func probeModbus(ctx context.Context, ip string, port int) (string, bool) {
 	if fc != 0x2B && fc != 0xAB {
 		return "", false
 	}
+	obs.Fields = map[string]string{"function_code": strconv.Itoa(int(fc))}
 	return fmt.Sprintf("Modbus TCP slave responded without authentication (function code 0x%02X)", fc), true
 }
 
@@ -1164,7 +1188,7 @@ type rtspResponse struct {
 // DESCRIBE request (Accept: application/sdp) and reports an unauthenticated
 // media server only when DESCRIBE returns 200 OK with SDP and no
 // WWW-Authenticate challenge.
-func probeRTSP(ctx context.Context, ip string, port int) (string, bool) {
+func probeRTSP(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1198,6 +1222,7 @@ func probeRTSP(ctx context.Context, ip string, port int) (string, bool) {
 	if !hasSDP {
 		return "", false
 	}
+	obs.Fields = map[string]string{"describe_status": strconv.Itoa(descResp.statusCode)}
 	if optResp.publicHeader != "" {
 		return fmt.Sprintf("RTSP DESCRIBE returned 200 OK with SDP without authentication (Public: %s)", optResp.publicHeader), true
 	}
@@ -1301,7 +1326,7 @@ func readRTSPResponse(ctx context.Context, conn net.Conn, reader *bufio.Reader, 
 // negotiations (replying WONT/DONT), and reads the initial banner so operators
 // know whether the port exposes a login prompt, an unauthenticated shell, or
 // a silent custom protocol instead of a blind "port 23 open" warning.
-func probeTelnet(ctx context.Context, ip string, port int) (string, bool) {
+func probeTelnet(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1343,12 +1368,16 @@ func probeTelnet(ctx context.Context, ip string, port int) (string, bool) {
 	lower := strings.ToLower(banner)
 	switch {
 	case banner == "":
+		obs.Fields = map[string]string{"prompt": "silent"}
 		return "Telnet port 23 accepted connection (silent/no banner; likely custom cleartext control protocol)", true
 	case strings.Contains(lower, "login:") || strings.Contains(lower, "username:") || strings.Contains(lower, "password:"):
+		obs.Fields = map[string]string{"prompt": "login"}
 		return fmt.Sprintf("cleartext Telnet login prompt observed (%q)", banner), true
 	case strings.HasSuffix(banner, "#") || strings.HasSuffix(banner, "$") || strings.HasSuffix(banner, ">"):
+		obs.Fields = map[string]string{"prompt": "shell"}
 		return fmt.Sprintf("unauthenticated Telnet command prompt observed without login (%q)", banner), true
 	default:
+		obs.Fields = map[string]string{"prompt": "banner"}
 		return fmt.Sprintf("cleartext Telnet banner observed (%q)", banner), true
 	}
 }
@@ -1406,7 +1435,7 @@ func stripTelnetIAC(data []byte) (reply []byte, cleaned []byte) {
 // Power State query) to a Denon/Marantz AVR Telnet control port. Receiving
 // "PWON" or "PWSTANDBY" confirms unauthenticated control access without
 // changing power, volume, or input state.
-func probeDenonMarantzAVR(ctx context.Context, ip string, port int) (string, bool) {
+func probeDenonMarantzAVR(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1424,6 +1453,7 @@ func probeDenonMarantzAVR(ctx context.Context, ip string, port int) (string, boo
 	}
 	resp := compactASCII(string(buf[:n]), 80)
 	if strings.Contains(resp, "PWON") || strings.Contains(resp, "PWSTANDBY") {
+		obs.Fields = map[string]string{"power_reply": resp}
 		return fmt.Sprintf("confirmed unauthenticated AVR control via read-only query PW? -> %q", resp), true
 	}
 	return "", false
@@ -1432,7 +1462,7 @@ func probeDenonMarantzAVR(ctx context.Context, ip string, port int) (string, boo
 // probeComfoConnect sends a strictly read-only 2-byte unicast UDP discovery
 // beacon after checking TCP reachability. Neither operation starts a control
 // session or tests the registration PIN.
-func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) {
+func probeComfoConnect(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	// First confirm TCP port 56747 is listening.
 	tcpConn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
@@ -1456,6 +1486,7 @@ func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) 
 	if _, err := udpConn.Write([]byte{0x0a, 0x00}); err == nil {
 		buf := make([]byte, 256)
 		if n, readErr := udpConn.Read(buf); readErr == nil && n >= 8 {
+			obs.Fields = map[string]string{"discovery_reply": "true"}
 			return fmt.Sprintf("TCP:%d open (%d-byte UDP discovery reply). PIN and control authorization untested", port, n), true
 		}
 	}
@@ -1468,7 +1499,7 @@ func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) 
 // active viewer is never disconnected, and reads ServerInit to report the exact
 // exposed desktop name and framebuffer dimensions, without sending input or
 // reading screen pixels.
-func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
+func probeVNC(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1542,6 +1573,14 @@ func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 		}
 	}
 
+	obs.Fields = map[string]string{"security_type": "none"}
+	// RFB 3.3 and 3.7 omit SecurityResult for None. ServerInit is the
+	// first confirmation that the server actually admitted this client.
+	if isRFB33 || isRFB37 {
+		obs.Level = ObsService
+	} else {
+		obs.Fields["session_accepted"] = "true"
+	}
 	// Step 3: Send ClientInit with shared-flag=1 (never kicks off active sessions)
 	// and read ServerInit to identify which VM or desktop is actually exposed.
 	if _, err := conn.Write([]byte{0x01}); err != nil {
@@ -1552,6 +1591,8 @@ func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 	if _, err := io.ReadFull(conn, initHdr); err != nil {
 		return "confirmed passwordless VNC access (RFB SecurityResult=OK)", true
 	}
+	obs.Level = ObsAuthVerified
+	obs.Fields["session_accepted"] = "true"
 	width := binary.BigEndian.Uint16(initHdr[0:2])
 	height := binary.BigEndian.Uint16(initHdr[2:4])
 	nameLen := binary.BigEndian.Uint32(initHdr[20:24])
@@ -1573,7 +1614,7 @@ func probeVNC(ctx context.Context, ip string, port int) (string, bool) {
 // probeEthereumRPC sends a strictly read-only JSON-RPC "web3_clientVersion"
 // query to confirm an unauthenticated Ethereum Execution RPC endpoint and
 // identify the exact client software (e.g., Geth, Reth, Nethermind, Besu).
-func (r *Runner) probeEthereumRPC(ctx context.Context, ip string, port int) (string, bool) {
+func (r *Runner) probeEthereumRPC(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	targetURL := fmt.Sprintf("http://%s/", net.JoinHostPort(ip, strconv.Itoa(port)))
 	payload := `{"jsonrpc":"2.0","method":"web3_clientVersion","params":[],"id":1}`
 
@@ -1600,6 +1641,7 @@ func (r *Runner) probeEthereumRPC(ctx context.Context, ip string, port int) (str
 	if err := json.Unmarshal(bodyBytes, &rpcResp); err != nil || strings.TrimSpace(rpcResp.Result) == "" {
 		return "", false
 	}
+	obs.Fields = map[string]string{"client_version": rpcResp.Result}
 	return fmt.Sprintf("confirmed unauthenticated Ethereum JSON-RPC: web3_clientVersion -> %q", compactASCII(rpcResp.Result, 96)), true
 }
 
@@ -1608,7 +1650,7 @@ func (r *Runner) probeEthereumRPC(ctx context.Context, ip string, port int) (str
 // (no RSA key authentication required). When the device responds with AUTH,
 // the connection is closed immediately without sending any key so no on-screen
 // prompt is ever triggered on Android TV / Fire TV devices.
-func probeADB(ctx context.Context, ip string, port int) (string, bool) {
+func probeADB(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1658,6 +1700,7 @@ func probeADB(ctx context.Context, ip string, port int) (string, bool) {
 			banner = compactASCII(string(buf), 100)
 		}
 	}
+	obs.Fields = map[string]string{"command": "CNXN"}
 	if banner != "" {
 		return fmt.Sprintf("confirmed unauthenticated ADB shell access (CNXN accepted without AUTH: %q)", banner), true
 	}
@@ -1672,7 +1715,7 @@ func probeADB(ctx context.Context, ip string, port int) (string, bool) {
 // PROTOCOL_RDP (0x00). If a legacy server refuses SSL with
 // SSL_NOT_ALLOWED_BY_SERVER (0x02) or SSL_CERT_NOT_ON_SERVER (0x03), the probe
 // retries once offering only PROTOCOL_RDP (0x00000000).
-func probeRDPNoNLA(ctx context.Context, ip string, port int) (string, bool) {
+func probeRDPNoNLA(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	const (
 		rdpProtoRDP               uint32 = 0x00000000
 		rdpProtoSSL               uint32 = 0x00000001
@@ -1681,19 +1724,19 @@ func probeRDPNoNLA(ctx context.Context, ip string, port int) (string, bool) {
 		rdpFailSSLCertNotOnServer uint32 = 0x00000003
 	)
 
-	ev, matched, failCode := probeRDPWithProtocol(ctx, ip, port, rdpProtoSSL)
+	ev, matched, failCode := probeRDPWithProtocol(ctx, ip, port, rdpProtoSSL, obs)
 	if matched {
 		return ev, true
 	}
 	if failCode == rdpFailSSLNotAllowed || failCode == rdpFailSSLCertNotOnServer {
-		ev, matched, _ = probeRDPWithProtocol(ctx, ip, port, rdpProtoRDP)
+		ev, matched, _ = probeRDPWithProtocol(ctx, ip, port, rdpProtoRDP, obs)
 		return ev, matched
 	}
 	_ = rdpFailSSLRequired
 	return "", false
 }
 
-func probeRDPWithProtocol(ctx context.Context, ip string, port int, requestedProto uint32) (string, bool, uint32) {
+func probeRDPWithProtocol(ctx context.Context, ip string, port int, requestedProto uint32, obs *Observation) (string, bool, uint32) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false, 0
@@ -1739,6 +1782,7 @@ func probeRDPWithProtocol(ctx context.Context, ip string, port int, requestedPro
 	}
 	// If the server omitted RDP_NEG_RSP entirely, it accepted legacy RDP security.
 	if len(body) == 7 {
+		obs.Fields = map[string]string{"selected_protocol": "rdp"}
 		return "RDP server accepted legacy PROTOCOL_RDP without Network Level Authentication (no RDP_NEG_RSP)", true, 0
 	}
 	// Otherwise inspect the 8-byte RDP_NEG_RSP / RDP_NEG_FAILURE block at body[7:].
@@ -1755,8 +1799,10 @@ func probeRDPWithProtocol(ctx context.Context, ip string, port int, requestedPro
 	selectedProto := binary.LittleEndian.Uint32(body[11:15])
 	switch selectedProto {
 	case 0x00000000:
+		obs.Fields = map[string]string{"selected_protocol": "rdp"}
 		return "RDP server accepted standard PROTOCOL_RDP with Network Level Authentication (NLA) disabled", true, 0
 	case 0x00000001:
+		obs.Fields = map[string]string{"selected_protocol": "tls"}
 		return "RDP server accepted TLS-only PROTOCOL_SSL with Network Level Authentication (NLA) disabled", true, 0
 	default:
 		return "", false, 0
@@ -1766,7 +1812,7 @@ func probeRDPWithProtocol(ctx context.Context, ip string, port int, requestedPro
 // probeFTPAnonymous checks whether an FTP daemon accepts anonymous login
 // ("USER anonymous" / "PASS uniblue@local") and immediately sends QUIT so no
 // files are listed or modified.
-func probeFTPAnonymous(ctx context.Context, ip string, port int) (string, bool) {
+func probeFTPAnonymous(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1799,6 +1845,7 @@ func probeFTPAnonymous(ctx context.Context, ip string, port int) (string, bool) 
 		return "", false
 	}
 	_, _ = io.WriteString(conn, "QUIT\r\n")
+	obs.Fields = map[string]string{"login_code": "230"}
 	return fmt.Sprintf("FTP server accepted anonymous login (230 OK; banner %q)", compactASCII(greeting, 80)), true
 }
 
@@ -1828,7 +1875,7 @@ func readFTPResponse(br *bufio.Reader) (int, string, bool) {
 // probeESFileExplorer sends a strictly read-only {"command":"getDeviceInfo"}
 // request to TCP port 59777 to confirm CVE-2019-6447 (ES File Explorer's
 // unauthenticated local HTTP server on Android) without listing files or apps.
-func (r *Runner) probeESFileExplorer(ctx context.Context, ip string, port int) (string, bool) {
+func (r *Runner) probeESFileExplorer(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	targetURL := fmt.Sprintf("http://%s/", net.JoinHostPort(ip, strconv.Itoa(port)))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(`{"command":"getDeviceInfo"}`))
 	if err != nil {
@@ -1859,13 +1906,20 @@ func (r *Runner) probeESFileExplorer(ctx context.Context, ip string, port int) (
 	if info.Model == "" && info.SDK == "" {
 		return "", false
 	}
+	obs.Fields = make(map[string]string)
+	if info.Model != "" {
+		obs.Fields["model"] = info.Model
+	}
+	if info.SDK != "" {
+		obs.Fields["sdk"] = info.SDK
+	}
 	return fmt.Sprintf("confirmed ES File Explorer CVE-2019-6447 unauthenticated HTTP server (model=%q, android=%q)",
 		compactASCII(info.Model, 48), compactASCII(info.Version, 16)), true
 }
 
 // probeRedisUnauth sends a single read-only RESP "PING\r\n" command and checks
 // for "+PONG\r\n", confirming Redis accepts commands without authentication.
-func probeRedisUnauth(ctx context.Context, ip string, port int) (string, bool) {
+func probeRedisUnauth(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -1881,6 +1935,7 @@ func probeRedisUnauth(ctx context.Context, ip string, port int) (string, bool) {
 		return "", false
 	}
 	if strings.HasPrefix(string(buf[:n]), "+PONG") {
+		obs.Fields = map[string]string{"reply": "PONG"}
 		return "Redis server replied +PONG to unauthenticated PING (no requirepass/ACL)", true
 	}
 	return "", false

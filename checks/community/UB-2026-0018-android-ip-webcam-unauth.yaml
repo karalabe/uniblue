@@ -36,6 +36,11 @@ probe:
       - '"video_recording":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Android IP Webcam exposed status and stream without login
+
 remediation:
   summary: >
     An Android phone or tablet running the "IP Webcam" app exposes its live

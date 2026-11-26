@@ -38,6 +38,11 @@ probe:
     evidence_summary: "Tesla Wall Connector Gen 3 returned /api/1/version telemetry without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Tesla Wall Connector returned local status info without login
+
 remediation:
   summary: >
     Tesla Wall Connector Gen 3 exposes unauthenticated local telemetry

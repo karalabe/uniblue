@@ -34,6 +34,14 @@ probe:
       - '"models":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Ollama listed installed models without login
+  - effect: disrupt
+    basis: conditional
+    requires: anyone on the network can run heavy LLM jobs or delete/pull models
+
 remediation:
   summary: >
     Ollama is bound to a LAN interface on port 11434 without authentication.

@@ -27,6 +27,11 @@ probe:
   port: 873
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: at least one rsync share allows anonymous reads
+
 remediation:
   summary: >
     An unencrypted rsync daemon is listening on TCP port 873. Verify that all

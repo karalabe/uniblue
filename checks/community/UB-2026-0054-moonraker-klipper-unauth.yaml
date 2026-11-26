@@ -35,6 +35,14 @@ probe:
       - '"moonraker_version":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Moonraker returned 3D printer status without login
+  - effect: control
+    basis: conditional
+    requires: Moonraker allows starting prints or controlling heaters without login
+
 remediation:
   summary: >
     Moonraker accepted an unauthenticated request to /server/info on port 7125.

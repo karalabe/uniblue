@@ -36,6 +36,14 @@ probe:
       - "<esp-app"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: ESPHome served its local web dashboard without login
+  - effect: control
+    basis: conditional
+    requires: ESPHome web UI allows toggling switches or relays without login
+
 remediation:
   summary: >
     ESPHome's optional web_server component is enabled without HTTP

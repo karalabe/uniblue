@@ -39,6 +39,19 @@ probe:
         equals: "false"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Shelly Gen1 returned its settings without login
+  - effect: configure
+    basis: implied
+    when_field: "$.login.enabled == false"
+    note: Shelly reports Restricted Login is turned off
+  - effect: control
+    basis: implied
+    when_field: "$.login.enabled == false"
+    note: Shelly reports Restricted Login is turned off
+
 remediation:
   summary: >
     The Shelly Gen1 /settings endpoint reports that Restricted Login is off.

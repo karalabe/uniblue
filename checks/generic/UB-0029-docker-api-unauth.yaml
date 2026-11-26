@@ -37,6 +37,20 @@ probe:
       - '"APIVersion":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Docker API returned version and host details without login
+  - effect: control
+    basis: implied
+    note: Docker TCP API answered without TLS client certificates or login
+  - effect: configure
+    basis: conditional
+    requires: the Docker API allows creating or modifying containers
+  - effect: pivot
+    basis: conditional
+    requires: a container started via Docker can reach the host or other LAN devices
+
 remediation:
   summary: >
     Docker Engine is listening on unencrypted TCP port 2375 without TLS client

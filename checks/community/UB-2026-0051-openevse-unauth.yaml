@@ -37,6 +37,14 @@ probe:
       - '"temp1":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: OpenEVSE returned charger status without login
+  - effect: control
+    basis: conditional
+    requires: OpenEVSE allows starting, stopping, or changing charging limits without login
+
 remediation:
   summary: >
     OpenEVSE Wi-Fi controller exposes /status and configuration/control

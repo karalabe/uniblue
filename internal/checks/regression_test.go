@@ -268,7 +268,7 @@ func TestRTSPDescribeAuthEnforcement(t *testing.T) {
 		})
 		defer closeFn()
 
-		if _, ok := probeRTSP(context.Background(), "127.0.0.1", port); !ok {
+		if _, ok := probeRTSP(context.Background(), "127.0.0.1", port, &Observation{}); !ok {
 			t.Fatal("expected RTSP DESCRIBE reconnect after OPTIONS close to match")
 		}
 	})
@@ -296,7 +296,7 @@ func TestRTSPDescribeAuthEnforcement(t *testing.T) {
 		})
 		defer closeFn()
 
-		if _, ok := probeRTSP(context.Background(), "127.0.0.1", port); ok {
+		if _, ok := probeRTSP(context.Background(), "127.0.0.1", port, &Observation{}); ok {
 			t.Fatal("expected DESCRIBE 403 NOT to match")
 		}
 	})
@@ -490,7 +490,7 @@ func TestTLSLegacyDetectsRSAKeyExchangeCipher(t *testing.T) {
 
 	_, pStr, _ := net.SplitHostPort(ln.Addr().String())
 	port, _ := strconv.Atoi(pStr)
-	ev, ok := probeTLSLegacy(context.Background(), "127.0.0.1", port)
+	ev, ok := probeTLSLegacy(context.Background(), "127.0.0.1", port, &Observation{})
 	if !ok || !strings.Contains(ev, "TLS 1.0") {
 		t.Fatalf("expected probeTLSLegacy to detect RSA-kex TLS 1.0 server, got ok=%v ev=%q", ok, ev)
 	}
@@ -542,7 +542,7 @@ func TestRDPNoNLATLSRequiredAndLegacyFallback(t *testing.T) {
 	})
 	defer closeTLSOnly()
 
-	ev, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portTLSOnly)
+	ev, ok := probeRDPNoNLA(context.Background(), "127.0.0.1", portTLSOnly, &Observation{})
 	if !ok || !strings.Contains(ev, "PROTOCOL_SSL") {
 		t.Fatalf("expected TLS-required RDP without NLA to match, got ok=%v ev=%q", ok, ev)
 	}
@@ -570,7 +570,7 @@ func TestRDPNoNLATLSRequiredAndLegacyFallback(t *testing.T) {
 	})
 	defer closeLegacy()
 
-	ev, ok = probeRDPNoNLA(context.Background(), "127.0.0.1", portLegacy)
+	ev, ok = probeRDPNoNLA(context.Background(), "127.0.0.1", portLegacy, &Observation{})
 	if !ok || !strings.Contains(ev, "PROTOCOL_RDP") {
 		t.Fatalf("expected legacy RDP fallback to match, got ok=%v ev=%q", ok, ev)
 	}
@@ -647,7 +647,7 @@ func TestMPDStatusAuthCheck(t *testing.T) {
 	})
 	defer closeAuth()
 
-	if ev, ok := probeMPD(context.Background(), "127.0.0.1", portAuth); ok {
+	if ev, ok := probeMPD(context.Background(), "127.0.0.1", portAuth, &Observation{}); ok {
 		t.Fatalf("expected password-protected MPD NOT to match, got ev=%q", ev)
 	}
 }
@@ -981,7 +981,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		[]byte(`{"name":"","type":"directory","content":[]}`),
 		truncLarge,
 	} {
-		if !jup.Probe.Match.matchesHTTP(okResp, body) {
+		if !jup.Probe.Match.matchesHTTP(okResp, body, nil) {
 			t.Fatalf("UB-0034 must match valid/truncated Jupyter listing (len=%d)", len(body))
 		}
 	}
@@ -989,7 +989,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		[]byte(`<html><body>Login</body></html>`),
 		[]byte(`{"message": "Forbidden", "reason": null}`),
 	} {
-		if jup.Probe.Match.matchesHTTP(okResp, body) {
+		if jup.Probe.Match.matchesHTTP(okResp, body, nil) {
 			t.Fatalf("UB-0034 must reject non-Jupyter response %q", string(body))
 		}
 	}
@@ -1005,7 +1005,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		`<html><head><title>Shelly</title></head><body><script>window.bootLogin();</script></body></html>`,
 		`<html><head><title>Shelly</title></head><body><a href="/login">Sign in</a><script src="/static/auth-bundle.js"></script></body></html>`,
 	} {
-		if panel.Probe.Match.matchesHTTP(okResp, []byte(html)) {
+		if panel.Probe.Match.matchesHTTP(okResp, []byte(html), nil) {
 			t.Fatalf("UB-0040 must reject login/SPA page %q", html)
 		}
 	}
@@ -1013,7 +1013,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		`<html><title>Smart Meter</title><body><button>Toggle Relay</button></body></html>`,
 		`<html><title>Tasmota</title><body><table><tr><td>OFF</td></tr></table><button>Toggle</button></body></html>`,
 	} {
-		if !panel.Probe.Match.matchesHTTP(okResp, []byte(html)) {
+		if !panel.Probe.Match.matchesHTTP(okResp, []byte(html), nil) {
 			t.Fatalf("UB-0040 must match unauthenticated static control panel %q", html)
 		}
 	}

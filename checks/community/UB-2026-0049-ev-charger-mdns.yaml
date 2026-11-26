@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "EV charging station local control interface advertised via DNS-SD"
 
+grants: []
+
 remediation:
   summary: >
     An EV charging station was discovered via DNS-SD. Keep charger

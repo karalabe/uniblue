@@ -39,6 +39,11 @@ probe:
       - '"#ServiceRoot'
     evidence_summary: "Redfish BMC service root discovered (public metadata endpoint; verify OOB VLAN isolation and authentication)"
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: a Redfish admin login to manage or reboot the server
+
 remediation:
   summary: >
     A server Baseboard Management Controller (BMC) Redfish API is directly

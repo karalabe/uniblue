@@ -32,6 +32,11 @@ probe:
     status: [200, 401]
     body_regex: "(?i)(Intel.{0,12}Active Management Technology|Intel\\(R\\) AMT)"
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: Intel AMT credentials to control power or remote KVM
+
 remediation:
   summary: >
     Intel AMT / vPro provides below-OS out-of-band power, BIOS, and KVM

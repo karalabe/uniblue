@@ -27,6 +27,16 @@ probe:
   port: 1883
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: conditional
+    when_field: "connack == 0"
+    requires: the broker allows anonymous clients to subscribe to topics
+  - effect: control
+    basis: conditional
+    when_field: "connack == 0"
+    requires: the broker allows anonymous clients to publish device commands
+
 remediation:
   summary: >
     MQTT broker accepts anonymous connections without credentials. Any host

@@ -34,6 +34,14 @@ probe:
       - '"TokenAuthSupport":"false"'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Samsung TV returned remote API info without auth
+  - effect: control
+    basis: implied
+    note: Samsung TV has remote-control token auth turned off
+
 remediation:
   summary: >
     Samsung Smart TV reports TokenAuthSupport=false on port 8001, indicating

@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Climate or automation bridge advertised via DNS-SD"
 
+grants: []
+
 remediation:
   summary: >
     A smart climate or automation bridge was discovered on the LAN. Keep control

@@ -37,6 +37,14 @@ probe:
       - '"nrg":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: go-eCharger returned charging status without login
+  - effect: control
+    basis: conditional
+    requires: go-eCharger allows changing charging power or stopping a session without login
+
 remediation:
   summary: >
     go-eCharger exposes its local HTTP API v2 without authentication. Any host

@@ -30,6 +30,11 @@ probe:
   match:
     evidence_summary: "Message broker protocol observed on LAN endpoint"
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: valid broker credentials (or anonymous queue access)
+
 remediation:
   summary: >
     A message broker or event-streaming service was discovered on the LAN.

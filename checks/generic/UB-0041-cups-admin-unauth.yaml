@@ -40,6 +40,11 @@ probe:
     evidence_summary: "CUPS served /admin/conf/cupsd.conf without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: CUPS admin panel exposed printer settings without login
+
 remediation:
   summary: >
     CUPS exposed its admin configuration endpoint (/admin/conf/cupsd.conf) on

@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Network UPS Tools daemon advertised on _nut._tcp (multiple read-only monitoring clients are normal)"
 
+grants: []
+
 remediation:
   summary: >
     A Network UPS Tools (NUT) power-monitoring daemon is advertised on the LAN.

@@ -29,6 +29,14 @@ probe:
   type: eth-engine
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: Ethereum Engine API returned capabilities without JWT auth
+  - effect: control
+    basis: implied
+    note: Ethereum Engine API accepted calls without a JWT secret
+
 remediation:
   summary: >
     The Ethereum Engine API (TCP 8551) accepted an unauthenticated JSON-RPC

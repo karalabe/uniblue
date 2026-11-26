@@ -25,6 +25,11 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: the TV allows remote commands over JointSpace RPC without pairing
+
 remediation:
   summary: >
     Philips Smart TV advertises its local JointSpace RPC control interface

@@ -28,6 +28,14 @@ probe:
   port: 9999
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: TP-Link Kasa returned device info without login
+  - effect: control
+    basis: implied
+    note: TP-Link Kasa answered local control protocol without login
+
 remediation:
   summary: >
     TP-Link Kasa device answered a read-only get_sysinfo query over its legacy

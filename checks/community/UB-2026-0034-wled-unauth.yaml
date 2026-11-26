@@ -37,6 +37,14 @@ probe:
       - '"fxcount":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: WLED returned device info without login
+  - effect: control
+    basis: conditional
+    requires: WLED allows changing lights or flashing firmware without login
+
 remediation:
   summary: >
     WLED exposes its unauthenticated HTTP/JSON API and OTA firmware update

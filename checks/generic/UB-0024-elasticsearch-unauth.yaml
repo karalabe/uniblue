@@ -38,6 +38,11 @@ probe:
     evidence_summary: "Elasticsearch/OpenSearch root endpoint returned cluster metadata without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Elasticsearch/OpenSearch answered without authentication
+
 remediation:
   summary: >
     Elasticsearch/OpenSearch responded on port 9200 without authentication.

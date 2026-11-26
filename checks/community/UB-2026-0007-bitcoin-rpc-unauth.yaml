@@ -29,6 +29,21 @@ probe:
   type: bitcoin-rpc
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: Bitcoin RPC answered without authentication
+
+  - effect: control
+    basis: conditional
+    requires: a wallet is loaded and unlocked on the Bitcoin node
+  - effect: disrupt
+    basis: conditional
+    requires: RPC allows administrative commands like stop
+  - effect: secrets
+    basis: conditional
+    requires: a wallet is loaded and readable over RPC
+
 remediation:
   summary: >
     Bitcoin JSON-RPC answered getblockchaininfo without HTTP Basic or cookie

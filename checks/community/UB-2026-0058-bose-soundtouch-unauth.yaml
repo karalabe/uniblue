@@ -35,6 +35,14 @@ probe:
     evidence_summary: "Bose SoundTouch speaker returned /info device metadata over unauthenticated HTTP"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Bose SoundTouch returned speaker info without login
+  - effect: control
+    basis: conditional
+    requires: Bose SoundTouch allows controlling audio playback without login
+
 remediation:
   summary: >
     Bose SoundTouch exposes its unauthenticated HTTP control API (port 8090)

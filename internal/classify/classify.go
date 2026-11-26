@@ -123,6 +123,10 @@ func Load(fsys fs.FS, ouiDB *oui.DB) (*Classifier, error) {
 		if err != nil || d.IsDir() {
 			return err
 		}
+		// Protocol traits share the embedded filesystem with device taxonomy rules.
+		if path == "protocols.yaml" {
+			return nil
+		}
 		ext := strings.ToLower(filepath.Ext(path))
 		if ext == ".yaml" || ext == ".yml" {
 			paths = append(paths, path)
@@ -255,8 +259,8 @@ func isDedicatedApplianceCategory(cat Category) bool {
 // supporting Signals for a single UniFi client using an ordered, deterministic
 // signal stack:
 //  1. Active protocol/port/HTTP banner proof (preserving hardware identity over WAN forward)
-//  1b. Dedicated appliance hardware OUI (camera, printer, BMC, IoT, media)
-//  1c. WAN HTTP/HTTPS port-forward entrypoint role (when not a dedicated appliance)
+//     1b. Dedicated appliance hardware OUI (camera, printer, BMC, IoT, media)
+//     1c. WAN HTTP/HTTPS port-forward entrypoint role (when not a dedicated appliance)
 //  2. Known virtualization MAC prefixes (QEMU, VMware, Proxmox, Docker, etc.)
 //  3. Remaining hardware manufacturer OUI (IEEE MA-S -> MA-M -> MA-L)
 //  4. DHCP hostname / controller display name patterns

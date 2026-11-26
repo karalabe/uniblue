@@ -27,6 +27,17 @@ probe:
   port: 5555
   timeout: 3s
 
+grants:
+  - effect: control
+    basis: implied
+    note: ADB accepted a connection without pairing or authorization
+  - effect: configure
+    basis: implied
+    note: ADB shell usually has enough access to change device settings
+  - effect: pivot
+    basis: conditional
+    requires: the ADB shell can reach other devices on the network
+
 remediation:
   summary: >
     Android Debug Bridge (ADB) over TCP port 5555 accepted a CNXN handshake

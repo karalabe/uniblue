@@ -35,6 +35,11 @@ probe:
     evidence_summary: "MFP exposed unauthenticated eSCL/AirScan ScannerCapabilities endpoint"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: network scanner answered eSCL queries without login
+
 remediation:
   summary: >
     Multifunction printer exposes its unauthenticated eSCL/AirScan interface

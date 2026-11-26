@@ -31,6 +31,8 @@ probe:
   match:
     evidence_summary: "Solar/energy gateway advertised via DNS-SD (keep inverter management isolated from guest/user networks)"
 
+grants: []
+
 remediation:
   summary: >
     A solar or home energy gateway was discovered via DNS-SD. Restrict guest and

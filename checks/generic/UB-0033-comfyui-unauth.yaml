@@ -38,6 +38,14 @@ probe:
     evidence_summary: "ComfyUI /system_stats responded on LAN port 8188 without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: ComfyUI exposed system stats without login
+  - effect: control
+    basis: conditional
+    requires: ComfyUI allows submitting workflows without login
+
 remediation:
   summary: >
     ComfyUI is listening on LAN port 8188 without authentication. Unauthenticated

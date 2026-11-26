@@ -26,6 +26,8 @@ preconditions:
 probe:
   type: observe
 
+grants: []
+
 remediation:
   summary: >
     An Android phone, tablet, or TV is actively advertising Wireless Debugging

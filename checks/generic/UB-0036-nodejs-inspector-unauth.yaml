@@ -37,6 +37,21 @@ probe:
     evidence_summary: "Node.js V8 Inspector /json/version exposed on LAN without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Node.js inspector exposed debugger endpoints without auth
+  - effect: control
+    basis: conditional
+    requires: Node.js inspector accepts remote debugging to run code
+
+  - effect: pivot
+    basis: conditional
+    requires: code executed in the Node.js process can reach other hosts on the network
+  - effect: secrets
+    basis: conditional
+    requires: the Node.js process holds environment variables, API keys, or local files
+
 remediation:
   summary: >
     A workstation or container is running Node.js with --inspect=0.0.0.0:9229.

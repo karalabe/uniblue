@@ -35,6 +35,11 @@ probe:
     status: [200]
     body_regex: "(?i)(<RIMP>|<HSI>[^<]{0,200}iLO|Integrated Dell Remote Access Controller|iDRAC[0-9]|Hewlett-Packard[^<]{0,80}iLO)"
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: a BMC login to open the server console, reboot, or mount virtual media
+
 remediation:
   summary: >
     A Dell iDRAC or HPE iLO out-of-band server management console is reachable

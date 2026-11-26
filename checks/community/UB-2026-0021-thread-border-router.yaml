@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Thread Border Router advertised MeshCoP service on _meshcop._udp"
 
+grants: []
+
 remediation:
   summary: >
     A Thread Border Router was discovered on the local network. Multiple border

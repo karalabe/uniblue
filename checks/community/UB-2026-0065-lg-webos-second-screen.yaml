@@ -25,6 +25,11 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: the TV pairs with the client or runs firmware vulnerable to PIN bypass
+
 remediation:
   summary: >
     LG webOS TV advertises its second-screen control service (TCP 3000/3001) on

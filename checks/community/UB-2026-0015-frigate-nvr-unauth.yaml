@@ -36,6 +36,14 @@ probe:
       - '"mqtt":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Frigate exposed camera and MQTT config without login
+  - effect: secrets
+    basis: conditional
+    requires: Frigate config includes camera or MQTT passwords
+
 remediation:
   summary: >
     Frigate's unauthenticated internal API port (5000) is reachable across the

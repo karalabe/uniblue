@@ -25,6 +25,11 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: the AFP share allows guest access or accepts a valid login
+
 remediation:
   summary: >
     Host advertises the deprecated Apple Filing Protocol (AFP, TCP 548) over

@@ -35,6 +35,11 @@ probe:
       - '"total_power_import_kwh":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: HomeWizard energy meter returned live power readings without login
+
 remediation:
   summary: >
     HomeWizard Energy device exposes its unauthenticated local API v1 on port

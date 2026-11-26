@@ -34,6 +34,11 @@ probe:
       - '"mac_address":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Chromecast exposed local setup info without auth
+
 remediation:
   summary: >
     Google Cast device exposes its unauthenticated local setup/status API on

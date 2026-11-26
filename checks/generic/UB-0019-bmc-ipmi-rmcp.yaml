@@ -29,6 +29,11 @@ probe:
   port: 623
   timeout: 2s
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: an IPMI login (or Cipher 0 / blank-password access) to power or console-control the server
+
 remediation:
   summary: >
     Bare-metal server management controller (BMC) responded to IPMI RMCP on UDP

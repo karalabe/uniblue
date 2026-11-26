@@ -84,7 +84,7 @@ func probeObserve(chk *Check, hp probe.HostProfile, port int) (string, bool) {
 // (1.3.6.1.2.1.1.1.0) and sysObjectID.0 (1.3.6.1.2.1.1.2.0) using the single
 // explicitly configured community string. It never cycles communities, never
 // emits SET requests, and never walks MIB tables.
-func probeSNMPReadOnly(ctx context.Context, ip string, port int, community string) (string, bool) {
+func probeSNMPReadOnly(ctx context.Context, ip string, port int, community string, obs *Observation) (string, bool) {
 	if community == "" {
 		community = "public"
 	}
@@ -116,7 +116,10 @@ func probeSNMPReadOnly(ctx context.Context, ip string, port int, community strin
 	if !ok {
 		return "", false
 	}
+	obs.Level = ObsService
 	if sysDescr != "" {
+		obs.Level = ObsPrivilegeVerified
+		obs.Fields = map[string]string{"sys_descr": sysDescr}
 		return fmt.Sprintf("SNMPv2c GET sysDescr.0 succeeded with community %q (%q)", community, compactASCII(sysDescr, 90)), true
 	}
 	return fmt.Sprintf("SNMPv2c GET sysDescr.0 succeeded with community %q", community), true
@@ -273,7 +276,7 @@ func decodeASN1Int(b []byte) int {
 // protocols (RFC 8996). It explicitly offers both standard and legacy/insecure
 // cipher suites (including RSA key exchange and 3DES) so old embedded appliances
 // (iLO, iDRAC, printers, NAS) that lack ECDHE are still detected.
-func probeTLSLegacy(ctx context.Context, ip string, port int) (string, bool) {
+func probeTLSLegacy(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	dialer := &tls.Dialer{
 		NetDialer: &net.Dialer{},
 		Config: &tls.Config{
@@ -295,8 +298,10 @@ func probeTLSLegacy(ctx context.Context, ip string, port int) (string, bool) {
 	ver := tlsConn.ConnectionState().Version
 	switch ver {
 	case tls.VersionTLS10:
+		obs.Fields = map[string]string{"tls_version": "1.0"}
 		return "endpoint negotiated deprecated TLS 1.0 (RFC 8996)", true
 	case tls.VersionTLS11:
+		obs.Fields = map[string]string{"tls_version": "1.1"}
 		return "endpoint negotiated deprecated TLS 1.1 (RFC 8996)", true
 	default:
 		return "", false
@@ -320,7 +325,7 @@ func allLegacyTLSCipherSuites() []uint16 {
 }
 
 // probeMemcached sends a single read-only "version\r\n" command to TCP 11211.
-func probeMemcached(ctx context.Context, ip string, port int) (string, bool) {
+func probeMemcached(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -333,13 +338,14 @@ func probeMemcached(ctx context.Context, ip string, port int) (string, bool) {
 	n, _ := conn.Read(buf)
 	line := compactASCII(string(buf[:n]), 80)
 	if strings.HasPrefix(line, "VERSION ") {
+		obs.Fields = map[string]string{"version": strings.TrimPrefix(line, "VERSION ")}
 		return fmt.Sprintf("Memcached responded to unauthenticated version query (%q)", line), true
 	}
 	return "", false
 }
 
 // probeRsync passively reads the initial "@RSYNCD: " greeting banner on TCP 873.
-func probeRsync(ctx context.Context, ip string, port int) (string, bool) {
+func probeRsync(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -349,6 +355,7 @@ func probeRsync(ctx context.Context, ip string, port int) (string, bool) {
 	n, _ := conn.Read(buf)
 	line := compactASCII(string(buf[:n]), 80)
 	if strings.HasPrefix(line, "@RSYNCD:") {
+		obs.Fields = map[string]string{"version": strings.TrimSpace(strings.TrimPrefix(line, "@RSYNCD:"))}
 		return fmt.Sprintf("rsync daemon greeting observed (%q)", line), true
 	}
 	return "", false
@@ -358,7 +365,7 @@ func probeRsync(ctx context.Context, ip string, port int) (string, bool) {
 // strictly read-only "status\n" command to verify whether the daemon actually
 // allows unauthenticated queries (password-protected MPD servers still emit
 // "OK MPD " on connect but reject "status" with an ACK permission error).
-func probeMPD(ctx context.Context, ip string, port int) (string, bool) {
+func probeMPD(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -392,6 +399,7 @@ func probeMPD(ctx context.Context, ip string, port int) (string, bool) {
 		if trimmed == "OK" {
 			_, _ = io.WriteString(conn, "close\n")
 			if sawState {
+				obs.Fields = map[string]string{"version": strings.TrimPrefix(greeting, "OK MPD ")}
 				return fmt.Sprintf("Music Player Daemon allowed unauthenticated status query (%q)", greeting), true
 			}
 			return "", false
@@ -405,7 +413,7 @@ func probeMPD(ctx context.Context, ip string, port int) (string, bool) {
 
 // probeKasa sends a single read-only TP-Link Kasa legacy XOR-framed
 // {"system":{"get_sysinfo":{}}} query on TCP port 9999 without toggling relays.
-func probeKasa(ctx context.Context, ip string, port int) (string, bool) {
+func probeKasa(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {
 		return "", false
@@ -446,6 +454,7 @@ func probeKasa(ctx context.Context, ip string, port int) (string, bool) {
 	if err := json.Unmarshal(dec, &parsed); err != nil || parsed.System.GetSysinfo.Model == "" {
 		return "", false
 	}
+	obs.Fields = map[string]string{"model": parsed.System.GetSysinfo.Model}
 	return fmt.Sprintf("TP-Link Kasa legacy XOR API responded to get_sysinfo (model=%q)", compactASCII(parsed.System.GetSysinfo.Model, 48)), true
 }
 
@@ -471,7 +480,7 @@ func kasaXORDecode(in []byte) []byte {
 
 // probeCoAP sends a single read-only CoAP CON GET /.well-known/core packet
 // (RFC 7252) on UDP 5683 and verifies a 2.05 Content (0x45) reply.
-func probeCoAP(ctx context.Context, ip string, port int) (string, bool) {
+func probeCoAP(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 5683
 	}
@@ -506,13 +515,14 @@ func probeCoAP(ctx context.Context, ip string, port int) (string, bool) {
 	if (buf[0]>>6) != 1 || buf[1] != 0x45 || binary.BigEndian.Uint16(buf[2:4]) != msgID {
 		return "", false
 	}
+	obs.Fields = map[string]string{"response_code": "2.05"}
 	return "CoAP server returned 2.05 Content for /.well-known/core resource discovery", true
 }
 
 // probeNATPMP sends a strictly read-only 2-byte NAT-PMP v0 External Address
 // Request (RFC 6886: version=0, opcode=0) on UDP 5351. It never creates or
 // modifies any port mappings.
-func probeNATPMP(ctx context.Context, ip string, port int) (string, bool) {
+func probeNATPMP(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 5351
 	}
@@ -537,12 +547,13 @@ func probeNATPMP(ctx context.Context, ip string, port int) (string, bool) {
 	if resp[0] != 0x00 || resp[1] != 0x80 || binary.BigEndian.Uint16(resp[2:4]) != 0 {
 		return "", false
 	}
+	obs.Fields = map[string]string{"result_code": "0"}
 	return "NAT-PMP gateway responded to v0 external-address query on UDP 5351", true
 }
 
 // probeIPP sends a minimal read-only IPP 1.1 Get-Printer-Attributes (0x000B)
 // request asking ONLY for printer-make-and-model and ipp-versions-supported.
-func (r *Runner) probeIPP(ctx context.Context, ip string, port int) (string, bool) {
+func (r *Runner) probeIPP(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	scheme := "http"
 	if port == 443 || port == 8443 {
 		scheme = "https"
@@ -585,6 +596,7 @@ func (r *Runner) probeIPP(ctx context.Context, ip string, port int) (string, boo
 	if reqID != 1 || status > 0x0002 {
 		return "", false
 	}
+	obs.Fields = map[string]string{"status": strconv.Itoa(int(status))}
 	return fmt.Sprintf("IPP Get-Printer-Attributes returned status 0x%04x on port %d", status, port), true
 }
 
@@ -598,7 +610,7 @@ func writeIPPAttr(w *bytes.Buffer, tag byte, name, val string) {
 
 // matchJSONPredicates evaluates bounded dot/index JSONPath predicates against
 // a decoded JSON response body.
-func matchJSONPredicates(body []byte, preds []JSONPredicate) bool {
+func matchJSONPredicates(body []byte, preds []JSONPredicate, fields map[string]string) bool {
 	if len(preds) == 0 {
 		return true
 	}
@@ -628,6 +640,16 @@ func matchJSONPredicates(body []byte, preds []JSONPredicate) bool {
 		}
 		if p.compiled != nil && !p.compiled.MatchString(strVal) {
 			return false
+		}
+		// Object and array predicates expose presence without retaining nested
+		// settings or credentials from an otherwise redacted response.
+		if fields != nil {
+			switch val.(type) {
+			case map[string]any, []any:
+				fields[p.Path] = ""
+			default:
+				fields[p.Path] = strVal
+			}
 		}
 	}
 	return true

@@ -25,6 +25,11 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: configure
+    basis: conditional
+    requires: a valid TR-064 admin login or weak local authentication on the router
+
 remediation:
   summary: >
     FRITZ!Box advertises its TR-064 LAN management interface over SSDP/UPnP.

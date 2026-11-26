@@ -29,6 +29,11 @@ probe:
   match:
     banner_regex: "(?i)^SSH-2\\.0-"
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: a working SSH login (such as the default root/alpine password)
+
 remediation:
   summary: >
     This device simultaneously exposes iOS lockdownd (port 62078, unique to

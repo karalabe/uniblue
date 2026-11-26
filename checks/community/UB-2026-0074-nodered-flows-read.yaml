@@ -36,6 +36,11 @@ probe:
       - '"type":"tab"'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Node-RED returned its flows without login
+
 remediation:
   summary: >
     Anonymous GET /flows exposes automation logic and configuration, including

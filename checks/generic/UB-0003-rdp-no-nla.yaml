@@ -27,6 +27,11 @@ probe:
   port: 3389
   timeout: 3s
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: a valid Windows/RDP login
+
 remediation:
   summary: >
     RDP port 3389 accepted a classic PROTOCOL_RDP or TLS-only handshake without

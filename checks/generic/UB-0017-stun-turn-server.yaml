@@ -31,6 +31,11 @@ probe:
   port: 3478
   timeout: 2s
 
+grants:
+  - effect: pivot
+    basis: conditional
+    requires: the server also allows unauthenticated TURN relaying
+
 remediation:
   summary: >
     A STUN server answered a read-only RFC 5389 Binding Request on UDP 3478.

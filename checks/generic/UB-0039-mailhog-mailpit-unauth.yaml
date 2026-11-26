@@ -38,6 +38,14 @@ probe:
     evidence_summary: "MailHog/Mailpit API exposed captured email inbox without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: MailHog/Mailpit exposed captured emails without login
+  - effect: secrets
+    basis: conditional
+    requires: captured test emails contain password resets, tokens, or secrets
+
 remediation:
   summary: >
     A MailHog or Mailpit SMTP testing inbox is reachable on LAN port 8025

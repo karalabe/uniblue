@@ -35,6 +35,11 @@ probe:
       - "Directory listing for /"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Python HTTP server listed local files without login
+
 remediation:
   summary: >
     A workstation or laptop is running Python's unauthenticated http.server

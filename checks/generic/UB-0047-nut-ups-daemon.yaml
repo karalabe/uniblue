@@ -29,6 +29,11 @@ probe:
   type: nut
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: implied
+    note: NUT UPS daemon answered version query on the LAN
+
 remediation:
   summary: >
     A NUT upsd daemon answered read-only VER/LIST UPS queries on TCP 3493.

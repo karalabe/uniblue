@@ -1,0 +1,55 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+# Traits describe the protocol family. Unknown transport covers negotiated
+# or deployment-specific protection. Anonymous grants describe baseline
+# operations available without credentials, subject to endpoint policy.
+adb: {transport_class: unknown, auth_model: optional, hub: false}
+afp: {transport_class: unknown, auth_model: optional, hub: false}
+coap: {transport_class: unknown, auth_model: optional, hub: false}
+dns: {transport_class: cleartext-noauth, auth_model: none, anon_grants: [read], hub: false}
+docker: {transport_class: unknown, auth_model: optional, hub: false}
+esphome: {transport_class: unknown, auth_model: optional, hub: false}
+etcd: {transport_class: unknown, auth_model: optional, hub: false}
+ftp: {transport_class: cleartext-auth, auth_model: optional, hub: false}
+hap: {transport_class: e2e, auth_model: device-paired, hub: false}
+home-assistant: {transport_class: unknown, auth_model: required, hub: true}
+http: {transport_class: cleartext-auth, auth_model: optional, hub: false}
+https: {transport_class: tls, auth_model: optional, hub: false}
+imap: {transport_class: unknown, auth_model: required, hub: false}
+ipmi: {transport_class: unknown, auth_model: optional, hub: false}
+ipp: {transport_class: unknown, auth_model: optional, hub: false}
+kerberos: {transport_class: unknown, auth_model: required, hub: false}
+kubernetes: {transport_class: tls, auth_model: optional, hub: false}
+ldap: {transport_class: cleartext-auth, auth_model: optional, hub: false}
+ldaps: {transport_class: tls, auth_model: optional, hub: false}
+matter: {transport_class: e2e, auth_model: device-paired, hub: true}
+mdns: {transport_class: cleartext-noauth, auth_model: none, anon_grants: [read], hub: false}
+memcached: {transport_class: unknown, auth_model: optional, hub: false}
+modbus: {transport_class: cleartext-noauth, auth_model: none, anon_grants: [read, control], hub: false}
+mongodb: {transport_class: unknown, auth_model: optional, hub: false}
+mqtt: {transport_class: unknown, auth_model: optional, hub: true}
+mssql: {transport_class: unknown, auth_model: required, hub: false}
+mysql: {transport_class: unknown, auth_model: required, hub: false}
+nfs: {transport_class: unknown, auth_model: optional, hub: false}
+ntp: {transport_class: cleartext-noauth, auth_model: optional, anon_grants: [read], hub: false}
+openvpn: {transport_class: e2e, auth_model: required, hub: false}
+pop3: {transport_class: unknown, auth_model: required, hub: false}
+postgres: {transport_class: unknown, auth_model: optional, hub: false}
+rdp: {transport_class: unknown, auth_model: required, hub: false}
+redis: {transport_class: unknown, auth_model: optional, hub: false}
+rsync: {transport_class: cleartext-auth, auth_model: optional, hub: false}
+rtsp: {transport_class: unknown, auth_model: optional, hub: false}
+smb: {transport_class: unknown, auth_model: optional, hub: false}
+smtp: {transport_class: unknown, auth_model: optional, hub: false}
+snmp: {transport_class: unknown, auth_model: optional, hub: false}
+ssdp: {transport_class: cleartext-noauth, auth_model: none, anon_grants: [read], hub: false}
+ssh: {transport_class: e2e, auth_model: required, hub: false}
+telnet: {transport_class: cleartext-auth, auth_model: optional, hub: false}
+upnp: {transport_class: cleartext-noauth, auth_model: none, anon_grants: [read, configure], hub: true}
+vnc: {transport_class: unknown, auth_model: optional, hub: false}
+winrm: {transport_class: unknown, auth_model: required, hub: false}
+wireguard: {transport_class: e2e, auth_model: device-paired, hub: false}

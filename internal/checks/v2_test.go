@@ -33,7 +33,8 @@ func TestPerHostPortPlannerZeroBloatAt1000Rules(t *testing.T) {
 		raw := fmt.Sprintf(`
 id: UB-SCALE-%04d
 title: Synthetic Specialty Device %d
-severity: low
+claim: asset-identity
+severity: info
 safety: read-only
 preconditions:
   ports_any: [%d]
@@ -83,6 +84,8 @@ preconditions:
   mdns_txt_regex: "(?i)^sf=1$"
 probe:
   type: observe
+grants:
+  - {effect: control, basis: conditional, requires: an attacker pairs with the accessory first}
 `), "hap.yaml")
 	if err != nil {
 		t.Fatalf("Parse observe check: %v", err)
@@ -122,6 +125,7 @@ probe:
 	httpChk, err := Parse([]byte(`
 id: UB-TEST-JSON
 title: Multi-Path JSON Check
+grants: [{effect: read, basis: proven}]
 severity: medium
 safety: read-only
 preconditions:
@@ -187,7 +191,7 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 			_, _ = conn.Write(out)
 		})
 		defer closeFn()
-		ev, ok := probeKasa(context.Background(), "127.0.0.1", port)
+		ev, ok := probeKasa(context.Background(), "127.0.0.1", port, &Observation{})
 		if !ok || !strings.Contains(ev, "HS110(EU)") {
 			t.Fatalf("expected Kasa match, got ok=%v ev=%q", ok, ev)
 		}
@@ -199,7 +203,7 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 			_, _ = io.WriteString(conn, "VERSION 1.6.22\r\n")
 		})
 		defer closeMC()
-		if _, ok := probeMemcached(context.Background(), "127.0.0.1", mcPort); !ok {
+		if _, ok := probeMemcached(context.Background(), "127.0.0.1", mcPort, &Observation{}); !ok {
 			t.Fatal("expected Memcached match")
 		}
 
@@ -207,7 +211,7 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 			_, _ = io.WriteString(conn, "@RSYNCD: 31.0\n")
 		})
 		defer closeRS()
-		if _, ok := probeRsync(context.Background(), "127.0.0.1", rsPort); !ok {
+		if _, ok := probeRsync(context.Background(), "127.0.0.1", rsPort, &Observation{}); !ok {
 			t.Fatal("expected rsync match")
 		}
 
@@ -220,7 +224,7 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 			}
 		})
 		defer closeMPD()
-		if _, ok := probeMPD(context.Background(), "127.0.0.1", mpdPort); !ok {
+		if _, ok := probeMPD(context.Background(), "127.0.0.1", mpdPort, &Observation{}); !ok {
 			t.Fatal("expected unauthenticated MPD status match")
 		}
 	})
@@ -261,7 +265,7 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 			_, _ = pc.WriteToUDP(asn1Seq(resp.Bytes()), addr)
 		}()
 
-		ev, ok := probeSNMPReadOnly(context.Background(), "127.0.0.1", pc.LocalAddr().(*net.UDPAddr).Port, "public")
+		ev, ok := probeSNMPReadOnly(context.Background(), "127.0.0.1", pc.LocalAddr().(*net.UDPAddr).Port, "public", &Observation{})
 		if !ok || !strings.Contains(ev, "ExampleOS Switch 2.4") {
 			t.Fatalf("expected SNMP match with sysDescr, got ok=%v ev=%q", ok, ev)
 		}
@@ -282,7 +286,7 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 			// ACK 2.05 Content echoing Message ID.
 			_, _ = coapConn.WriteToUDP([]byte{0x60, 0x45, buf[2], buf[3], 0xff, '<', '/', 't', 'e', 'm', 'p', '>'}, addr)
 		}()
-		if _, ok := probeCoAP(context.Background(), "127.0.0.1", coapConn.LocalAddr().(*net.UDPAddr).Port); !ok {
+		if _, ok := probeCoAP(context.Background(), "127.0.0.1", coapConn.LocalAddr().(*net.UDPAddr).Port, &Observation{}); !ok {
 			t.Fatal("expected CoAP 2.05 match")
 		}
 
@@ -300,7 +304,7 @@ func TestExtendedReadOnlyProtocolProbes(t *testing.T) {
 			// RFC 6886 external address response: ver=0, op=128, result=0, epoch=1, ip=198.51.100.1
 			_, _ = pmpConn.WriteToUDP([]byte{0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 198, 51, 100, 1}, addr)
 		}()
-		if _, ok := probeNATPMP(context.Background(), "127.0.0.1", pmpConn.LocalAddr().(*net.UDPAddr).Port); !ok {
+		if _, ok := probeNATPMP(context.Background(), "127.0.0.1", pmpConn.LocalAddr().(*net.UDPAddr).Port, &Observation{}); !ok {
 			t.Fatal("expected NAT-PMP match")
 		}
 	})

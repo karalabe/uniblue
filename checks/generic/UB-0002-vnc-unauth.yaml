@@ -26,6 +26,24 @@ probe:
   type: vnc
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: implied
+    when_field: session_accepted
+    note: VNC accepted a connection with no password
+  - effect: control
+    basis: implied
+    when_field: session_accepted
+    note: VNC connected with no password (could still be view-only)
+  - effect: configure
+    basis: conditional
+    when_field: session_accepted
+    requires: the VNC session is not view-only
+  - effect: pivot
+    basis: conditional
+    when_field: session_accepted
+    requires: the VNC desktop user can reach other devices or services
+
 remediation:
   summary: >
     VNC server advertises RFB security type "None", granting full remote

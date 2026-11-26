@@ -37,6 +37,14 @@ probe:
       - '"fw_id":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Shelly Gen2/Gen3 returned device config without login
+  - effect: configure
+    basis: conditional
+    requires: Shelly Gen2/Gen3 RPC allows changing settings or toggling relays without auth
+
 remediation:
   summary: >
     Shelly Gen2/Gen3 device returned full system configuration from

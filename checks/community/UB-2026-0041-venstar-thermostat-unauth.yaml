@@ -40,6 +40,14 @@ probe:
     evidence_summary: "Venstar thermostat returned /query/info HVAC state without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Venstar thermostat returned current temperature and mode without login
+  - effect: control
+    basis: conditional
+    requires: the thermostat accepts temperature changes without login
+
 remediation:
   summary: >
     Venstar thermostat exposes its local HTTP API without authentication,

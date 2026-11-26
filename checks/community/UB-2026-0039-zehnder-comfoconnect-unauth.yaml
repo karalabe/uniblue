@@ -30,6 +30,11 @@ probe:
   port: 56747
   timeout: 3s
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: the ComfoConnect bridge accepts a client pairing or PIN to control ventilation
+
 remediation:
   summary: >
     The ComfoConnect LAN C control port is reachable. The bridge uses TCP

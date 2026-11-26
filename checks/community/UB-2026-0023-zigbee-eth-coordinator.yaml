@@ -25,6 +25,14 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: the Zigbee serial bridge accepts TCP connections without authentication
+  - effect: configure
+    basis: conditional
+    requires: the Zigbee bridge allows re-pairing or hijacking connected devices
+
 remediation:
   summary: >
     An Ethernet Zigbee coordinator is advertising its raw TCP serial radio

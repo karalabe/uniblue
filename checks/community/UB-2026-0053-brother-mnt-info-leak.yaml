@@ -35,6 +35,14 @@ probe:
       - "Serial No."
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Brother printer exposed maintenance info and serial number without login
+  - effect: secrets
+    basis: conditional
+    requires: the printer still uses its default password derived from the leaked serial
+
 remediation:
   summary: >
     Printer exposed /etc/mnt_info.csv without authentication (CVE-2024-51977),

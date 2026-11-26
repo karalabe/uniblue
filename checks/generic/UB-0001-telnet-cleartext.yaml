@@ -27,6 +27,24 @@ probe:
   port: 23
   timeout: 3s
 
+grants:
+  - effect: control
+    basis: implied
+    when_field: "prompt == shell"
+    note: Telnet dropped straight into a command shell without asking for a password
+  - effect: configure
+    basis: conditional
+    when_field: "prompt == shell"
+    requires: the Telnet shell allows changing device settings
+  - effect: pivot
+    basis: conditional
+    when_field: "prompt == shell"
+    requires: the Telnet shell can reach other devices on the network
+  - effect: control
+    basis: conditional
+    when_field: "prompt == login"
+    requires: a valid Telnet login
+
 remediation:
   summary: >
     Device accepts cleartext Telnet connections on port 23. Credentials and

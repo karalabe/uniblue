@@ -31,6 +31,8 @@ probe:
   match:
     evidence_summary: "Matter commissionable advertisement with active commissioning mode (cm=1 or cm=2) on _matterc._udp"
 
+grants: []
+
 remediation:
   summary: >
     A Matter accessory is actively advertising commissioning mode (cm=1/2; note

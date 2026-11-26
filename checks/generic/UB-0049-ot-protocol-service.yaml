@@ -30,6 +30,11 @@ probe:
   match:
     evidence_summary: "OT / building control protocol observed (verify isolation from guest and general user VLANs; OPC UA discovery alone does not prove unauthorized actuation)"
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: the building/industrial protocol accepts commands without authentication
+
 remediation:
   summary: >
     A building-automation or industrial OT protocol was discovered on the LAN.

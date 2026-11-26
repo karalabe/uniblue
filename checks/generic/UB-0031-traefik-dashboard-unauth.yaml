@@ -36,6 +36,11 @@ probe:
       - '"rule":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Traefik dashboard exposed internal routes and backend services without login
+
 remediation:
   summary: >
     Traefik is running with api.insecure=true on port 8080, exposing its full

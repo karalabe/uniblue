@@ -27,6 +27,11 @@ probe:
   port: 5683
   timeout: 2s
 
+grants:
+  - effect: read
+    basis: proven
+    note: CoAP listed its local resources without authentication
+
 remediation:
   summary: >
     IoT endpoint responded with CoAP 2.05 Content to /.well-known/core over

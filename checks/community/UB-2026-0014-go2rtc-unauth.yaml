@@ -35,6 +35,14 @@ probe:
       - '"consumers":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: go2rtc exposed camera streams and config without login
+  - effect: secrets
+    basis: conditional
+    requires: camera stream URLs in go2rtc include RTSP usernames or passwords
+
 remediation:
   summary: >
     go2rtc's HTTP API on port 1984 returned active camera streams without

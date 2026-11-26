@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Shelly device advertised on _shelly._tcp (authentication posture evaluated separately by UB-2026-0031 / UB-2026-0032)"
 
+grants: []
+
 remediation:
   summary: >
     A Shelly smart relay or plug was discovered via mDNS. Authentication posture

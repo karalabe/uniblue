@@ -27,6 +27,18 @@ probe:
   port: 59777
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: ES File Explorer answered unauthenticated file-server API on port 59777
+
+  - effect: control
+    basis: implied
+    note: the same open port can launch apps on the Android device
+  - effect: secrets
+    basis: implied
+    note: the same open port can download photos and files from device storage
+
 remediation:
   summary: >
     An Android phone or tablet on the Wi-Fi network is running a vulnerable

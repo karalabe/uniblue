@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Matter operational fabric service advertised via _matter._tcp (UDP MRP transport)"
 
+grants: []
+
 remediation:
   summary: >
     An operational Matter device was discovered on the local network. Verify

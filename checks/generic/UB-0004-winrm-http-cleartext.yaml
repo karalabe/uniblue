@@ -33,6 +33,11 @@ probe:
       Server: "Microsoft-HTTPAPI"
     redact_body: true
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: a valid Windows admin login over HTTP
+
 remediation:
   summary: >
     Windows Remote Management (WinRM) over unencrypted HTTP (port 5985) is

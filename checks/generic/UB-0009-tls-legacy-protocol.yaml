@@ -27,6 +27,11 @@ probe:
   type: tls-legacy
   timeout: 3s
 
+grants:
+  - effect: secrets
+    basis: conditional
+    requires: a client sends passwords or tokens over deprecated TLS 1.0/1.1
+
 remediation:
   summary: >
     HTTPS service negotiated deprecated TLS 1.0 or TLS 1.1 (deprecated by RFC

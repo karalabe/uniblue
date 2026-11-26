@@ -26,6 +26,11 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: configure
+    basis: conditional
+    requires: the gateway accepts UPnP requests to open new WAN port forwards
+
 remediation:
   summary: >
     A gateway on this network advertises UPnP IGD (WANIPConnection /

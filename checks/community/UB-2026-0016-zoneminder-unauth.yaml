@@ -39,6 +39,11 @@ probe:
     evidence_summary: "ZoneMinder API returned version details without authentication (OPT_USE_AUTH may be off)"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: ZoneMinder API answered without login
+
 remediation:
   summary: >
     ZoneMinder's /zm/api/host/getVersion.json endpoint responded with HTTP 200

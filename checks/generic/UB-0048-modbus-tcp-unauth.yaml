@@ -27,6 +27,14 @@ probe:
   port: 502
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: the Modbus device accepts register reads
+  - effect: control
+    basis: conditional
+    requires: the Modbus device accepts register writes to control equipment
+
 remediation:
   summary: >
     Device responds to unauthenticated Modbus TCP requests on port 502. Modbus

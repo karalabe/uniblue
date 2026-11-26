@@ -49,6 +49,20 @@ probe:
         evidence_summary: "Runtime settings grant anonymous users wildcard (*) permissions"
         redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Node-RED returned its flows without login
+  - effect: control
+    basis: implied
+    note: "Node-RED grants full wildcard (*) permissions to anonymous users"
+  - effect: configure
+    basis: implied
+    note: "Node-RED grants full wildcard (*) permissions to anonymous users"
+  - effect: pivot
+    basis: implied
+    note: anonymous users can deploy flows that run code and reach other devices on this VLAN
+
 remediation:
   summary: >
     Node-RED grants anonymous users wildcard ("*") permissions via adminAuth's

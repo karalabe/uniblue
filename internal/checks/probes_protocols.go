@@ -26,7 +26,7 @@ import (
 // probeBitcoinP2P performs a strictly read-only Bitcoin P2P `version` handshake
 // (relay=false) on TCP (default 8333) to confirm a live Bitcoin node and extract
 // its protocol version and user-agent string without requesting blocks or mempool.
-func probeBitcoinP2P(ctx context.Context, ip string, port int) (string, bool) {
+func probeBitcoinP2P(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 8333
 	}
@@ -106,6 +106,7 @@ func probeBitcoinP2P(ctx context.Context, ip string, port int) (string, bool) {
 
 	protoVer := int32(binary.LittleEndian.Uint32(respPayload[0:4]))
 	agent := parseBitcoinUserAgent(respPayload)
+	obs.Fields = map[string]string{"network": network, "version": strconv.Itoa(int(protoVer))}
 	if agent != "" {
 		return fmt.Sprintf("Bitcoin P2P (%s) version=%d agent=%s", network, protoVer, agent), true
 	}
@@ -141,7 +142,7 @@ func parseBitcoinUserAgent(payload []byte) string {
 
 // probeBitcoinRPC issues a strictly read-only JSON-RPC `getnetworkinfo` call
 // with no credentials to verify whether Bitcoin Core RPC enforces HTTP auth.
-func (r *Runner) probeBitcoinRPC(ctx context.Context, ip string, port int) (string, bool) {
+func (r *Runner) probeBitcoinRPC(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 8332
 	}
@@ -178,13 +179,14 @@ func (r *Runner) probeBitcoinRPC(ctx context.Context, ip string, port int) (stri
 	if parsed.Result.Subversion == "" || parsed.Result.ProtocolVersion <= 0 {
 		return "", false
 	}
+	obs.Fields = map[string]string{"subversion": parsed.Result.Subversion}
 	return fmt.Sprintf("Unauthenticated Bitcoin JSON-RPC getnetworkinfo succeeded (subversion=%q, version=%d)", parsed.Result.Subversion, parsed.Result.Version), true
 }
 
 // probeEthEngineAPI issues a strictly read-only `engine_exchangeCapabilities`
 // request without a JWT Authorization header on TCP 8551 to verify whether an
 // Ethereum Execution Client Engine API enforces JWT authentication.
-func (r *Runner) probeEthEngineAPI(ctx context.Context, ip string, port int) (string, bool) {
+func (r *Runner) probeEthEngineAPI(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 8551
 	}
@@ -221,12 +223,13 @@ func (r *Runner) probeEthEngineAPI(ctx context.Context, ip string, port int) (st
 	if !hasEngineMethod {
 		return "", false
 	}
+	obs.Fields = map[string]string{"capability_count": strconv.Itoa(len(parsed.Result))}
 	return fmt.Sprintf("Ethereum Engine API responded to engine_exchangeCapabilities without JWT auth (%d capabilities)", len(parsed.Result)), true
 }
 
 // probeNUT performs a strictly read-only `VER` + `LIST UPS` query against a
 // Network UPS Tools (NUT) upsd daemon (TCP 3493) without issuing control commands.
-func probeNUT(ctx context.Context, ip string, port int) (string, bool) {
+func probeNUT(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 3493
 	}
@@ -266,7 +269,11 @@ func probeNUT(ctx context.Context, ip string, port int) (string, bool) {
 			if strings.HasPrefix(line, "UPS ") {
 				upsCount++
 			}
-			if line == "END LIST UPS" || strings.HasPrefix(line, "ERR ") {
+			if line == "END LIST UPS" {
+				obs.Fields = map[string]string{"listed_ups": strconv.Itoa(upsCount)}
+				break
+			}
+			if strings.HasPrefix(line, "ERR ") {
 				break
 			}
 		}
@@ -276,7 +283,7 @@ func probeNUT(ctx context.Context, ip string, port int) (string, bool) {
 
 // probeLIFX sends a single read-only LIFX LAN GetVersion (type 32) UDP packet
 // to port 56700 and decodes the StateVersion (type 33) vendor/product IDs.
-func probeLIFX(ctx context.Context, ip string, port int) (string, bool) {
+func probeLIFX(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 56700
 	}
@@ -315,13 +322,14 @@ func probeLIFX(ctx context.Context, ip string, port int) (string, bool) {
 	}
 	vendor := binary.LittleEndian.Uint32(buf[36:40])
 	product := binary.LittleEndian.Uint32(buf[40:44])
+	obs.Fields = map[string]string{"vendor_id": strconv.FormatUint(uint64(vendor), 10), "product_id": strconv.FormatUint(uint64(product), 10)}
 	return fmt.Sprintf("LIFX LAN StateVersion vendor=%d product=%d", vendor, product), true
 }
 
 // probePJLink passively reads the initial PJLink greeting on TCP 4352 without
 // sending any commands. Matches ONLY `PJLINK 0` (no authentication required);
 // `PJLINK 1 <salt>` indicates password protection and returns false.
-func probePJLink(ctx context.Context, ip string, port int) (string, bool) {
+func probePJLink(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 4352
 	}
@@ -343,6 +351,7 @@ func probePJLink(ctx context.Context, ip string, port int) (string, bool) {
 	}
 	greeting := strings.TrimSpace(line)
 	if greeting == "PJLINK 0" {
+		obs.Fields = map[string]string{"auth_required": "false"}
 		return "PJLink display advertised 'PJLINK 0' (unauthenticated projector/signage control)", true
 	}
 	return "", false
@@ -351,7 +360,7 @@ func probePJLink(ctx context.Context, ip string, port int) (string, bool) {
 // probeNBNS sends one unicast RFC 1002 NBSTAT query (QTYPE=0x0021) to UDP 137,
 // validates the transaction ID, and reports NetBIOS service role flags without
 // broadcasting or persisting raw workstation/user strings.
-func probeNBNS(ctx context.Context, ip string, port int) (string, bool) {
+func probeNBNS(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 137
 	}
@@ -409,12 +418,13 @@ func probeNBNS(ctx context.Context, ip string, port int) (string, bool) {
 	if hasFileServer {
 		role = "file-server (0x20)"
 	}
+	obs.Fields = map[string]string{"name_count": strconv.Itoa(int(numNames))}
 	return fmt.Sprintf("NetBIOS NBSTAT responded (%d name entries, role=%s)", numNames, role), true
 }
 
 // probePCP sends a strictly read-only RFC 6887 PCP v2 ANNOUNCE request (opcode 0)
 // to UDP 5351 without creating or modifying any port mapping.
-func probePCP(ctx context.Context, ip string, port int) (string, bool) {
+func probePCP(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 5351
 	}
@@ -451,12 +461,13 @@ func probePCP(ctx context.Context, ip string, port int) (string, bool) {
 		return "", false
 	}
 	epoch := binary.BigEndian.Uint32(buf[8:12])
+	obs.Fields = map[string]string{"epoch": strconv.FormatUint(uint64(epoch), 10)}
 	return fmt.Sprintf("PCP v2 ANNOUNCE succeeded (epoch=%d)", epoch), true
 }
 
 // probeDNSRecursion sends one read-only RFC 1035 standard query (RD=1) to UDP 53
 // and checks whether the server sets Recursion Available (RA=1) without REFUSED.
-func probeDNSRecursion(ctx context.Context, ip string, port int) (string, bool) {
+func probeDNSRecursion(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 53
 	}
@@ -499,12 +510,13 @@ func probeDNSRecursion(ctx context.Context, ip string, port int) (string, bool) 
 	if !isResp || !ra || rcode != 0 || ancount == 0 {
 		return "", false
 	}
+	obs.Fields = map[string]string{"answers": strconv.Itoa(int(ancount))}
 	return fmt.Sprintf("DNS server resolved recursive query (RA=1, NOERROR, answers=%d)", ancount), true
 }
 
 // probeNTP sends a single read-only 48-byte NTPv4 client request (Mode 3) to
 // UDP 123 and validates a Mode 4 server response with stratum 1..15.
-func probeNTP(ctx context.Context, ip string, port int) (string, bool) {
+func probeNTP(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 123
 	}
@@ -535,12 +547,13 @@ func probeNTP(ctx context.Context, ip string, port int) (string, bool) {
 	if mode != 4 || stratum == 0 || stratum > 15 {
 		return "", false
 	}
+	obs.Fields = map[string]string{"stratum": strconv.Itoa(int(stratum))}
 	return fmt.Sprintf("NTPv%d server responded (stratum=%d)", (buf[0]>>3)&0x07, stratum), true
 }
 
 // probeSTUN sends a read-only RFC 5389 STUN Binding Request to UDP 3478 and
 // validates a Binding Success Response with matching magic cookie & transaction ID.
-func probeSTUN(ctx context.Context, ip string, port int) (string, bool) {
+func probeSTUN(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 3478
 	}
@@ -575,5 +588,6 @@ func probeSTUN(ctx context.Context, ip string, port int) (string, bool) {
 		!bytes.Equal(buf[8:20], pkt[8:20]) {
 		return "", false
 	}
+	obs.Fields = map[string]string{"binding_success": "true"}
 	return "STUN Binding Success Response (RFC 5389) verified", true
 }

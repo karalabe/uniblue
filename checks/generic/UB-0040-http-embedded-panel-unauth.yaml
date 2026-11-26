@@ -36,6 +36,11 @@ probe:
     body_not_regex: '(?is)(type\s*=\s*["'']?password\b|autocomplete\s*=\s*["'']?current-password|name\s*=\s*["'']?(password|passwd|passcode)\b|<form[^>]*(login|signin|sign-in|auth)|<div\s+id\s*=\s*["'']?(app|root)["'']?[^>]*>\s*</div>|<script[^>]+(login|auth|signin|bundle|chunk))'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: embedded control panel loaded without asking for a password
+
 remediation:
   summary: >
     Embedded device exposes a web control interface without HTTP

@@ -81,7 +81,7 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 			}
 		}()
 
-		ev, ok := probeBitcoinP2P(ctx, "127.0.0.1", port)
+		ev, ok := probeBitcoinP2P(ctx, "127.0.0.1", port, &Observation{})
 		if !ok || !strings.Contains(ev, "/Satoshi:27.0.0/") || !strings.Contains(ev, "mainnet") {
 			t.Fatalf("expected Bitcoin P2P match with Satoshi agent, got ok=%v ev=%q", ok, ev)
 		}
@@ -112,13 +112,13 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 		_, p3, _ := net.SplitHostPort(unrelatedSrv.Listener.Addr().String())
 		port3, _ := strconv.Atoi(p3)
 
-		if ev, ok := r.probeBitcoinRPC(ctx, "127.0.0.1", port1); !ok || !strings.Contains(ev, "Satoshi:27.0.0") {
+		if ev, ok := r.probeBitcoinRPC(ctx, "127.0.0.1", port1, &Observation{}); !ok || !strings.Contains(ev, "Satoshi:27.0.0") {
 			t.Fatalf("expected unauth Bitcoin RPC match, got ok=%v ev=%q", ok, ev)
 		}
-		if _, ok := r.probeBitcoinRPC(ctx, "127.0.0.1", port2); ok {
+		if _, ok := r.probeBitcoinRPC(ctx, "127.0.0.1", port2, &Observation{}); ok {
 			t.Fatal("401-authenticated Bitcoin RPC must NOT match")
 		}
-		if _, ok := r.probeBitcoinRPC(ctx, "127.0.0.1", port3); ok {
+		if _, ok := r.probeBitcoinRPC(ctx, "127.0.0.1", port3, &Observation{}); ok {
 			t.Fatal("unrelated JSON {\"result\":{\"version\":1}} must NOT trigger Bitcoin RPC")
 		}
 	})
@@ -147,13 +147,13 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 		_, p3, _ := net.SplitHostPort(unrelatedSrv.Listener.Addr().String())
 		port3, _ := strconv.Atoi(p3)
 
-		if ev, ok := r.probeEthEngineAPI(ctx, "127.0.0.1", port1); !ok || !strings.Contains(ev, "2 capabilities") {
+		if ev, ok := r.probeEthEngineAPI(ctx, "127.0.0.1", port1, &Observation{}); !ok || !strings.Contains(ev, "2 capabilities") {
 			t.Fatalf("expected unauth Eth Engine API match, got ok=%v ev=%q", ok, ev)
 		}
-		if _, ok := r.probeEthEngineAPI(ctx, "127.0.0.1", port2); ok {
+		if _, ok := r.probeEthEngineAPI(ctx, "127.0.0.1", port2, &Observation{}); ok {
 			t.Fatal("JWT-protected Eth Engine API must NOT match")
 		}
-		if _, ok := r.probeEthEngineAPI(ctx, "127.0.0.1", port3); ok {
+		if _, ok := r.probeEthEngineAPI(ctx, "127.0.0.1", port3, &Observation{}); ok {
 			t.Fatal("unrelated JSON {\"result\":[\"status\"]} must NOT trigger Eth Engine API")
 		}
 	})
@@ -187,7 +187,7 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 				}(c)
 			}
 		}()
-		ev, ok := probeNUT(ctx, "127.0.0.1", port)
+		ev, ok := probeNUT(ctx, "127.0.0.1", port, &Observation{})
 		if !ok || !strings.Contains(ev, "1 UPS unit(s)") {
 			t.Fatalf("expected NUT match with 1 UPS, got ok=%v ev=%q", ok, ev)
 		}
@@ -217,10 +217,10 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 		}
 		pOpen := startBanner("PJLINK 0\r")
 		pAuth := startBanner("PJLINK 1 498e4a67\r")
-		if _, ok := probePJLink(ctx, "127.0.0.1", pOpen); !ok {
+		if _, ok := probePJLink(ctx, "127.0.0.1", pOpen, &Observation{}); !ok {
 			t.Fatal("expected PJLINK 0 to match unauthenticated projector")
 		}
-		if _, ok := probePJLink(ctx, "127.0.0.1", pAuth); ok {
+		if _, ok := probePJLink(ctx, "127.0.0.1", pAuth, &Observation{}); ok {
 			t.Fatal("PJLINK 1 password-protected projector must NOT match")
 		}
 	})
@@ -262,7 +262,7 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 			binary.LittleEndian.PutUint32(rep[40:44], 27)   // A19 product
 			return rep
 		})
-		if ev, ok := probeLIFX(ctx, "127.0.0.1", lifxPort); !ok || !strings.Contains(ev, "product=27") {
+		if ev, ok := probeLIFX(ctx, "127.0.0.1", lifxPort, &Observation{}); !ok || !strings.Contains(ev, "product=27") {
 			t.Fatalf("expected LIFX StateVersion match, got ok=%v ev=%q", ok, ev)
 		}
 
@@ -277,7 +277,7 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 			rep[57+15] = 0x20
 			return rep
 		})
-		if ev, ok := probeNBNS(ctx, "127.0.0.1", nbnsPort); !ok || !strings.Contains(ev, "file-server") {
+		if ev, ok := probeNBNS(ctx, "127.0.0.1", nbnsPort, &Observation{}); !ok || !strings.Contains(ev, "file-server") {
 			t.Fatalf("expected NBNS file-server match, got ok=%v ev=%q", ok, ev)
 		}
 
@@ -292,7 +292,7 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 			binary.BigEndian.PutUint32(rep[8:12], 4200)
 			return rep
 		})
-		if ev, ok := probePCP(ctx, "127.0.0.1", pcpPort); !ok || !strings.Contains(ev, "epoch=4200") {
+		if ev, ok := probePCP(ctx, "127.0.0.1", pcpPort, &Observation{}); !ok || !strings.Contains(ev, "epoch=4200") {
 			t.Fatalf("expected PCP v2 ANNOUNCE match, got ok=%v ev=%q", ok, ev)
 		}
 
@@ -318,13 +318,13 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 			binary.BigEndian.PutUint16(rep[2:4], 0x8105) // QR=1, RA=0, REFUSED
 			return rep
 		})
-		if _, ok := probeDNSRecursion(ctx, "127.0.0.1", dnsRecPort); !ok {
+		if _, ok := probeDNSRecursion(ctx, "127.0.0.1", dnsRecPort, &Observation{}); !ok {
 			t.Fatal("expected DNS recursion RA=1 NOERROR with answer to match")
 		}
-		if _, ok := probeDNSRecursion(ctx, "127.0.0.1", dnsServfailPort); ok {
+		if _, ok := probeDNSRecursion(ctx, "127.0.0.1", dnsServfailPort, &Observation{}); ok {
 			t.Fatal("DNS SERVFAIL with 0 answers must NOT match confirmed recursion")
 		}
-		if _, ok := probeDNSRecursion(ctx, "127.0.0.1", dnsRefusedPort); ok {
+		if _, ok := probeDNSRecursion(ctx, "127.0.0.1", dnsRefusedPort, &Observation{}); ok {
 			t.Fatal("DNS REFUSED/RA=0 must NOT match recursion check")
 		}
 
@@ -337,7 +337,7 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 			rep[1] = 2    // Stratum 2
 			return rep
 		})
-		if ev, ok := probeNTP(ctx, "127.0.0.1", ntpPort); !ok || !strings.Contains(ev, "stratum=2") {
+		if ev, ok := probeNTP(ctx, "127.0.0.1", ntpPort, &Observation{}); !ok || !strings.Contains(ev, "stratum=2") {
 			t.Fatalf("expected NTP server stratum=2 match, got ok=%v ev=%q", ok, ev)
 		}
 
@@ -350,7 +350,7 @@ func TestHigherLevelAppAndLANProtocolProbes(t *testing.T) {
 			copy(rep[4:20], req[4:20])
 			return rep
 		})
-		if _, ok := probeSTUN(ctx, "127.0.0.1", stunPort); !ok {
+		if _, ok := probeSTUN(ctx, "127.0.0.1", stunPort, &Observation{}); !ok {
 			t.Fatal("expected STUN Binding Success Response match")
 		}
 	})

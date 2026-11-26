@@ -154,8 +154,9 @@ func TestFalsePositiveGuards_MatterCommissioning_DoorBirdVsAxis_RawPrinter(t *te
 	httpChk := &Check{
 		ID:       "UB-2026-9999",
 		Title:    "Test HTTP Probe",
+		Claim:    ClaimAssetIdentity,
 		Safety:   "read-only",
-		Severity: SeverityLow,
+		Severity: SeverityInfo,
 		Preconditions: Preconditions{
 			PortsAny:      []int{rawPort},
 			DiscoveryOnly: true,

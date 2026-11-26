@@ -33,6 +33,17 @@ probe:
     body_regex: '(?s)\A\s*\{.*(?:"content"\s*:\s*\[.*"type"\s*:\s*"(?:directory|notebook|file)"|"type"\s*:\s*"directory".*"content"\s*:\s*\[)'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Jupyter listed workspace files without login
+  - effect: control
+    basis: conditional
+    requires: Jupyter allows starting code kernels without a token or password
+  - effect: pivot
+    basis: conditional
+    requires: code running in a Jupyter kernel can reach other hosts on the network
+
 remediation:
   summary: >
     Jupyter Server returned workspace contents from /api/contents on port 8888

@@ -33,6 +33,11 @@ probe:
     headers_absent: ["WWW-Authenticate"]
     redact_body: true
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: Transmission allows adding or deleting torrents without a password
+
 remediation:
   summary: >
     Transmission RPC on port 9091 returned an X-Transmission-Session-Id CSRF

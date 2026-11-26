@@ -26,6 +26,11 @@ probe:
   type: ftp-anon
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: at least one file is shared for anonymous FTP download
+
 remediation:
   summary: >
     FTP daemon accepted passwordless login as "anonymous" over cleartext TCP.

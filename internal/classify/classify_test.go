@@ -7,9 +7,13 @@
 package classify
 
 import (
+	"slices"
+	"strings"
 	"testing"
+	"testing/fstest"
 
 	classifydata "github.com/karalabe/uniblue/classify"
+	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -295,5 +299,41 @@ func TestClassifyHostnameBoundariesAndPersonalPrecedence(t *testing.T) {
 				t.Fatalf("got category %q (role=%q, signals=%v), want %q", got.Category, got.Role, got.Signals, tc.wantCat)
 			}
 		})
+	}
+}
+
+// TestProtocolTraits checks the embedded catalog and the names used by service fingerprints.
+func TestProtocolTraits(t *testing.T) {
+	catalog, err := LoadProtocols(classifydata.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range strings.Fields("ssh http https smb rdp vnc telnet ftp snmp mqtt modbus rtsp ipp redis memcached mongodb postgres mysql mssql docker kubernetes etcd rsync nfs afp ldap ldaps kerberos dns ntp smtp imap pop3 upnp mdns ssdp esphome hap matter wireguard openvpn ipmi winrm adb coap home-assistant") {
+		if _, ok := catalog[name]; !ok {
+			t.Errorf("missing %s protocol traits", name)
+		}
+	}
+	if trait, ok := LookupProtocol(" MQTT "); !ok || !trait.Hub || trait.AuthModel != "optional" {
+		t.Errorf("MQTT traits = %+v, %t", trait, ok)
+	}
+	if trait, ok := LookupProtocol("postgresql"); !ok || trait.AuthModel != catalog["postgres"].AuthModel {
+		t.Errorf("PostgreSQL lookup = %+v, %t", trait, ok)
+	}
+	if trait, ok := LookupProtocol("mdns"); !ok || trait.TransportClass != "cleartext-noauth" || !slices.Equal(trait.AnonGrants, []checks.GrantEffect{checks.GrantRead}) {
+		t.Errorf("mDNS lookup = %+v, %t", trait, ok)
+	}
+	if _, ok := LookupProtocol("unrecognized"); ok {
+		t.Error("unknown protocol matched")
+	}
+	for _, fields := range []string{
+		"hub: false, transport_class: insecure, auth_model: none",
+		"hub: false, transport_class: tls, auth_model: password",
+		"hub: false, transport_class: tls, auth_model: none, anon_grants: [admin]",
+		"transport_class: tls, auth_model: required",
+	} {
+		fsys := fstest.MapFS{"protocols.yaml": {Data: []byte("test: {" + fields + "}")}}
+		if _, err := LoadProtocols(fsys); err == nil {
+			t.Errorf("accepted invalid protocol traits %q", fields)
+		}
 	}
 }

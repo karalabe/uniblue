@@ -29,6 +29,12 @@ probe:
   community: public
   timeout: 800ms
 
+grants:
+  - effect: read
+    basis: proven
+    when_field: "sys_descr"
+    note: "SNMP returned system info using the default 'public' community string"
+
 remediation:
   summary: >
     Device answered a read-only SNMPv2c GET sysDescr.0 query using the default

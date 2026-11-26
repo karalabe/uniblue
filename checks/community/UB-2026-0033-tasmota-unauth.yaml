@@ -36,6 +36,14 @@ probe:
       - '"StatusNET":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Tasmota returned status and network details without login
+  - effect: control
+    basis: implied
+    note: Tasmota accepted a command without a web password
+
 remediation:
   summary: >
     Tasmota accepted an unauthenticated HTTP command (/cm?cmnd=Status 0),

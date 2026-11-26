@@ -31,6 +31,11 @@ probe:
   port: 5351
   timeout: 2s
 
+grants:
+  - effect: configure
+    basis: conditional
+    requires: the PCP service allows creating or editing port forwards
+
 remediation:
   summary: >
     A PCP v2 listener responded to a read-only ANNOUNCE query on UDP 5351.

@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Lutron lighting bridge advertised on _lutron._tcp (paired LEAP/LIP control bridge)"
 
+grants: []
+
 remediation:
   summary: >
     A Lutron smart lighting bridge was discovered on the LAN. Keep bridge

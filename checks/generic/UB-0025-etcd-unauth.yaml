@@ -37,6 +37,24 @@ probe:
     evidence_summary: "etcd client port 2379 served version metadata without client TLS authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: etcd answered without authentication
+  - effect: secrets
+    basis: conditional
+    requires: unauthenticated reads can pull secrets or config keys from etcd
+
+  - effect: configure
+    basis: conditional
+    requires: etcd allows unauthenticated writes to cluster config or keys
+  - effect: control
+    basis: conditional
+    requires: writing keys in etcd lets an attacker control connected workloads
+  - effect: pivot
+    basis: conditional
+    requires: cluster credentials or workloads controlled via etcd can reach other hosts
+
 remediation:
   summary: >
     etcd's client API on port 2379 answered over unauthenticated HTTP. In

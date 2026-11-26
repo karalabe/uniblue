@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Victron GX energy gateway discovered via SSDP/UPnP"
 
+grants: []
+
 remediation:
   summary: >
     A Victron GX energy controller was discovered via SSDP/UPnP. Isolate

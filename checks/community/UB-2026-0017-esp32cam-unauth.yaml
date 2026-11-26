@@ -36,6 +36,11 @@ probe:
       - '"awb_gain":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: ESP32-CAM exposed camera settings and live stream without login
+
 remediation:
   summary: >
     ESP32-CAM exposes its CameraWebServer API (/status, /capture, /stream)

@@ -30,6 +30,11 @@ probe:
   port: 53
   timeout: 2s
 
+grants:
+  - effect: read
+    basis: proven
+    note: DNS server answered a recursive lookup without restriction
+
 remediation:
   summary: >
     The host answered a recursive DNS query on UDP 53 with Recursion Available

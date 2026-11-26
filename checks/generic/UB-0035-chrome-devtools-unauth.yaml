@@ -34,6 +34,21 @@ probe:
       - '"Browser":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Chrome DevTools exposed open tabs and debugger URLs
+  - effect: control
+    basis: conditional
+    requires: Chrome DevTools accepts remote debugging connections without auth
+  - effect: secrets
+    basis: conditional
+    requires: the browser holds logged-in cookies, sessions, or saved data
+
+  - effect: pivot
+    basis: conditional
+    requires: code running in the browser session can reach other internal services
+
 remediation:
   summary: >
     A browser or Electron app on this workstation is exposing the Chrome

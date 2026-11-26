@@ -27,6 +27,11 @@ probe:
   type: tcp
   timeout: 2s
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: a valid iKVM login to open the server console or mount virtual media
+
 remediation:
   summary: >
     A server BMC is exposing legacy iKVM video or Virtual Media (CD/Floppy/ISO

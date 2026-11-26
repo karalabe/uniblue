@@ -30,6 +30,20 @@ probe:
   port: 23
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: AVR returned its current power state over telnet
+  - effect: control
+    basis: implied
+    note: AVR answered telnet control commands without a password
+  - effect: configure
+    basis: implied
+    note: AVR telnet port allows changing receiver settings without login
+  - effect: pivot
+    basis: conditional
+    requires: the receiver forwards control to connected HDMI/CEC or trigger devices
+
 remediation:
   summary: >
     Denon and Marantz AV receivers expose an unauthenticated cleartext Telnet

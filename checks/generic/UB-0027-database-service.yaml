@@ -30,6 +30,11 @@ probe:
   match:
     evidence_summary: "Database protocol observed on LAN endpoint (check host authentication policy and source-network scoping)"
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: valid database credentials (or guest/trust login)
+
 remediation:
   summary: >
     A network database service was discovered on the LAN. Ensure host-based

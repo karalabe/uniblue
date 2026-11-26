@@ -27,6 +27,14 @@ probe:
   port: 6600
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: MPD returned playback status without a password
+  - effect: control
+    basis: conditional
+    requires: MPD allows changing playlists or playback without a password
+
 remediation:
   summary: >
     Music Player Daemon (MPD) allowed an unauthenticated read-only status query

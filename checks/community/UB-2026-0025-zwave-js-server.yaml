@@ -25,6 +25,11 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: the Z-Wave JS WebSocket port is reachable from this VLAN without authentication
+
 remediation:
   summary: >
     Z-Wave JS Server is advertising its unauthenticated WebSocket control

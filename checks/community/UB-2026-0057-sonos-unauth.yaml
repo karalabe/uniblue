@@ -36,6 +36,11 @@ probe:
       - "<ZoneName>"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: implied
+    note: Sonos exposed local speaker diagnostics on port 1400
+
 remediation:
   summary: >
     Sonos exposes unauthenticated UPnP playback/volume control and embedded

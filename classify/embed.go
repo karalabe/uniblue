@@ -4,13 +4,12 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package classifydata embeds UniBlue's built-in declarative device-taxonomy
-// YAML rules directly into the compiled binary.
+// Package classifydata embeds UniBlue's device taxonomy and protocol traits.
 package classifydata
 
 import "embed"
 
-// BuiltinFS contains all embedded device classification rules.
+// BuiltinFS contains the device taxonomy and the protocol trait catalog.
 //
 //go:embed *.yaml
 var BuiltinFS embed.FS

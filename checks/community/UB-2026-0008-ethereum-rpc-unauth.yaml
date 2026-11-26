@@ -27,6 +27,11 @@ probe:
   port: 8545
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: Ethereum RPC answered without authentication
+
 remediation:
   summary: >
     Ethereum Execution JSON-RPC responds on TCP port 8545 without

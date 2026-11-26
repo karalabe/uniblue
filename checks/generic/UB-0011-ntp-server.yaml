@@ -31,6 +31,11 @@ probe:
   port: 123
   timeout: 2s
 
+grants:
+  - effect: read
+    basis: implied
+    note: NTP server answered a time request
+
 remediation:
   summary: >
     A local NTP server responded to a read-only mode-3 time request on UDP 123.

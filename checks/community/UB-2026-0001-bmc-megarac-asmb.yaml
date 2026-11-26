@@ -38,6 +38,11 @@ probe:
     status: [200]
     body_regex: "(?i)(MegaRAC|ASMB[0-9]|American Megatrends[^<]{0,80}(BMC|IPMI|SPX)|ATEN International|jviewer\\.jnlp|SMCIPMITool|Supermicro[^<]{0,80}(IPMI|BMC|ATEN)|webgui[^<]{0,40}ipmi)"
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: a BMC login to open the server console, reboot, or mount virtual media
+
 remediation:
   summary: >
     An out-of-band server management console (AMI MegaRAC / ASUS ASMB /

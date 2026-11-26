@@ -73,7 +73,7 @@ var ipmiEnterpriseVendors = map[uint32]string{
 // Capabilities query on UDP 623 (and, when IPMI v2.0 RMCP+ is advertised, a
 // read-only RMCP+ Open Session Cipher 0 probe) to detect exposed out-of-band
 // server management controllers and authentication weaknesses.
-func probeIPMI(ctx context.Context, ip string, port int) (string, bool) {
+func probeIPMI(ctx context.Context, ip string, port int, obs *Observation) (string, bool) {
 	if port <= 0 {
 		port = 623
 	}
@@ -196,6 +196,19 @@ func probeIPMI(ctx context.Context, ip string, port int) (string, bool) {
 	}
 	if len(risks) > 0 {
 		parts = append(parts, strings.Join(risks, "; "))
+	}
+	fields := make(map[string]string)
+	if anonLogin {
+		fields["anonymous_login"] = "true"
+	}
+	if nullUser {
+		fields["null_user"] = "true"
+	}
+	if cipher0Accepted {
+		fields["cipher_zero"] = "true"
+	}
+	if len(fields) > 0 {
+		obs.Fields = fields
 	}
 	return strings.Join(parts, " · "), true
 }

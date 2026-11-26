@@ -27,6 +27,14 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: an attacker on the same Wi-Fi pairs with the accessory before you do
+  - effect: configure
+    basis: conditional
+    requires: an attacker on the same Wi-Fi pairs with the accessory and claims admin control
+
 remediation:
   summary: >
     Device is advertising an unpaired HomeKit HAP status flag (sf bit 0 set,

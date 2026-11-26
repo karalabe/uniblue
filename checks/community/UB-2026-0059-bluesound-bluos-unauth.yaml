@@ -35,6 +35,14 @@ probe:
     evidence_summary: "BluOS player returned playback state on /Status without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Bluesound returned current playback status without login
+  - effect: control
+    basis: conditional
+    requires: Bluesound allows controlling audio playback without login
+
 remediation:
   summary: >
     BluOS media player exposes unauthenticated HTTP playback and volume control

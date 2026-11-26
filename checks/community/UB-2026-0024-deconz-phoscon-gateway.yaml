@@ -39,6 +39,11 @@ probe:
     evidence_summary: "deCONZ/Phoscon gateway responded with public bridge metadata on /api/config"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: deCONZ Zigbee gateway exposed bridge info on the LAN
+
 remediation:
   summary: >
     deCONZ / Phoscon Zigbee gateway is reachable on the LAN. Keep the gateway

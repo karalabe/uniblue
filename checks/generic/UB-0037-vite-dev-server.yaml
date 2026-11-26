@@ -34,6 +34,11 @@ probe:
     evidence_summary: "Vite development server exposed /@vite/client on LAN port 5173"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Vite dev server answered directly on the LAN
+
 remediation:
   summary: >
     A workstation is running Vite's development server bound to a LAN

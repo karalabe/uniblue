@@ -35,6 +35,14 @@ probe:
       - "stemp="
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Daikin AC returned current power and temperature without login
+  - effect: control
+    basis: conditional
+    requires: the Daikin AC accepts power and temperature changes without login
+
 remediation:
   summary: >
     Daikin Wi-Fi controller exposes its cleartext HTTP HVAC control API

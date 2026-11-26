@@ -26,6 +26,14 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: the unencrypted ESPHome port accepts connections without a password
+  - effect: control
+    basis: conditional
+    requires: the ESPHome device exposes switches, relays, or locks without encryption
+
 remediation:
   summary: >
     ESPHome node advertised its native API on port 6053 without Noise protocol

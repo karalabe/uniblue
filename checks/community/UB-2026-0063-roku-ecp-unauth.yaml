@@ -35,6 +35,14 @@ probe:
       - "<serial-number>"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Roku TV returned device info without auth
+  - effect: control
+    basis: conditional
+    requires: Roku allows sending remote button presses or launching apps over the LAN
+
 remediation:
   summary: >
     Roku exposes its unauthenticated External Control Protocol (ECP) on port

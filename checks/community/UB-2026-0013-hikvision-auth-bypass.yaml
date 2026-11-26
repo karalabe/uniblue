@@ -34,6 +34,21 @@ probe:
       - "<userName>"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Hikvision camera leaked its user list via auth bypass
+
+  - effect: configure
+    basis: implied
+    note: auth bypass gives full admin access to camera settings and accounts
+  - effect: control
+    basis: implied
+    note: auth bypass gives admin control over the camera
+  - effect: secrets
+    basis: implied
+    note: admin access exposes stored camera accounts and passwords
+
 remediation:
   summary: >
     IP camera is vulnerable to the critical Hikvision authentication bypass

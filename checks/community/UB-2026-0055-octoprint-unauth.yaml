@@ -36,6 +36,17 @@ probe:
       - '"serial":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: OctoPrint returned printer settings without login
+  - effect: control
+    basis: conditional
+    requires: OctoPrint allows starting prints or controlling heaters without login
+  - effect: configure
+    basis: conditional
+    requires: OctoPrint allows changing settings without login
+
 remediation:
   summary: >
     OctoPrint returned full printer settings from /api/settings without an API

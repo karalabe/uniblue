@@ -27,6 +27,11 @@ probe:
   port: 554
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: RTSP returned stream details without login (live playback was not started)
+
 remediation:
   summary: >
     RTSP service on port 554 responded successfully without requiring

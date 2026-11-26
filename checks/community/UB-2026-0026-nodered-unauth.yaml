@@ -59,6 +59,20 @@ probe:
         evidence_summary: "Runtime settings confirmed adminAuth is unset"
         redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Node-RED returned its flows without login
+  - effect: control
+    basis: implied
+    note: Node-RED confirmed admin authentication is turned off
+  - effect: configure
+    basis: implied
+    note: Node-RED admin editor has no login configured
+  - effect: pivot
+    basis: implied
+    note: Node-RED flows can run code and talk to other devices on this VLAN
+
 remediation:
   summary: >
     Node-RED served flow data anonymously and confirmed adminAuth is unset.

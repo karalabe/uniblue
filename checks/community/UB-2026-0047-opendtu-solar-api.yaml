@@ -38,6 +38,11 @@ probe:
     evidence_summary: "OpenDTU solar gateway served /api/livedata/status without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: OpenDTU returned live solar inverter readings without login
+
 remediation:
   summary: >
     OpenDTU exposes its local solar telemetry API on port 80. Verify that an

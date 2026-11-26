@@ -27,6 +27,14 @@ probe:
   port: 11211
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: proven
+    note: Memcached answered without authentication
+  - effect: secrets
+    basis: conditional
+    requires: cached items contain session tokens or sensitive data
+
 remediation:
   summary: >
     Memcached responded to an unauthenticated version query on TCP port 11211.

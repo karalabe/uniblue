@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "IPP/IPPS printing service advertised via DNS-SD (printing separated from printer administration)"
 
+grants: []
+
 remediation:
   summary: >
     A network printer is advertising IPP/IPPS printing via DNS-SD. Approved

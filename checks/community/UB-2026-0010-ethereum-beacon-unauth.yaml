@@ -33,6 +33,11 @@ probe:
     headers_absent: ["WWW-Authenticate"]
     redact_body: false
 
+grants:
+  - effect: read
+    basis: proven
+    note: Ethereum Beacon API answered without authentication
+
 remediation:
   summary: >
     Ethereum Consensus Beacon REST API is reachable without authentication.

@@ -39,6 +39,7 @@ func TestRunnerUsesEffectiveProbeIPAndNeverContactsPublicIPv4(t *testing.T) {
 	rawCheck := `
 id: UB-TEST-PROBEIP
 title: Test EffectiveProbeIP Selection
+grants: [{effect: read, basis: proven}]
 category: test
 severity: high
 safety: read-only
@@ -63,10 +64,10 @@ probe:
 	// never 8.8.8.8.
 	hp := probe.HostProfile{
 		Client: unifi.Client{
-			MAC:   "aa:bb:cc:dd:ee:10",
-			IP:    "198.51.100.25",
-			IPv6:  []string{"127.0.0.1"},
-			Name:  "DualStackPublicV4",
+			MAC:  "aa:bb:cc:dd:ee:10",
+			IP:   "198.51.100.25",
+			IPv6: []string{"127.0.0.1"},
+			Name: "DualStackPublicV4",
 		},
 		ProbeIP:   addrPort.Addr().String(),
 		OpenPorts: []int{port},
@@ -104,6 +105,8 @@ preconditions:
   mdns_type_any: ["_slzb-06._tcp"]
 probe:
   type: observe
+grants:
+  - {effect: control, basis: conditional, requires: the bridge accepts TCP connections without authentication}
 `
 	chk, err := Parse([]byte(rawCheck), "test")
 	if err != nil {

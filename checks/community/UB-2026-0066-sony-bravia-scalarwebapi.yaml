@@ -25,6 +25,11 @@ preconditions:
 probe:
   type: observe
 
+grants:
+  - effect: control
+    basis: conditional
+    requires: IP control is enabled without a pre-shared key
+
 remediation:
   summary: >
     Sony Bravia TV advertises its local ScalarWebAPI / IRCC remote-control

@@ -31,6 +31,8 @@ probe:
   match:
     evidence_summary: "DoorBird IP intercom identified via _axis-video._tcp with DoorBird OUI 1c:ca:e3 (prevents Axis camera misattribution)"
 
+grants: []
+
 remediation:
   summary: >
     A DoorBird video intercom was discovered on the LAN. Restrict administration

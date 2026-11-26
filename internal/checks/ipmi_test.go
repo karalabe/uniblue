@@ -64,7 +64,7 @@ func TestProbeIPMIRMCPAndCipher0(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	ev, ok := probeIPMI(ctx, "127.0.0.1", udpAddr.Port)
+	ev, ok := probeIPMI(ctx, "127.0.0.1", udpAddr.Port, &Observation{})
 	if !ok {
 		t.Fatalf("expected IPMI probe to match mock BMC")
 	}

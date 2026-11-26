@@ -29,6 +29,11 @@ probe:
   type: bitcoin-p2p
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: implied
+    note: Bitcoin node answered P2P handshake on the LAN
+
 remediation:
   summary: >
     A Bitcoin P2P peer listener responded with a mainnet/testnet version

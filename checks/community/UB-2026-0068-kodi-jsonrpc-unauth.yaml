@@ -35,6 +35,14 @@ probe:
       - '"name":"Kodi"'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Kodi answered JSON-RPC queries without login
+  - effect: control
+    basis: conditional
+    requires: Kodi allows controlling playback or add-ons without login
+
 remediation:
   summary: >
     Kodi's HTTP JSON-RPC API on port 8080 responded without HTTP Basic

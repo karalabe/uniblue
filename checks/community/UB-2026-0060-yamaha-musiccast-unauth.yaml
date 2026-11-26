@@ -35,6 +35,14 @@ probe:
       - '"api_version":'
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Yamaha MusicCast returned receiver info without login
+  - effect: control
+    basis: conditional
+    requires: Yamaha MusicCast allows controlling playback and zones without login
+
 remediation:
   summary: >
     Yamaha MusicCast exposes its unauthenticated Extended Control (YXC) HTTP

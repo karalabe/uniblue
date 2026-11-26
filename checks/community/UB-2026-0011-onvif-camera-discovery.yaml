@@ -26,6 +26,8 @@ preconditions:
 probe:
   type: observe
 
+grants: []
+
 remediation:
   summary: >
     An ONVIF IP camera or NVR answered WS-Discovery on UDP 3702. Verify that

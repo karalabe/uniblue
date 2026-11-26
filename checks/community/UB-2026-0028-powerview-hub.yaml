@@ -30,6 +30,8 @@ probe:
   match:
     evidence_summary: "Hunter Douglas PowerView shade hub advertised via DNS-SD"
 
+grants: []
+
 remediation:
   summary: >
     A Hunter Douglas PowerView motorized shade hub was discovered on the LAN.

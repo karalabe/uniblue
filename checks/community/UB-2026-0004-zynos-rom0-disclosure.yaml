@@ -35,6 +35,14 @@ probe:
       - "autoexec.net"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: router served /rom-0 config backup without login
+  - effect: secrets
+    basis: implied
+    note: "the /rom-0 backup contains the router's admin password"
+
 remediation:
   summary: >
     Device serves its raw ZynOS /rom-0 backup archive without authentication

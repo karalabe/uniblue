@@ -39,6 +39,14 @@ probe:
         regex: "ValetudoRobot"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Valetudo exposed vacuum info without login
+  - effect: control
+    basis: conditional
+    requires: Valetudo allows starting or steering the vacuum without login
+
 remediation:
   summary: >
     Valetudo's REST API is accessible without HTTP Basic Authentication. Any

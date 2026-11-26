@@ -39,6 +39,11 @@ probe:
     evidence_summary: "Fronius Solar API discovery endpoint responded with unauthenticated API version metadata"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: Fronius inverter returned solar API info without login
+
 remediation:
   summary: >
     Fronius inverter exposes its unauthenticated Solar API v1 on port 80,

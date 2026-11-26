@@ -35,6 +35,11 @@ probe:
     evidence_summary: "AirGradient monitor served /measures/current sensor telemetry without authentication"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: AirGradient returned air-quality readings without login
+
 remediation:
   summary: >
     AirGradient monitor exposes its local HTTP sensor API without

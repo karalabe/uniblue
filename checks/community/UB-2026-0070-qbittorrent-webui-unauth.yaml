@@ -35,6 +35,14 @@ probe:
     evidence_summary: "qBittorrent /api/v2/app/version returned version without session cookie (subnet auth bypass active)"
     redact_body: true
 
+grants:
+  - effect: read
+    basis: proven
+    note: qBittorrent Web UI answered without login
+  - effect: control
+    basis: conditional
+    requires: qBittorrent allows adding or managing torrents without login
+
 remediation:
   summary: >
     qBittorrent Web UI answered /api/v2/app/version without requiring login,

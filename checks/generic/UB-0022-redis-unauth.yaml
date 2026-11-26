@@ -27,6 +27,20 @@ probe:
   port: 6379
   timeout: 3s
 
+grants:
+  - effect: read
+    basis: conditional
+    requires: Redis allows reading keys without authentication
+  - effect: control
+    basis: conditional
+    requires: Redis allows write commands
+  - effect: configure
+    basis: conditional
+    requires: Redis allows admin commands like CONFIG SET
+  - effect: pivot
+    basis: conditional
+    requires: Redis can write files, load modules, or connect out to other hosts
+
 remediation:
   summary: >
     Redis responded with +PONG to an unauthenticated PING on port 6379. Any
