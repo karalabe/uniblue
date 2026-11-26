@@ -479,7 +479,7 @@ func TestDualStackPeersWithIPv4OnlyDeny(t *testing.T) {
 		Source:      unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
 		Destination: unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
 	}}
-	_, _, findings := evaluatePeerContainmentAxis(s, s.Networks[2], "complete", "")
+	_, _, findings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[2])
 	f := findPeerGap(t, findings, "isolation-wired-sensors")
 	if !strings.Contains(f.Evidence, "Switch L2/L3 Default permits IPv6") || strings.Contains(f.Evidence, "IPv4") || strings.Contains(f.Remediation.Summary, "IPv4") {
 		t.Fatalf("incorrect family attribution: %+v", f)
@@ -534,7 +534,7 @@ func TestWiredPeerACLUsesBothRealEndpoints(t *testing.T) {
 	if p := sensorContainment(t, s, cfg).Peers; !p.Violation {
 		t.Fatalf("missed reverse connection: %+v", p)
 	}
-	_, _, findings := evaluatePeerContainmentAxis(s, s.Networks[2], "complete", "")
+	_, _, findings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[2])
 	f := findPeerGap(t, findings, "isolation-wired-sensors")
 	flow := "IPv4 TCP/8554 from " + b.IP + " ("
 	if !strings.Contains(f.Evidence, flow) || !strings.Contains(f.Evidence, "to "+a.IP) ||
@@ -592,7 +592,7 @@ func TestWiredPeerAttributionAndSummary(t *testing.T) {
 		s.Devices[0].Ports[i].Isolation = i >= 2
 		macs = append(macs, s.Clients[i].MAC)
 	}
-	axis, _, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	axis, _, findings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 	f := findPeerGap(t, findings, "isolation-wired-cameras")
 	wantPorts := []checks.SwitchPortRef{{SwitchMAC: s.Devices[0].MAC, PortIdx: 1}, {SwitchMAC: s.Devices[0].MAC, PortIdx: 2}}
 	if !slices.Equal(f.AffectedClientMACs, macs) || !slices.Equal(f.AffectedSwitchPorts, wantPorts) {
@@ -607,7 +607,7 @@ func TestWiredPeerAttributionAndSummary(t *testing.T) {
 	}
 	slices.Reverse(s.Clients)
 	slices.Reverse(s.Devices[0].Ports)
-	next, _, nextFindings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	next, _, nextFindings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 	if next != axis || !reflect.DeepEqual(nextFindings, findings) {
 		t.Fatal("controller ordering changed the peer summary")
 	}
@@ -625,7 +625,7 @@ func TestPeerRuleSummaries(t *testing.T) {
 			Destination: unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true},
 		})
 	}
-	_, cells, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	_, cells, findings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 	f := findPeerGap(t, findings, "isolation-wired-cameras")
 	if len(cells) != 2 || !strings.Contains(f.Evidence, "Allow peer 1 on Network POE Switch permits IPv4") ||
 		!strings.Contains(f.Evidence, "Allow peer 2 on Network POE Switch permits IPv4") ||
@@ -648,7 +648,7 @@ func TestSharedWiredPeerCoverage(t *testing.T) {
 				}
 			}
 			s.Devices[0].Ports[1].MACTableCount = tc.macs
-			axis, cells, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+			axis, cells, findings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 			unknown, blocked := 0, 0
 			for _, c := range cells {
 				switch c.Verdict {
@@ -696,7 +696,7 @@ func TestWiFiPeerRemediation(t *testing.T) {
 			}
 			s.Clients = append(s.Clients, unifi.Client{MAC: "02:00:00:02:00:11", APMAC: s.Devices[1].MAC, NetworkName: "Cameras"})
 			s.WLANs = []unifi.WLANConfig{{Name: "Patio", NetworkName: "Cameras", Enabled: true}}
-			axis, cells, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+			axis, cells, findings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 			if strings.Contains(axis.Detail, "Downstream") {
 				t.Fatalf("AP trunk treated as a shared access socket: %+v", axis)
 			}
@@ -723,7 +723,7 @@ func TestWiFiPeerRemediation(t *testing.T) {
 				}
 			}
 			s.Clients = nil
-			_, _, findings = evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+			_, _, findings = NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 			f := findPeerGap(t, findings, "isolation-same-ap-cameras")
 			if f.Evidence != "Client Device Isolation is off on SSID Patio." || f.Remediation.Summary != "Enable Client Device Isolation on Patio." ||
 				len(f.AffectedClientMACs)+len(f.AffectedSwitchPorts) != 0 {
@@ -740,7 +740,7 @@ func TestPeerSummaryBounds(t *testing.T) {
 	for i := range s.Clients {
 		s.Clients[i].Name = strings.Repeat("x", 100)
 	}
-	axis, _, findings := evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	axis, _, findings := NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 	f := findPeerGap(t, findings, "isolation-wired-cameras")
 	if len(f.AffectedClientMACs) != 20 || len(f.AffectedSwitchPorts) != 20 || !strings.Contains(f.Evidence, "190 of 190 wired peer pairs") ||
 		!strings.Contains(f.Evidence, "+14 more ports") || !strings.Contains(f.Remediation.Summary, "+14 more ports") ||
@@ -758,7 +758,7 @@ func TestPeerSummaryBounds(t *testing.T) {
 		})
 		s.WLANs = append(s.WLANs, unifi.WLANConfig{Name: fmt.Sprintf("SSID %02d", i+1), Enabled: true, NetworkName: "Cameras"})
 	}
-	_, _, findings = evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	_, _, findings = NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 	f = findPeerGap(t, findings, "isolation-wired-cameras")
 	if !strings.Contains(f.Evidence, "+14 more rules") || !strings.Contains(f.Remediation.Summary, "+14 more rules") {
 		t.Fatalf("rule display limit missing: %+v", f)
@@ -771,7 +771,7 @@ func TestPeerSummaryBounds(t *testing.T) {
 	for i := range s.Devices[0].Ports {
 		s.Devices[0].Ports[i].Isolation = i != 0
 	}
-	axis, _, findings = evaluatePeerContainmentAxis(s, s.Networks[0], "complete", "")
+	axis, _, findings = NewOracle(s, config.NetworkConfig{}).evaluatePeerContainmentAxis(s.Networks[0])
 	f = findPeerGap(t, findings, "isolation-wired-cameras")
 	if !strings.Contains(f.Evidence, "64 of 2048 evaluated wired peer pairs") || !strings.Contains(axis.Detail, "limit reached") || !axis.Violation {
 		t.Fatalf("lost partial coverage: %+v, %s", f, axis.Detail)

@@ -897,13 +897,17 @@ func SaveState(path string, st *State) error {
 // Isolation flags, and UniFi's structural network purpose ("corporate" vs "guest").
 // It never guesses trust tiers from user-chosen VLAN names.
 func resolveVLANTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig) (trusted, isolated map[string]struct{}) {
+	return vlanTiers(snap, netCfg, isolatedZoneSet(snap))
+}
+
+// vlanTiers assigns trust and isolation after resolving the effective firewall zones.
+func vlanTiers(snap *unifi.Snapshot, netCfg config.NetworkConfig, isoZones map[string]bool) (trusted, isolated map[string]struct{}) {
 	trusted = toLowerSet(netCfg.TrustedVLANs)
 	isolated = toLowerSet(netCfg.IsolatedVLANs)
 	if snap == nil {
 		return trusted, isolated
 	}
 
-	isoZones := isolatedZoneSet(snap)
 	intendedIsoZones := intendedIsolatedZoneSet(snap)
 
 	for _, n := range snap.Networks {
@@ -1063,45 +1067,25 @@ func intendedIsolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 // connection states, and schedules while tolerating only single-host /32 or
 // /128 narrow-port pinholes such as DNS 53 or NTP 123).
 func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
+	return newPolicyOracle(snap).isolatedZones()
+}
+
+// isolatedZones checks the candidate zones against the same routing evidence used for isolation cells.
+func (o *Oracle) isolatedZones() map[string]bool {
+	snap := o.snap
 	zones := map[string]bool{
 		"hotspot": true,
 		"dmz":     true,
 	}
-	if snap == nil || len(snap.FirewallPolicies) == 0 {
+	if len(o.sortedPolicies) == 0 || !o.gwPoliciesAvailable {
 		return zones
 	}
-	if snap.Visibility != nil && !snap.Visibility.GatewayPoliciesAvailable {
-		return zones
-	}
-	sorted := make([]unifi.FirewallPolicy, len(snap.FirewallPolicies))
-	copy(sorted, snap.FirewallPolicies)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		if sorted[i].Index != sorted[j].Index {
-			return sorted[i].Index < sorted[j].Index
-		}
-		return i < j
-	})
-
 	candidates := blanketBlockZones(snap, false)
 	intNets := zoneLANNetworks(snap, "Internal")
-
-	gwName, _ := findGatewayIdentity(snap)
-	switchACLStatus := "unavailable"
-	switchACLReason := "controller snapshot omits switch ACLs"
-	if snap.SwitchACLCoverage != nil && snap.SwitchACLCoverage.Status != "" {
-		switchACLStatus = strings.ToLower(snap.SwitchACLCoverage.Status)
-		if snap.SwitchACLCoverage.Reason != "" {
-			switchACLReason = snap.SwitchACLCoverage.Reason
-		}
-	} else if len(snap.SwitchACLs) > 0 {
-		switchACLStatus = "complete"
-		switchACLReason = ""
-	}
-
 	for srcLow, srcRaw := range candidates {
 		srcNets := zoneLANNetworks(snap, srcRaw)
 		pinholeIntent := config.IsolationIntent{
-			ApprovedPaths: narrowPinholePathsForZone(sorted, srcRaw),
+			ApprovedPaths: narrowPinholePathsForZone(o.sortedPolicies, srcRaw),
 		}
 		var pinholeIPsV4, pinholeIPsV6 []string
 		for _, ap := range pinholeIntent.ApprovedPaths {
@@ -1119,10 +1103,8 @@ func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 		for _, srcNet := range srcNets {
 			for _, dstNet := range intNets {
 				for _, fam := range []string{"ipv4", "ipv6"} {
-					cell := evaluateTransitBoundary(
-						snap, nil, sorted, pinholeIntent, true, "",
-						switchACLStatus, switchACLReason, gwName,
-						srcNet, dstNet, srcRaw, "Internal", fam,
+					cell := o.evaluateBoundary(
+						nil, pinholeIntent, srcNet, dstNet, srcRaw, "Internal", fam, "deny", nil,
 					)
 					if cell.Verdict != IsolationBlockedOK {
 						fullyIsolated = false
@@ -1148,7 +1130,7 @@ func isolatedZoneSet(snap *unifi.Snapshot) map[string]bool {
 								}
 							}
 							srcIP := sampleNetworkIPForFamily(srcNet, snap, fam)
-							udpDec := evaluateGatewayPolicies(sorted, pathQuery{
+							udpDec := evaluateGatewayPolicies(o.sortedPolicies, pathQuery{
 								srcZone:    srcRaw,
 								srcNetID:   srcNet.ID,
 								srcNetName: srcNet.Name,

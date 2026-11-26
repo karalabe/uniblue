@@ -369,18 +369,11 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 	// shadowed BLOCK policies) so broad ALLOW rules defeating custom-zone
 	// isolation are still flagged as isolation leaks.
 	isoZones := intendedIsolatedZoneSet(snap)
-	gwName, gwIP := findGatewayIdentity(snap)
+	gwName, _, gwIP := findGatewayIdentity(snap)
 
 	// Sort policies by Index so we can detect when an earlier broad BLOCK/REJECT
 	// rule already shadows a later ALLOW policy on the same zone pair.
-	sorted := make([]unifi.FirewallPolicy, len(snap.FirewallPolicies))
-	copy(sorted, snap.FirewallPolicies)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		if sorted[i].Index != sorted[j].Index {
-			return sorted[i].Index < sorted[j].Index
-		}
-		return i < j
-	})
+	sorted := orderedFirewallPolicies(snap.FirewallPolicies)
 
 	isShadowedByEarlierDeny := func(pos int, pol unifi.FirewallPolicy) bool {
 		for k := 0; k < pos; k++ {
@@ -544,9 +537,9 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 	return findings
 }
 
-// findGatewayIdentity returns a human-readable name and IP for the UniFi
+// findGatewayIdentity returns the display name, MAC and IP for the UniFi
 // gateway from snap.Devices so firewall policy findings display cleanly.
-func findGatewayIdentity(snap *unifi.Snapshot) (name, ip string) {
+func findGatewayIdentity(snap *unifi.Snapshot) (name, mac, ip string) {
 	for _, d := range snap.Devices {
 		modelLower := strings.ToLower(d.Model)
 		if strings.Contains(modelLower, "udm") || strings.Contains(modelLower, "ucg") ||
@@ -557,10 +550,10 @@ func findGatewayIdentity(snap *unifi.Snapshot) (name, ip string) {
 			if n == "" {
 				n = d.Model
 			}
-			return n, d.IP
+			return n, d.MAC, d.IP
 		}
 	}
-	return "UniFi Gateway", ""
+	return "UniFi Gateway", "", ""
 }
 
 // formatPolicyPorts formats a PolicyEndpoint's destination port restriction.

@@ -139,7 +139,7 @@ func TestControllerPolicyParity(t *testing.T) {
 func TestACLClassAndCompoundTargets(t *testing.T) {
 	any := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
 	acls := []unifi.SwitchACL{{Enabled: true, RuleType: "IPV4", Index: 0, Action: "ALLOW", Source: any, Destination: any}, {Enabled: true, RuleType: "MAC", Index: 12, Action: "BLOCK", Source: any, Destination: any}}
-	if got := evaluateSwitchACLs(acls, "", pathQuery{ipFamily: "ipv4"}); got.action != "deny" {
+	if got := evaluateSwitchACLs(orderedSwitchACLs(acls), "", pathQuery{ipFamily: "ipv4"}); got.action != "deny" {
 		t.Fatal(got)
 	}
 	ep := unifi.PolicyEndpoint{AnyPort: true, IPs: []string{"192.0.2.4"}, MACs: []string{"02:00:00:00:00:01"}, NetworkIDs: []string{"iot"}}

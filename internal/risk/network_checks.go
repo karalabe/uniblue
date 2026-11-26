@@ -31,7 +31,7 @@ func AnalyzeExtendedNetworkChecks(
 	}
 	var findings []checks.Finding
 	var notes []PostureNote
-	gwName, gwIP := findGatewayIdentity(snap)
+	gwName, _, gwIP := findGatewayIdentity(snap)
 	gwClient := unifi.Client{MAC: "gw:" + snap.Site, IP: gwIP, Name: gwName}
 
 	// 1. Upstream NAT / CGNAT WAN reachability disclaimer (never overstate

@@ -36,26 +36,48 @@ const (
 // IsolationCell records one evaluated network isolation path across a specific
 // source, destination function, transport, port, IP family, and enforcement point.
 type IsolationCell struct {
-	SourceZone       string           `json:"source_zone"`
-	SourceNetwork    string           `json:"source_network,omitempty"`
-	DestZone         string           `json:"dest_zone"`
-	DestNetwork      string           `json:"dest_network,omitempty"`
-	DestHost         string           `json:"dest_host,omitempty"`
-	DestIP           string           `json:"dest_ip,omitempty"`
-	DestFunction     string           `json:"dest_function"`
-	Transport        string           `json:"transport"`
-	Port             int              `json:"port,omitempty"`
-	IPFamily         string           `json:"ip_family"` // "ipv4" | "ipv6"
-	PathKind         string           `json:"path_kind"` // "gateway-routed" | "switch-routed" | "same-ap-wifi" | "cross-ap-wifi" | "wired-same-vlan" | "mixed-same-vlan" | "gateway-local"
-	Enforcer         string           `json:"enforcer"`  // device/layer actually enforcing the boundary
-	Expected         string           `json:"expected"`  // "allow" | "deny"
-	Effective        string           `json:"effective"` // "allow" | "deny" | "unknown"
-	Verdict          IsolationVerdict `json:"verdict"`
-	DecisiveRuleID   string           `json:"decisive_rule_id,omitempty"`
-	DecisiveRuleName string           `json:"decisive_rule_name,omitempty"`
-	DecisiveReason   string           `json:"decisive_reason,omitempty"`
-	MissingInput     string           `json:"missing_input,omitempty"`
-	RecommendedFix   string           `json:"recommended_fix,omitempty"`
+	// SourceZone is the firewall zone where the connection originates.
+	SourceZone string `json:"source_zone"`
+	// SourceNetwork names the originating VLAN or the permitted WAN sources.
+	SourceNetwork string `json:"source_network,omitempty"`
+	// DestZone is the firewall zone containing the destination.
+	DestZone string `json:"dest_zone"`
+	// DestNetwork names the network containing the destination.
+	DestNetwork string `json:"dest_network,omitempty"`
+	// DestHost identifies the evaluated host or network by its display name.
+	DestHost string `json:"dest_host,omitempty"`
+	// DestIP is the destination address used for the decision.
+	DestIP string `json:"dest_ip,omitempty"`
+	// DestFunction identifies the service or boundary being evaluated.
+	DestFunction string `json:"dest_function"`
+	// Transport is the evaluated protocol or "all" for a protocol-independent path.
+	Transport string `json:"transport"`
+	// Port is the destination port when the decision identifies one.
+	Port int `json:"port,omitempty"`
+	// IPFamily is "ipv4", "ipv6", or "both" for a family-independent decision.
+	IPFamily string `json:"ip_family"`
+	// PathKind describes how traffic reaches the destination.
+	PathKind string `json:"path_kind"`
+	// Enforcer names the device or setting responsible for the decision.
+	Enforcer string `json:"enforcer"`
+	// EnforcerMACs identifies the enforcing devices by their canonical hardware addresses.
+	EnforcerMACs []string `json:"enforcer_macs,omitempty"`
+	// Expected records whether site intent requires "allow" or "deny".
+	Expected string `json:"expected"`
+	// Effective records the configured outcome as "allow", "deny", or "unknown".
+	Effective string `json:"effective"`
+	// Verdict compares the effective outcome with the expected one.
+	Verdict IsolationVerdict `json:"verdict"`
+	// DecisiveRuleID identifies the matching rule in the controller.
+	DecisiveRuleID string `json:"decisive_rule_id,omitempty"`
+	// DecisiveRuleName names the matching rule or default disposition.
+	DecisiveRuleName string `json:"decisive_rule_name,omitempty"`
+	// DecisiveReason explains which evidence determined the outcome.
+	DecisiveReason string `json:"decisive_reason,omitempty"`
+	// MissingInput identifies the evidence needed to resolve an unknown outcome.
+	MissingInput string `json:"missing_input,omitempty"`
+	// RecommendedFix describes the change needed to meet site intent.
+	RecommendedFix string `json:"recommended_fix,omitempty"`
 }
 
 // IsolationMatrix summarizes effective isolation policy evaluation across zones,
@@ -119,47 +141,13 @@ func EvaluateIsolation(
 	var findings []checks.Finding
 	var notes []PostureNote
 
-	trustedSet, isolatedSet := resolveVLANTiers(snap, netCfg)
+	o := NewOracle(snap, netCfg)
+	trustedSet, isolatedSet := vlanTiers(snap, netCfg, o.isolatedZones())
 	intendedIsoZones := intendedIsolatedZoneSet(snap)
-	intent := netCfg.IsolationPolicy
-	gwName, gwIP := findGatewayIdentity(snap)
-
-	// Determine whether gateway firewall policy telemetry is genuinely available.
-	// Never certify a path as blocked-ok when the controller failed to supply
-	// firewall policies or uses a legacy API without zone policies.
-	gwPoliciesAvailable := true
-	gwMissingReason := ""
-	if snap.Visibility != nil {
-		gwPoliciesAvailable = snap.Visibility.GatewayPoliciesAvailable
-		if !gwPoliciesAvailable {
-			gwMissingReason = "gateway firewall policies were unavailable from the controller"
-			for _, f := range snap.Visibility.MissingFeeds {
-				if strings.Contains(strings.ToLower(f), "firewall") {
-					gwMissingReason = f
-					break
-				}
-			}
-		}
-	} else if len(snap.Zones) == 0 && len(snap.FirewallPolicies) == 0 {
-		gwPoliciesAvailable = false
-		gwMissingReason = "snapshot includes no firewall zones or policies"
-	}
-
-	// Index networks and resolve roles (guest, iot, camera, management, trusted).
-	netByName := make(map[string]unifi.Network, len(snap.Networks))
-	netByID := make(map[string]unifi.Network, len(snap.Networks))
-	for _, n := range snap.Networks {
-		if n.Name != "" {
-			netByName[strings.ToLower(n.Name)] = n
-		}
-		if n.ID != "" {
-			netByID[n.ID] = n
-		}
-	}
+	intent := o.intent
 
 	var untrustedNets []unifi.Network
 	var trustedNets []unifi.Network
-	var mgmtNets []unifi.Network
 	var containmentNets []unifi.Network
 	// Always include VLANs explicitly named in containment policy lists even if
 	// they currently reside in the Internal zone without UniFi network isolation.
@@ -179,7 +167,6 @@ func EvaluateIsolation(
 			containmentNets = append(containmentNets, n)
 		}
 		if isManagementNetwork(n, intent) {
-			mgmtNets = append(mgmtNets, n)
 			continue
 		}
 		if isNetworkInSet(n.Name, isolatedSet) || isGuestNetwork(n, intent) || isCameraNetwork(n, intent) ||
@@ -193,29 +180,8 @@ func EvaluateIsolation(
 		}
 	}
 
-	bmcClients := identifyBMCClients(snap, rawFindings, mgmtNets)
-	printerClients := identifyPrinterClients(snap, rawFindings, intent)
-
-	sortedPolicies := make([]unifi.FirewallPolicy, len(snap.FirewallPolicies))
-	copy(sortedPolicies, snap.FirewallPolicies)
-	sort.SliceStable(sortedPolicies, func(i, j int) bool {
-		if sortedPolicies[i].Index != sortedPolicies[j].Index {
-			return sortedPolicies[i].Index < sortedPolicies[j].Index
-		}
-		return i < j
-	})
-
-	switchACLStatus := "unavailable"
-	switchACLReason := "controller snapshot omits switch ACLs"
-	if snap.SwitchACLCoverage != nil && snap.SwitchACLCoverage.Status != "" {
-		switchACLStatus = strings.ToLower(snap.SwitchACLCoverage.Status)
-		if snap.SwitchACLCoverage.Reason != "" {
-			switchACLReason = snap.SwitchACLCoverage.Reason
-		}
-	} else if len(snap.SwitchACLs) > 0 {
-		switchACLStatus = "complete"
-		switchACLReason = ""
-	}
+	bmcClients := o.identifyBMCClients(rawFindings)
+	printerClients := o.identifyPrinterClients(rawFindings)
 
 	addCell := func(cell IsolationCell) {
 		matrix.Cells = append(matrix.Cells, cell)
@@ -236,7 +202,7 @@ func EvaluateIsolation(
 	// 1. Evaluate Untrusted/Guest -> BMC paths across IPv4 and IPv6 using real
 	// family-specific addresses and observed BMC service endpoints.
 	for _, bmc := range bmcClients {
-		bmcNet := lookupClientNetwork(bmc, netByID, netByName)
+		bmcNet := o.network(bmc.NetworkID, bmc.NetworkName)
 		bmcZone := strings.TrimSpace(bmcNet.ZoneName)
 		endpoints := bmcServiceEndpoints(bmc, rawFindings)
 		for _, srcNet := range untrustedNets {
@@ -254,9 +220,8 @@ func EvaluateIsolation(
 					if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, bmc, bmcZone, "bmc", ep.proto, ep.port, fam) {
 						expected = "allow"
 					}
-					cell := evaluateRoutedPath(
-						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-						switchACLStatus, switchACLReason, gwName, srcNet, bmcNet,
+					cell := o.evaluateRoutedPath(
+						srcNet, bmcNet,
 						pathQuery{
 							srcZone:    srcZone,
 							srcNetID:   srcNet.ID,
@@ -313,7 +278,7 @@ func EvaluateIsolation(
 	// 2. Evaluate Guest/Untrusted -> Printer (Approved IPPS Printing vs Blocked Printer Admin)
 	// across both IPv4 and IPv6 whenever IPv6 context is present on the site/printer.
 	for _, prn := range printerClients {
-		prnNet := lookupClientNetwork(prn, netByID, netByName)
+		prnNet := o.network(prn.NetworkID, prn.NetworkName)
 		prnZone := strings.TrimSpace(prnNet.ZoneName)
 		printPort := printerServicePort(prn, rawFindings, intent)
 		cupsAdminOn631 := hasCUPSAdminFinding(prn, rawFindings)
@@ -336,9 +301,8 @@ func EvaluateIsolation(
 				if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, prn, prnZone, "printing", "tcp", printPort, fam) {
 					ippsExpected = "allow"
 				}
-				ippsCell := evaluateRoutedPath(
-					snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-					switchACLStatus, switchACLReason, gwName, srcNet, prnNet,
+				ippsCell := o.evaluateRoutedPath(
+					srcNet, prnNet,
 					pathQuery{
 						srcZone:    srcZone,
 						srcNetID:   srcNet.ID,
@@ -383,6 +347,7 @@ func EvaluateIsolation(
 						IPFamily:         fam,
 						PathKind:         ippsCell.PathKind,
 						Enforcer:         ippsCell.Enforcer + " + CUPS /admin",
+						EnforcerMACs:     ippsCell.EnforcerMACs,
 						Expected:         "deny",
 						Effective:        "allow",
 						Verdict:          IsolationViolation,
@@ -413,9 +378,8 @@ func EvaluateIsolation(
 
 				// 2b. Dedicated Printer Web Administration (TCP 443 / 80) must be denied from Guest.
 				for _, adminPort := range []int{443, 80} {
-					adminCell := evaluateRoutedPath(
-						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-						switchACLStatus, switchACLReason, gwName, srcNet, prnNet,
+					adminCell := o.evaluateRoutedPath(
+						srcNet, prnNet,
 						pathQuery{
 							srcZone:    srcZone,
 							srcNetID:   srcNet.ID,
@@ -500,7 +464,7 @@ func EvaluateIsolation(
 					}
 				}
 			}
-			dstNet := lookupClientNetwork(dstClient, netByID, netByName)
+			dstNet := o.network(dstClient.NetworkID, dstClient.NetworkName)
 			if dstNet.Name == "" && ap.DestZone != "" {
 				for _, n := range snap.Networks {
 					if strings.EqualFold(n.ZoneName, ap.DestZone) || strings.EqualFold(n.Name, ap.DestZone) {
@@ -514,7 +478,7 @@ func EvaluateIsolation(
 			}
 		} else if strings.TrimSpace(ap.DestRole) != "" {
 			for _, cl := range snap.Clients {
-				clNet := lookupClientNetwork(cl, netByID, netByName)
+				clNet := o.network(cl.NetworkID, cl.NetworkName)
 				if ap.DestZone != "" && !strings.EqualFold(clNet.ZoneName, ap.DestZone) && !strings.EqualFold(clNet.Name, ap.DestZone) {
 					continue
 				}
@@ -573,9 +537,8 @@ func EvaluateIsolation(
 						continue
 					}
 					dstAddr := firstNonEmptyStr(clientAddressForFamily(dstClient, fam), ap.DestIP)
-					cell := evaluateRoutedPath(
-						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-						switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
+					cell := o.evaluateRoutedPath(
+						srcNet, dstNet,
 						pathQuery{
 							srcZone:    srcZone,
 							srcNetID:   srcNet.ID,
@@ -618,10 +581,8 @@ func EvaluateIsolation(
 				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, unifi.Client{}) {
 					continue
 				}
-				cell := evaluateTransitBoundary(
-					snap, rawFindings, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason,
-					switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
-					srcZone, dstZone, fam,
+				cell := o.evaluateBoundary(
+					rawFindings, intent, srcNet, dstNet, srcZone, dstZone, fam, "deny", nil,
 				)
 				if cell.Verdict == IsolationViolation {
 					cell.RecommendedFix = fmt.Sprintf(
@@ -637,7 +598,7 @@ func EvaluateIsolation(
 						Transport:         cell.Transport,
 						BaseSeverity:      checks.SeverityHigh,
 						EffectiveSeverity: checks.SeverityHigh,
-						Client:            unifi.Client{MAC: "iso:" + srcNet.ID + ":" + dstNet.ID, IP: gwIP, Name: fmt.Sprintf("%s -> %s", srcNet.Name, dstNet.Name), NetworkName: srcNet.Name},
+						Client:            unifi.Client{MAC: "iso:" + srcNet.ID + ":" + dstNet.ID, IP: o.gwIP, Name: fmt.Sprintf("%s -> %s", srcNet.Name, dstNet.Name), NetworkName: srcNet.Name},
 						Port:              cell.Port,
 						Evidence:          fmt.Sprintf("source=%s (%s) -> dest=%s (%s, family=%s, proto=%s/%d, enforcer=%s, decisive_rule=%q)", srcNet.Name, srcZone, dstNet.Name, dstZone, fam, cell.Transport, cell.Port, cell.Enforcer, cell.DecisiveRuleName),
 						Remediation: checks.Remediation{
@@ -659,13 +620,12 @@ func EvaluateIsolation(
 		// 3b. Untrusted -> Gateway Administration (always enforced by the Gateway Zone Firewall, never an L3 switch)
 		// across IPv4 and, whenever IPv6 context exists on the source network or gateway policies, IPv6.
 		for _, fam := range []string{"ipv4", "ipv6"} {
-			if fam == "ipv6" && !gatewayHasIPv6Context(snap, srcNet, sortedPolicies) {
+			if fam == "ipv6" && !gatewayHasIPv6Context(snap, srcNet, o.sortedPolicies) {
 				continue
 			}
-			gwIPsFam := allGatewayIPsForFamily(snap, gwIP, fam, srcNet, sortedPolicies)
-			gwAdminCell := evaluateGatewayAdminBoundary(
-				snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-				switchACLStatus, switchACLReason, gwName, gwIPsFam, srcNet, srcZone, fam,
+			gwIPsFam := allGatewayIPsForFamily(snap, o.gwIP, fam, srcNet, o.sortedPolicies)
+			gwAdminCell := o.evaluateGatewayAdminBoundary(
+				gwIPsFam, srcNet, srcZone, fam,
 			)
 			if gwAdminCell.Verdict == IsolationViolation {
 				gwAdminCell.RecommendedFix = fmt.Sprintf(
@@ -674,16 +634,16 @@ func EvaluateIsolation(
 				)
 				findings = append(findings, checks.Finding{
 					CheckID:           "UB-UNIFI-ISO-GW-ADMIN",
-					Title:             fmt.Sprintf("Untrusted Network Permitted %s Gateway Administration (%s -> %s)", strings.ToUpper(fam), srcNet.Name, gwName),
+					Title:             fmt.Sprintf("Untrusted Network Permitted %s Gateway Administration (%s -> %s)", strings.ToUpper(fam), srcNet.Name, o.gwName),
 					Category:          "isolation-policy",
 					ClaimKind:         checks.ClaimConfiguredAccess,
 					Property:          fmt.Sprintf("isolation-gw-admin-%s-%s", strings.ToLower(srcNet.Name), fam),
 					Transport:         gwAdminCell.Transport,
 					BaseSeverity:      checks.SeverityHigh,
 					EffectiveSeverity: checks.SeverityHigh,
-					Client:            unifi.Client{MAC: "gw:" + srcNet.ID, IP: firstNonEmptyStr(gwAdminCell.DestIP, gwIP), Name: gwName, NetworkName: srcNet.Name + " -> Gateway"},
+					Client:            unifi.Client{MAC: "gw:" + srcNet.ID, IP: firstNonEmptyStr(gwAdminCell.DestIP, o.gwIP), Name: o.gwName, NetworkName: srcNet.Name + " -> Gateway"},
 					Port:              gwAdminCell.Port,
-					Evidence:          fmt.Sprintf("source=%s (%s) -> gateway=%s (function=gateway-admin, family=%s, proto=%s/%d, decisive_rule=%q)", srcNet.Name, srcZone, gwName, fam, gwAdminCell.Transport, gwAdminCell.Port, gwAdminCell.DecisiveRuleName),
+					Evidence:          fmt.Sprintf("source=%s (%s) -> gateway=%s (function=gateway-admin, family=%s, proto=%s/%d, decisive_rule=%q)", srcNet.Name, srcZone, o.gwName, fam, gwAdminCell.Transport, gwAdminCell.Port, gwAdminCell.DecisiveRuleName),
 					Remediation: checks.Remediation{
 						Summary:      gwAdminCell.RecommendedFix,
 						UniFiActions: []string{"block_untrusted_gateway_admin"},
@@ -697,13 +657,13 @@ func EvaluateIsolation(
 		// flag only if an explicit rule breaks them (broken-dependency). Check both the source
 		// VLAN's own gateway interface IP (from srcNet.Subnet) and the primary gateway IP so
 		// DNS/DHCP ALLOW rules scoped to the VLAN's local gateway IP are recognized as approved.
-		if gwPoliciesAvailable {
+		if o.gwPoliciesAvailable {
 			var depDstIPs []string
 			if vlanGW := subnetGatewayIP(srcNet.Subnet); vlanGW != "" {
 				depDstIPs = append(depDstIPs, vlanGW)
 			}
-			if gwIP != "" && (len(depDstIPs) == 0 || depDstIPs[0] != gwIP) {
-				depDstIPs = append(depDstIPs, gwIP)
+			if o.gwIP != "" && (len(depDstIPs) == 0 || depDstIPs[0] != o.gwIP) {
+				depDstIPs = append(depDstIPs, o.gwIP)
 			}
 			if len(depDstIPs) == 0 {
 				depDstIPs = []string{""}
@@ -725,9 +685,8 @@ func EvaluateIsolation(
 				}
 				var depCell IsolationCell
 				for idxIP, candidateIP := range depDstIPs {
-					cand := evaluateRoutedPath(
-						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-						switchACLStatus, switchACLReason, gwName, srcNet, unifi.Network{Name: "Gateway", ZoneName: "Gateway"},
+					cand := o.evaluateRoutedPath(
+						srcNet, unifi.Network{Name: "Gateway", ZoneName: "Gateway"},
 						pathQuery{
 							srcZone:    srcZone,
 							srcNetID:   srcNet.ID,
@@ -740,7 +699,7 @@ func EvaluateIsolation(
 							port:       dep.port,
 							ipFamily:   "ipv4",
 							state:      "new",
-						}, gwName, dep.function, "allow",
+						}, o.gwName, dep.function, "allow",
 					)
 					if idxIP == 0 {
 						depCell = cand
@@ -774,9 +733,8 @@ func EvaluateIsolation(
 
 	// Evaluate 4-axis network containment (Peers, LAN Egress, Internet Egress,
 	// and LAN Inbound) for every isolated or explicitly targeted VLAN.
-	containment, contCells, contFindings, contNotes := evaluateNetworkContainment(
-		snap, rawFindings, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason,
-		switchACLStatus, switchACLReason, gwName,
+	containment, contCells, contFindings, contNotes := o.evaluateNetworkContainment(
+		rawFindings,
 		containmentNets, trustedNets, matrix.Cells,
 	)
 	matrix.Containment = containment
@@ -787,265 +745,6 @@ func EvaluateIsolation(
 	notes = append(notes, contNotes...)
 
 	return matrix, findings, notes
-}
-
-// evaluateRoutedPath resolves the enforcement owner (Gateway vs L3 Switch) and
-// computes the effective allow/deny/unknown decision for a single routed path.
-func evaluateRoutedPath(
-	snap *unifi.Snapshot,
-	sortedPolicies []unifi.FirewallPolicy,
-	gwPoliciesAvailable bool,
-	gwMissingReason string,
-	switchACLStatus, switchACLReason, gwName string,
-	srcNet, dstNet unifi.Network,
-	q pathQuery,
-	destHost, destFunction, expected string,
-) IsolationCell {
-	// When a network-wide query leaves srcIP/srcMAC unspecified (for example,
-	// Untrusted -> BMC, Guest -> Printer, or Gateway DHCP/DNS), partition the
-	// source network across all policy source selectors so subnet-scoped rules
-	// (such as UniFi's "Isolated Networks" with source 10.3.0.0/16) resolve
-	// cleanly while single-host rules still get exact multi-partition coverage.
-	if strings.TrimSpace(q.srcIP) == "" && strings.TrimSpace(q.srcMAC) == "" {
-		if sample := sampleNetworkIPForFamily(srcNet, snap, q.ipFamily); sample != "" {
-			return evaluateRoutedPathAcrossSourceNetwork(
-				snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-				switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
-				q, destHost, destFunction, expected, sample,
-			)
-		}
-	}
-
-	isGatewayLocal := strings.EqualFold(q.dstZone, "gateway")
-	pathKind := "gateway-routed"
-	if isGatewayLocal {
-		pathKind = "gateway-local"
-	}
-
-	cell := IsolationCell{
-		SourceZone:    firstNonEmptyStr(q.srcZone, srcNet.Name),
-		SourceNetwork: srcNet.Name,
-		DestZone:      firstNonEmptyStr(q.dstZone, dstNet.Name),
-		DestNetwork:   dstNet.Name,
-		DestHost:      destHost,
-		DestIP:        q.dstIP,
-		DestFunction:  destFunction,
-		Transport:     q.proto,
-		Port:          q.port,
-		IPFamily:      q.ipFamily,
-		PathKind:      pathKind,
-		Enforcer:      gwName + " (Zone Firewall)",
-		Expected:      expected,
-	}
-
-	// Gateway-local traffic is ALWAYS evaluated by the UniFi Gateway itself,
-	// never by an L3 switch ACL.
-	if !isGatewayLocal && (srcNet.RouterUnresolved || dstNet.RouterUnresolved) {
-		cell.Effective = "unknown"
-		cell.Verdict = IsolationUnknown
-		cell.MissingInput = "Switch routing owner could not be resolved"
-		return cell
-	}
-	if !isGatewayLocal {
-		l3SwitchMAC := firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC)
-		if l3SwitchMAC != "" {
-			cell.PathKind = "switch-routed"
-			swName := deviceNameByMAC(snap, l3SwitchMAC)
-			cell.Enforcer = swName + " (L3 Switch ACL)"
-			if switchACLStatus != "complete" {
-				cell.Effective = "unknown"
-				cell.Verdict = IsolationUnknown
-				cell.MissingInput = fmt.Sprintf(
-					"Switch ACL unavailable for L3 switch %s (%s); gateway firewall rules do not govern switch-routed inter-VLAN traffic.",
-					swName, switchACLReason,
-				)
-				cell.RecommendedFix = fmt.Sprintf(
-					"Collect switch ACL configuration from %s (or move routing for %s to the UniFi gateway) to verify effective isolation.",
-					swName, firstNonEmptyStr(srcNet.Name, dstNet.Name),
-				)
-				return cell
-			}
-			dec := evaluateSwitchACLs(snap.SwitchACLs, l3SwitchMAC, q)
-			applyDecisionToCell(&cell, dec)
-			return cell
-		}
-	}
-
-	// Gateway-routed or gateway-local path: require real gateway firewall policy telemetry.
-	if !gwPoliciesAvailable {
-		cell.Effective = "unknown"
-		cell.Verdict = IsolationUnknown
-		cell.MissingInput = fmt.Sprintf(
-			"Gateway firewall policy telemetry is unavailable (%s); isolation cannot be verified without controller firewall rules.",
-			firstNonEmptyStr(gwMissingReason, "firewall policy feed missing"),
-		)
-		cell.RecommendedFix = "Grant the configured account read access to the site firewall zones and policies to verify gateway isolation."
-		return cell
-	}
-	if strings.TrimSpace(q.srcZone) == "" || strings.TrimSpace(q.dstZone) == "" {
-		cell.Effective = "unknown"
-		cell.Verdict = IsolationUnknown
-		cell.MissingInput = fmt.Sprintf(
-			"Unresolved firewall zone for %s -> %s; controller did not map one or both networks to a Zone-Based Firewall zone.",
-			srcNet.Name, dstNet.Name,
-		)
-		return cell
-	}
-
-	dec := evaluateGatewayPolicies(sortedPolicies, q)
-	applyDecisionToCell(&cell, dec)
-	return cell
-}
-
-// evaluateRoutedPathAcrossSourceNetwork evaluates a network-wide routed query
-// across every distinct source IP/MAC equivalence class of srcNet so subnet-scoped
-// rules resolve deterministically without ever masking partial-subnet leaks.
-func evaluateRoutedPathAcrossSourceNetwork(
-	snap *unifi.Snapshot,
-	sortedPolicies []unifi.FirewallPolicy,
-	gwPoliciesAvailable bool,
-	gwMissingReason string,
-	switchACLStatus, switchACLReason, gwName string,
-	srcNet, dstNet unifi.Network,
-	q pathQuery,
-	destHost, destFunction, expected, srcIPSample string,
-) IsolationCell {
-	var srcPosSelectors, srcNegSelectors []string
-	srcMACSet := make(map[string]struct{})
-	hasSrcMAC := false
-
-	collectEndpoint := func(ep unifi.PolicyEndpoint) {
-		if ep.ZoneName != "" && q.srcZone != "" && !strings.EqualFold(ep.ZoneName, q.srcZone) {
-			return
-		}
-		if !endpointMatchesNetworkSelector(ep, srcNet) {
-			return
-		}
-		if ep.AnyTarget {
-			return
-		}
-		if ep.NegateTarget {
-			srcNegSelectors = append(srcNegSelectors, ep.IPs...)
-		} else {
-			srcPosSelectors = append(srcPosSelectors, ep.IPs...)
-		}
-		for _, m := range ep.MACs {
-			if ml := strings.ToLower(strings.TrimSpace(m)); ml != "" {
-				hasSrcMAC = true
-				srcMACSet[ml] = struct{}{}
-			}
-		}
-	}
-
-	for _, pol := range sortedPolicies {
-		if !pol.Enabled || !matchesIPFamily(pol.IPVersion, q.ipFamily) || !matchesConnState(pol.ConnectionStates, q.state) {
-			continue
-		}
-		if pol.Destination.ZoneName != "" && q.dstZone != "" && !strings.EqualFold(pol.Destination.ZoneName, q.dstZone) {
-			continue
-		}
-		collectEndpoint(pol.Source)
-	}
-	if !strings.EqualFold(q.dstZone, "gateway") && firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC) != "" {
-		for _, acl := range snap.SwitchACLs {
-			if !acl.Enabled || !matchesIPFamily(acl.IPVersion, q.ipFamily) {
-				continue
-			}
-			collectEndpoint(acl.Source)
-		}
-	}
-
-	srcNetPfx, hasSrcNetPfx := networkPrefixForFamily(srcNet, q.ipFamily)
-	prefSrc, _ := netip.ParseAddr(strings.TrimSpace(srcIPSample))
-	prefSrc = prefSrc.Unmap()
-
-	var srcIPs []string
-	for _, iv := range partitionIPIntervals(srcNet, snap, q.ipFamily, srcPosSelectors, srcNegSelectors, nil) {
-		if rep := representativeIPInInterval(iv, srcNetPfx, hasSrcNetPfx, prefSrc); rep != "" {
-			srcIPs = append(srcIPs, rep)
-		}
-	}
-	if len(srcIPs) == 0 {
-		srcIPs = []string{srcIPSample}
-	}
-
-	var srcMACs []string
-	if hasSrcMAC {
-		for m := range srcMACSet {
-			srcMACs = append(srcMACs, m)
-		}
-		sort.Strings(srcMACs)
-		srcMACs = append(srcMACs, syntheticOtherMAC)
-	} else {
-		srcMACs = []string{""}
-	}
-
-	var firstCell IsolationCell
-	var unknownCell *IsolationCell
-	var brokenCell *IsolationCell
-	first := true
-	evals := 0
-	for _, sip := range srcIPs {
-		for _, smac := range srcMACs {
-			evals++
-			if evals > maxExactBoundaryEvals {
-				if first {
-					firstCell = evaluateRoutedPath(
-						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-						switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
-						pathQuery{
-							srcZone: q.srcZone, srcNetID: q.srcNetID, srcNetName: q.srcNetName,
-							srcIP: srcIPSample, srcPort: q.srcPort,
-							dstZone: q.dstZone, dstNetID: q.dstNetID, dstNetName: q.dstNetName,
-							dstIP: q.dstIP, dstMAC: q.dstMAC,
-							proto: q.proto, port: q.port, ipFamily: q.ipFamily, state: q.state,
-						}, destHost, destFunction, expected,
-					)
-				}
-				firstCell.Effective = "unknown"
-				firstCell.Verdict = IsolationUnknown
-				firstCell.MissingInput = fmt.Sprintf("Policy evaluation exceeded %d exact source partitions for %s -> %s.", maxExactBoundaryEvals, srcNet.Name, dstNet.Name)
-				return firstCell
-			}
-			sub := q
-			sub.srcIP = sip
-			sub.srcMAC = smac
-			cell := evaluateRoutedPath(
-				snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-				switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
-				sub, destHost, destFunction, expected,
-			)
-			if first {
-				firstCell = cell
-				first = false
-			}
-			if expected == "deny" {
-				if cell.Verdict == IsolationViolation {
-					return cell
-				}
-				if cell.Verdict == IsolationUnknown && unknownCell == nil {
-					cp := cell
-					unknownCell = &cp
-				}
-			} else {
-				if cell.Verdict == IsolationBrokenDependency && brokenCell == nil {
-					cp := cell
-					brokenCell = &cp
-				}
-				if cell.Verdict == IsolationUnknown && unknownCell == nil {
-					cp := cell
-					unknownCell = &cp
-				}
-			}
-		}
-	}
-	if brokenCell != nil {
-		return *brokenCell
-	}
-	if unknownCell != nil {
-		return *unknownCell
-	}
-	return firstCell
 }
 
 func applyDecisionToCell(cell *IsolationCell, dec policyDecision) {
@@ -1248,9 +947,8 @@ func orderedSwitchACLs(acls []unifi.SwitchACL) []unifi.SwitchACL {
 // switchMAC for the directed query q, returning the first matching verdict or
 // the default switch forwarding allow when no rule matches.
 func evaluateSwitchACLs(acls []unifi.SwitchACL, switchMAC string, q pathQuery) policyDecision {
-	sorted := orderedSwitchACLs(acls)
 	swLower := strings.ToLower(strings.TrimSpace(switchMAC))
-	for _, acl := range sorted {
+	for _, acl := range acls {
 		if !acl.Enabled {
 			continue
 		}
@@ -1527,20 +1225,6 @@ func sameClient(a, b unifi.Client) bool {
 		return true
 	}
 	return a.IP != "" && b.IP != "" && a.IP == b.IP
-}
-
-func lookupClientNetwork(cl unifi.Client, netByID, netByName map[string]unifi.Network) unifi.Network {
-	if cl.NetworkID != "" {
-		if n, ok := netByID[cl.NetworkID]; ok {
-			return n
-		}
-	}
-	if cl.NetworkName != "" {
-		if n, ok := netByName[strings.ToLower(cl.NetworkName)]; ok {
-			return n
-		}
-	}
-	return unifi.Network{Name: cl.NetworkName}
 }
 
 func matchesIPFamily(ruleVer, queryFam string) bool {
@@ -2153,6 +1837,11 @@ func approvedHostIPsFor(
 // match net (respecting AnyTarget and NegateTarget).
 func endpointMatchesNetworkSelector(ep unifi.PolicyEndpoint, net unifi.Network) bool {
 	if ep.AnyTarget || ep.UnsupportedSelector != "" || (ep.NegateTarget && ep.HasCompoundTarget()) || len(ep.NetworkIDs) == 0 {
+		return true
+	}
+	if net.ID == "" && net.Name == "" {
+		// An unresolved network (for example, a zone-only placeholder or WAN
+		// fallback without WAN inventory) cannot be ruled out against NetworkIDs.
 		return true
 	}
 	hit := (net.ID != "" && containsFold(ep.NetworkIDs, net.ID)) ||
@@ -2863,31 +2552,16 @@ type boundaryRule struct {
 	priorUncondBlocked []portInterval
 }
 
-// evaluateTransitBoundary verifies an untrusted-to-trusted network pair across
-// TCP, UDP, and any other allow-referenced protocols using exact equivalence
-// partitioning over source IPs, destination IPs, MACs, and port ranges across
-// every relevant rule and approved exception. It returns IsolationBlockedOK
-// only when every class covered by an allow rule is proven blocked or approved,
-// returning IsolationUnknown if exact coverage cannot be completed.
-func evaluateTransitBoundary(
-	snap *unifi.Snapshot,
-	rawFindings []checks.Finding,
-	sortedPolicies []unifi.FirewallPolicy,
-	intent config.IsolationIntent,
-	gwPoliciesAvailable bool,
-	gwMissingReason, switchACLStatus, switchACLReason, gwName string,
-	srcNet, dstNet unifi.Network,
-	srcZone, dstZone, fam string,
-) IsolationCell {
-	return evaluateBoundary(snap, rawFindings, sortedPolicies, intent, gwPoliciesAvailable, gwMissingReason, switchACLStatus, switchACLReason, gwName, srcNet, dstNet, srcZone, dstZone, fam, "deny", nil)
-}
-
-// peerEndpoints constrains a same-VLAN boundary evaluation to two concrete
-// attached clients. Leaving a side empty keeps that side network-wide (for
-// example, traffic behind a wireless AP or a lone wired client on the VLAN).
+// peerEndpoints constrains a boundary evaluation to concrete source and
+// destination clients across either routed or same-VLAN Oracle queries.
+// Leaving a side empty keeps that side network-wide (for example, traffic
+// behind a wireless AP or a lone wired client on a VLAN).
 type peerEndpoints struct {
-	src unifi.Client
-	dst unifi.Client
+	// concrete pins missing client attributes as unknown in individual queries.
+	// Whole-VLAN containment leaves unobserved attachment endpoints unconstrained.
+	concrete bool
+	src      unifi.Client
+	dst      unifi.Client
 }
 
 // peerAddresses extracts every IP address of client c matching fam ("ipv4" or
@@ -2907,19 +2581,15 @@ func peerAddresses(c unifi.Client, fam string) []string {
 // "allow"). Invoking it for both expectations distinguishes a mixed/restricted
 // policy from an unconditional allow or deny while preserving exact first-match
 // rule ordering.
-func evaluateBoundary(
-	snap *unifi.Snapshot,
+func (o *Oracle) evaluateBoundary(
 	rawFindings []checks.Finding,
-	sortedPolicies []unifi.FirewallPolicy,
 	intent config.IsolationIntent,
-	gwPoliciesAvailable bool,
-	gwMissingReason, switchACLStatus, switchACLReason, gwName string,
 	srcNet, dstNet unifi.Network,
 	srcZone, dstZone, fam, expected string,
 	peers *peerEndpoints,
 ) IsolationCell {
-	srcIPSample := sampleNetworkIPForFamily(srcNet, snap, fam)
-	dstIPSample := sampleNetworkIPForFamily(dstNet, snap, fam)
+	srcIPSample := sampleNetworkIPForFamily(srcNet, o.snap, fam)
+	dstIPSample := sampleNetworkIPForFamily(dstNet, o.snap, fam)
 
 	var fixedSrc, fixedDst []string
 	var fixedSrcMAC, fixedDstMAC string
@@ -2927,6 +2597,14 @@ func evaluateBoundary(
 		fixedSrc = peerAddresses(peers.src, fam)
 		fixedDst = peerAddresses(peers.dst, fam)
 		fixedSrcMAC, fixedDstMAC = peers.src.MAC, peers.dst.MAC
+		if peers.concrete {
+			if len(fixedSrc) == 0 && (peers.src.MAC != "" || peers.src.IP != "") {
+				fixedSrc = []string{""}
+			}
+			if len(fixedDst) == 0 {
+				fixedDst = []string{""}
+			}
+		}
 		if len(fixedSrc) > 0 {
 			srcIPSample = fixedSrc[0]
 		}
@@ -2938,7 +2616,7 @@ func evaluateBoundary(
 	// External zone so internet-egress witnesses always target public space.
 	var externalExclusions []string
 	var excludedPrefixes []netip.Prefix
-	if dstZone == "External" {
+	if dstZone == "External" && (peers == nil || !peers.concrete) {
 		externalExclusions = []string{
 			"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
 			"169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "192.0.2.0/24",
@@ -2946,7 +2624,7 @@ func evaluateBoundary(
 			"3fff::/20", "224.0.0.0/4", "240.0.0.0/4", "::/96", "::ffff:0:0/96",
 			"fc00::/7", "fe80::/10", "ff00::/8",
 		}
-		for _, local := range snap.Networks {
+		for _, local := range o.snap.Networks {
 			externalExclusions = append(externalExclusions, local.Subnet, local.IPv6Subnet)
 		}
 		for _, raw := range externalExclusions {
@@ -2960,8 +2638,8 @@ func evaluateBoundary(
 		}
 	}
 	baseDstIP := func(proto string, port int) string {
-		if approvedIPs, _ := approvedHostIPsFor(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, proto, port, fam); len(approvedIPs) > 0 {
-			if outside := sampleIPOutsideSelectors(dstNet, snap, fam, approvedIPs); outside != "" {
+		if approvedIPs, _ := approvedHostIPsFor(o.snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, proto, port, fam); len(approvedIPs) > 0 {
+			if outside := sampleIPOutsideSelectors(dstNet, o.snap, fam, approvedIPs); outside != "" {
 				return outside
 			}
 		}
@@ -2982,6 +2660,11 @@ func evaluateBoundary(
 	hasFirst := false
 	var unknownCell *IsolationCell
 
+	evaluate := o.evaluateRoutedPath
+	if peers != nil && peers.concrete && len(fixedSrc) != 0 {
+		// A missing address on an identified client cannot stand in for the whole VLAN.
+		evaluate = o.routedCell
+	}
 	evalOne := func(proto string, port, srcPort int, srcIP, srcMAC, dstIP, dstMAC string, allowSkipApproved bool) (IsolationCell, bool) {
 		if len(externalExclusions) > 0 {
 			ip, err := netip.ParseAddr(dstIP)
@@ -3008,12 +2691,11 @@ func evaluateBoundary(
 		}
 		evaluated[k] = struct{}{}
 
-		if expected == "deny" && allowSkipApproved && isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
+		if expected == "deny" && allowSkipApproved && isTransitProbeApproved(o.snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
 			return IsolationCell{}, false
 		}
-		cell := evaluateRoutedPath(
-			snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-			switchACLStatus, switchACLReason, gwName, srcNet, dstNet,
+		cell := evaluate(
+			srcNet, dstNet,
 			pathQuery{
 				srcZone:    srcZone,
 				srcNetID:   srcNet.ID,
@@ -3033,7 +2715,7 @@ func evaluateBoundary(
 			}, dstNet.Name, "trusted-lan-transit", expected,
 		)
 		if cell.Verdict == IsolationViolation || cell.Verdict == IsolationBrokenDependency {
-			if expected == "deny" && isTransitProbeApproved(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
+			if expected == "deny" && isTransitProbeApproved(o.snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
 				return IsolationCell{}, false
 			}
 			return cell, true
@@ -3055,18 +2737,21 @@ func evaluateBoundary(
 	if viol, ok := evalOne("tcp", 443, 49152, srcIPSample, fixedSrcMAC, baseDstIP("tcp", 443), fixedDstMAC, false); ok {
 		return viol
 	}
-	if srcNet.RouterUnresolved || dstNet.RouterUnresolved {
+	isGatewayOnly := strings.EqualFold(srcZone, "External") || strings.EqualFold(dstZone, "External") || strings.EqualFold(dstZone, "Gateway")
+	if !isGatewayOnly && (srcNet.RouterUnresolved || dstNet.RouterUnresolved) {
 		return firstCell
 	}
-	if !gwPoliciesAvailable && firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC) == "" {
+	l3SwitchMAC := ""
+	if !isGatewayOnly {
+		l3SwitchMAC = firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC)
+	}
+	if !o.gwPoliciesAvailable && l3SwitchMAC == "" {
 		return firstCell
 	}
 	if viol, ok := evalOne("udp", 53, 49152, srcIPSample, fixedSrcMAC, baseDstIP("udp", 53), fixedDstMAC, true); ok {
 		return viol
 	}
-
-	l3SwitchMAC := firstNonEmptyStr(srcNet.RouterDeviceMAC, dstNet.RouterDeviceMAC)
-	if l3SwitchMAC != "" && switchACLStatus != "complete" {
+	if l3SwitchMAC != "" && o.switchACLStatus != "complete" {
 		return firstCell
 	}
 	if l3SwitchMAC == "" && (strings.TrimSpace(srcZone) == "" || strings.TrimSpace(dstZone) == "") {
@@ -3094,14 +2779,14 @@ func evaluateBoundary(
 
 	var sortedACLs []unifi.SwitchACL
 	if l3SwitchMAC != "" {
-		sortedACLs = orderedSwitchACLs(snap.SwitchACLs)
+		sortedACLs = o.sortedACLs
 		for _, acl := range sortedACLs {
 			if acl.Enabled && matchesIPFamily(acl.IPVersion, fam) {
 				addProto(acl.Protocol)
 			}
 		}
 	} else {
-		for _, pol := range sortedPolicies {
+		for _, pol := range o.sortedPolicies {
 			if pol.Enabled && matchesIPFamily(pol.IPVersion, fam) {
 				addProto(pol.Protocol)
 			}
@@ -3304,14 +2989,14 @@ func evaluateBoundary(
 			}
 		} else {
 			deferBlocks = true
-			for i := 0; i < len(sortedPolicies); {
-				idx := sortedPolicies[i].Index
+			for i := 0; i < len(o.sortedPolicies); {
+				idx := o.sortedPolicies[i].Index
 				j := i + 1
-				for j < len(sortedPolicies) && sortedPolicies[j].Index == idx {
+				for j < len(o.sortedPolicies) && o.sortedPolicies[j].Index == idx {
 					j++
 				}
 				for k := i; k < j; k++ {
-					pol := sortedPolicies[k]
+					pol := o.sortedPolicies[k]
 					if !pol.Enabled || !matchesIPFamily(pol.IPVersion, fam) || !matchesConnState(pol.ConnectionStates, "new") {
 						continue
 					}
@@ -3355,7 +3040,7 @@ func evaluateBoundary(
 		// Include all approved destination host IPs and ports AND each allow
 		// rule's prior unconditional block intervals (never post-allow blocks!)
 		// so every unblocked, unapproved port interval is isolated cleanly.
-		approvedIPs, approvedPorts := collectApprovedPointsFor(snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, pr, fam)
+		approvedIPs, approvedPorts := collectApprovedPointsFor(o.snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, pr, fam)
 		dstPorts = append(dstPorts, approvedPorts...)
 		for _, ar := range allowRules {
 			for _, iv := range ar.priorUncondBlocked {
@@ -3363,12 +3048,19 @@ func evaluateBoundary(
 			}
 		}
 
-		srcIntervals := partitionIPIntervals(srcNet, snap, fam, srcPosSelectors, srcNegSelectors, nil)
-		dstIntervals := partitionIPIntervals(dstNet, snap, fam, append(dstPosSelectors, externalExclusions...), dstNegSelectors, approvedIPs)
+		srcNeg := srcNegSelectors
+		if strings.EqualFold(srcZone, "External") {
+			srcNeg = append(append([]string(nil), srcNegSelectors...), nonRoutableExternalCIDRs(fam)...)
+		}
+		srcIntervals := partitionIPIntervals(srcNet, o.snap, fam, srcPosSelectors, srcNeg, nil)
+		dstIntervals := partitionIPIntervals(dstNet, o.snap, fam, append(dstPosSelectors, externalExclusions...), dstNegSelectors, approvedIPs)
 
 		var srcReps []string
 		for _, iv := range srcIntervals {
 			if rep := representativeIPInInterval(iv, srcNetPfx, hasSrcNetPfx, prefSrc); rep != "" {
+				if strings.EqualFold(srcZone, "External") && isNonRoutableIP(rep) {
+					continue
+				}
 				srcReps = append(srcReps, rep)
 			}
 		}
@@ -3426,10 +3118,10 @@ func evaluateBoundary(
 		if len(fixedDst) > 0 {
 			dstReps = fixedDst
 		}
-		if fixedSrcMAC != "" {
+		if fixedSrcMAC != "" || (peers != nil && peers.concrete && len(fixedSrc) != 0) {
 			srcMACs = []string{fixedSrcMAC}
 		}
-		if fixedDstMAC != "" {
+		if fixedDstMAC != "" || (peers != nil && peers.concrete) {
 			dstMACs = []string{fixedDstMAC}
 		}
 		sourcePorts := []int{0}
@@ -3542,7 +3234,8 @@ func evaluateBoundary(
 				Transport:     "tcp",
 				IPFamily:      fam,
 				PathKind:      "gateway-routed",
-				Enforcer:      gwName + " (Zone Firewall)",
+				Enforcer:      o.gwName + " (Zone Firewall)",
+				EnforcerMACs:  enforcerMACs(o.gwMAC),
 				Expected:      "deny",
 			}
 		}
@@ -3562,74 +3255,17 @@ func evaluateBoundary(
 // and all gateway interface IPs for the requested address family ("ipv4" or
 // "ipv6") so narrow earlier blocks never mask neighbor sources or alternate
 // gateway IPs.
-func evaluateGatewayAdminBoundary(
-	snap *unifi.Snapshot,
-	sortedPolicies []unifi.FirewallPolicy,
-	gwPoliciesAvailable bool,
-	gwMissingReason, switchACLStatus, switchACLReason, gwName string,
+func (o *Oracle) evaluateGatewayAdminBoundary(
 	gwIPs []string,
 	srcNet unifi.Network,
 	srcZone, fam string,
 ) IsolationCell {
 	adminPorts := []int{443, 22, 80, 8443}
-	srcIPSample := sampleNetworkIPForFamily(srcNet, snap, fam)
+	srcIPSample := sampleNetworkIPForFamily(srcNet, o.snap, fam)
 
-	var srcPosSelectors, srcNegSelectors []string
-	srcMACSet := make(map[string]struct{})
-	hasSrcMAC := false
-	for _, pol := range sortedPolicies {
-		if !pol.Enabled || !matchesIPFamily(pol.IPVersion, fam) || !matchesConnState(pol.ConnectionStates, "new") {
-			continue
-		}
-		if pol.Destination.ZoneName != "" && !strings.EqualFold(pol.Destination.ZoneName, "gateway") {
-			continue
-		}
-		if pol.Source.ZoneName != "" && srcZone != "" && !strings.EqualFold(pol.Source.ZoneName, srcZone) {
-			continue
-		}
-		if !endpointMatchesNetworkSelector(pol.Source, srcNet) {
-			continue
-		}
-		if !pol.Source.AnyTarget {
-			if pol.Source.NegateTarget {
-				srcNegSelectors = append(srcNegSelectors, pol.Source.IPs...)
-			} else {
-				srcPosSelectors = append(srcPosSelectors, pol.Source.IPs...)
-			}
-			for _, m := range pol.Source.MACs {
-				ml := strings.ToLower(strings.TrimSpace(m))
-				if ml != "" {
-					hasSrcMAC = true
-					srcMACSet[ml] = struct{}{}
-				}
-			}
-		}
-	}
-
-	srcNetPfx, hasSrcNetPfx := networkPrefixForFamily(srcNet, fam)
-	prefSrc, _ := netip.ParseAddr(strings.TrimSpace(srcIPSample))
-	prefSrc = prefSrc.Unmap()
-
-	var srcIPs []string
-	for _, iv := range partitionIPIntervals(srcNet, snap, fam, srcPosSelectors, srcNegSelectors, nil) {
-		if rep := representativeIPInInterval(iv, srcNetPfx, hasSrcNetPfx, prefSrc); rep != "" {
-			srcIPs = append(srcIPs, rep)
-		}
-	}
-	if len(srcIPs) == 0 {
-		srcIPs = []string{srcIPSample}
-	}
-
-	var srcMACs []string
-	if hasSrcMAC {
-		for m := range srcMACSet {
-			srcMACs = append(srcMACs, m)
-		}
-		sort.Strings(srcMACs)
-		srcMACs = append(srcMACs, syntheticOtherMAC)
-	} else {
-		srcMACs = []string{""}
-	}
+	gateway := unifi.Network{Name: "Gateway", ZoneName: "Gateway"}
+	query := pathQuery{srcZone: srcZone, dstZone: gateway.ZoneName, ipFamily: fam, state: "new"}
+	srcIPs, srcMACs := o.sourceRepresentatives(srcNet, gateway, query, srcIPSample)
 
 	var firstCell IsolationCell
 	var unknownCell *IsolationCell
@@ -3645,9 +3281,8 @@ func evaluateGatewayAdminBoundary(
 						incomplete = true
 						goto doneGW
 					}
-					cell := evaluateRoutedPath(
-						snap, sortedPolicies, gwPoliciesAvailable, gwMissingReason,
-						switchACLStatus, switchACLReason, gwName, srcNet, unifi.Network{Name: "Gateway", ZoneName: "Gateway"},
+					cell := o.evaluateRoutedPath(
+						srcNet, gateway,
 						pathQuery{
 							srcZone:    srcZone,
 							srcNetID:   srcNet.ID,
@@ -3661,7 +3296,7 @@ func evaluateGatewayAdminBoundary(
 							port:       port,
 							ipFamily:   fam,
 							state:      "new",
-						}, gwName, "gateway-admin", "deny",
+						}, o.gwName, "gateway-admin", "deny",
 					)
 					if first {
 						firstCell = cell
@@ -4106,33 +3741,19 @@ func isCameraNetwork(n unifi.Network, intent config.IsolationIntent) bool {
 	return strings.Contains(low, "camera") || strings.Contains(low, "cam") || strings.Contains(low, "nvr")
 }
 
-func identifyBMCClients(snap *unifi.Snapshot, rawFindings []checks.Finding, mgmtNets []unifi.Network) []unifi.Client {
-	clientByKey := make(map[string]unifi.Client, len(snap.Clients))
-	for _, cl := range snap.Clients {
-		if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
-			clientByKey[m] = cl
-		}
-		if cl.IP != "" {
-			clientByKey[cl.IP] = cl
-		}
-	}
+// identifyBMCClients resolves finding identities against the snapshot inventory.
+func (o *Oracle) identifyBMCClients(rawFindings []checks.Finding) []unifi.Client {
 	bmcByKey := make(map[string]unifi.Client)
 	for _, f := range rawFindings {
 		if f.Category == "oob-bmc" || f.CheckID == "UB-0020" || f.CheckID == "UB-0019" {
-			cl := f.Client
-			// Prefer the richer snapshot Client record (which carries IPv6 addresses).
-			if full, ok := clientByKey[strings.ToLower(strings.TrimSpace(cl.MAC))]; ok {
-				cl = full
-			} else if full, ok := clientByKey[cl.IP]; ok {
-				cl = full
-			}
+			cl := o.inventoryClient(f.Client)
 			k := firstNonEmptyStr(strings.ToLower(cl.MAC), cl.IP)
 			if k != "" {
 				bmcByKey[k] = cl
 			}
 		}
 	}
-	for _, cl := range snap.Clients {
+	for _, cl := range o.snap.Clients {
 		if bmcIdentityPattern.MatchString(cl.Name) || bmcIdentityPattern.MatchString(cl.Hostname) {
 			k := firstNonEmptyStr(strings.ToLower(cl.MAC), cl.IP)
 			if k != "" {
@@ -4148,34 +3769,21 @@ func identifyBMCClients(snap *unifi.Snapshot, rawFindings []checks.Finding, mgmt
 	return out
 }
 
-func identifyPrinterClients(snap *unifi.Snapshot, rawFindings []checks.Finding, intent config.IsolationIntent) []unifi.Client {
-	clientByKey := make(map[string]unifi.Client, len(snap.Clients))
-	for _, cl := range snap.Clients {
-		if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
-			clientByKey[m] = cl
-		}
-		if cl.IP != "" {
-			clientByKey[cl.IP] = cl
-		}
-	}
+// identifyPrinterClients combines printing evidence with the printers named in site policy.
+func (o *Oracle) identifyPrinterClients(rawFindings []checks.Finding) []unifi.Client {
 	prnByKey := make(map[string]unifi.Client)
 	for _, f := range rawFindings {
 		if f.Port == 631 || strings.Contains(strings.ToLower(f.Title), "ipp") || strings.Contains(strings.ToLower(f.Title), "printer") {
-			cl := f.Client
-			if full, ok := clientByKey[strings.ToLower(strings.TrimSpace(cl.MAC))]; ok {
-				cl = full
-			} else if full, ok := clientByKey[cl.IP]; ok {
-				cl = full
-			}
+			cl := o.inventoryClient(f.Client)
 			k := firstNonEmptyStr(strings.ToLower(cl.MAC), cl.IP)
 			if k != "" {
 				prnByKey[k] = cl
 			}
 		}
 	}
-	for _, ap := range intent.ApprovedPaths {
+	for _, ap := range o.intent.ApprovedPaths {
 		if strings.Contains(strings.ToLower(ap.Function), "print") || strings.Contains(strings.ToLower(ap.DestRole), "printer") || ap.Port == 631 {
-			for _, cl := range snap.Clients {
+			for _, cl := range o.snap.Clients {
 				if (ap.DestIP != "" && cl.IP == ap.DestIP) || strings.Contains(strings.ToLower(cl.Name+cl.Hostname), "print") {
 					k := firstNonEmptyStr(strings.ToLower(cl.MAC), cl.IP)
 					if k != "" {

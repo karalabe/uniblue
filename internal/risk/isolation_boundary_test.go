@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ func TestTransitEvaluationCatchesPartiallyBlockedPortRange(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Devices: []unifi.Device{
-			{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "10.0.1.1", Model: "UDM-Pro", Type: "udm"},
+			{Name: "Gateway", MAC: "AA:00:00:00:00:01", IP: "10.0.1.1", Model: "UDM-Pro", Type: "udm"},
 		},
 		Networks: []unifi.Network{
 			{ID: "net-lan", Name: "LAN", VLAN: "1", Subnet: "10.0.1.1/24", Purpose: "corporate", ZoneName: "Internal"},
@@ -71,6 +72,7 @@ func TestTransitEvaluationCatchesPartiallyBlockedPortRange(t *testing.T) {
 			if c.Port <= 8000 || c.Port > 8010 {
 				t.Fatalf("expected violation on open port in 8001-8010, got port=%d (%+v)", c.Port, c)
 			}
+			checkOracleTransit(t, snap, c, "aa:00:00:00:00:01")
 			foundViolation = true
 		}
 	}
@@ -84,11 +86,11 @@ func TestTransitEvaluationCatchesPartiallyBlockedPortRange(t *testing.T) {
 // EvaluateIsolation inspects switch ACL ALLOW rules and reports a violation
 // instead of false blocked-ok.
 func TestTransitEvaluationCatchesL3SwitchACLException(t *testing.T) {
-	const swMAC = "bb:00:00:00:00:10"
+	const swMAC = "BB:00:00:00:00:10"
 	snap := &unifi.Snapshot{
 		Site: "default",
 		Devices: []unifi.Device{
-			{Name: "Gateway", MAC: "aa:00:00:00:00:01", IP: "10.0.1.1", Model: "UDM-Pro", Type: "udm"},
+			{Name: "Gateway", MAC: "AA:00:00:00:00:01", IP: "10.0.1.1", Model: "UDM-Pro", Type: "udm"},
 			{Name: "Core L3 Switch", MAC: swMAC, IP: "10.0.1.2", Model: "USW-Pro-24", Type: "usw"},
 		},
 		Networks: []unifi.Network{
@@ -127,6 +129,7 @@ func TestTransitEvaluationCatchesL3SwitchACLException(t *testing.T) {
 			if c.Verdict != IsolationViolation || c.Port != 8443 || c.DecisiveRuleID != "acl-allow-8443" {
 				t.Fatalf("expected L3 switch ACL exception violation on port 8443, got %+v", c)
 			}
+			checkOracleTransit(t, snap, c, strings.ToLower(swMAC))
 			foundViolation = true
 		}
 	}
@@ -1394,4 +1397,379 @@ func TestControllerPortFilterDoesNotBlockAllTraffic(t *testing.T) {
 		}
 	}
 	t.Fatal("no transit cell found")
+}
+
+// checkOracleTransit compares a concrete client pair with the service witness
+// found by the matrix's network-wide search on the same uniform boundary.
+func checkOracleTransit(t *testing.T, snap *unifi.Snapshot, want IsolationCell, mac string) {
+	t.Helper()
+	o := NewOracle(snap, config.NetworkConfig{})
+	src := Position{NetworkID: "net-iot", IP: "10.0.30.42"}
+	dst := unifi.Client{NetworkName: "LAN", IP: "10.0.1.42"}
+	for _, got := range []IsolationCell{o.Service(src, dst, want.Transport, want.Port, want.IPFamily), o.AnyPort(src, dst, want.IPFamily)} {
+		if got.Effective != want.Effective || got.Verdict != want.Verdict || got.DecisiveRuleID != want.DecisiveRuleID ||
+			got.PathKind != want.PathKind || got.Enforcer != want.Enforcer || !slices.Equal(got.EnforcerMACs, want.EnforcerMACs) ||
+			!slices.Equal(got.EnforcerMACs, []string{mac}) {
+			t.Fatalf("Oracle returned %+v for matrix witness %+v", got, want)
+		}
+	}
+	if got := o.Service(src, dst, "udp", want.Port, want.IPFamily); got.Verdict != IsolationBlockedOK {
+		t.Fatalf("TCP witness also allowed UDP: %+v", got)
+	}
+}
+
+// TestOraclePeerParity checks both physical isolation and a directional ACL
+// exception against the pair represented in the containment matrix.
+func TestOraclePeerParity(t *testing.T) {
+	for _, medium := range []string{"switch ACL", "isolated ports", "same AP", "cross AP", "mixed"} {
+		t.Run(medium, func(t *testing.T) {
+			s := wiredPeerSite(2)
+			s.Networks[0].IsolationEnabled = true
+			s.Networks[0].ZoneName = "Cameras"
+			a, b := &s.Clients[0], &s.Clients[1]
+			sw := s.Devices[0].MAC
+			kind, mac, verdict := "wired-same-vlan", sw, IsolationBlockedOK
+			switch medium {
+			case "switch ACL":
+				verdict = IsolationViolation
+				any := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
+				s.SwitchACLs = []unifi.SwitchACL{
+					{ID: "exception", Enabled: true, Action: "ALLOW", Protocol: "tcp", Source: unifi.PolicyEndpoint{MACs: []string{a.MAC}, AnyPort: true}, Destination: unifi.PolicyEndpoint{AnyTarget: true, Ports: []int{8443}}},
+					{ID: "block", Index: 1, Enabled: true, Action: "BLOCK", Source: any, Destination: any},
+				}
+			case "isolated ports":
+				for i := range s.Devices[0].Ports {
+					s.Devices[0].Ports[i].Isolation = true
+				}
+			default:
+				ap1, ap2 := "02:00:00:00:01:af", "02:00:00:00:01:bf"
+				s.Devices = append(s.Devices, unifi.Device{Type: "uap", MAC: ap1, UplinkMAC: sw, UplinkPort: 1},
+					unifi.Device{Type: "uap", MAC: ap2, UplinkMAC: sw, UplinkPort: 2})
+				s.WLANs = []unifi.WLANConfig{{Name: "Patio", NetworkName: "Cameras", Enabled: true, L2Isolation: true}}
+				b.IsWired, b.APMAC, b.ESSID = false, ap2, "Patio"
+				switch medium {
+				case "same AP":
+					a.IsWired, a.APMAC, a.ESSID = false, strings.ToUpper(ap2), "Patio"
+					kind, mac = "same-ap-wifi", ap2
+				case "cross AP":
+					a.IsWired, a.APMAC, a.ESSID = false, ap1, "Patio"
+					kind, verdict = "cross-ap-wifi", IsolationViolation
+				case "mixed":
+					kind, verdict = "mixed-same-vlan", IsolationViolation
+				}
+			}
+			matrix, _, _ := EvaluateIsolation(s, nil, config.NetworkConfig{})
+			o := NewOracle(s, config.NetworkConfig{})
+			src := PositionForClient(*a)
+			for _, got := range []IsolationCell{o.Service(src, *b, "tcp", 8443, "ipv4"), o.AnyPort(src, *b, "ipv4")} {
+				if got.PathKind != kind || got.Verdict != verdict || !slices.Equal(got.EnforcerMACs, []string{mac}) ||
+					!slices.ContainsFunc(matrix.Cells, func(c IsolationCell) bool {
+						return c.PathKind == got.PathKind && (c.IPFamily == "both" || c.IPFamily == got.IPFamily) &&
+							c.Effective == got.Effective && c.Verdict == got.Verdict && c.DecisiveRuleID == got.DecisiveRuleID &&
+							c.Enforcer == got.Enforcer && slices.Equal(c.EnforcerMACs, got.EnforcerMACs)
+					}) {
+					t.Fatalf("missing matching matrix decision for %+v", got)
+				}
+			}
+			if medium == "isolated ports" {
+				// Partial wired client structs hydrate cleanly (even without IsWired or SwitchMAC),
+				// while a caller-supplied switch port is preserved over inventory.
+				for _, partial := range []unifi.Client{
+					{MAC: b.MAC, IsWired: true},
+					{MAC: b.MAC, IsWired: true, SwitchMAC: b.SwitchMAC},
+					{MAC: b.MAC, SwitchMAC: b.SwitchMAC},
+					{MAC: b.MAC, SwitchPort: b.SwitchPort},
+				} {
+					if got := o.Service(src, partial, "tcp", 8443, "ipv4"); got.Verdict != IsolationBlockedOK {
+						t.Fatalf("partial wired dst %+v lost switch port isolation: %+v", partial, got)
+					}
+				}
+				overridePort := unifi.Client{MAC: b.MAC, IsWired: true, SwitchMAC: b.SwitchMAC, SwitchPort: 99}
+				if got := o.Service(src, overridePort, "tcp", 8443, "ipv4"); got.Verdict == IsolationBlockedOK {
+					t.Fatalf("caller-supplied switch port was overwritten by inventory: %+v", got)
+				}
+				// Shared fe80:: addresses across VLANs must resolve by VLAN scope in either inventory order.
+				b.IPv6 = []string{"fe80::42"}
+				other := unifi.Client{MAC: "02:00:00:00:00:99", NetworkID: "other", NetworkName: "Other", IPv6: []string{"fe80::42"}, IsWired: true, SwitchMAC: "02:00:00:00:00:dd", SwitchPort: 9}
+				for _, clients := range [][]unifi.Client{append(slices.Clone(s.Clients), other), append([]unifi.Client{other}, s.Clients...)} {
+					scoped := *s
+					scoped.Clients = clients
+					if got := NewOracle(&scoped, config.NetworkConfig{}).Service(src, unifi.Client{NetworkName: b.NetworkName, IPv6: []string{"fe80::42"}}, "tcp", 8443, "ipv6"); got.PathKind != "wired-same-vlan" || got.Verdict != IsolationBlockedOK {
+						t.Fatalf("VLAN-scoped link-local lookup selected wrong client: %+v", got)
+					}
+				}
+			}
+			if medium == "switch ACL" {
+				for _, got := range []IsolationCell{o.Service(src, *b, "udp", 8443, "ipv4"), o.AnyPort(PositionForClient(*b), *a, "ipv4")} {
+					if got.DecisiveRuleID != "block" {
+						t.Fatalf("directional TCP exception leaked: %+v", got)
+					}
+				}
+				// Unresolved L3 router or External zone + Internet toggle must not override same-switch L2 ACLs.
+				inetOn := true
+				s.Networks[0].RouterUnresolved = true
+				s.Networks[0].ZoneName = "External"
+				s.Networks[0].InternetAccessEnabled = &inetOn
+				so := NewOracle(s, config.NetworkConfig{})
+				if got := so.Service(src, *b, "udp", 8443, "ipv4"); got.DecisiveRuleID != "block" {
+					t.Fatalf("unresolved L3 router or External zone overrode known L2 switch ACL decision: %+v", got)
+				}
+				if got := so.AnyPort(PositionForClient(*b), *a, "ipv4"); got.DecisiveRuleID != "block" {
+					t.Fatalf("External zone overrode AnyPort L2 switch ACL block: %+v", got)
+				}
+			}
+		})
+	}
+}
+
+// TestOracleInternet resolves publications by backend address and service. The
+// earlier External deny shadows the allow for one port in the same range.
+func TestOracleInternet(t *testing.T) {
+	dst := unifi.Client{IP: "192.0.2.10", IPv6: []string{"2001:db8::10"}, NetworkID: "lan"}
+	block, allow := zoneRule(1, "External", "Internal", "BLOCK", "tcp"), zoneRule(2, "External", "Internal", "ALLOW", "tcp")
+	block.Destination.AnyPort, block.Destination.Ports = false, []int{8444}
+	allow.Destination = unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{dst.IP}, PortRanges: []unifi.PortRange{{Start: 8443, End: 8444}}}
+	restricted := "198.51.100.0/24"
+	allow.Source = unifi.PolicyEndpoint{ZoneName: "External", NetworkIDs: []string{"wan2"}, IPs: []string{restricted}, Ports: []int{50000}}
+	taken := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	s := &unifi.Snapshot{
+		CollectedAt: taken,
+		Networks: []unifi.Network{{ID: "lan", Name: "Office", ZoneName: "Internal", RouterDeviceMAC: "02:00:00:00:00:aa"},
+			{ID: "wan1", Name: "Primary", Purpose: "wan"}, {ID: "wan2", Name: "Backup", Purpose: "wan2"}},
+		Devices: []unifi.Device{{Type: "ugw", Name: "Gateway", MAC: "02:00:00:00:00:BB"}},
+		PortForwards: []unifi.PortForward{
+			{ID: "open", Enabled: true, FwdIP: dst.IP, FwdPort: "443", DstPort: "10443", Proto: "tcp"},
+			{ID: "restricted", Enabled: true, FwdIP: dst.IP, DstPort: "443", Proto: "tcp", Src: restricted},
+			{ID: "unresolved", Enabled: true, FwdIP: dst.IP, FwdPort: "443", Proto: "tcp", SourceUnknown: true},
+		},
+		DynamicMappings: []unifi.DynamicPortMapping{
+			{Protocol: "pcp", Transport: "udp", ExtPort: 1053, InternalIP: dst.IP, IntPort: 53},
+			{Protocol: "upnp", Transport: "udp", ExtPort: 2053, InternalIP: dst.IP, IntPort: 53, ExpiresAt: &taken},
+		},
+		PublishedTunnels: []unifi.PublishedTunnel{{Provider: "tunnel", Hostname: "web.example", BackendIP: dst.IPv6[0], BackendPort: 443}},
+		ProxyRoutes: []unifi.ProxyRoute{{Hostname: "proxy.example", PublicExposed: true, BackendIP: dst.IPv6[0], BackendPort: 443},
+			{Hostname: "private.example", BackendIP: dst.IPv6[0], BackendPort: 443}},
+		FirewallPolicies: []unifi.FirewallPolicy{allow, block},
+	}
+	o := NewOracle(s, config.NetworkConfig{})
+	fw := o.Internet(dst, "tcp", 8443, "ipv4")
+	if len(fw) != 1 || fw[0].DecisiveRuleID != allow.ID || fw[0].Effective != "allow" || fw[0].SourceNetwork != "Backup" || !slices.Equal(fw[0].EnforcerMACs, []string{"02:00:00:00:00:bb"}) {
+		t.Fatalf("External firewall decision: %+v", fw)
+	}
+	forwards := o.Internet(dst, "tcp", 443, "ipv4")
+	if len(forwards) != 3 || forwards[0].DecisiveRuleID != "open" || forwards[0].Effective != "allow" ||
+		forwards[1].Effective != "allow" || forwards[1].SourceNetwork != restricted ||
+		forwards[2].Verdict != IsolationUnknown || forwards[2].MissingInput == "" {
+		t.Fatalf("WAN forward scope: %+v", forwards)
+	}
+	web := o.Internet(dst, "tcp", 443, "ipv6")
+	if len(web) != 2 || web[0].DecisiveRuleName != "web.example" || web[1].DecisiveRuleName != "proxy.example" {
+		t.Fatalf("owner publications: %+v", web)
+	}
+	if maps := o.Internet(dst, "udp", 53, "ipv4"); len(maps) != 1 || maps[0].DecisiveRuleName != "pcp" {
+		t.Fatalf("active leases: %+v", maps)
+	}
+	for _, q := range []struct {
+		proto string
+		port  int
+		fam   string
+	}{
+		{"tcp", 10443, "ipv4"}, {"udp", 443, "ipv4"}, {"udp", 443, "ipv6"}, {"tcp", 8444, "ipv4"},
+	} {
+		if cells := o.Internet(dst, q.proto, q.port, q.fam); len(cells) != 0 {
+			t.Fatalf("%+v matched %+v", q, cells)
+		}
+	}
+
+	// Finding-shaped dst (MAC, IPv6-in-IP, or IPv6-only) hydrates full addresses from inventory,
+	// and missing visibility feeds emit explicit unknown cells instead of empty slices.
+	s.Clients = []unifi.Client{
+		{MAC: "02:00:00:00:00:10", IP: dst.IP, IPv6: dst.IPv6, NetworkID: "lan"},
+		{MAC: "02:00:00:00:00:11", IP: "2001:db8::11", NetworkID: "lan"},
+	}
+	s.PublishedTunnels = append(s.PublishedTunnels, unifi.PublishedTunnel{Provider: "tunnel", Hostname: "v6only.example", BackendIP: "2001:db8::11", BackendPort: 443})
+	o = NewOracle(s, config.NetworkConfig{})
+	if got := o.Internet(unifi.Client{MAC: "02:00:00:00:00:10"}, "tcp", 443, "ipv6"); len(got) != 2 {
+		t.Fatalf("hydrated finding dst missed IPv6 publications: %+v", got)
+	}
+	if got := o.Internet(unifi.Client{MAC: "02:00:00:00:00:11"}, "tcp", 443, "ipv6"); len(got) != 1 || got[0].DecisiveRuleName != "v6only.example" {
+		t.Fatalf("MAC-only dst missed IPv6 address stored in Client.IP: %+v", got)
+	}
+	for _, partial := range []unifi.Client{{IP: dst.IPv6[0], NetworkID: "lan"}, {IPv6: dst.IPv6, NetworkID: "lan"}} {
+		if got := o.Internet(partial, "tcp", 443, "ipv4"); len(got) != 3 {
+			t.Fatalf("IPv6-identified dst %+v missed IPv4 forwards: %+v", partial, got)
+		}
+	}
+	// Multi-WAN scoped allow keeps distinct WAN cells; unscoped allow deduplicates as "Internet"
+	// only when all uplinks permit, preserving the permitting WAN when another uplink is blocked.
+	dualAllow := zoneRule(3, "External", "Internal", "ALLOW", "tcp")
+	dualAllow.ID = "dual-allow"
+	dualAllow.Source = unifi.PolicyEndpoint{ZoneName: "External", NetworkIDs: []string{"wan1", "wan2"}, AnyPort: true}
+	dualAllow.Destination = unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{dst.IP}, Ports: []int{9443}}
+	unscopedAllow := zoneRule(4, "External", "Internal", "ALLOW", "tcp")
+	unscopedAllow.ID = "unscoped-allow"
+	unscopedAllow.Destination = unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{dst.IP}, Ports: []int{9444}}
+	blockWan1 := zoneRule(5, "External", "Internal", "BLOCK", "tcp")
+	blockWan1.ID = "block-wan1"
+	blockWan1.Source = unifi.PolicyEndpoint{ZoneName: "External", NetworkIDs: []string{"wan1"}, AnyPort: true}
+	blockWan1.Destination = unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{dst.IP}, Ports: []int{9445}}
+	partialAllow := zoneRule(6, "External", "Internal", "ALLOW", "tcp")
+	partialAllow.ID = "partial-allow"
+	partialAllow.Destination = unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{dst.IP}, Ports: []int{9445}}
+	multiWAN := &unifi.Snapshot{
+		Networks:         s.Networks,
+		Devices:          s.Devices,
+		FirewallPolicies: []unifi.FirewallPolicy{dualAllow, unscopedAllow, blockWan1, partialAllow},
+		Visibility:       &unifi.SiteVisibility{GatewayPoliciesAvailable: true, PortForwardsAvailable: true},
+	}
+	mo := NewOracle(multiWAN, config.NetworkConfig{})
+	if got := mo.Internet(dst, "tcp", 9443, "ipv4"); len(got) != 2 {
+		t.Fatalf("dual-WAN scoped rule should keep 2 cells, got %+v", got)
+	}
+	if got := mo.Internet(dst, "tcp", 9444, "ipv4"); len(got) != 1 || got[0].SourceNetwork != "Internet" {
+		t.Fatalf("unscoped External rule should deduplicate as Internet, got %+v", got)
+	}
+	if got := mo.Internet(dst, "tcp", 9445, "ipv4"); len(got) != 1 || got[0].SourceNetwork != "Backup" {
+		t.Fatalf("partial multi-WAN allow must keep permitting interface name, got %+v", got)
+	}
+	// Concrete External destination honors InternetAccessEnabled, gateway enforcement
+	// even on switch-routed VLANs, and does not substitute 1.1.1.1 or drop WAN-subnet IPs.
+	inetOff, inetOn := false, true
+	blockDNS := zoneRule(1, "Internal", "External", "BLOCK", "all")
+	blockDNS.Destination = unifi.PolicyEndpoint{ZoneName: "External", IPs: []string{"8.8.8.8"}, AnyPort: true}
+	allowExt := zoneRule(2, "Internal", "External", "ALLOW", "all")
+	extSnap := &unifi.Snapshot{
+		Networks: []unifi.Network{
+			{ID: "lan", Name: "Office", ZoneName: "Internal", Subnet: "192.0.2.0/24", InternetAccessEnabled: &inetOff},
+			{ID: "hot", Name: "Guest", ZoneName: "Hotspot", Subnet: "198.51.100.0/24", RouterDeviceMAC: "02:00:00:00:00:aa", InternetAccessEnabled: &inetOn},
+			{ID: "wan1", Name: "Primary", ZoneName: "External", Purpose: "wan", Subnet: "8.8.8.0/24"},
+		},
+		Devices:          s.Devices,
+		FirewallPolicies: []unifi.FirewallPolicy{blockDNS, allowExt},
+		Visibility:       &unifi.SiteVisibility{GatewayPoliciesAvailable: true, PortForwardsAvailable: true},
+	}
+	eo := NewOracle(extSnap, config.NetworkConfig{})
+	if got := eo.AnyPort(Position{NetworkID: "lan", IP: dst.IP}, unifi.Client{IP: "8.8.8.8", NetworkID: "wan1"}, "ipv4"); got.Effective != "deny" {
+		t.Fatalf("InternetAccessEnabled=false must deny External egress, got %+v", got)
+	}
+	if got := eo.Service(Position{NetworkID: "hot", IP: "198.51.100.10"}, unifi.Client{IP: "8.8.8.8", NetworkID: "wan1"}, "tcp", 443, "ipv4"); got.Effective != "allow" || !slices.Equal(got.EnforcerMACs, []string{"02:00:00:00:00:bb"}) {
+		t.Fatalf("switch-routed Hotspot External egress must use gateway and InternetAccessEnabled=true, got %+v", got)
+	}
+	// External ingress into a switch-routed VLAN enforces gateway rules across Service and AnyPort,
+	// and non-routable link-local or loopback addresses cannot receive direct WAN-routed traffic.
+	extAllowHot := zoneRule(3, "External", "Hotspot", "ALLOW", "tcp")
+	extAllowHot.Destination.AnyPort, extAllowHot.Destination.Ports = false, []int{8443}
+	extSnap.FirewallPolicies = append(extSnap.FirewallPolicies, extAllowHot, zoneRule(4, "External", "Hotspot", "BLOCK", "all"))
+	eo = NewOracle(extSnap, config.NetworkConfig{})
+	wan, guest := Position{Zone: "External", IP: "203.0.113.42"}, unifi.Client{IP: "198.51.100.10", NetworkID: "hot"}
+	if got := eo.Service(wan, guest, "tcp", 443, "ipv4"); got.Effective != "deny" {
+		t.Fatalf("External ingress into switch-routed VLAN bypassed gateway block: %+v", got)
+	}
+	if got := eo.AnyPort(wan, guest, "ipv4"); got.Effective != "allow" || got.Port != 8443 {
+		t.Fatalf("External ingress into switch-routed VLAN missed gateway allow: %+v", got)
+	}
+	if got := eo.AnyPort(Position{Zone: "External"}, guest, "ipv4"); got.Effective != "allow" || got.Port != 8443 {
+		t.Fatalf("External zone ingress without fixed IP missed gateway allow: %+v", got)
+	}
+	llGuest := unifi.Client{NetworkID: "hot", IPv6: []string{"fe80::1234"}}
+	if got := eo.Internet(llGuest, "tcp", 8443, "ipv6"); len(got) != 0 {
+		t.Fatalf("link-local IPv6 backend must not match direct WAN ingress: %+v", got)
+	}
+	if got := eo.Service(wan, llGuest, "tcp", 8443, "ipv6"); got.Effective != "deny" {
+		t.Fatalf("Service must deny direct WAN path to link-local IPv6: %+v", got)
+	}
+	if got := eo.AnyPort(wan, llGuest, "ipv6"); got.Effective != "deny" {
+		t.Fatalf("AnyPort must deny direct WAN path to link-local IPv6: %+v", got)
+	}
+	if got := eo.Service(Position{Zone: "External", IP: "fe80::1"}, guest, "tcp", 8443, "ipv6"); got.Effective != "deny" {
+		t.Fatalf("Service must deny non-routable link-local External source: %+v", got)
+	}
+	if got := eo.Internet(unifi.Client{NetworkID: "hot", IP: "127.0.0.1"}, "tcp", 8443, "ipv4"); len(got) != 0 {
+		t.Fatalf("IPv4 loopback backend must not match direct WAN ingress: %+v", got)
+	}
+	if got := eo.Internet(unifi.Client{NetworkID: "hot", IPv6: []string{"::1"}}, "tcp", 8443, "ipv6"); len(got) != 0 {
+		t.Fatalf("IPv6 loopback backend must not match direct WAN ingress: %+v", got)
+	}
+	// WAN NAT rules to non-routable backends, loopback-only External source rules,
+	// WAN uplink queries with narrow uplink subnets, and cross-VLAN IP lookups stay sound.
+	loopbackAllow := zoneRule(3, "External", "Hotspot", "ALLOW", "tcp")
+	loopbackAllow.Source = unifi.PolicyEndpoint{ZoneName: "External", IPs: []string{"127.0.0.2"}, AnyPort: true}
+	loopbackAllow.Destination.AnyPort, loopbackAllow.Destination.Ports = false, []int{9443}
+	remoteAllow := zoneRule(4, "External", "Hotspot", "ALLOW", "tcp")
+	remoteAllow.Source = unifi.PolicyEndpoint{ZoneName: "External", IPs: []string{"198.51.100.7"}, AnyPort: true}
+	remoteAllow.Destination.AnyPort, remoteAllow.Destination.Ports = false, []int{9444}
+	wanEdgeSnap := &unifi.Snapshot{
+		Networks: []unifi.Network{
+			{ID: "hot", Name: "Guest", ZoneName: "Hotspot", Subnet: "198.51.100.0/24"},
+			{ID: "wan-p", Name: "Primary", Purpose: "wan", Subnet: "203.0.113.0/30"},
+			{ID: "other", Name: "Other", ZoneName: "Internal", Subnet: "192.0.2.0/24"},
+		},
+		Clients: []unifi.Client{{MAC: "02:00:00:00:00:aa", IP: "198.51.100.10", NetworkID: "other"}},
+		Devices: s.Devices,
+		PortForwards: []unifi.PortForward{
+			{ID: "ll-pf", Enabled: true, FwdIP: "169.254.7.12", FwdPort: "443", DstPort: "443", Proto: "tcp"},
+		},
+		FirewallPolicies: []unifi.FirewallPolicy{loopbackAllow, remoteAllow, zoneRule(5, "External", "Hotspot", "BLOCK", "all")},
+		Visibility:       &unifi.SiteVisibility{GatewayPoliciesAvailable: true, PortForwardsAvailable: true},
+	}
+	wo := NewOracle(wanEdgeSnap, config.NetworkConfig{})
+	if got := wo.Internet(unifi.Client{NetworkID: "hot", IP: "169.254.7.12"}, "tcp", 443, "ipv4"); len(got) != 0 {
+		t.Fatalf("WAN port forward to link-local IPv4 must be ignored: %+v", got)
+	}
+	if got := wo.Internet(guest, "tcp", 9443, "ipv4"); len(got) != 0 {
+		t.Fatalf("loopback-only External allow must not permit WAN ingress: %+v", got)
+	}
+	if got := wo.Service(Position{NetworkID: "wan-p"}, guest, "tcp", 9443, "ipv4"); got.Effective != "deny" {
+		t.Fatalf("loopback-only External allow must not permit Service: %+v", got)
+	}
+	if got := wo.Service(Position{NetworkID: "wan-p"}, guest, "tcp", 9444, "ipv4"); got.Effective != "allow" {
+		t.Fatalf("WAN uplink without ZoneName and narrow /30 must still find remote External allow: %+v", got)
+	}
+	if got := wo.AnyPort(Position{NetworkID: "wan-p"}, guest, "ipv4"); got.Effective != "allow" || got.Port != 9444 {
+		t.Fatalf("AnyPort from WAN uplink with narrow /30 missed remote External allow: %+v", got)
+	}
+	if hydrated := wo.inventoryClient(unifi.Client{IP: "198.51.100.10", NetworkID: "hot"}); hydrated.MAC != "" {
+		t.Fatalf("VLAN-scoped IP lookup copied MAC from another VLAN: %+v", hydrated)
+	}
+	// Unresolved switch router on a VLAN must not cause Internet Egress containment to skip UDP probes.
+	extSnap.Networks[1].RouterUnresolved = true
+	extSnap.FirewallPolicies = []unifi.FirewallPolicy{
+		zoneRule(1, "Hotspot", "External", "ALLOW", "udp"),
+		zoneRule(2, "Hotspot", "External", "BLOCK", "all"),
+	}
+	extMatrix, _, _ := EvaluateIsolation(extSnap, nil, config.NetworkConfig{IsolationPolicy: config.IsolationIntent{NoInternetVLANs: []string{"Guest"}}})
+	if len(extMatrix.Containment) == 0 || extMatrix.Containment[0].InternetEgress.State == "blocked" {
+		t.Fatalf("unresolved router must not hide UDP internet egress allow: %+v", extMatrix.Containment)
+	}
+	// Concurrent IPv6 hydration must not race on caller-owned slice backing arrays.
+	sharedIPv6 := make([]string, 0, 2)
+	callerDst := unifi.Client{IP: dst.IPv6[0], IPv6: sharedIPv6, NetworkID: "lan"}
+	done := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			_ = o.Internet(callerDst, "tcp", 443, "ipv4")
+			done <- struct{}{}
+		}()
+	}
+	<-done
+	<-done
+	missingSnap := &unifi.Snapshot{
+		Networks:   []unifi.Network{{ID: "lan", Name: "Office", ZoneName: "Internal"}},
+		Devices:    s.Devices,
+		Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: false, PortForwardsAvailable: false},
+	}
+	missCells := NewOracle(missingSnap, config.NetworkConfig{}).Internet(dst, "tcp", 443, "ipv4")
+	if len(missCells) < 2 || missCells[0].Verdict != IsolationUnknown || missCells[1].Verdict != IsolationUnknown {
+		t.Fatalf("missing feeds must produce unknown cells, got %+v", missCells)
+	}
+	// Missing WAN inventory leaves WAN-scoped NetworkIDs unresolved (unknown), never hard-mismatched.
+	noWANSnap := &unifi.Snapshot{
+		Networks:         []unifi.Network{{ID: "lan", Name: "Office", ZoneName: "Internal"}},
+		Devices:          s.Devices,
+		FirewallPolicies: []unifi.FirewallPolicy{allow},
+		Visibility:       &unifi.SiteVisibility{GatewayPoliciesAvailable: true, PortForwardsAvailable: true},
+	}
+	if got := NewOracle(noWANSnap, config.NetworkConfig{}).Internet(dst, "tcp", 8443, "ipv4"); len(got) != 1 || got[0].Verdict != IsolationUnknown {
+		t.Fatalf("WAN-scoped rule without WAN inventory must resolve unknown, got %+v", got)
+	}
 }

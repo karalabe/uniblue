@@ -266,18 +266,13 @@ func dedupeSortedStrings(in []string) []string {
 // LAN Egress, Internet Egress, LAN Inbound) for every isolated or explicitly
 // targeted VLAN, emitting findings for real isolation gaps and archetype-aware
 // recommendations without false alarms on Guest Wi-Fi.
-func evaluateNetworkContainment(
-	snap *unifi.Snapshot,
+func (o *Oracle) evaluateNetworkContainment(
 	rawFindings []checks.Finding,
-	sortedPolicies []unifi.FirewallPolicy,
-	intent config.IsolationIntent,
-	gwPoliciesAvailable bool,
-	gwMissingReason string,
-	switchACLStatus, switchACLReason, gwName string,
 	untrustedNets, trustedNets []unifi.Network,
 	existingCells []IsolationCell,
 ) ([]NetworkContainment, []IsolationCell, []checks.Finding, []PostureNote) {
-	if snap == nil || len(untrustedNets) == 0 {
+	snap, intent := o.snap, o.intent
+	if len(untrustedNets) == 0 {
 		return nil, nil, nil, nil
 	}
 
@@ -311,17 +306,7 @@ func evaluateNetworkContainment(
 		}
 	}
 
-	routed := containmentEvaluator{
-		snap:           snap,
-		rawFindings:    rawFindings,
-		policies:       sortedPolicies,
-		intent:         intent,
-		gatewayOK:      gwPoliciesAvailable,
-		gatewayMissing: gwMissingReason,
-		switchStatus:   switchACLStatus,
-		switchMissing:  switchACLReason,
-		gateway:        gwName,
-	}
+	routed := containmentEvaluator{Oracle: o, rawFindings: rawFindings}
 	for _, ent := range entries {
 		n := ent.net
 		nLow := strings.ToLower(strings.TrimSpace(n.Name))
@@ -351,7 +336,7 @@ func evaluateNetworkContainment(
 		}
 
 		// Axis 1: Peer-to-peer L2 isolation (same-AP Wi-Fi, wired ports, mixed, cross-AP).
-		peerAxis, peerCells, peerFindings := evaluatePeerContainmentAxis(snap, n, switchACLStatus, switchACLReason)
+		peerAxis, peerCells, peerFindings := o.evaluatePeerContainmentAxis(n)
 		nc.Peers = peerAxis
 		cells = append(cells, peerCells...)
 		findings = append(findings, peerFindings...)
@@ -660,22 +645,14 @@ func (g *peerGap) finding(snap *unifi.Snapshot, n unifi.Network) (checks.Finding
 // evaluatePeerContainmentAxis assesses Layer-2 client-to-client isolation on n
 // across same-AP Wi-Fi l2_isolation, wired switch port isolation, mixed wired-to-AP
 // paths, cross-AP uplinks, and directional IPv4/IPv6 switch ACLs.
-func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, missing string) (ContainmentAxis, []IsolationCell, []checks.Finding) {
-	// A wireless attachment represents the AP uplink, so its ACL endpoint is
-	// network-wide. Only wired attachments identify a concrete client.
-	type peerAttachment struct {
-		label  string
-		ref    checks.SwitchPortRef
-		client unifi.Client
-	}
-	// Normalize both LLDP and client references before using them as map keys.
-	portRef := func(mac string, idx int) checks.SwitchPortRef {
-		return checks.SwitchPortRef{SwitchMAC: strings.ToLower(strings.TrimSpace(mac)), PortIdx: idx}
-	}
-	var wired, aps []peerAttachment
+func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, []IsolationCell, []checks.Finding) {
+	snap := o.snap
+	var wired []peerAttachment
+	aps := slices.Clone(o.apUplinks)
 	wiredCount := make(map[checks.SwitchPortRef]int)
 	seenClients := make(map[string]bool)
 	wifiClients, unresolvedMedium := false, false
+	apMACs := make(map[string][]string)
 	for _, cl := range snap.Clients {
 		if !(n.ID != "" && cl.NetworkID == n.ID) && !strings.EqualFold(cl.NetworkName, n.Name) {
 			continue
@@ -692,27 +669,11 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 			wired = append(wired, peerAttachment{label: cl.DisplayName(), ref: ref, client: cl})
 		} else if cl.APMAC != "" || cl.ESSID != "" {
 			wifiClients = true
+			if mac, ok := config.ParseCanonicalMAC(cl.APMAC); ok {
+				apMACs[cl.ESSID] = append(apMACs[cl.ESSID], mac)
+			}
 		} else {
 			unresolvedMedium = true
-		}
-	}
-
-	ports := make(map[checks.SwitchPortRef]unifi.SwitchPort)
-	infrastructure := make(map[checks.SwitchPortRef]bool)
-	for _, d := range snap.Devices {
-		for _, p := range d.Ports {
-			ref := portRef(d.MAC, p.PortIdx)
-			ports[ref] = p
-			if p.IsUplink {
-				infrastructure[ref] = true
-			}
-		}
-		uplink := portRef(d.UplinkMAC, d.UplinkPort)
-		if uplink.SwitchMAC != "" && uplink.PortIdx > 0 {
-			infrastructure[uplink] = true
-		}
-		if strings.EqualFold(d.Type, "uap") {
-			aps = append(aps, peerAttachment{label: firstNonEmptyStr(d.Name, d.MAC), ref: uplink})
 		}
 	}
 
@@ -754,27 +715,8 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 			continue
 		}
 		hasWiFi = true
-		c := IsolationCell{
-			PathKind:       "same-ap-wifi",
-			DestFunction:   "same-vlan-wifi-peers",
-			Transport:      "all",
-			IPFamily:       "both",
-			Enforcer:       wlan.Name,
-			Effective:      "deny",
-			Verdict:        IsolationBlockedOK,
-			DecisiveReason: "Same-AP client isolation enabled on " + wlan.Name,
-		}
-		if !wlan.L2Isolation {
-			c.Effective = "allow"
-			c.Verdict = IsolationViolation
-			c.DecisiveReason = "Same-AP client isolation is disabled on " + wlan.Name
-			c.RecommendedFix = "Enable Client Device Isolation on " + wlan.Name
-		}
-		if snap.Visibility != nil && !snap.Visibility.WLANsAvailable && c.Verdict == IsolationBlockedOK {
-			c.Verdict = IsolationUnknown
-			c.Effective = "unknown"
-			c.MissingInput = "Current WLAN isolation settings unavailable for " + wlan.Name
-		}
+		c := o.sameAP(wlan)
+		c.EnforcerMACs = dedupeSortedStrings(apMACs[wlan.Name])
 		record(c)
 		if c.Verdict == IsolationViolation {
 			sameAP.ssids[firstNonEmptyStr(wlan.Name, wlan.ID, "unnamed SSID")] = true
@@ -799,8 +741,8 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 	var downstream []checks.SwitchPortRef
 	for _, ref := range slices.SortedFunc(maps.Keys(wiredCount), comparePeerPorts) {
 		count := wiredCount[ref]
-		p := ports[ref]
-		if ref.SwitchMAC == "" || ref.PortIdx <= 0 || infrastructure[ref] {
+		p := o.ports[ref]
+		if ref.SwitchMAC == "" || ref.PortIdx <= 0 || o.infrastructure[ref] {
 			continue
 		}
 		if count <= 1 && (p.IsolationUnknown || !p.Isolation || p.MACTableCount <= 1) {
@@ -829,13 +771,6 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 	if siteHasIPv6Context(snap, n, n, unifi.Client{}) {
 		families = append(families, "ipv6")
 	}
-	// Include the physical attachment so similarly named peers remain identifiable.
-	label := func(x peerAttachment) string {
-		if x.ref.SwitchMAC != "" && x.ref.PortIdx > 0 {
-			return fmt.Sprintf("%s (%s port %d)", peerLabel(x.label), peerLabel(deviceNameByMAC(snap, x.ref.SwitchMAC)), x.ref.PortIdx)
-		}
-		return peerLabel(x.label)
-	}
 	// Evaluate ACLs only for traffic that can actually cross the switch fabric.
 	// The lone-client check models a client-to-VLAN path with an unconstrained peer.
 	evaluatePair := func(a, b peerAttachment, g *peerGap, single bool) {
@@ -843,41 +778,19 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 		if a.ref == b.ref && shared[a.ref] {
 			return
 		}
-		path := label(a)
+		path := o.peerLabel(a)
 		if !single {
-			path += " and " + label(b)
+			path += " and " + o.peerLabel(b)
 		}
-		pa, okA := ports[a.ref]
-		pb, okB := ports[b.ref]
-		sameSwitch := a.ref.SwitchMAC != "" && a.ref.SwitchMAC == b.ref.SwitchMAC && a.ref.PortIdx > 0 && b.ref.PortIdx > 0
-		c := IsolationCell{
-			PathKind:     g.kind,
-			DestFunction: g.function,
-			Enforcer:     "Switch port isolation",
-			Transport:    "all",
-			IPFamily:     "both",
-		}
-		if sameSwitch && (single || a.ref != b.ref) && !pa.IsolationUnknown && !pb.IsolationUnknown && pa.Isolation && pb.Isolation {
-			c.Verdict, c.Effective = IsolationBlockedOK, "deny"
-			c.DecisiveReason = "Isolated switch ports: " + path
-			record(c)
-			return
-		}
-		if !sameSwitch || (!single && a.ref == b.ref) || status != "complete" {
-			c.Verdict, c.Effective = IsolationUnknown, "unknown"
-			c.MissingInput = "Cannot verify the complete switched path for " + path
-			why := "complete switched paths"
-			if status != "complete" {
-				c.MissingInput += ". Switch ACL unavailable: " + missing
-				why = "switch ACLs (" + peerLabel(missing) + ")"
+		cell, gap := o.peerPorts(a.ref, b.ref, path, single)
+		if cell.Effective != "" {
+			cell.PathKind, cell.DestFunction = g.kind, g.function
+			record(cell)
+			if gap != "" {
+				coverage[gap] = true
 			}
-			coverage[why] = true
-			record(c)
 			return
 		}
-
-		swNet := n
-		swNet.RouterDeviceMAC = a.ref.SwitchMAC
 		endpoints := []peerAttachment{a}
 		if !single {
 			endpoints = append(endpoints, b)
@@ -885,10 +798,10 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 		var fixPorts []peerAttachment
 		requiresACL := false
 		for _, x := range endpoints {
-			if ports[x.ref].Isolation {
+			if o.ports[x.ref].Isolation {
 				continue
 			}
-			if x.client.IsWired && !infrastructure[x.ref] {
+			if x.client.IsWired && !o.infrastructure[x.ref] {
 				fixPorts = append(fixPorts, x)
 			} else {
 				// Enabling isolation on an AP trunk affects every carried VLAN.
@@ -898,11 +811,11 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 		var names []string
 		if !requiresACL {
 			for _, x := range fixPorts {
-				names = append(names, label(x))
+				names = append(names, o.peerLabel(x))
 			}
 		}
 		fixSockets := strings.Join(names, " and ")
-		knownPorts := okA && okB && !pa.IsolationUnknown && !pb.IsolationUnknown
+		knownPorts := o.peerPortSettingsKnown(a.ref, b.ref)
 		permitted := false
 		for _, fam := range families {
 			// A lone client and an AP both leave one side of the ACL query network-wide.
@@ -911,10 +824,9 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 				if single {
 					peers.dst = unifi.Client{}
 				}
-				return evaluateBoundary(snap, nil, nil, config.IsolationIntent{}, false, "",
-					status, missing, "", swNet, swNet, zone, zone, fam, "deny", &peers)
+				return o.peerACL(n, peers, a.ref.SwitchMAC, fam, "", 0)
 			}
-			from, to := label(a), label(b)
+			from, to := o.peerLabel(a), o.peerLabel(b)
 			cell := checkDir(a, b)
 			if single {
 				to = "a VLAN peer"
@@ -932,10 +844,7 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 				}
 			}
 			cell.PathKind, cell.DestFunction = g.kind, g.function
-			cell.Enforcer = deviceNameByMAC(snap, a.ref.SwitchMAC) + " (switch ACL)"
-			if cell.Verdict == IsolationViolation && !knownPorts {
-				cell.Verdict, cell.Effective = IsolationUnknown, "unknown"
-				cell.MissingInput = "Effective switch port settings unavailable for " + path
+			if unknownPeerPorts(&cell, knownPorts, path) {
 				coverage["effective switch port settings"] = true
 			} else if cell.Verdict == IsolationUnknown {
 				coverage[peerLabel(cell.MissingInput)] = true
@@ -956,7 +865,7 @@ func evaluatePeerContainmentAxis(snap *unifi.Snapshot, n unifi.Network, status, 
 			}
 			for _, x := range fixPorts {
 				if wiredCount[x.ref] > 1 {
-					g.ports[x.ref] = ports[x.ref].Name
+					g.ports[x.ref] = o.ports[x.ref].Name
 				} else {
 					g.ports[x.ref] = x.label
 				}
@@ -1117,15 +1026,8 @@ func summarizeLANEgressAxis(netName string, cells []IsolationCell) ContainmentAx
 // evaluate routed containment boundaries (Internet Egress and LAN Inbound)
 // using the exact first-match boundary solver.
 type containmentEvaluator struct {
-	snap           *unifi.Snapshot
-	rawFindings    []checks.Finding
-	policies       []unifi.FirewallPolicy
-	intent         config.IsolationIntent
-	gatewayOK      bool
-	gatewayMissing string
-	switchStatus   string
-	switchMissing  string
-	gateway        string
+	*Oracle
+	rawFindings []checks.Finding
 }
 
 // containmentBoundary identifies one directed network-to-network address-family
@@ -1162,7 +1064,8 @@ func (e containmentEvaluator) evaluateInternetEgress(
 				Transport:     "all",
 				IPFamily:      fam,
 				PathKind:      "gateway-routed",
-				Enforcer:      e.gateway,
+				Enforcer:      e.gwName,
+				EnforcerMACs:  enforcerMACs(e.gwMAC),
 				Expected:      "deny",
 			}
 			if archetype == "guest" && !strict {
@@ -1184,25 +1087,11 @@ func (e containmentEvaluator) evaluateInternetEgress(
 	// Append a trailing External fallback rule so unmatched traffic uses the
 	// controller's network internet setting when present, or yields unknown when
 	// neither a catch-all External rule nor the network toggle was retrieved.
-	anyEP := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
-	fallback := unifi.FirewallPolicy{
-		Enabled:     true,
-		Index:       1 << 30,
-		Name:        "External default",
-		Protocol:    "all",
-		Source:      anyEP,
-		Destination: anyEP,
-		Action:      "ALLOW",
-	}
-	fallback.Destination.ZoneName = "External"
-	if n.InternetAccessEnabled == nil {
-		fallback.UnsupportedReason = "controller omitted the External default"
-	}
-	policies := append(append([]unifi.FirewallPolicy(nil), e.policies...), fallback)
+	policies := e.policiesWithExternalDefault(n)
 
 	// External traffic always traverses the gateway even for switch-routed VLANs.
 	srcNet := n
-	srcNet.RouterDeviceMAC = ""
+	srcNet.RouterDeviceMAC, srcNet.RouterUnresolved = "", false
 	external := unifi.Network{
 		Name:       "Internet",
 		ZoneName:   "External",
@@ -1234,7 +1123,7 @@ func (e containmentEvaluator) evaluateLANInbound(
 			paths = append(paths, containmentBoundary{src: src, dst: n, fam: "ipv6"})
 		}
 	}
-	return e.evaluateRoutedAxis(n, archetype, "lan-inbound", false, strict, e.policies, paths)
+	return e.evaluateRoutedAxis(n, archetype, "lan-inbound", false, strict, e.sortedPolicies, paths)
 }
 
 // evaluateRoutedAxis evaluates each directed boundary for both permit and deny
@@ -1290,7 +1179,8 @@ func (e containmentEvaluator) evaluateRoutedAxis(
 				DestNetwork:   "Internet",
 				DestFunction:  function,
 				PathKind:      "gateway-routed",
-				Enforcer:      e.gateway,
+				Enforcer:      e.gwName,
+				EnforcerMACs:  enforcerMACs(e.gwMAC),
 				IPFamily:      path.fam,
 				Expected:      "deny",
 				Effective:     "unknown",
@@ -1300,12 +1190,12 @@ func (e containmentEvaluator) evaluateRoutedAxis(
 			continue
 		}
 
+		// Use the path's filtered rules, including the External fallback on egress.
+		scoped := *e.Oracle
+		scoped.sortedPolicies = policies
 		check := func(expected string, intent config.IsolationIntent) IsolationCell {
-			c := evaluateBoundary(
-				e.snap, e.rawFindings, policies, intent,
-				e.gatewayOK, e.gatewayMissing, e.switchStatus, e.switchMissing, e.gateway,
-				path.src, path.dst, path.src.ZoneName, path.dst.ZoneName, path.fam, expected, nil,
-			)
+			c := scoped.evaluateBoundary(e.rawFindings, intent,
+				path.src, path.dst, path.src.ZoneName, path.dst.ZoneName, path.fam, expected, nil)
 			c.DestFunction = function
 			return c
 		}
