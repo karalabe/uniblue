@@ -5,11 +5,14 @@
 # license that can be found in the LICENSE file.
 
 id: UB-2026-0026
-title: Unauthenticated Node-RED Flow Editor
+title: Unauthenticated Node-RED Admin Editor (No Auth)
 cve: null
 category: unauth-rce
+claim: confirmed-permission
+property: nodered-admin-noauth
 severity: critical
 safety: read-only
+supersedes: ["UB-2026-0074"]
 
 metadata:
   vendor: OpenJS Foundation
@@ -17,6 +20,7 @@ metadata:
   affected_versions: any (when adminAuth is unset)
   author: "@karalabe"
   references:
+    - https://nodered.org/docs/api/admin/methods/get/auth/login/
     - https://nodered.org/docs/user-guide/runtime/securing-node-red
 
 preconditions:
@@ -24,23 +28,43 @@ preconditions:
 
 probe:
   type: http
-  method: GET
-  path: /flows
   timeout: 3s
-  match:
-    status: [200]
-    headers_absent: ["WWW-Authenticate"]
-    body_contains_all:
-      - '"type":"tab"'
-    redact_body: true
+  steps:
+    - method: GET
+      path: /flows
+      match:
+        status: [200]
+        headers_absent: ["WWW-Authenticate"]
+        body_contains_any: ['"type":"tab"', '[]']
+        evidence_summary: "Node-RED served flows anonymously"
+        redact_body: true
+    - method: GET
+      path: /auth/login
+      match:
+        status: [200]
+        headers_absent: ["WWW-Authenticate"]
+        body_regex: '^\s*\{\s*\}\s*$'
+        evidence_summary: "Admin API reported no active authentication scheme"
+        redact_body: true
+    - method: GET
+      path: /settings
+      match:
+        status: [200]
+        headers_absent: ["WWW-Authenticate"]
+        json_match:
+          - path: "$.httpNodeRoot"
+            exists: true
+          - path: "$.user"
+            exists: false
+        evidence_summary: "Runtime settings confirmed adminAuth is unset"
+        redact_body: true
 
 remediation:
   summary: >
-    Node-RED returned active automation flows from GET /flows without
-    authentication. Because Node-RED includes the exec node and arbitrary
-    JavaScript function nodes, an unauthenticated editor grants immediate
-    remote code execution on the host. Enable adminAuth in settings.js and
-    restrict port 1880 to trusted admin hosts.
+    Node-RED served flow data anonymously and confirmed adminAuth is unset.
+    Anonymous users may deploy flows that run commands with the Node-RED
+    service account's privileges. Enable adminAuth in settings.js and restrict
+    port 1880 to trusted admin hosts.
   unifi_actions:
     - enable_nodered_admin_auth
     - restrict_inter_vlan_access

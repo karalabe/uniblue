@@ -8,6 +8,7 @@ id: UB-2026-0031
 title: Unauthenticated Shelly Gen1 Control & Config API
 cve: null
 category: unauth-control
+claim: confirmed-permission
 severity: high
 safety: read-only
 supersedes: ["UB-0040"]
@@ -31,18 +32,20 @@ probe:
   match:
     status: [200]
     headers_absent: ["WWW-Authenticate"]
-    body_contains_all:
-      - '"wifi_sta":'
-      - '"login":'
-      - '"enabled":false'
+    json_match:
+      - path: "$.wifi_sta"
+        exists: true
+      - path: "$.login.enabled"
+        equals: "false"
     redact_body: true
 
 remediation:
   summary: >
-    Shelly Gen1 device exposes /settings with login.enabled=false. Any host on
-    the LAN can toggle mains relays, read Wi-Fi/MQTT settings, or trigger
-    arbitrary OTA firmware updates. Enable "Restrict Login" in the Shelly web
-    UI and isolate smart relays on a dedicated IoT VLAN.
+    The Shelly Gen1 /settings endpoint reports that Restricted Login is off.
+    It exposes configuration such as the Wi-Fi SSID and MQTT username. Hosts
+    that can reach the device can also control relays, change configuration,
+    or start firmware updates without signing in. Enable "Restrict Login" in
+    the Shelly web UI and isolate smart relays on a dedicated IoT VLAN.
   unifi_actions:
     - enable_shelly_restricted_login
     - move_to_iot_vlan

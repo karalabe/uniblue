@@ -8,6 +8,7 @@ id: UB-2026-0039
 title: Unencrypted Zehnder ComfoConnect LAN C Control Interface
 cve: null
 category: unauth-control
+claim: service-observed
 severity: high
 safety: read-only
 
@@ -31,12 +32,11 @@ probe:
 
 remediation:
   summary: >
-    Zehnder ComfoConnect LAN C exposes its cleartext protobuf control API on
-    TCP/UDP port 56747. Out of the box, many units use default PIN 0000 and
-    allow any host on the LAN to register or hijack the sole active control
-    session (changing fan speeds, temperature profiles, or disabling bypass).
-    Set a non-default PIN in ComfoControl, move the bridge to an isolated IoT
-    VLAN, and restrict port 56747 strictly to your Home Assistant / controller IP.
+    The ComfoConnect LAN C control port is reachable. The bridge uses TCP
+    port 56747 for cleartext ventilation control and UDP on the same port for
+    discovery. The read-only check leaves app registration, the PIN, and
+    control permissions untested. Set a non-default PIN, isolate the bridge
+    on an IoT VLAN, and restrict port 56747 to the ventilation controller.
   unifi_actions:
     - set_custom_pin_on_device
     - move_to_iot_vlan

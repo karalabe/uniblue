@@ -1,0 +1,60 @@
+# uniblue: blue-team security engine for UniFi networks
+# Copyright 2026 Péter Szilágyi. All rights reserved.
+#
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+id: UB-2026-0075
+title: Unauthenticated Node-RED Anonymous Admin (Default Wildcard)
+cve: null
+category: unauth-rce
+claim: confirmed-permission
+property: nodered-anon-admin
+severity: critical
+safety: read-only
+supersedes: ["UB-2026-0074"]
+
+metadata:
+  vendor: OpenJS Foundation
+  product: Node-RED
+  affected_versions: any configuration with adminAuth default permissions "*"
+  author: "@karalabe"
+  references:
+    - https://nodered.org/docs/user-guide/runtime/securing-node-red#setting-a-default-user
+
+preconditions:
+  ports_any: [1880]
+
+probe:
+  type: http
+  timeout: 3s
+  steps:
+    - method: GET
+      path: /flows
+      match:
+        status: [200]
+        headers_absent: ["WWW-Authenticate"]
+        body_contains_any: ['"type":"tab"', '[]']
+        evidence_summary: "Node-RED served flows anonymously"
+        redact_body: true
+    - method: GET
+      path: /settings
+      match:
+        status: [200]
+        headers_absent: ["WWW-Authenticate"]
+        json_match:
+          - path: "$.httpNodeRoot"
+            exists: true
+        body_regex: '"user"\s*:\s*\{[^}]*"permissions"\s*:\s*("\*"|\[[^\]]*"\*"[^\]]*\])'
+        evidence_summary: "Runtime settings grant anonymous users wildcard (*) permissions"
+        redact_body: true
+
+remediation:
+  summary: >
+    Node-RED grants anonymous users wildcard ("*") permissions via adminAuth's
+    default user. Anonymous callers can deploy flows and execute arbitrary
+    commands on the host. Remove the wildcard default user in settings.js and
+    restrict port 1880 to trusted admin hosts.
+  unifi_actions:
+    - enable_nodered_admin_auth
+    - restrict_inter_vlan_access

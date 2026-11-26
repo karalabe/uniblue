@@ -30,11 +30,18 @@ const (
 
 	// defaultProbeTimeout is applied when a YAML check omits probe.timeout.
 	defaultProbeTimeout = 3 * time.Second
+
+	// maxProbeSteps limits sequential HTTP observations within one probe timeout.
+	maxProbeSteps = 4
 )
 
 // idPattern restricts check identifiers to compact, uppercase alphanumeric IDs
 // such as "UB-0001" or "UB-2026-0042".
 var idPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9_-]{2,48}$`)
+
+// jsonPathPattern accepts the root, object keys and optional array indices
+// supported by evalJSONPath. Wildcards and filters are outside this subset.
+var jsonPathPattern = regexp.MustCompile(`^\$(\[[0-9]+\])?(\.[^.\[\]*]+(\[[0-9]+\])?)*$`)
 
 // Severity ranks the impact of a security finding from informational to critical.
 type Severity int
@@ -307,6 +314,23 @@ type ProbeSpec struct {
 	// the port when left empty.
 	Scheme string `yaml:"scheme"`
 
+	// HTTPStepSpec holds single-request HTTP fields as well as match rules for
+	// non-HTTP probes. It cannot be combined with Steps.
+	HTTPStepSpec `yaml:",inline"`
+
+	// Steps defines an ordered sequence of read-only HTTP requests that must
+	// all succeed against the same target endpoint within Probe.Timeout.
+	Steps []HTTPStepSpec `yaml:"steps,omitempty"`
+
+	// Community sets the single read-only SNMP community string for "snmp" probes.
+	Community string `yaml:"community"`
+
+	// Timeout bounds how long the probe waits for a response from the target.
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// HTTPStepSpec describes a read-only HTTP request and the evidence it must return.
+type HTTPStepSpec struct {
 	// Method sets the HTTP verb for HTTP probes. Only GET, HEAD, and OPTIONS are
 	// permitted so community checks remain strictly read-only.
 	Method string `yaml:"method"`
@@ -322,12 +346,6 @@ type ProbeSpec struct {
 	// headers (e.g., Accept). Host, Authorization, Cookie, and forwarding headers
 	// are rejected by Validate().
 	RequestHeaders map[string]string `yaml:"request_headers"`
-
-	// Community sets the single read-only SNMP community string for "snmp" probes.
-	Community string `yaml:"community"`
-
-	// Timeout bounds how long the probe waits for a response from the target.
-	Timeout time.Duration `yaml:"timeout"`
 
 	// Match configures response matching rules for HTTP and TCP banner probes.
 	Match MatchSpec `yaml:"match"`
@@ -395,6 +413,12 @@ type MatchSpec struct {
 
 	// RedactBody ensures raw response content is never copied into evidence strings.
 	RedactBody bool `yaml:"redact_body"`
+
+	// Compiled regular expressions cached during Validate so matching does not
+	// recompile patterns per host.
+	bodyPattern    *regexp.Regexp
+	bodyNotPattern *regexp.Regexp
+	bannerPattern  *regexp.Regexp
 }
 
 // Remediation captures plain-English guidance and suggested UniFi actions.
@@ -416,9 +440,6 @@ type compiledPatterns struct {
 	upnpDevice  *regexp.Regexp
 	upnpService *regexp.Regexp
 	wsType      *regexp.Regexp
-	body        *regexp.Regexp
-	bodyNot     *regexp.Regexp
-	banner      *regexp.Regexp
 }
 
 // LoadFromFS walks an embedded or virtual filesystem, parsing and validating
@@ -561,39 +582,12 @@ func (c *Check) Validate() error {
 		"coap", "natpmp", "ipp", "ipmi",
 		"bitcoin-p2p", "bitcoin-rpc", "eth-engine", "nut", "lifx",
 		"pjlink", "nbns", "pcp", "dns-recursion", "ntp", "stun":
+		if c.Probe.Steps != nil {
+			return errors.New("probe.steps requires probe.type http")
+		}
 	case "http":
-		method := strings.ToUpper(strings.TrimSpace(c.Probe.Method))
-		if method == "" {
-			method = "GET"
-		}
-		if method != "GET" && method != "HEAD" && method != "OPTIONS" {
-			return fmt.Errorf("http probe method %q is forbidden; only GET, HEAD, and OPTIONS are allowed", method)
-		}
-		c.Probe.Method = method
-
-		allPaths := c.httpPaths()
-		if len(allPaths) == 0 {
-			return errors.New("http probe requires path or paths")
-		}
-		for _, p := range allPaths {
-			// Paths must be strictly relative so a check can never direct traffic to
-			// an external host or trigger an SSRF callback.
-			if !strings.HasPrefix(p, "/") || strings.Contains(p, "://") || strings.HasPrefix(p, "//") {
-				return fmt.Errorf("http probe path %q must be a relative path starting with /", p)
-			}
-		}
 		if c.Probe.Scheme != "" && c.Probe.Scheme != "http" && c.Probe.Scheme != "https" {
 			return fmt.Errorf("http probe scheme %q must be http or https", c.Probe.Scheme)
-		}
-		for hk := range c.Probe.RequestHeaders {
-			switch strings.ToLower(strings.TrimSpace(hk)) {
-			case "accept", "accept-language", "cache-control":
-			default:
-				return fmt.Errorf("http probe request header %q is not in the read-only allowlist (Accept, Accept-Language, Cache-Control)", hk)
-			}
-		}
-		if !c.Probe.Match.hasHTTPMatcher() {
-			return errors.New("http probe requires at least one positive response matcher in probe.match (status, body_contains_all, body_contains_any, body_regex, json_match, headers_present, or header_contains)")
 		}
 	default:
 		return fmt.Errorf("unsupported probe.type %q", c.Probe.Type)
@@ -651,31 +645,116 @@ func (c *Check) Validate() error {
 			return fmt.Errorf("preconditions.ws_type_regex: %w", err)
 		}
 	}
-	if c.Probe.Match.BodyRegex != "" {
-		if c.compiled.body, err = regexp.Compile(c.Probe.Match.BodyRegex); err != nil {
-			return fmt.Errorf("probe.match.body_regex: %w", err)
+	if c.Probe.Steps != nil {
+		if !c.Probe.HTTPStepSpec.isZero() {
+			return errors.New("probe.steps cannot be combined with top-level method, path, paths, request_headers, or match")
 		}
-	}
-	if c.Probe.Match.BodyNotRegex != "" {
-		if c.compiled.bodyNot, err = regexp.Compile(c.Probe.Match.BodyNotRegex); err != nil {
-			return fmt.Errorf("probe.match.body_not_regex: %w", err)
+		if len(c.Probe.Steps) == 0 || len(c.Probe.Steps) > maxProbeSteps {
+			return fmt.Errorf("probe.steps requires between 1 and %d steps", maxProbeSteps)
 		}
-	}
-	if c.Probe.Match.BannerRegex != "" {
-		if c.compiled.banner, err = regexp.Compile(c.Probe.Match.BannerRegex); err != nil {
-			return fmt.Errorf("probe.match.banner_regex: %w", err)
-		}
-	}
-	for i := range c.Probe.Match.JSONMatch {
-		if c.Probe.Match.JSONMatch[i].Regex != "" {
-			re, err := regexp.Compile(c.Probe.Match.JSONMatch[i].Regex)
-			if err != nil {
-				return fmt.Errorf("probe.match.json_match[%d].regex: %w", i, err)
+		for i := range c.Probe.Steps {
+			if err := c.Probe.Steps[i].validateHTTP(); err != nil {
+				return fmt.Errorf("probe.steps[%d]: %w", i, err)
 			}
-			c.Probe.Match.JSONMatch[i].compiled = re
+		}
+		return nil
+	}
+	if c.Probe.Type == "http" {
+		return c.Probe.HTTPStepSpec.validateHTTP()
+	}
+	return c.Probe.Match.compile()
+}
+
+// isZero reports whether all top-level HTTP step fields are unset.
+func (s HTTPStepSpec) isZero() bool {
+	return s.Method == "" &&
+		s.Path == "" &&
+		len(s.Paths) == 0 &&
+		len(s.RequestHeaders) == 0 &&
+		s.Match.isZero()
+}
+
+// isZero reports whether no match fields were configured on MatchSpec.
+func (m MatchSpec) isZero() bool {
+	return len(m.Status) == 0 &&
+		len(m.BodyContainsAll) == 0 &&
+		len(m.BodyContainsAny) == 0 &&
+		len(m.BodyNotContains) == 0 &&
+		m.BodyRegex == "" &&
+		m.BodyNotRegex == "" &&
+		len(m.JSONMatch) == 0 &&
+		len(m.HeadersAbsent) == 0 &&
+		len(m.HeadersPresent) == 0 &&
+		len(m.HeaderContains) == 0 &&
+		m.BannerRegex == "" &&
+		m.EvidenceSummary == "" &&
+		!m.RedactBody
+}
+
+// validateHTTP applies the same target and response constraints to both YAML forms.
+func (s *HTTPStepSpec) validateHTTP() error {
+	s.Method = strings.ToUpper(strings.TrimSpace(s.Method))
+	switch s.Method {
+	case "":
+		s.Method = "GET"
+	case "GET", "HEAD", "OPTIONS":
+	default:
+		return fmt.Errorf("http probe method %q is forbidden; only GET, HEAD, and OPTIONS are allowed", s.Method)
+	}
+	paths := s.httpPaths()
+	if len(paths) == 0 {
+		return errors.New("http probe requires path or paths")
+	}
+	for _, path := range paths {
+		if !strings.HasPrefix(path, "/") || strings.Contains(path, "://") || strings.HasPrefix(path, "//") {
+			return fmt.Errorf("http probe path %q must be a relative path starting with /", path)
 		}
 	}
+	for name := range s.RequestHeaders {
+		switch strings.ToLower(name) {
+		case "accept", "accept-language", "cache-control":
+		default:
+			return fmt.Errorf("http probe request header %q is not in the read-only allowlist (Accept, Accept-Language, Cache-Control)", name)
+		}
+	}
+	if !s.Match.hasHTTPMatcher() {
+		return errors.New("http probe requires at least one positive response matcher")
+	}
+	return s.Match.compile()
+}
 
+// compile validates response predicates once at load time, including for TCP banners.
+func (m *MatchSpec) compile() error {
+	var err error
+	if m.BodyRegex != "" {
+		if m.bodyPattern, err = regexp.Compile(m.BodyRegex); err != nil {
+			return fmt.Errorf("match.body_regex: %w", err)
+		}
+	}
+	if m.BodyNotRegex != "" {
+		if m.bodyNotPattern, err = regexp.Compile(m.BodyNotRegex); err != nil {
+			return fmt.Errorf("match.body_not_regex: %w", err)
+		}
+	}
+	if m.BannerRegex != "" {
+		if m.bannerPattern, err = regexp.Compile(m.BannerRegex); err != nil {
+			return fmt.Errorf("match.banner_regex: %w", err)
+		}
+	}
+	for i := range m.JSONMatch {
+		p := &m.JSONMatch[i]
+		if !jsonPathPattern.MatchString(p.Path) {
+			return fmt.Errorf("match.json_match[%d]: unsupported JSON path %q", i, p.Path)
+		}
+		if p.Exists == nil && p.Equals == "" && p.NotEquals == "" && p.Regex == "" {
+			return fmt.Errorf("match.json_match[%d]: predicate requires exists, equals, not_equals, or regex", i)
+		}
+		if p.Regex != "" {
+			if p.compiled, err = regexp.Compile(p.Regex); err != nil {
+				return fmt.Errorf("match.json_match[%d].regex: %w", i, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -683,25 +762,30 @@ func (c *Check) Validate() error {
 // response matching condition. Negative-only matchers (headers_absent,
 // body_not_contains, body_not_regex) do not qualify on their own because they
 // would match arbitrary 404 or 500 error responses.
-func (m MatchSpec) hasHTTPMatcher() bool {
+func (m *MatchSpec) hasHTTPMatcher() bool {
+	for _, p := range m.JSONMatch {
+		// A missing JSON field or bare root "$" check alone matches unrelated JSON error pages.
+		if (p.Exists != nil && *p.Exists && p.Path != "$") || p.Equals != "" || p.NotEquals != "" || p.Regex != "" {
+			return true
+		}
+	}
 	return len(m.Status) > 0 ||
 		len(m.BodyContainsAll) > 0 ||
 		len(m.BodyContainsAny) > 0 ||
 		strings.TrimSpace(m.BodyRegex) != "" ||
-		len(m.JSONMatch) > 0 ||
 		len(m.HeadersPresent) > 0 ||
 		len(m.HeaderContains) > 0
 }
 
-// httpPaths returns the ordered deduplicated list of relative paths configured
-// on an HTTP probe (combining Path and Paths).
-func (c *Check) httpPaths() []string {
+// httpPaths returns the ordered deduplicated list of non-empty relative paths
+// configured on an HTTP step, trying Path before any entries in Paths.
+func (s *HTTPStepSpec) httpPaths() []string {
 	var out []string
-	if c.Probe.Path != "" {
-		out = append(out, c.Probe.Path)
+	if s.Path != "" {
+		out = append(out, s.Path)
 	}
-	for _, p := range c.Probe.Paths {
-		if p != "" && p != c.Probe.Path {
+	for _, p := range s.Paths {
+		if p != "" && p != s.Path {
 			out = append(out, p)
 		}
 	}

@@ -5,16 +5,17 @@
 # license that can be found in the LICENSE file.
 
 id: UB-2026-0001
-title: Legacy Server BMC Web Console (MegaRAC / ASMB / iKVM)
-cve: CVE-2024-54085
+title: Server BMC Web Console (MegaRAC / ASMB / iKVM)
+cve: null
 category: oob-bmc
+claim: service-observed
 severity: high
 safety: read-only
 
 metadata:
   vendor: AMI / ASUS / Supermicro / ASRock Rack
   product: MegaRAC SPX / ASMB / ATEN IPMI Web Console
-  affected_versions: Legacy and unpatched AMI MegaRAC / ASMB / Supermicro BMC web stacks
+  affected_versions: any matching console (firmware version unverified)
   author: "@karalabe"
   references:
     - https://nvd.nist.gov/vuln/detail/CVE-2024-54085
@@ -40,12 +41,11 @@ probe:
 remediation:
   summary: >
     An out-of-band server management console (AMI MegaRAC / ASUS ASMB /
-    Supermicro ATEN BMC) web interface is reachable on this network. Legacy BMC
-    web stacks frequently run outdated embedded Linux/lighttpd firmware with
-    critical authentication bypasses (such as CVE-2024-54085) and grant
-    bare-metal console, power, virtual USB boot, and BIOS flashing access.
-    Isolate the BMC onto a dedicated Out-of-Band Management VLAN with strict
-    firewall ACLs and update BMC firmware immediately.
+    Supermicro ATEN BMC) is reachable on this network. The console can manage
+    server power, boot media, and firmware. Check the installed firmware
+    against vendor advisories. CVE-2024-54085 is an example of an authentication
+    bypass affecting unpatched MegaRAC SPx versions. Apply vendor updates and
+    restrict BMC access to trusted administrators on a dedicated management VLAN.
   unifi_actions:
     - move_bmc_to_dedicated_oob_mgmt_vlan
     - restrict_bmc_access_to_admin_ips

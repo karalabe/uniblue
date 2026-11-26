@@ -1536,8 +1536,8 @@ function humanReason(r, ent) {
       fix: r.remediation || "Turn off SNMP in the device settings, or switch to SNMPv3 with a private password."
     },
     "UB-2026-0039": {
-      title: "Ventilation unit control API (ComfoConnect) is open",
-      why: "Anyone on the same network can connect to this Zehnder ComfoConnect bridge over cleartext port 56747 and adjust ventilation settings.",
+      title: "Ventilation unit cleartext control port (ComfoConnect) is reachable",
+      why: "This Zehnder ComfoConnect bridge exposes cleartext port 56747 on this network (read-only scan does not test PIN or control auth). Keep ventilation controllers isolated from general LAN devices.",
       fix: r.remediation || "Set a non-default PIN in ComfoControl, move the bridge to an isolated IoT network, and allow port 56747 only from your home automation controller."
     },
     "UB-2026-0056": {

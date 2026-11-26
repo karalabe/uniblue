@@ -8,15 +8,18 @@ package checks
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	builtinchecks "github.com/karalabe/uniblue/checks"
 	"github.com/karalabe/uniblue/internal/probe"
@@ -724,4 +727,233 @@ func startMockTCP(t *testing.T, fn func(net.Conn)) (int, func()) {
 		}
 	}()
 	return ln.Addr().(*net.TCPAddr).Port, func() { _ = ln.Close() }
+}
+
+type stepTransport func(*http.Request) (*http.Response, error)
+
+func (f stepTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestHTTPStepValidation verifies read-only and schema guardrails for probe.steps.
+func TestHTTPStepValidation(t *testing.T) {
+	const header = "id: UB-TEST-HTTP\ntitle: HTTP step test\nsafety: read-only\npreconditions: {ports_any: [80]}\nprobe: "
+	const valid = "{path: /info, match: {status: [200]}}"
+	inSteps := func(step string) string { return "{type: http, steps: [" + valid + ", " + step + "]}" }
+
+	for _, tc := range []struct{ name, spec, wantErr string }{
+		{"forbidden method", inSteps("{method: POST, path: /, match: {status: [200]}}"), "method"},
+		{"absolute path", inSteps("{path: 'https://example.org/', match: {status: [200]}}"), "relative path"},
+		{"scheme-relative path", inSteps("{paths: [/ok, //example.org], match: {status: [200]}}"), "relative path"},
+		{"forbidden header", inSteps("{path: /, request_headers: {Cookie: session}, match: {status: [200]}}"), "allowlist"},
+		{"negative matcher only", inSteps("{path: /, match: {headers_absent: [Server]}}"), "positive"},
+		{"bare root JSON exists only", inSteps("{path: /, match: {json_match: [{path: '$', exists: true}]}}"), "positive"},
+		{"empty steps", "{type: http, steps: []}", "between"},
+		{"too many steps", "{type: http, steps: [" + strings.Repeat(valid+", ", maxProbeSteps) + valid + "]}", "between"},
+		{"mixed top-level path", "{type: http, path: /, steps: [" + valid + "]}", "combined"},
+		{"mixed top-level match", "{type: http, match: {status: [200]}, steps: [" + valid + "]}", "combined"},
+		{"non-HTTP probe", "{type: tcp, steps: [" + valid + "]}", "requires probe.type http"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Parse([]byte(header+tc.spec), "test.yaml"); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+	// Preserve compatibility for single-request paths with interior "//".
+	if _, err := Parse([]byte(header+"{type: http, path: /api//status, match: {status: [200]}}"), "test.yaml"); err != nil {
+		t.Fatalf("interior // path should remain valid: %v", err)
+	}
+}
+
+// TestHTTPStepExecutionAndLegacyFraming checks multi-step matching, body read errors,
+// and legacy single-request resilience against truncated embedded HTTP responses.
+func TestHTTPStepExecutionAndLegacyFraming(t *testing.T) {
+	const header = "id: UB-TEST-HTTP\ntitle: HTTP test\nsafety: read-only\npreconditions: {ports_any: [80]}\nprobe: "
+	multi, err := Parse([]byte(header+`{type: http, timeout: 100ms, steps: [
+		{paths: [/first, /alt], match: {status: [200], body_regex: '^ready', evidence_summary: ready}},
+		{method: HEAD, path: /second, match: {status: [200]}}
+	]}`), "test.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Happy path via fallback /alt + shared deadline.
+	r := NewRunner(nil, 1)
+	var seen []string
+	var deadline time.Time
+	r.httpClient.Transport = stepTransport(func(req *http.Request) (*http.Response, error) {
+		seen = append(seen, req.URL.Path)
+		dl, ok := req.Context().Deadline()
+		if !ok || (!deadline.IsZero() && !deadline.Equal(dl)) {
+			t.Fatalf("missing or mismatched deadline on %s", req.URL.Path)
+		}
+		deadline = dl
+		if req.URL.Path == "/first" {
+			return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ready"))}, nil
+	})
+	if ev, ok := r.executeProbe(t.Context(), multi, "127.0.0.1", 80); !ok || !slices.Equal(seen, []string{"/first", "/alt", "/second"}) || !strings.Contains(ev, "ready") {
+		t.Fatalf("multi-step match failed: ok=%t seen=%v ev=%q", ok, seen, ev)
+	}
+
+	// Multi-step sequences reject responses whose body read fails mid-stream.
+	r.httpClient.Transport = stepTransport(func(req *http.Request) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = io.WriteString(pw, "ready")
+			_ = pw.CloseWithError(io.ErrUnexpectedEOF)
+		}()
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(pr)}, nil
+	})
+	if _, ok := r.executeProbe(t.Context(), multi, "127.0.0.1", 80); ok {
+		t.Fatal("multi-step check must reject truncated body read error")
+	}
+
+	// Legacy single-request HTTP check must still match sloppy embedded/BMC responses.
+	legacy, err := Parse([]byte(header+`{type: http, path: /, match: {status: [200], body_contains_all: ["MegaRAC"]}}`), "test.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.httpClient.Transport = stepTransport(func(req *http.Request) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = io.WriteString(pw, "<title>MegaRAC SPx</title>")
+			_ = pw.CloseWithError(io.ErrUnexpectedEOF)
+		}()
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(pr)}, nil
+	})
+	if _, ok := r.executeProbe(t.Context(), legacy, "127.0.0.1", 80); !ok {
+		t.Fatal("legacy single-request HTTP check must still match partial body before EOF error")
+	}
+}
+
+// runBuiltinHTTP redirects connections for port to an ephemeral httptest.Server.
+func runBuiltinHTTP(t *testing.T, port int, handler http.HandlerFunc, checks ...*Check) []Finding {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+	r := NewRunner(checks, 1)
+	r.httpClient.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+	return r.RunHost(t.Context(), probe.HostProfile{
+		Client:    unifi.Client{IP: "127.0.0.1"},
+		OpenPorts: []int{port},
+	})
+}
+
+// TestCommunityCheckPrecision verifies Node-RED auth modes, Shelly Gen1 json_match,
+// and honest service-observed evidence on MegaRAC and ComfoConnect.
+func TestCommunityCheckPrecision(t *testing.T) {
+	all := loadBuiltinMap(t)
+
+	t.Run("Node-RED", func(t *testing.T) {
+		chks := []*Check{all["UB-2026-0026"], all["UB-2026-0074"], all["UB-2026-0075"]}
+		tabFlow := `[{"type":"tab","label":"secret-flow","info":"` + strings.Repeat("x", maxProbeBodyBytes) + `"}]`
+		for _, tc := range []struct {
+			name         string
+			flowsStatus  int
+			flowsBody    string
+			loginBody    string
+			settingsBody string
+			wantID       string
+			wantSev      Severity
+		}{
+			{"auth required", 401, "", "", "", "", SeverityInfo},
+			{"anon read only", 200, tabFlow, `{"type":"credentials"}`, `{"httpNodeRoot":"/","user":{"anonymous":true,"permissions":"read"}}`, "UB-2026-0074", SeverityHigh},
+			{"token-only anon read", 200, tabFlow, `{}`, `{"httpNodeRoot":"/","user":{"anonymous":true,"permissions":"read"}}`, "UB-2026-0074", SeverityHigh},
+			{"anon wildcard admin", 200, tabFlow, `{"type":"credentials"}`, `{"httpNodeRoot":"/","user":{"anonymous":true,"permissions":"*"}}`, "UB-2026-0075", SeverityCritical},
+			{"anon wildcard admin array", 200, tabFlow, `{"type":"credentials"}`, `{"httpNodeRoot":"/","user":{"anonymous":true,"permissions":["*"]}}`, "UB-2026-0075", SeverityCritical},
+			{"no adminAuth", 200, tabFlow, " {}\n", `{"httpNodeRoot":"/","version":"4.0.0"}`, "UB-2026-0026", SeverityCritical},
+			{"no adminAuth empty flows", 200, `[]`, `{}`, `{"httpNodeRoot":"/","version":"4.0.0"}`, "UB-2026-0026", SeverityCritical},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := runBuiltinHTTP(t, 1880, func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/flows":
+						w.WriteHeader(tc.flowsStatus)
+						_, _ = io.WriteString(w, tc.flowsBody)
+					case "/auth/login":
+						_, _ = io.WriteString(w, tc.loginBody)
+					case "/settings":
+						_, _ = io.WriteString(w, tc.settingsBody)
+					}
+				}, chks...)
+				if tc.wantID == "" {
+					if len(got) != 0 {
+						t.Fatalf("expected 0 findings, got %+v", got)
+					}
+					return
+				}
+				if len(got) != 1 || got[0].CheckID != tc.wantID || got[0].BaseSeverity != tc.wantSev || strings.Contains(got[0].Evidence, "secret-flow") {
+					t.Fatalf("want single %s (%v), got %+v", tc.wantID, tc.wantSev, got)
+				}
+			})
+		}
+	})
+
+	t.Run("Shelly Gen1", func(t *testing.T) {
+		chk := all["UB-2026-0031"]
+		for _, tc := range []struct {
+			name   string
+			status int
+			body   string
+			want   bool
+		}{
+			{"wifi_ap disabled but login enabled", 200, `{"wifi_ap":{"enabled":false},"login":{"enabled":true},"wifi_sta":{}}`, false},
+			{"login disabled", 200, `{"wifi_sta":{"ssid":"secret-ssid"},"login":{"enabled":false}}`, true},
+			{"auth challenge", 401, `{"wifi_sta":{},"login":{"enabled":false}}`, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := runBuiltinHTTP(t, 80, func(w http.ResponseWriter, r *http.Request) {
+					if tc.status == 401 {
+						w.Header().Set("WWW-Authenticate", `Basic realm="Shelly"`)
+					}
+					w.WriteHeader(tc.status)
+					_, _ = io.WriteString(w, tc.body)
+				}, chk)
+				if (len(got) == 1) != tc.want {
+					t.Fatalf("want match=%t, got %+v", tc.want, got)
+				}
+				if tc.want && strings.Contains(got[0].Evidence, "secret-ssid") {
+					t.Fatalf("evidence leaked body: %q", got[0].Evidence)
+				}
+			})
+		}
+	})
+
+	t.Run("MegaRAC and ComfoConnect stay actionable service-observed", func(t *testing.T) {
+		got := runBuiltinHTTP(t, 80, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "<title>MegaRAC SPx Login</title>")
+		}, all["UB-2026-0001"])
+		if len(got) != 1 || got[0].ClaimKind != ClaimServiceObserved || got[0].BaseSeverity != SeverityHigh || got[0].IsInventoryOnly() || got[0].CVE != "" {
+			t.Fatalf("unexpected MegaRAC finding: %+v", got)
+		}
+
+		port, closeTCP := startMockTCP(t, func(net.Conn) {})
+		defer closeTCP()
+		udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer udp.Close()
+		go func() {
+			var req [64]byte
+			if n, addr, err := udp.ReadFromUDP(req[:]); err == nil && bytes.Equal(req[:n], []byte{0x0a, 0}) {
+				_, _ = udp.WriteToUDP([]byte{0x12, 6, 0x0a, 4, 127, 0, 0, 1}, addr)
+			}
+		}()
+		chk := *all["UB-2026-0039"]
+		chk.Preconditions.PortsAny = []int{port}
+		chk.Probe.Port = port
+		chk.Probe.Timeout = 500 * time.Millisecond
+		got = NewRunner([]*Check{&chk}, 1).RunHost(t.Context(), probe.HostProfile{
+			Client:    unifi.Client{IP: "127.0.0.1", Hostname: "comfoconnect"},
+			OpenPorts: []int{port},
+		})
+		if len(got) != 1 || got[0].ClaimKind != ClaimServiceObserved || got[0].BaseSeverity != SeverityHigh ||
+			got[0].IsInventoryOnly() || !strings.Contains(got[0].Evidence, "PIN and control authorization untested") {
+			t.Fatalf("unexpected ComfoConnect finding: %+v", got)
+		}
+	})
 }

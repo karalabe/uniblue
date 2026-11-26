@@ -849,7 +849,7 @@ func probeTCP(ctx context.Context, ip string, port int, chk *Check) (string, boo
 	}
 	defer conn.Close()
 
-	if chk.compiled.banner == nil {
+	if chk.Probe.Match.bannerPattern == nil {
 		return fmt.Sprintf("TCP port %d accepted connection", port), true
 	}
 
@@ -859,28 +859,59 @@ func probeTCP(ctx context.Context, ip string, port int, chk *Check) (string, boo
 	}
 	buf := make([]byte, maxBannerReadBytes)
 	n, _ := conn.Read(buf)
-	if n == 0 || !chk.compiled.banner.Match(buf[:n]) {
+	if n == 0 || !chk.Probe.Match.bannerPattern.Match(buf[:n]) {
 		return "", false
 	}
 	return fmt.Sprintf("TCP port %d banner matched check signature", port), true
 }
 
-// probeHTTP executes strictly read-only, target-IP-only HTTP request(s) across
-// Path / Paths and evaluates status, header, body, negative, and JSONPath matchers.
+// probeHTTP executes strictly read-only, target-IP-only HTTP request(s) against
+// ip:port. Multi-step probes require every step to match sequentially under the
+// check's shared context deadline.
 func (r *Runner) probeHTTP(ctx context.Context, hp probe.HostProfile, ip string, port int, chk *Check) (string, bool) {
-	scheme := inferHTTPScheme(hp, port, chk)
+	endpoint := inferHTTPScheme(hp, port, chk) + "://" + net.JoinHostPort(ip, strconv.Itoa(port))
+	if chk.Probe.Steps == nil {
+		return r.probeHTTPStep(ctx, endpoint, &chk.Probe.HTTPStepSpec, chk)
+	}
+	if len(chk.Probe.Steps) == 0 {
+		return "", false
+	}
 
-	for _, path := range chk.httpPaths() {
+	var evidence []string
+	for i := range chk.Probe.Steps {
+		ev, matched := r.probeHTTPStep(ctx, endpoint, &chk.Probe.Steps[i], chk)
+		if !matched {
+			return "", false
+		}
+		evidence = append(evidence, ev)
+	}
+	return strings.Join(evidence, ". "), true
+}
+
+// probeHTTPStep evaluates one HTTP step across its configured path candidates,
+// aborting immediately on transport errors or unexpected 401/403 challenges.
+func (r *Runner) probeHTTPStep(ctx context.Context, endpoint string, step *HTTPStepSpec, chk *Check) (string, bool) {
+	// Multi-step regex, JSON, and negative body assertions read one lookahead
+	// byte past maxProbeBodyBytes so truncated bodies cannot spoof full-body
+	// matches. Single-request checks keep bounded prefix matching so embedded
+	// devices with sloppy HTTP framing still match reliably.
+	isMultiStep := chk.Probe.Steps != nil
+	readLimit := int64(maxProbeBodyBytes)
+	m := &step.Match
+	if isMultiStep && (m.bodyPattern != nil || m.bodyNotPattern != nil ||
+		len(m.BodyNotContains) > 0 || len(m.JSONMatch) > 0) {
+		readLimit++
+	}
+	for _, path := range step.httpPaths() {
 		if ctx.Err() != nil {
 			return "", false
 		}
-		targetURL := fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(ip, strconv.Itoa(port)), path)
-		req, err := http.NewRequestWithContext(ctx, chk.Probe.Method, targetURL, nil)
+		req, err := http.NewRequestWithContext(ctx, step.Method, endpoint+path, nil)
 		if err != nil {
 			return "", false
 		}
 		req.Header.Set("User-Agent", "UniBlue-Checker/0.1")
-		for hk, hv := range chk.Probe.RequestHeaders {
+		for hk, hv := range step.RequestHeaders {
 			req.Header.Set(hk, hv)
 		}
 
@@ -888,24 +919,40 @@ func (r *Runner) probeHTTP(ctx context.Context, hp probe.HostProfile, ip string,
 		if err != nil {
 			return "", false
 		}
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxProbeBodyBytes))
-		_ = resp.Body.Close()
 
 		// Stop trying alternate paths if the service explicitly challenged authentication.
-		if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) &&
-			!intInSlice(resp.StatusCode, chk.Probe.Match.Status) {
+		challenge := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
+		if challenge && !intInSlice(resp.StatusCode, m.Status) {
+			_ = resp.Body.Close()
 			return "", false
 		}
-		if !matchHTTPResponse(resp, bodyBytes, chk) {
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, readLimit))
+		_ = resp.Body.Close()
+		if isMultiStep {
+			if err != nil {
+				return "", false
+			}
+			if len(bodyBytes) > maxProbeBodyBytes {
+				continue
+			}
+		}
+		matched := m.matchesHTTP(resp, bodyBytes)
+		if isMultiStep && ctx.Err() != nil {
+			return "", false
+		}
+		if !matched {
 			continue
 		}
-		if chk.Probe.Match.EvidenceSummary != "" {
-			return fmt.Sprintf("%s (%s %s -> HTTP %d)", chk.Probe.Match.EvidenceSummary, chk.Probe.Method, path, resp.StatusCode), true
+		if m.EvidenceSummary != "" {
+			return fmt.Sprintf("%s (%s %s -> HTTP %d)", m.EvidenceSummary, step.Method, path, resp.StatusCode), true
+		}
+		if challenge {
+			return fmt.Sprintf("%s %s returned HTTP %d", step.Method, path, resp.StatusCode), true
 		}
 		if chk.Claim == ClaimServiceObserved || chk.Claim == ClaimAssetIdentity {
-			return fmt.Sprintf("%s %s returned HTTP %d (service observed)", chk.Probe.Method, path, resp.StatusCode), true
+			return fmt.Sprintf("%s %s returned HTTP %d (service observed)", step.Method, path, resp.StatusCode), true
 		}
-		return fmt.Sprintf("%s %s returned HTTP %d without required authentication", chk.Probe.Method, path, resp.StatusCode), true
+		return fmt.Sprintf("%s %s returned HTTP %d without required authentication", step.Method, path, resp.StatusCode), true
 	}
 	return "", false
 }
@@ -935,15 +982,15 @@ func inferHTTPScheme(hp probe.HostProfile, port int, chk *Check) string {
 	}
 }
 
-func matchHTTPResponse(resp *http.Response, bodyBytes []byte, chk *Check) bool {
+// matchesHTTP evaluates the signature against the bounded response without retaining body content.
+func (m *MatchSpec) matchesHTTP(resp *http.Response, bodyBytes []byte) bool {
 	body := string(bodyBytes)
-	m := chk.Probe.Match
 
 	if len(m.Status) > 0 && !intInSlice(resp.StatusCode, m.Status) {
 		return false
 	}
 	for _, h := range m.HeadersAbsent {
-		if resp.Header.Get(h) != "" {
+		if len(resp.Header.Values(h)) != 0 {
 			return false
 		}
 	}
@@ -979,10 +1026,10 @@ func matchHTTPResponse(resp *http.Response, bodyBytes []byte, chk *Check) bool {
 			return false
 		}
 	}
-	if chk.compiled.body != nil && !chk.compiled.body.MatchString(body) {
+	if m.bodyPattern != nil && !m.bodyPattern.MatchString(body) {
 		return false
 	}
-	if chk.compiled.bodyNot != nil && chk.compiled.bodyNot.MatchString(body) {
+	if m.bodyNotPattern != nil && m.bodyNotPattern.MatchString(body) {
 		return false
 	}
 	if !matchJSONPredicates(bodyBytes, m.JSONMatch) {
@@ -1383,9 +1430,8 @@ func probeDenonMarantzAVR(ctx context.Context, ip string, port int) (string, boo
 }
 
 // probeComfoConnect sends a strictly read-only 2-byte unicast UDP discovery
-// beacon (0x0a 0x00) directly to the target host on port 56747 to verify it is
-// an active Zehnder ComfoConnect LAN C bridge without ever attempting app
-// registration or disrupting an existing Home Assistant TCP session.
+// beacon after checking TCP reachability. Neither operation starts a control
+// session or tests the registration PIN.
 func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) {
 	// First confirm TCP port 56747 is listening.
 	tcpConn, err := dialWithContextDeadline(ctx, ip, port)
@@ -1394,10 +1440,13 @@ func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) 
 	}
 	_ = tcpConn.Close()
 
+	// TCP reachability is the only evidence if unicast discovery fails.
+	tcpOnly := fmt.Sprintf("TCP:%d open (UDP discovery unconfirmed). PIN and control authorization untested", port)
+
 	// Send unicast read-only UDP discovery request (protobuf SearchGatewayRequest = 0x0a 0x00).
 	udpConn, err := (&net.Dialer{}).DialContext(ctx, "udp", net.JoinHostPort(ip, strconv.Itoa(port)))
 	if err != nil {
-		return fmt.Sprintf("TCP port %d accepted connection (ComfoConnect control API)", port), true
+		return tcpOnly, true
 	}
 	defer udpConn.Close()
 
@@ -1407,11 +1456,10 @@ func probeComfoConnect(ctx context.Context, ip string, port int) (string, bool) 
 	if _, err := udpConn.Write([]byte{0x0a, 0x00}); err == nil {
 		buf := make([]byte, 256)
 		if n, readErr := udpConn.Read(buf); readErr == nil && n >= 8 {
-			// Discovery response ends with the bridge UUID/MAC identifier.
-			return fmt.Sprintf("confirmed active ComfoConnect LAN C bridge via read-only UDP discovery (%d-byte response) + TCP:%d open", n, port), true
+			return fmt.Sprintf("TCP:%d open (%d-byte UDP discovery reply). PIN and control authorization untested", port, n), true
 		}
 	}
-	return fmt.Sprintf("TCP port %d accepted connection (ComfoConnect control API)", port), true
+	return tcpOnly, true
 }
 
 // probeVNC completes the read-only RFB initialization handshake when security

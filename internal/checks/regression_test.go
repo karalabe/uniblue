@@ -981,7 +981,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		[]byte(`{"name":"","type":"directory","content":[]}`),
 		truncLarge,
 	} {
-		if !matchHTTPResponse(okResp, body, jup) {
+		if !jup.Probe.Match.matchesHTTP(okResp, body) {
 			t.Fatalf("UB-0034 must match valid/truncated Jupyter listing (len=%d)", len(body))
 		}
 	}
@@ -989,7 +989,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		[]byte(`<html><body>Login</body></html>`),
 		[]byte(`{"message": "Forbidden", "reason": null}`),
 	} {
-		if matchHTTPResponse(okResp, body, jup) {
+		if jup.Probe.Match.matchesHTTP(okResp, body) {
 			t.Fatalf("UB-0034 must reject non-Jupyter response %q", string(body))
 		}
 	}
@@ -1005,7 +1005,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		`<html><head><title>Shelly</title></head><body><script>window.bootLogin();</script></body></html>`,
 		`<html><head><title>Shelly</title></head><body><a href="/login">Sign in</a><script src="/static/auth-bundle.js"></script></body></html>`,
 	} {
-		if matchHTTPResponse(okResp, []byte(html), panel) {
+		if panel.Probe.Match.matchesHTTP(okResp, []byte(html)) {
 			t.Fatalf("UB-0040 must reject login/SPA page %q", html)
 		}
 	}
@@ -1013,7 +1013,7 @@ func TestHTTPMatchersAndPassiveUDPPreconditionsInMemory(t *testing.T) {
 		`<html><title>Smart Meter</title><body><button>Toggle Relay</button></body></html>`,
 		`<html><title>Tasmota</title><body><table><tr><td>OFF</td></tr></table><button>Toggle</button></body></html>`,
 	} {
-		if !matchHTTPResponse(okResp, []byte(html), panel) {
+		if !panel.Probe.Match.matchesHTTP(okResp, []byte(html)) {
 			t.Fatalf("UB-0040 must match unauthenticated static control panel %q", html)
 		}
 	}
