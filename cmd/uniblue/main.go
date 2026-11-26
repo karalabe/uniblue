@@ -1247,9 +1247,9 @@ func printReport(w io.Writer, snap *unifi.Snapshot, report risk.Report, profiles
 		_ = tw.Flush()
 	}
 
-	// 3. Rolled-up Patch Verification Reminders (version unknown).
+	// 3. Rolled-up Patch Verification Reminders.
 	if cveLoaded && len(potentialCVEs) > 0 {
-		fmt.Fprintf(w, "\n3. Patch Verification (Version Unknown, %d product(s)):\n", len(potentialCVEs))
+		fmt.Fprintf(w, "\n3. Patch Verification (%d product(s)):\n", len(potentialCVEs))
 		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 		fmt.Fprintln(tw, "  MAX SEV\tHOST\tVLAN\tSUMMARY\tTOP CVES")
 		for _, s := range potentialCVEs {
@@ -1439,22 +1439,24 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-// runCVE dispatches `uniblue cve <sync|explore|search|show>` subcommands.
+// runCVE dispatches `uniblue cve <sync|explore|search|show|history>` subcommands.
 func runCVE(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: uniblue cve <sync|explore|search|show> [flags]")
+		return errors.New("usage: uniblue cve <sync|explore|search|show|history> [flags]")
 	}
 	switch args[0] {
 	case "sync":
 		return runCVESync(ctx, args[1:], stdout, stderr)
 	case "explore":
 		return runCVEExplore(ctx, args[1:], stdout, stderr)
+	case "history":
+		return runCVEHistory(args[1:], stdout, stderr)
 	case "search":
 		return runCVESearch(ctx, args[1:], stdout, stderr)
 	case "show":
 		return runCVEShow(ctx, args[1:], stdout, stderr)
 	default:
-		return fmt.Errorf("unknown cve subcommand %q (want sync, explore, search, or show)", args[0])
+		return fmt.Errorf("unknown cve subcommand %q (want sync, explore, search, show, or history)", args[0])
 	}
 }
 
@@ -1635,11 +1637,14 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	_ = tw.Flush()
 
-	var exact, potential []cve.Match
+	var exact, ambiguous, potential []cve.Match
 	for _, m := range matches {
-		if m.Confidence == cve.ConfidenceExact {
+		switch m.Confidence {
+		case cve.ConfidenceExact:
 			exact = append(exact, m)
-		} else {
+		case cve.ConfidenceVersionAmbiguous:
+			ambiguous = append(ambiguous, m)
+		default:
 			potential = append(potential, m)
 		}
 	}
@@ -1651,11 +1656,75 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 		printCVEMatchTable(stdout, exact, len(exact))
 	}
 
-	fmt.Fprintf(stdout, "\nPotential Product Matches (Version Unknown, %d total, showing up to %d):\n", len(potential), *limit)
+	if len(ambiguous) > 0 {
+		fmt.Fprintf(stdout, "\nDistro-Packaged Software (Verify Backported Patches, %d):\n", len(ambiguous))
+		printCVEMatchTable(stdout, ambiguous, len(ambiguous))
+	}
+	fmt.Fprintf(stdout, "\nPotential Product Matches (%d total, showing up to %d):\n", len(potential), *limit)
 	if len(potential) == 0 {
 		fmt.Fprintln(stdout, "  None.")
 	} else {
 		printCVEMatchTable(stdout, potential, *limit)
+	}
+	return nil
+}
+
+// runCVEHistory reports product-wide history using only the local cache.
+func runCVEHistory(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("cve history", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "config.yaml", "optional UniBlue config for cve.cache_dir")
+	cacheDir := fs.String("cache", "", "local CVE cache directory (overrides config)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var vendor, product string
+	switch fs.NArg() {
+	case 1:
+		v, p, ok := strings.Cut(strings.TrimSpace(fs.Arg(0)), ":")
+		if !ok {
+			return errors.New("usage: uniblue cve history [-cache <dir>] <vendor> <product> (or <vendor>:<product>)")
+		}
+		vendor, product = strings.TrimSpace(v), strings.TrimSpace(p)
+	case 2:
+		vendor, product = strings.TrimSpace(fs.Arg(0)), strings.TrimSpace(fs.Arg(1))
+	default:
+		return errors.New("usage: uniblue cve history [-cache <dir>] <vendor> <product> (or <vendor>:<product>)")
+	}
+	if vendor == "" || product == "" || strings.ContainsAny(vendor+product, "*") {
+		return errors.New("history requires a specific vendor and product")
+	}
+	dir, err := resolveCVECacheDir(*cacheDir, *cfgPath, flagPassed(fs, "config"))
+	if err != nil {
+		return err
+	}
+	h, err := cve.NewCache(dir).ProductVelocity(cve.Product{
+		Vendors: []string{vendor}, Products: []string{product}, HighConfidence: true,
+	}, time.Now())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "%s:%s  %s\n", vendor, product, h.Class)
+	fmt.Fprintf(stdout, "Historical CVEs: %d\nCISA KEV: %d", h.TotalCVEs, h.KEVCount)
+	if h.LatestKEV != "" {
+		fmt.Fprintf(stdout, " (latest addition %s)", h.LatestKEV)
+	}
+	fmt.Fprintf(stdout, ", %d linked to ransomware\n", h.RansomwareCount)
+	for _, years := range []int{1, 3, 5} {
+		count, covered := h.NetworkHigh[years]
+		if covered {
+			fmt.Fprintf(stdout, "%dy AV:N High/Critical: %d\n", years, count)
+		} else {
+			fmt.Fprintf(stdout, "%dy AV:N High/Critical: unavailable (incomplete coverage)\n", years)
+		}
+	}
+	for _, year := range h.IncompleteYears {
+		c := h.YearCoverage[year]
+		if c.Total == 0 {
+			fmt.Fprintf(stdout, "%s NVD CPE coverage unavailable\n", year)
+		} else {
+			fmt.Fprintf(stdout, "%s NVD CPE coverage %d/%d (%.1f%%, below 60%%)\n", year, c.WithCPE, c.Total, 100*float64(c.WithCPE)/float64(c.Total))
+		}
 	}
 	return nil
 }
@@ -1757,7 +1826,11 @@ func runCVEShow(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if len(rec.Matches) > 0 {
 		fmt.Fprintf(stdout, "\nAffected CPE Ranges (%d):\n", len(rec.Matches))
 		for _, m := range rec.Matches {
-			fmt.Fprintf(stdout, "  - %s:%s %s\n", m.Vendor, m.Product, formatCPERange(m))
+			bounds := formatCPERange(m)
+			if m.NeedsContext {
+				bounds += " (requires platform verification)"
+			}
+			fmt.Fprintf(stdout, "  - %s:%s %s\n", m.Vendor, m.Product, bounds)
 		}
 	}
 	return nil

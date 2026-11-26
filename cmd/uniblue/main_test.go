@@ -12,12 +12,15 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
@@ -597,5 +600,77 @@ func TestWatchSessionPreservesUnavailableSettingsAcrossTransientOutage(t *testin
 	sess.runCycle(context.Background())
 	if len(sentDiffs) != 1 {
 		t.Fatalf("cycle 3 re-alerted after transient settings outage recovery: sentDiffs=%+v", sentDiffs)
+	}
+}
+
+// TestCVEHistoryFromOfflineSync exercises the CLI against cached archives and
+// checks that refreshing a high-profile product leaves the alert baseline intact.
+func TestCVEHistoryFromOfflineSync(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	cache := filepath.Join(dir, "cache")
+	feeds := filepath.Join(cache, "feeds")
+	if err := os.MkdirAll(feeds, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const baseline = "existing alert baseline"
+	write := func(path, data string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("uniblue-state.json", baseline)
+	write(filepath.Join(cache, "stats.json"), "{}")
+	now := time.Now().UTC()
+	year := now.Year()
+	date := now.Format(time.DateOnly)
+	write(filepath.Join(cache, "kev.json"), fmt.Sprintf(`{"vulnerabilities":[{"cveID":"CVE-%d-1234","dateAdded":%q}]}`, year, date))
+	for y := year - 2; y <= year; y++ {
+		feed := fmt.Sprintf(`{"vulnerabilities":[{"cve":{"id":"CVE-%d-1234","published":"%s","metrics":{"cvssMetricV40":[{"cvssData":{"baseScore":9.5,"vectorString":"CVSS:4.0/AV:N/PR:N/UI:P"}}]},"configurations":[{"nodes":[{"cpeMatch":[{"vulnerable":true,"criteria":"cpe:2.3:a:example:portal:*"}]}]}]}}]}`, y, date)
+		if y == year-1 {
+			feed = strings.ReplaceAll(feed, date, fmt.Sprintf("%d-01-01", y))
+			feed = strings.ReplaceAll(feed, ":portal:", ":other:")
+		}
+		if y == year-2 {
+			feed = fmt.Sprintf(`{"vulnerabilities":[{"cve":{"id":"CVE-%d-2222","published":"%d-01-01"}}]}`, y, y)
+		}
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		if _, err := gz.Write([]byte(feed)); err != nil {
+			t.Fatal(err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatal(err)
+		}
+		write(filepath.Join(feeds, fmt.Sprintf("nvdcve-2.0-%d.json.gz", y)), buf.String())
+	}
+	var out bytes.Buffer
+	if err := run([]string{"cve", "sync", "-cache", cache, "-since", fmt.Sprint(year - 2)}, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := run([]string{"cve", "history", "-cache", cache, "example", "portal"}, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"high-profile target", "CISA KEV: 1 (latest addition " + date + ")", "1y AV:N High/Critical: 1",
+		"3y AV:N High/Critical: unavailable", "5y AV:N High/Critical: unavailable", fmt.Sprintf("%d NVD CPE coverage 0/1", year-2)} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q in history:\n%s", want, &out)
+		}
+	}
+	out.Reset()
+	if err := run([]string{"cve", "history", "-cache", cache, "opaque", "sensor"}, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "unknown (opaque firmware - not evidence of safety)") {
+		t.Fatalf("opaque history: %s", &out)
+	}
+	raw, err := os.ReadFile("uniblue-state.json")
+	if err != nil || string(raw) != baseline {
+		t.Fatalf("alert baseline after cache commands: %q, %v", raw, err)
+	}
+	if _, err := os.Stat("uniblue-state.json.pending-webhooks.json"); !os.IsNotExist(err) {
+		t.Fatalf("unexpected alert queue after cache commands: %v", err)
 	}
 }

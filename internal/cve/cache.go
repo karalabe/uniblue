@@ -9,6 +9,7 @@ package cve
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -186,11 +188,21 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 		prevMeta = prevStats.YearMeta
 	}
 
-	// Step 1: Fetch CISA KEV catalog (single ~1.5 MB JSON file, fast and zero rate limits).
-	progress("Fetching CISA KEV catalog...")
-	kevSet, kevSHA, err := c.fetchKEV(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("fetch cisa kev: %w", err)
+	// A schema upgrade recompiles the local snapshot. The next regular sync
+	// resumes upstream freshness checks, including KEV-only changes.
+	migrating := prevStats != nil && prevStats.SchemaVersion != CurrentIndexSchemaVersion && !opts.Force
+	kevPath := filepath.Join(c.dir, "kev.json")
+	var kevSet map[string]kevEntry
+	var kevSHA string
+	if migrating {
+		kevSet, kevSHA, err = readKEV(kevPath)
+	}
+	if !migrating || err != nil {
+		progress("Fetching CISA KEV catalog...")
+		kevSet, kevSHA, err = c.fetchKEV(ctx, kevPath)
+		if err != nil {
+			return nil, fmt.Errorf("fetch cisa kev: %w", err)
+		}
 	}
 	progress(fmt.Sprintf("Loaded %d CISA KEV entries.", len(kevSet)))
 
@@ -201,17 +213,6 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 		years = append(years, strconv.Itoa(y))
 	}
 
-	type feedResult struct {
-		year     string
-		sha      string
-		filePath string
-		size     int64
-		meta     FeedFileMeta
-		changed  bool
-		skipped  bool
-		err      error
-	}
-
 	jobs := make(chan string)
 	results := make(chan feedResult, len(years))
 	done := make(chan struct{}, syncWorkers)
@@ -220,7 +221,7 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 		go func() {
 			defer func() { done <- struct{}{} }()
 			for year := range jobs {
-				results <- c.syncYearFeed(ctx, feedsDir, year, prevSHAs[year], prevMeta[year], opts.Force)
+				results <- c.syncYearFeed(ctx, feedsDir, year, prevSHAs[year], prevMeta[year], opts.Force, migrating)
 			}
 		}()
 	}
@@ -276,10 +277,10 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	sort.Strings(feedFiles)
 
 	// Skip rebuilding vendor shards only when both NVD feeds and the CISA KEV
-	// catalog are unchanged and shards already exist.
-	if downloaded == 0 && !opts.Force && prevStats != nil && prevStats.VendorCount > 0 &&
+	// catalog match the last successful build of the current schema.
+	if downloaded == 0 && !opts.Force && !migrating && prevStats != nil &&
 		prevStats.KEVSHA != "" && prevStats.KEVSHA == kevSHA &&
-		equalStringMaps(prevStats.YearSHAs, newSHAs) {
+		equalFeedSHAs(prevStats.YearSHAs, newSHAs) {
 		if len(prevStats.YearMeta) == 0 && len(newMeta) > 0 {
 			updated := *prevStats
 			updated.YearMeta = newMeta
@@ -308,22 +309,20 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	return stats, nil
 }
 
-// equalStringMaps reports whether a and b contain identical key/value pairs.
-func equalStringMaps(a, b map[string]string) bool {
+// equalFeedSHAs compares feed digests regardless of the case used by the NVD meta file.
+func equalFeedSHAs(a, b map[string]string) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for k, v := range a {
-		if bv, ok := b[k]; !ok || bv != v {
+		if bv, ok := b[k]; !ok || !strings.EqualFold(bv, v) {
 			return false
 		}
 	}
 	return true
 }
 
-// syncYearFeed fetches the .meta checksum for a single NVD year and downloads
-// nvdcve-2.0-<year>.json.gz only when the local copy is missing or outdated.
-func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string, prevMeta FeedFileMeta, force bool) struct {
+type feedResult struct {
 	year     string
 	sha      string
 	filePath string
@@ -332,19 +331,14 @@ func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string
 	changed  bool
 	skipped  bool
 	err      error
-} {
-	out := struct {
-		year     string
-		sha      string
-		filePath string
-		size     int64
-		meta     FeedFileMeta
-		changed  bool
-		skipped  bool
-		err      error
-	}{
-		year:     year,
-		filePath: filepath.Join(feedsDir, fmt.Sprintf("nvdcve-2.0-%s.json.gz", year)),
+}
+
+// syncYearFeed reuses verified archives during migration. Regular refreshes
+// also check the upstream checksum before deciding whether to download.
+func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string, prevMeta FeedFileMeta, force, migrating bool) feedResult {
+	out := feedResult{year: year, filePath: filepath.Join(feedsDir, fmt.Sprintf("nvdcve-2.0-%s.json.gz", year))}
+	if migrating && out.reuseArchive(prevSHA, prevSHA, prevMeta) {
+		return out
 	}
 
 	metaURL := fmt.Sprintf("%s/nvdcve-2.0-%s.meta", c.nvdBaseURL, year)
@@ -365,25 +359,8 @@ func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string
 	}
 	out.sha = sha
 
-	if !force && sha != "" {
-		if info, statErr := os.Stat(out.filePath); statErr == nil && info.Size() > 0 {
-			curMeta := FeedFileMeta{Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()}
-			if sha == prevSHA && prevMeta.Size > 0 && curMeta == prevMeta {
-				// File metadata and upstream SHA match the previously verified
-				// download; skip full decompression and SHA-256 hashing.
-				out.size = info.Size()
-				out.meta = curMeta
-				return out
-			}
-			// Either prevMeta is unavailable, file size/mtime changed, or an
-			// interrupted first sync left a valid archive on disk before
-			// stats.json was written: verify integrity before reusing it.
-			if verifyFeedGzipFile(out.filePath, sha) == nil {
-				out.size = info.Size()
-				out.meta = curMeta
-				return out
-			}
-		}
+	if !force && out.reuseArchive(sha, prevSHA, prevMeta) {
+		return out
 	}
 
 	feedURL := fmt.Sprintf("%s/nvdcve-2.0-%s.json.gz", c.nvdBaseURL, year)
@@ -400,67 +377,106 @@ func (c *Cache) syncYearFeed(ctx context.Context, feedsDir, year, prevSHA string
 	return out
 }
 
-// fetchKEV downloads CISA's KEV catalog, validates its JSON structure before
-// persisting it locally, and returns a lookup map of all actively exploited
-// CVE IDs along with the catalog's SHA256.
-func (c *Cache) fetchKEV(ctx context.Context) (map[string]struct{}, string, error) {
-	kevPath := filepath.Join(c.dir, "kev.json")
-	raw, err := c.downloadAndValidateKEV(ctx, c.kevURL, kevPath)
+// reuseArchive checks file metadata or verifies the uncompressed checksum
+// before reusing an archive. Older caches may lack either piece of metadata.
+func (r *feedResult) reuseArchive(sha, prevSHA string, prev FeedFileMeta) bool {
+	info, err := os.Stat(r.filePath)
+	if err != nil || info.Size() == 0 {
+		return false
+	}
+	meta := FeedFileMeta{Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()}
+	if sha == "" || !strings.EqualFold(sha, prevSHA) || prev != meta {
+		digest, err := feedDigest(r.filePath, sha)
+		if err != nil {
+			return false
+		}
+		if sha == "" {
+			sha = digest
+		}
+	}
+	r.sha, r.meta, r.size = sha, meta, meta.Size
+	return true
+}
+
+// kevEntry retains CISA's product identity even when NVD has no matching CPE.
+type kevEntry struct {
+	// CVEID joins the catalog entry to NVD records.
+	CVEID string `json:"cveID"`
+	// Vendor names the project or vendor in CISA terminology.
+	Vendor string `json:"vendorProject"`
+	// Product is CISA's product name for exact offline queries.
+	Product string `json:"product"`
+	// DateAdded records when CISA first listed the CVE.
+	DateAdded string `json:"dateAdded"`
+	// Ransomware retains CISA's distinction between known and unknown campaign use.
+	Ransomware string `json:"knownRansomwareCampaignUse"`
+}
+
+// parseKEV validates the catalog before it can replace a previously usable copy.
+func parseKEV(raw []byte) (map[string]kevEntry, string, error) {
+	var payload struct {
+		Vulnerabilities []kevEntry `json:"vulnerabilities"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, "", err
+	}
+	if payload.Vulnerabilities == nil {
+		return nil, "", errors.New("missing KEV vulnerabilities array")
+	}
+	set := make(map[string]kevEntry, len(payload.Vulnerabilities))
+	for _, entry := range payload.Vulnerabilities {
+		if id := strings.ToUpper(strings.TrimSpace(entry.CVEID)); id != "" {
+			set[id] = entry
+		}
+	}
+	return set, fmt.Sprintf("%x", sha256.Sum256(raw)), nil
+}
+
+// readKEV shares the same catalog validation between migration and offline queries.
+func readKEV(path string) (map[string]kevEntry, string, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, "", err
 	}
-	sum := sha256.Sum256(raw)
-	kevSHA := hex.EncodeToString(sum[:])
-
-	var payload struct {
-		Vulnerabilities []struct {
-			CVEID string `json:"cveID"`
-		} `json:"vulnerabilities"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, "", fmt.Errorf("decode kev json: %w", err)
-	}
-	set := make(map[string]struct{}, len(payload.Vulnerabilities))
-	for _, v := range payload.Vulnerabilities {
-		if id := strings.ToUpper(strings.TrimSpace(v.CVEID)); id != "" {
-			set[id] = struct{}{}
-		}
-	}
-	return set, kevSHA, nil
+	return parseKEV(raw)
 }
 
-func (c *Cache) downloadAndValidateKEV(ctx context.Context, url, dst string) ([]byte, error) {
+// fetchKEV publishes the catalog only after its entries decode successfully.
+func (c *Cache) fetchKEV(ctx context.Context, dst string) (map[string]kevEntry, string, error) {
+	url := c.kevURL
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("User-Agent", "UniBlue/1.0")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		return nil, "", fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	var probe struct {
-		Vulnerabilities json.RawMessage `json:"vulnerabilities"`
+	set, sha, err := parseKEV(raw)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid kev json payload: %w", err)
 	}
-	if err := json.Unmarshal(raw, &probe); err != nil || len(bytes.TrimSpace(probe.Vulnerabilities)) == 0 {
-		return nil, fmt.Errorf("invalid kev json payload from %s", url)
+	// A freshness check with the same catalog leaves the cached file untouched.
+	if local, err := os.ReadFile(dst); err == nil && bytes.Equal(local, raw) {
+		return set, sha, nil
 	}
 	if err := writeBytesAtomic(dst, raw, 0o644); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return raw, nil
+	return set, sha, nil
 }
 
 // fetchMetaSHA downloads an NVD .meta file and extracts its required sha256 line.
@@ -507,15 +523,21 @@ func isHexSHA256(s string) bool {
 // when expectedSHA is a 64-character hex SHA256 digest, verifies the
 // uncompressed JSON payload matches expectedSHA.
 func verifyFeedGzipFile(path, expectedSHA string) error {
+	_, err := feedDigest(path, expectedSHA)
+	return err
+}
+
+// feedDigest also supplies the checksum for legacy snapshots without a stored SHA.
+func feedDigest(path, expectedSHA string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return fmt.Errorf("invalid gzip header: %w", err)
+		return "", fmt.Errorf("invalid gzip header: %w", err)
 	}
 	defer gz.Close()
 
@@ -540,19 +562,17 @@ func verifyFeedGzipFile(path, expectedSHA string) error {
 			break
 		}
 		if readErr != nil {
-			return fmt.Errorf("corrupt gzip stream: %w", readErr)
+			return "", fmt.Errorf("corrupt gzip stream: %w", readErr)
 		}
 	}
 	if !foundNonSpace || firstByte[0] != '{' {
-		return errors.New("feed payload is not a JSON object")
+		return "", errors.New("feed payload is not a JSON object")
 	}
-	if isHexSHA256(expectedSHA) {
-		got := hex.EncodeToString(h.Sum(nil))
-		if !strings.EqualFold(got, expectedSHA) {
-			return fmt.Errorf("feed sha256 mismatch: got %s, want %s", got, expectedSHA)
-		}
+	got := hex.EncodeToString(h.Sum(nil))
+	if isHexSHA256(expectedSHA) && !strings.EqualFold(got, expectedSHA) {
+		return "", fmt.Errorf("feed sha256 mismatch: got %s, want %s", got, expectedSHA)
 	}
-	return nil
+	return got, nil
 }
 
 // downloadFeedFile streams url into a unique temporary file, validates its gzip
@@ -641,7 +661,7 @@ func cleanupStaleSyncArtifacts(cacheDir, feedsDir, vendorsDir string) {
 // into compact gzipped vendor shard files under vendorsDir. Partitioning by
 // sanitized shard key across 64 buckets avoids vendor filename collisions and
 // keeps working memory bounded on the full 400k+ NVD dataset.
-func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendorsDir string, kevSet map[string]struct{}, kevSHA string, yearSHAs map[string]string, rawBytes int64, started time.Time) (*CacheStats, error) {
+func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendorsDir string, kevSet map[string]kevEntry, kevSHA string, yearSHAs map[string]string, rawBytes int64, started time.Time) (*CacheStats, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -706,11 +726,12 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 	// keyed by sanitized vendor shard name so colliding vendor tokens merge cleanly.
 	totalCVEs := 0
 	indexedCPECVEs := 0
+	coverage := make(map[string]YearCoverageStats)
 	for _, path := range feedFiles {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		total, withCPE, err := streamNVDFeed(ctx, path, kevSet, func(vendor string, rec Record) error {
+		total, withCPE, err := streamNVDFeed(ctx, path, kevSet, coverage, func(vendor string, rec Record) error {
 			shardKey := sanitizeVendor(vendor)
 			if shardKey == "" {
 				return nil
@@ -737,10 +758,8 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 
 	// Pass 2: Load one bucket at a time, group/dedup/sort by sanitized shard key,
 	// and atomically write each vendor's compressed shard file.
-	var (
-		vendorCount int
-		indexBytes  int64
-	)
+	built := make(map[string]bool)
+	var indexBytes int64
 	for _, b := range buckets {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -772,6 +791,7 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 				// Merge CPE match entries when distinct raw vendor spellings map to
 				// the same sanitized shard file for the same CVE.
 				prev.Matches = append(prev.Matches, se.Record.Matches...)
+				prev.NeedsContext = prev.NeedsContext || se.Record.NeedsContext
 				if se.Record.KEV {
 					prev.KEV = true
 				}
@@ -792,7 +812,9 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 		if len(byShard) == 0 {
 			continue
 		}
-		vendorCount += len(byShard)
+		for shard := range byShard {
+			built[shard] = true
+		}
 
 		type vendorJob struct {
 			shard string
@@ -886,11 +908,27 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 		}
 	}
 
+	// A vendor can lose its last vulnerable CPE. Remove obsolete generated
+	// shards so a successful rebuild cannot serve records from the old index.
+	entries, err := os.ReadDir(vendorsDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		shard, ok := strings.CutSuffix(e.Name(), ".json.gz")
+		if ok && e.Type().IsRegular() && !built[shard] && shard != "" && sanitizeVendor(shard) == shard {
+			if err := os.Remove(filepath.Join(vendorsDir, e.Name())); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return &CacheStats{
+		SchemaVersion:  CurrentIndexSchemaVersion,
+		YearCoverage:   coverage,
 		SyncedAt:       time.Now().UTC(),
 		TotalCVEs:      totalCVEs,
 		IndexedCPECVEs: indexedCPECVEs,
-		VendorCount:    vendorCount,
+		VendorCount:    len(built),
 		KEVCount:       len(kevSet),
 		KEVSHA:         kevSHA,
 		RawFeedBytes:   rawBytes,
@@ -902,7 +940,7 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 
 // streamNVDFeed streams a single nvdcve-2.0-<year>.json.gz archive one
 // vulnerability item at a time without materializing the whole feed in RAM.
-func streamNVDFeed(ctx context.Context, path string, kevSet map[string]struct{}, emit func(vendor string, rec Record) error) (int, int, error) {
+func streamNVDFeed(ctx context.Context, path string, kevSet map[string]kevEntry, coverage map[string]YearCoverageStats, emit func(vendor string, rec Record) error) (int, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, 0, err
@@ -969,30 +1007,27 @@ func streamNVDFeed(ctx context.Context, path string, kevSet map[string]struct{},
 			total++
 
 			vendorMatches := extractVendorMatches(c.Configurations)
+			if len(c.Published) >= 10 {
+				year := c.Published[:4]
+				count := coverage[year]
+				count.Total++
+				if len(vendorMatches) > 0 {
+					count.WithCPE++
+				}
+				coverage[year] = count
+			}
 			if len(vendorMatches) == 0 {
 				continue
 			}
 			withCPE++
-
-			sev, score := extractCVSS(c.Metrics)
-			_, isKEV := kevSet[strings.ToUpper(c.ID)]
-			desc := extractEnglishDesc(c.Descriptions)
-
-			published := c.Published
-			if len(published) >= 10 {
-				published = published[:10]
+			rec := c.record(kevSet)
+			if len(rec.Description) > maxDescriptionLen {
+				rec.Description = rec.Description[:maxDescriptionLen-3] + "..."
 			}
-
 			for vendor, matches := range vendorMatches {
-				if err := emit(vendor, Record{
-					ID:          c.ID,
-					Published:   published,
-					Severity:    sev,
-					CVSS:        score,
-					KEV:         isKEV,
-					Description: desc,
-					Matches:     matches,
-				}); err != nil {
+				rec.Matches = matches
+				rec.NeedsContext = slices.ContainsFunc(matches, func(m CPEMatch) bool { return m.NeedsContext })
+				if err := emit(vendor, rec); err != nil {
 					return 0, 0, err
 				}
 			}
@@ -1039,7 +1074,7 @@ func (c *Cache) LookupVendor(vendor string) ([]Record, error) {
 }
 
 // MatchProducts evaluates a slice of detected LAN/UniFi Products against the
-// local vendor shards, returning deterministic Exact and Potential CVE matches.
+// local vendor shards and retains the evidence for each match.
 func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, error) {
 	// Load each referenced vendor shard once and reuse it across all products.
 	loaded := make(map[string][]Record)
@@ -1080,16 +1115,22 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 				var bestCPE CPEMatch
 
 				for _, cpe := range rec.Matches {
-					if !matchesAnyPattern(prod.Products, cpe.Product) {
+					if !strings.EqualFold(vendor, cpe.Vendor) || !matchesAnyPattern(prod.Products, cpe.Product) {
 						continue
 					}
 					ok, conf := matchesRange(prod.Version, cpe, prod.Source == "unifi-firmware" || isUniFiFirmwareCPE(cpe))
 					if !ok {
 						continue
 					}
-					// Prefer an Exact match over a Potential match if the CVE has
-					// multiple CPE entries for the same product.
-					if bestConf == "" || (bestConf == ConfidencePotential && conf == ConfidenceExact) {
+					// Downgrade exact upstream range hits when the CVE requires
+					// unobserved OS/application context or when distro backports
+					// obscure patch status, never promoting potential matches.
+					if cpe.NeedsContext && conf == ConfidenceExact {
+						conf = ConfidencePotential
+					} else if prod.VersionAmbiguous && conf == ConfidenceExact {
+						conf = ConfidenceVersionAmbiguous
+					}
+					if conf.rank() > bestConf.rank() {
 						bestConf = conf
 						bestCPE = cpe
 					}
@@ -1098,7 +1139,7 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					continue
 				}
 
-				// For version-unknown matches, suppress ancient non-KEV CVEs so
+				// For potential matches, suppress ancient non-KEV CVEs so
 				// operators see current risks rather than decade-old noise.
 				if bestConf == ConfidencePotential && !rec.KEV && cutoffDate != "" && rec.Published != "" && rec.Published < cutoffDate {
 					continue
@@ -1120,7 +1161,7 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					MatchedCPE: bestCPE,
 				}
 				if idx, exists := seenIdx[dedupKey]; exists {
-					if matches[idx].Confidence == ConfidencePotential && bestConf == ConfidenceExact {
+					if bestConf.rank() > matches[idx].Confidence.rank() {
 						matches[idx] = candidate
 					}
 					continue
@@ -1136,7 +1177,7 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 	if len(exactByHostLabelCVE) > 0 {
 		filtered := matches[:0]
 		for _, m := range matches {
-			if m.Confidence == ConfidencePotential && strings.TrimSpace(m.Product.Version) == "" {
+			if m.Confidence == ConfidencePotential && len(m.Product.Ports) == 0 && strings.TrimSpace(m.Product.Version) == "" {
 				k := fmt.Sprintf("%s|%s|%s",
 					productHostKey(m.Product),
 					strings.ToLower(strings.TrimSpace(m.Product.Label)),
@@ -1155,7 +1196,7 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 	// KEV before non-KEV, WAN-exposed before LAN-only, then highest CVSS/newest CVE.
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].Confidence != matches[j].Confidence {
-			return matches[i].Confidence == ConfidenceExact
+			return matches[i].Confidence.rank() > matches[j].Confidence.rank()
 		}
 		if matches[i].Record.KEV != matches[j].Record.KEV {
 			return matches[i].Record.KEV
@@ -1257,6 +1298,7 @@ func (c *Cache) LookupCVE(ctx context.Context, cveID string) (*Record, error) {
 			continue
 		}
 		combined.Matches = append(combined.Matches, r.Matches...)
+		combined.NeedsContext = combined.NeedsContext || r.NeedsContext
 	}
 	if combined == nil {
 		return nil, fmt.Errorf("%s not found in local CVE cache", want)
@@ -1284,29 +1326,16 @@ func (c *Cache) lookupCVEInFeed(feedPath, wantID string) (*Record, bool, error) 
 		return nil, false, err
 	}
 
-	kevSet := c.loadLocalKEVSet()
+	kevSet, _, err := readKEV(filepath.Join(c.dir, "kev.json"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
+	}
 
 	for _, item := range feed.Vulnerabilities {
 		if !strings.EqualFold(item.CVE.ID, wantID) {
 			continue
 		}
-		sev, score := extractCVSS(item.CVE.Metrics)
-		_, isKEV := kevSet[strings.ToUpper(item.CVE.ID)]
-
-		// Keep the full untruncated English description for single-CVE inspection.
-		var fullDesc string
-		for _, d := range item.CVE.Descriptions {
-			if strings.EqualFold(d.Lang, "en") {
-				fullDesc = strings.Join(strings.Fields(d.Value), " ")
-				break
-			}
-		}
-
-		published := item.CVE.Published
-		if len(published) >= 10 {
-			published = published[:10]
-		}
-
+		rec := item.CVE.record(kevSet)
 		vendorMatches := extractVendorMatches(item.CVE.Configurations)
 		var allMatches []CPEMatch
 		for _, list := range vendorMatches {
@@ -1319,40 +1348,11 @@ func (c *Cache) lookupCVEInFeed(feedPath, wantID string) (*Record, bool, error) 
 			return allMatches[i].Product < allMatches[j].Product
 		})
 
-		return &Record{
-			ID:          item.CVE.ID,
-			Published:   published,
-			Severity:    sev,
-			CVSS:        score,
-			KEV:         isKEV,
-			Description: fullDesc,
-			Matches:     allMatches,
-		}, true, nil
+		rec.Matches = allMatches
+		rec.NeedsContext = slices.ContainsFunc(allMatches, func(m CPEMatch) bool { return m.NeedsContext })
+		return &rec, true, nil
 	}
 	return nil, false, nil
-}
-
-// loadLocalKEVSet reads the cached kev.json catalog if present on disk.
-func (c *Cache) loadLocalKEVSet() map[string]struct{} {
-	raw, err := os.ReadFile(filepath.Join(c.dir, "kev.json"))
-	if err != nil {
-		return nil
-	}
-	var payload struct {
-		Vulnerabilities []struct {
-			CVEID string `json:"cveID"`
-		} `json:"vulnerabilities"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil
-	}
-	set := make(map[string]struct{}, len(payload.Vulnerabilities))
-	for _, v := range payload.Vulnerabilities {
-		if id := strings.ToUpper(strings.TrimSpace(v.CVEID)); id != "" {
-			set[id] = struct{}{}
-		}
-	}
-	return set
 }
 
 // Search scans the local CVE cache offline (either one vendor shard or all
@@ -1733,11 +1733,16 @@ type nvdFeedFile struct {
 }
 
 type nvdCVE struct {
-	ID             string          `json:"id"`
-	Published      string          `json:"published"`
-	VulnStatus     string          `json:"vulnStatus"`
-	Descriptions   []nvdLangValue  `json:"descriptions"`
-	Metrics        nvdMetrics      `json:"metrics"`
+	ID           string         `json:"id"`
+	Published    string         `json:"published"`
+	VulnStatus   string         `json:"vulnStatus"`
+	Descriptions []nvdLangValue `json:"descriptions"`
+	Metrics      nvdMetrics     `json:"metrics"`
+	// Weaknesses holds the CWE assessments from NVD and assigning authorities.
+	Weaknesses []struct {
+		// Description contains the identifiers and any placeholders for missing analysis.
+		Description []nvdLangValue `json:"description"`
+	} `json:"weaknesses"`
 	Configurations []nvdConfigNode `json:"configurations"`
 }
 
@@ -1755,70 +1760,132 @@ type nvdMetrics struct {
 
 type nvdCVSSMetric struct {
 	BaseSeverity string `json:"baseSeverity"`
-	CVSSData     struct {
+	// UserInteractionRequired is optional in CVSS v2 assessments.
+	UserInteractionRequired *bool `json:"userInteractionRequired"`
+	CVSSData                struct {
 		BaseScore    float64 `json:"baseScore"`
 		BaseSeverity string  `json:"baseSeverity"`
+		// Vector is the serialized set of metric values underlying BaseScore.
+		Vector string `json:"vectorString"`
 	} `json:"cvssData"`
 }
 
 type nvdConfigNode struct {
-	Nodes []struct {
-		CPEMatch []struct {
-			Vulnerable            bool   `json:"vulnerable"`
-			Criteria              string `json:"criteria"`
-			VersionStartIncluding string `json:"versionStartIncluding"`
-			VersionStartExcluding string `json:"versionStartExcluding"`
-			VersionEndIncluding   string `json:"versionEndIncluding"`
-			VersionEndExcluding   string `json:"versionEndExcluding"`
-		} `json:"cpeMatch"`
-	} `json:"nodes"`
+	// Operator determines whether sibling applicability requirements must hold together.
+	Operator string `json:"operator"`
+	// Nodes contains the alternatives or prerequisites of this configuration.
+	Nodes    []nvdConfigNode `json:"nodes"`
+	CPEMatch []struct {
+		Vulnerable            bool   `json:"vulnerable"`
+		Criteria              string `json:"criteria"`
+		VersionStartIncluding string `json:"versionStartIncluding"`
+		VersionStartExcluding string `json:"versionStartExcluding"`
+		VersionEndIncluding   string `json:"versionEndIncluding"`
+		VersionEndExcluding   string `json:"versionEndExcluding"`
+	} `json:"cpeMatch"`
 }
 
-// extractVendorMatches collects all vulnerable CPE 2.3 entries in a CVE grouped
-// by their normalized vendor token.
+// hasPlatform reports whether this branch contains a non-hardware environmental
+// prerequisite (such as a specific OS or companion app). Hardware nodes (part
+// "h") pair firmware with its own appliance model and do not require separate OS
+// context.
+func (n nvdConfigNode) hasPlatform() bool {
+	for _, m := range n.CPEMatch {
+		if !m.Vulnerable {
+			crit := strings.ToLower(strings.TrimSpace(m.Criteria))
+			if crit != "" && !strings.HasPrefix(crit, "cpe:2.3:h:") {
+				return true
+			}
+		}
+	}
+	return slices.ContainsFunc(n.Nodes, nvdConfigNode.hasPlatform)
+}
+
+// collectMatches carries AND prerequisites down to the affected ranges, keeping
+// independent alternatives in the same advisory eligible for exact matching.
+func (n nvdConfigNode) collectMatches(out map[string][]CPEMatch, needsContext bool) {
+	needsContext = needsContext || (strings.EqualFold(n.Operator, "AND") && n.hasPlatform())
+	for _, cm := range n.CPEMatch {
+		if !cm.Vulnerable {
+			continue
+		}
+		m, ok := ParseCPE23(cm.Criteria)
+		if !ok {
+			continue
+		}
+		m.StartIncl, m.StartExcl = cm.VersionStartIncluding, cm.VersionStartExcluding
+		m.EndIncl, m.EndExcl = cm.VersionEndIncluding, cm.VersionEndExcluding
+		m.NeedsContext = needsContext
+		out[m.Vendor] = append(out[m.Vendor], m)
+	}
+	for _, child := range n.Nodes {
+		child.collectMatches(out, needsContext)
+	}
+}
+
+// extractVendorMatches groups vulnerable ranges for indexing and offline lookup.
 func extractVendorMatches(configs []nvdConfigNode) map[string][]CPEMatch {
 	out := make(map[string][]CPEMatch)
 	for _, cfg := range configs {
-		for _, node := range cfg.Nodes {
-			for _, cm := range node.CPEMatch {
-				if !cm.Vulnerable {
-					continue
-				}
-				parsed, ok := ParseCPE23(cm.Criteria)
-				if !ok {
-					continue
-				}
-				parsed.StartIncl = cm.VersionStartIncluding
-				parsed.StartExcl = cm.VersionStartExcluding
-				parsed.EndIncl = cm.VersionEndIncluding
-				parsed.EndExcl = cm.VersionEndExcluding
-				out[parsed.Vendor] = append(out[parsed.Vendor], parsed)
-			}
-		}
+		cfg.collectMatches(out, false)
 	}
 	return out
 }
 
-// extractCVSS selects the highest-precedence CVSS score and severity (v4.0 ->
-// v3.1 -> v3.0 -> v2.0).
-func extractCVSS(m nvdMetrics) (checks.Severity, float64) {
-	groups := [][]nvdCVSSMetric{m.CVSSMetricV40, m.CVSSMetricV31, m.CVSSMetricV30, m.CVSSMetricV2}
-	for _, grp := range groups {
-		if len(grp) == 0 {
-			continue
+// record uses the same selected metric and catalog entry for shard and feed lookups.
+func (c nvdCVE) record(kev map[string]kevEntry) Record {
+	entry, listed := kev[strings.ToUpper(c.ID)]
+	rec := Record{ID: c.ID, Published: c.Published[:min(10, len(c.Published))],
+		KEV: listed, KEVDateAdded: entry.DateAdded, KEVRansomware: entry.Ransomware == "Known"}
+	for _, d := range c.Descriptions {
+		if strings.EqualFold(d.Lang, "en") {
+			rec.Description = strings.Join(strings.Fields(d.Value), " ")
+			break
 		}
-		first := grp[0]
-		score := first.CVSSData.BaseScore
-		sevStr := first.CVSSData.BaseSeverity
-		if sevStr == "" {
-			sevStr = first.BaseSeverity
-		}
-		if sev, err := checks.ParseSeverity(sevStr); err == nil {
-			return sev, score
-		}
-		return severityFromScore(score), score
 	}
-	return checks.SeverityInfo, 0
+	for _, w := range c.Weaknesses {
+		for _, d := range w.Description {
+			if strings.HasPrefix(d.Value, "CWE-") && !slices.Contains(rec.CWEs, d.Value) {
+				rec.CWEs = append(rec.CWEs, d.Value)
+			}
+		}
+	}
+	for _, group := range [][]nvdCVSSMetric{c.Metrics.CVSSMetricV40, c.Metrics.CVSSMetricV31, c.Metrics.CVSSMetricV30, c.Metrics.CVSSMetricV2} {
+		if len(group) > 0 {
+			group[0].apply(&rec)
+			break
+		}
+	}
+	return rec
+}
+
+// apply keeps the compact metrics tied to the same vector as the score. CVSS v2
+// has no PR metric, but NVD can supply user interaction separately.
+func (m nvdCVSSMetric) apply(rec *Record) {
+	data := m.CVSSData
+	rec.CVSS, rec.CVSSVector = data.BaseScore, data.Vector
+	sev, err := checks.ParseSeverity(cmp.Or(data.BaseSeverity, m.BaseSeverity))
+	if err != nil {
+		sev = severityFromScore(rec.CVSS)
+	}
+	rec.Severity = sev
+	for part := range strings.SplitSeq(strings.Trim(data.Vector, "()"), "/") {
+		key, val, _ := strings.Cut(part, ":")
+		switch key {
+		case "AV":
+			rec.AttackVector = val
+		case "PR":
+			rec.PrivilegesRequired = val
+		case "UI":
+			rec.UserInteraction = val
+		}
+	}
+	if rec.UserInteraction == "" && m.UserInteractionRequired != nil {
+		rec.UserInteraction = "N"
+		if *m.UserInteractionRequired {
+			rec.UserInteraction = "R"
+		}
+	}
 }
 
 // severityFromScore maps a numeric CVSS score onto UniBlue's Severity scale
@@ -1836,18 +1903,4 @@ func severityFromScore(score float64) checks.Severity {
 	default:
 		return checks.SeverityInfo
 	}
-}
-
-// extractEnglishDesc returns a compact single-line English CVE description.
-func extractEnglishDesc(descs []nvdLangValue) string {
-	for _, d := range descs {
-		if strings.EqualFold(d.Lang, "en") {
-			clean := strings.Join(strings.Fields(d.Value), " ")
-			if len(clean) > maxDescriptionLen {
-				return clean[:maxDescriptionLen-3] + "..."
-			}
-			return clean
-		}
-	}
-	return ""
 }

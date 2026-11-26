@@ -11,13 +11,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -174,7 +177,7 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 	profiles := []probe.HostProfile{
 		{
 			Client:    unifi.Client{IP: "192.168.10.2", MAC: "aa:01", Name: "truenas-01", NetworkName: "LAN"},
-			SSHBanner: "SSH-2.0-OpenSSH_9.6p1 Debian-1",
+			SSHBanner: "SSH-2.0-OpenSSH_9.2p1",
 		},
 	}
 	products := fp.Identify(nil, profiles)
@@ -218,6 +221,26 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 	if summaries[0].MinFixedVersion != "9.8p1" || summaries[0].KEVCount != 1 {
 		t.Fatalf("unexpected OpenSSH rollup summary: %+v", summaries[0])
 	}
+	profiles[0].SSHBanner += " Debian-2+deb12u3"
+	matches, err = cache.MatchProducts(fp.Identify(nil, profiles), MatchOptions{PotentialMaxAgeYears: 2})
+	if err != nil || len(matches) != 2 {
+		t.Fatalf("packaged OpenSSH matches: %v, %v", matches, err)
+	}
+	m := matches[0]
+	if m.Product.Version != "9.2p1" || m.Confidence != ConfidenceVersionAmbiguous || !m.Record.KEV ||
+		!slices.Equal(m.Product.Ports, []EndpointPort{{"tcp", 22}}) {
+		t.Fatalf("packaged OpenSSH match: %+v", m)
+	}
+	summary := RollupMatches(matches)[0]
+	if summary.Confidence != ConfidenceVersionAmbiguous || summary.MinFixedVersion != "" || !strings.Contains(summary.Headline(), "distribution") {
+		t.Fatalf("packaged OpenSSH verification: %+v", summary)
+	}
+	profiles[0].SSHBanner = "SSH-2.0-OpenSSH_9.8p1 Ubuntu-1"
+	matches, err = cache.MatchProducts(fp.Identify(nil, profiles), MatchOptions{PotentialMaxAgeYears: 2})
+	if err != nil || len(matches) != 1 || matches[0].Product.Label == "OpenSSH" {
+		t.Fatalf("out-of-range packaged OpenSSH: %v, %v", matches, err)
+	}
+
 }
 
 // TestSyncCancelPreventsPartialStats verifies that cancelling a Sync context
@@ -469,10 +492,9 @@ func TestSyncRebuildsOnKEVChange(t *testing.T) {
 	}
 }
 
-// TestFingerprintHTTPDeterminismAndVersionPreference verifies that multi-port
-// HTTP fingerprinting iterates ports deterministically, prefers versioned
-// Server banners over versionless ones, and emits distinct versions consistently.
-func TestFingerprintHTTPDeterminismAndVersionPreference(t *testing.T) {
+// TestFingerprintHTTPDeterminismAndVersionBinding verifies that independent HTTP
+// listeners retain their own versions and produce a stable product listing.
+func TestFingerprintHTTPDeterminismAndVersionBinding(t *testing.T) {
 	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
 	if err != nil {
 		t.Fatalf("LoadFingerprinter: %v", err)
@@ -487,7 +509,7 @@ func TestFingerprintHTTPDeterminismAndVersionPreference(t *testing.T) {
 		},
 	}
 
-	wantVersions := []string{"1.18.0", "1.25.4"}
+	wantVersions := []string{"", "1.18.0", "1.25.4"}
 	for i := range 100 {
 		prods := fp.Identify(nil, []probe.HostProfile{profile})
 		var gotVersions []string
@@ -501,21 +523,6 @@ func TestFingerprintHTTPDeterminismAndVersionPreference(t *testing.T) {
 		}
 	}
 
-	// When port 80 is versionless and port 8443 carries a version, the versioned
-	// capture must always win over the versionless banner.
-	singleVer := probe.HostProfile{
-		Client: unifi.Client{IP: "192.168.1.51", MAC: "aa:bb:cc:dd:ee:02", Name: "web-02"},
-		HTTP: map[int]probe.HTTPBanner{
-			80:   {Server: "nginx"},
-			8443: {Server: "nginx/1.25.4"},
-		},
-	}
-	for i := range 50 {
-		prods := fp.Identify(nil, []probe.HostProfile{singleVer})
-		if len(prods) != 1 || prods[0].Version != "1.25.4" {
-			t.Fatalf("iteration %d: expected single versioned nginx 1.25.4, got %+v", i, prods)
-		}
-	}
 }
 
 // TestMapUniFiDeviceProducts verifies that UniFi device product mapping uses
@@ -1518,5 +1525,400 @@ func TestVersionlessSupersedingMergesUncoveredVendorAliases(t *testing.T) {
 	}
 	if len(matches) != 1 || matches[0].Record.ID != "CVE-2021-23017" || matches[0].Confidence != ConfidenceExact {
 		t.Fatalf("expected exact match CVE-2021-23017 from merged nginx vendor shard, got %+v", matches)
+	}
+}
+
+// TestProductEndpointExposure checks that a forward reaches the observed transport
+// and internal port, including when multiple fingerprint sources agree on the product.
+func TestProductEndpointExposure(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ip = "192.0.2.10"
+	const ssh = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
+	hp := probe.HostProfile{Client: unifi.Client{IP: ip, Name: "truenas"}, SSHBanner: ssh,
+		HTTP: map[int]probe.HTTPBanner{443: {Server: "nginx/1.18.0-1.el9"}, 8443: {Server: "nginx/1.18.0"}},
+		Services: []probe.Service{
+			{Port: 443, Transport: "tcp", Protocol: "https", State: probe.ServiceStateObservedProtocol, CPEs: []string{"cpe:2.3:a:f5:nginx:1.18.0"}},
+			{Port: 51820, Transport: "udp", Protocol: "wireguard", State: probe.ServiceStateObservedProtocol, CPEs: []string{"cpe:2.3:a:wireguard:wireguard:1.0"}},
+			{Port: 2222, Transport: "tcp", Protocol: "ssh", Banner: ssh},
+		},
+	}
+	snap := &unifi.Snapshot{PortForwards: []unifi.PortForward{
+		{Enabled: true, FwdIP: ip, Proto: "udp", FwdPort: "51820"},
+		{Enabled: true, FwdIP: ip, Proto: "udp", FwdPort: "443"},
+		{Enabled: true, FwdIP: "192.0.2.11", Proto: "tcp", FwdPort: "443"},
+		{FwdIP: ip, Proto: "tcp", FwdPort: "443", DstPort: "10443"},
+	}}
+	for _, enabled := range []bool{false, true} {
+		snap.PortForwards[3].Enabled = enabled
+		prods := fp.Identify(snap, []probe.HostProfile{hp})
+		if len(prods) != 4 {
+			t.Fatalf("unexpected products: %+v", prods)
+		}
+		for _, p := range prods {
+			switch p.Source {
+			case "http-server":
+				if p.WANExposed != enabled || p.HighConfidence || !p.VersionAmbiguous || p.Version != "1.18.0" ||
+					!slices.Equal(p.Ports, []EndpointPort{{"tcp", 443}, {"tcp", 8443}}) {
+					t.Fatalf("nginx evidence with HTTPS forward enabled=%v: %+v", enabled, p)
+				}
+			case "ssh-banner":
+				if p.WANExposed || !p.VersionAmbiguous || !slices.Equal(p.Ports, []EndpointPort{{"tcp", 2222}}) {
+					t.Fatalf("alternate SSH endpoint: %+v", p)
+				}
+			case "nerva-cpe":
+				if !p.WANExposed || !p.HighConfidence || !slices.Equal(p.Ports, []EndpointPort{{"udp", 51820}}) {
+					t.Fatalf("Nerva endpoint: %+v", p)
+				}
+			case "hostname":
+				if !p.WANExposed || len(p.Ports) != 0 || p.HighConfidence {
+					t.Fatalf("host-only evidence: %+v", p)
+				}
+			default:
+				t.Fatalf("unexpected fingerprint: %+v", p)
+			}
+		}
+	}
+}
+
+// TestOfflineIndexMigration checks that cached inputs suffice for a schema upgrade
+// and that the next freshness check leaves the rebuilt shards alone.
+func TestOfflineIndexMigration(t *testing.T) {
+	const vector = "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:H"
+	feed := `{"vulnerabilities":[
+		{"cve":{"id":"CVE-2024-1001","published":"2025-01-02","metrics":{"cvssMetricV31":[{"cvssData":{"baseScore":8,"vectorString":"` + vector + `"}}]},
+		"weaknesses":[{"description":[{"value":"CWE-79"},{"value":"CWE-79"},{"value":"NVD-CWE-noinfo"}]}],
+		"configurations":[{"operator":"AND","nodes":[{"cpeMatch":[{"vulnerable":true,"criteria":"cpe:2.3:a:example:portal:1"}]},
+		{"cpeMatch":[{"vulnerable":false,"criteria":"cpe:2.3:o:example:os:2"}]}]},
+		{"nodes":[{"cpeMatch":[{"vulnerable":true,"criteria":"cpe:2.3:a:example:portal:2"}]}]}]}},
+		{"cve":{"id":"CVE-2024-1002","published":"2025-01-03"}},
+		{"cve":{"id":"CVE-2024-1003","published":"2025-01-04","vulnStatus":"Rejected"}}]}`
+	const kev = `{"vulnerabilities":[{"cveID":"CVE-2024-1001","dateAdded":"2025-02-01","knownRansomwareCampaignUse":"Known"}]}`
+	dir := t.TempDir()
+	cache := NewCache(dir)
+	feedDir := filepath.Join(dir, "feeds")
+	if err := os.Mkdir(feedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(feedDir, "nvdcve-2.0-2024.json.gz"), json.RawMessage(feed)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kev.json"), []byte(kev), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(dir, "stats.json"), CacheStats{}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a legacy shard for a vendor whose last CPE has been withdrawn.
+	staleDir := filepath.Join(dir, "vendors")
+	if err := os.Mkdir(staleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(staleDir, "withdrawn.json.gz"), []Record{{ID: "CVE-2024-9999"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Any upstream access during migration would fail immediately.
+	cache.kevURL, cache.nvdBaseURL = "offline:", "offline:"
+	indexes := 0
+	opts := SyncOptions{SinceYear: 2024, EndYear: 2024, Progress: func(msg string) {
+		if strings.HasPrefix(msg, "Indexing ") {
+			indexes++
+		}
+	}}
+	st, err := cache.Sync(t.Context(), opts)
+	if err != nil || st.SchemaVersion != 2 || st.YearCoverage["2025"] != (YearCoverageStats{Total: 2, WithCPE: 1}) {
+		t.Fatalf("migrated stats: %+v, %v", st, err)
+	}
+	if obsolete, err := cache.LookupVendor("withdrawn"); err != nil || len(obsolete) > 0 {
+		t.Fatalf("withdrawn product survived rebuild: %v, %v", obsolete, err)
+	}
+	recs, err := cache.LookupVendor("example")
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("migrated shard: %v, %v", recs, err)
+	}
+	r := recs[0]
+	if r.CVSSVector != vector || r.AttackVector != "N" || r.PrivilegesRequired != "L" || r.UserInteraction != "R" ||
+		!slices.Equal(r.CWEs, []string{"CWE-79"}) || !r.KEV || !r.KEVRansomware || r.KEVDateAdded != "2025-02-01" || !r.NeedsContext {
+		t.Fatalf("missing enrichment: %+v", r)
+	}
+	for version, want := range map[string]Confidence{"1": ConfidencePotential, "2": ConfidenceExact} {
+		p := Product{Vendors: []string{"example"}, Products: []string{"portal"}, Version: version}
+		m, err := cache.MatchProducts([]Product{p}, MatchOptions{})
+		if err != nil || len(m) != 1 || m[0].Confidence != want {
+			t.Fatalf("version %s: %+v, %v", version, m, err)
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/kev":
+			fmt.Fprint(w, kev)
+		case "/nvdcve-2.0-2024.meta":
+			fmt.Fprint(w, "sha256:"+strings.ToUpper(st.YearSHAs["2024"]))
+		default:
+			t.Errorf("unexpected archive request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	cache.kevURL, cache.nvdBaseURL = srv.URL+"/kev", srv.URL
+	next, err := cache.Sync(t.Context(), opts)
+	if err != nil || indexes != 1 || !st.SyncedAt.Equal(next.SyncedAt) {
+		t.Fatalf("unchanged sync: %+v, %v, %d rebuilds", next, err, indexes)
+	}
+}
+
+// TestTargetVelocity separates a sustained network CVE history from a burst,
+// incomplete coverage, and weak product identity.
+func TestTargetVelocity(t *testing.T) {
+	cache := NewCache(t.TempDir())
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	coverage := make(map[string]YearCoverageStats)
+	for year := 2021; year <= 2026; year++ {
+		coverage[fmt.Sprint(year)] = YearCoverageStats{Total: 5, WithCPE: 3}
+	}
+	if err := os.Mkdir(filepath.Join(cache.dir, "vendors"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	records := []Record{}
+	for i, date := range []string{"2026-06-01", "2024-07-01", "2023-06-01", "2021-06-01", "2021-05-31", "2026-06-02"} {
+		records = append(records, Record{ID: fmt.Sprintf("CVE-2021-%04d", i), Published: date, AttackVector: "N",
+			Severity: checks.SeverityHigh, Matches: []CPEMatch{{Vendor: "example", Product: "portal"}}})
+	}
+	for _, av := range []string{"A", "L", "P"} {
+		r := records[0]
+		r.ID, r.AttackVector = "local-"+av, av
+		records = append(records, r)
+	}
+	records = append(records, records[0])
+	if _, err := writeGzipJSONAtomic(filepath.Join(cache.dir, "vendors", "example.json.gz"), records); err != nil {
+		t.Fatal(err)
+	}
+	p := Product{Vendors: []string{"example"}, Products: []string{"portal"}, HighConfidence: true}
+	query := func() TargetVelocity {
+		t.Helper()
+		if err := writeJSONAtomic(filepath.Join(cache.dir, "stats.json"), CacheStats{SchemaVersion: 2, YearCoverage: coverage}); err != nil {
+			t.Fatal(err)
+		}
+		h, err := cache.ProductVelocity(p, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	h := query()
+	if h.Class != VelocityHighProfile || h.TotalCVEs != 8 || !reflect.DeepEqual(h.NetworkHigh, map[int]int{1: 1, 3: 3, 5: 4}) {
+		t.Fatalf("complete windows: %+v", h)
+	}
+	coverage["2024"] = YearCoverageStats{Total: 5, WithCPE: 2}
+	h = query()
+	if h.Class != VelocityObserved || !reflect.DeepEqual(h.NetworkHigh, map[int]int{1: 1}) || !slices.Equal(h.IncompleteYears, []string{"2024"}) {
+		t.Fatalf("incomplete windows: %+v", h)
+	}
+	const kev = `{"vulnerabilities":[
+		{"cveID":"CVE-2021-0000","dateAdded":"2020-03-01","knownRansomwareCampaignUse":"Known"},
+		{"cveID":"CVE-2026-5000","vendorProject":"Example","product":"Portal","dateAdded":"2026-05-02"},
+		{"cveID":"CVE-2026-6000","vendorProject":"Example","product":"Portal Pro","dateAdded":"2026-06-01"}
+	]}`
+	if err := os.WriteFile(filepath.Join(cache.dir, "kev.json"), []byte(kev), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h = query()
+	if h.Class != VelocityHighProfile || h.TotalCVEs != 9 || h.KEVCount != 2 || h.RansomwareCount != 1 || h.LatestKEV != "2026-05-02" {
+		t.Fatalf("KEV history: %+v", h)
+	}
+	// Before the recent listings, the older ransomware-linked KEV still qualifies.
+	past, err := cache.ProductVelocity(p, now.AddDate(-1, 0, 0))
+	if err != nil || past.Class != VelocityHighProfile || past.KEVCount != 1 || past.LatestKEV != "2020-03-01" {
+		t.Fatalf("older ransomware history: %+v, %v", past, err)
+	}
+	p.HighConfidence = false
+	if h := query(); h.Class != VelocityUnknown || h.KEVCount != 2 {
+		t.Fatalf("unconfirmed identity: %+v", h)
+	}
+}
+
+// TestCVSSMetricPrecedence checks the older metric layouts and keeps the score,
+// vector, and compact fields together when both v3 and v2 are available.
+func TestCVSSMetricPrecedence(t *testing.T) {
+	var advisory nvdCVE
+	err := json.Unmarshal([]byte(`{"metrics":{
+		"cvssMetricV30":[{"cvssData":{"baseScore":7.2,"vectorString":"CVSS:3.0/AV:A/PR:L/UI:N"}}],
+		"cvssMetricV2":[{"baseSeverity":"HIGH","userInteractionRequired":true,"cvssData":{"baseScore":7.5,"vectorString":"AV:N/AC:L/Au:S/C:P/I:P/A:P"}}]}}`), &advisory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := advisory.record(nil)
+	if r.CVSS != 7.2 || r.AttackVector != "A" || r.PrivilegesRequired != "L" || r.UserInteraction != "N" {
+		t.Fatalf("v3.0 score and vector: %+v", r)
+	}
+	advisory.Metrics.CVSSMetricV30 = nil
+	r = advisory.record(nil)
+	if r.CVSS != 7.5 || r.AttackVector != "N" || r.PrivilegesRequired != "" || r.UserInteraction != "R" {
+		t.Fatalf("v2.0 score and vector: %+v", r)
+	}
+}
+
+// TestFirmwareHardwareANDAndDistroBackports verifies that NVD firmware+hardware
+// AND nodes stay exact, unbounded wildcard CPEs on distro packages never promote
+// above potential, RHEL rebuilds/FreeBSD flag version-ambiguous, and superseding
+// a host-only product preserves WAN exposure.
+func TestFirmwareHardwareANDAndDistroBackports(t *testing.T) {
+	// 1. Firmware AND hardware node must stay exact (NeedsContext=false).
+	var fwAdvisory nvdCVE
+	if err := json.Unmarshal([]byte(`{"id":"CVE-2026-34910","configurations":[{"operator":"AND","nodes":[
+		{"cpeMatch":[{"vulnerable":true,"criteria":"cpe:2.3:o:ui:unifi_dream_machine_pro_firmware:*:*:*:*:*:*:*:*","versionEndExcluding":"5.1.12"}]},
+		{"cpeMatch":[{"vulnerable":false,"criteria":"cpe:2.3:h:ui:unifi_dream_machine_pro:-:*:*:*:*:*:*:*"}]}
+	]}]}`), &fwAdvisory); err != nil {
+		t.Fatal(err)
+	}
+	fwMatches := extractVendorMatches(fwAdvisory.Configurations)["ui"]
+	if len(fwMatches) != 1 || fwMatches[0].NeedsContext {
+		t.Fatalf("firmware+hardware AND must not set NeedsContext: %+v", fwMatches)
+	}
+	// Wildcard OS prerequisite (o:microsoft:*) still marks NeedsContext=true.
+	var osWildAdvisory nvdCVE
+	if err := json.Unmarshal([]byte(`{"id":"CVE-2026-34911","configurations":[{"operator":"AND","nodes":[
+		{"cpeMatch":[{"vulnerable":true,"criteria":"cpe:2.3:a:example:portal:2.0:*:*:*:*:*:*:*"}]},
+		{"cpeMatch":[{"vulnerable":false,"criteria":"cpe:2.3:o:microsoft:*:*:*:*:*:*:*:*"}]}
+	]}]}`), &osWildAdvisory); err != nil {
+		t.Fatal(err)
+	}
+	if osMatches := extractVendorMatches(osWildAdvisory.Configurations)["example"]; len(osMatches) != 1 || !osMatches[0].NeedsContext {
+		t.Fatalf("wildcard OS prerequisite must set NeedsContext: %+v", osMatches)
+	}
+
+	// 2. Wildcard CPE + VersionAmbiguous stays ConfidencePotential and honors age cutoff.
+	cache := NewCache(t.TempDir())
+	if err := os.Mkdir(filepath.Join(cache.dir, "vendors"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recs := []Record{
+		{ID: "CVE-1999-1237", Published: "1999-06-01", Severity: checks.SeverityCritical, CVSS: 10.0,
+			Matches: []CPEMatch{{Part: "a", Vendor: "apache", Product: "http_server"}}},
+		{ID: "CVE-2024-9999", Published: "2024-06-01", Severity: checks.SeverityHigh, CVSS: 7.5,
+			Matches: []CPEMatch{{Part: "a", Vendor: "apache", Product: "http_server", EndExcl: "2.4.60"}}},
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(cache.dir, "vendors", "apache.json.gz"), recs); err != nil {
+		t.Fatal(err)
+	}
+	prod := Product{Vendors: []string{"apache"}, Products: []string{"http_server"}, Version: "2.4.6", VersionAmbiguous: true}
+	got, err := cache.MatchProducts([]Product{prod}, MatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Confidence{}
+	for _, m := range got {
+		byID[m.Record.ID] = m.Confidence
+	}
+	if byID["CVE-1999-1237"] != ConfidencePotential {
+		t.Fatalf("wildcard CPE on distro package should stay potential, got %+v", byID)
+	}
+	if byID["CVE-2024-9999"] != ConfidenceVersionAmbiguous {
+		t.Fatalf("bounded CPE on distro package should be version-ambiguous, got %+v", byID)
+	}
+	aged, err := cache.MatchProducts([]Product{prod}, MatchOptions{PotentialMaxAgeYears: 5})
+	if err != nil || len(aged) != 1 || aged[0].Record.ID != "CVE-2024-9999" {
+		t.Fatalf("ancient wildcard CPE should be filtered by PotentialMaxAgeYears: %+v, %v", aged, err)
+	}
+	// Versionless product with NeedsContext still respects PotentialMaxAgeYears,
+	// and NeedsContext outranks distro ambiguity on a bounded range.
+	if _, err := writeGzipJSONAtomic(filepath.Join(cache.dir, "vendors", "apache.json.gz"), []Record{
+		{ID: "CVE-2010-0001", Published: "2010-01-01", Severity: checks.SeverityHigh, NeedsContext: true,
+			Matches: []CPEMatch{{Part: "a", Vendor: "apache", Product: "http_server", EndExcl: "2.4.60", NeedsContext: true}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if aged, err := cache.MatchProducts([]Product{{Vendors: []string{"apache"}, Products: []string{"http_server"}}}, MatchOptions{PotentialMaxAgeYears: 5}); err != nil || len(aged) != 0 {
+		t.Fatalf("ancient versionless NeedsContext CVE bypassed PotentialMaxAgeYears: %+v, %v", aged, err)
+	}
+	if m, err := cache.MatchProducts([]Product{prod}, MatchOptions{}); err != nil || len(m) != 1 || m[0].Confidence != ConfidencePotential {
+		t.Fatalf("NeedsContext must outrank VersionAmbiguous: %+v, %v", m, err)
+	}
+
+	// 3. RHEL rebuilds, Fedora, Amazon Linux, and FreeBSD banners trigger distroPackage.
+	for _, raw := range []string{
+		"Apache/2.4.6 (CentOS)",
+		"Apache/2.4.57 (Rocky Linux)",
+		"Apache/2.4.57 (AlmaLinux)",
+		"Apache/2.4.57 (Oracle Linux Server)",
+		"Apache/2.4.57 (Amazon Linux)",
+		"Apache/2.4.58 (Fedora Linux)",
+		"OpenSSH_9.6 FreeBSD-20240806",
+	} {
+		if !distroPackage.MatchString(raw) {
+			t.Errorf("expected distroPackage to match %q", raw)
+		}
+	}
+
+	// 4. Superseding a host-only WAN-exposed product retains WANExposed on the survivor.
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := &unifi.Snapshot{
+		PortForwards: []unifi.PortForward{{Enabled: true, FwdIP: "192.0.2.50", FwdPort: "5001", DstPort: "5001", Proto: "tcp"}},
+	}
+	hp := probe.HostProfile{
+		Client: unifi.Client{MAC: "00:11:32:aa:bb:cc", IP: "192.0.2.50", Name: "synology-nas"},
+		HTTP:   map[int]probe.HTTPBanner{5000: {Title: "DiskStation"}, 8443: {Title: "DiskStation"}},
+		Services: []probe.Service{{
+			Port: 5000, Transport: "tcp", Protocol: "http", State: probe.ServiceStateObservedProtocol,
+			CPEs: []string{"cpe:2.3:o:synology:diskstation_manager:7.2:*:*:*:*:*:*:*"},
+		}},
+	}
+	prods := fp.Identify(snap, []probe.HostProfile{hp})
+	found := false
+	for _, p := range prods {
+		if slices.Contains(p.Vendors, "synology") && p.Version == "7.2" {
+			found = true
+			if !p.WANExposed {
+				t.Fatalf("versioned product dropped WANExposed inherited from host-only rule: %+v", p)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected synology 7.2 product, got %+v", prods)
+	}
+	// Versionless distro banner and WAN exposure stay scoped to their matching port,
+	// without bleeding onto an unrelated listener on another port.
+	hpDistro := probe.HostProfile{
+		Client: unifi.Client{IP: "192.0.2.51"},
+		HTTP:   map[int]probe.HTTPBanner{443: {Server: "nginx (Rocky Linux)"}, 8443: {Server: "nginx"}},
+		Services: []probe.Service{
+			{Port: 443, Transport: "tcp", Protocol: "http", CPEs: []string{"cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*"}},
+			{Port: 8443, Transport: "tcp", Protocol: "http", CPEs: []string{"cpe:2.3:a:f5:nginx:1.25.0:*:*:*:*:*:*:*"}},
+		},
+	}
+	nginxSnap := &unifi.Snapshot{
+		PortForwards: []unifi.PortForward{{Enabled: true, FwdIP: "192.0.2.51", FwdPort: "443", DstPort: "443", Proto: "tcp"}},
+	}
+	distroProds := fp.Identify(nginxSnap, []probe.HostProfile{hpDistro})
+	if len(distroProds) != 2 {
+		t.Fatalf("expected 2 versioned nginx products, got %+v", distroProds)
+	}
+	for _, p := range distroProds {
+		if p.Version == "1.24.0" && (!p.VersionAmbiguous || !p.WANExposed) {
+			t.Fatalf("port 443 distro banner lost VersionAmbiguous or WANExposed: %+v", p)
+		}
+		if p.Version == "1.25.0" && (p.VersionAmbiguous || p.WANExposed) {
+			t.Fatalf("port 443 distro ambiguity or WANExposed bled onto unforwarded port 8443: %+v", p)
+		}
+	}
+	// Two plain versionless nginx banners on 443 (forwarded) and 8443 (not forwarded)
+	// must never leak WANExposed onto the unforwarded versioned listener on 8443.
+	hpPlain := probe.HostProfile{
+		Client: unifi.Client{IP: "192.0.2.51"},
+		HTTP:   map[int]probe.HTTPBanner{443: {Server: "nginx"}, 8443: {Server: "nginx"}},
+		Services: []probe.Service{
+			{Port: 443, Transport: "tcp", Protocol: "http", CPEs: []string{"cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*"}},
+			{Port: 8443, Transport: "tcp", Protocol: "http", CPEs: []string{"cpe:2.3:a:f5:nginx:1.25.0:*:*:*:*:*:*:*"}},
+		},
+	}
+	for _, p := range fp.Identify(nginxSnap, []probe.HostProfile{hpPlain}) {
+		if p.Version == "1.25.0" && p.WANExposed {
+			t.Fatalf("port 443 WANExposed leaked onto unforwarded port 8443: %+v", p)
+		}
 	}
 }

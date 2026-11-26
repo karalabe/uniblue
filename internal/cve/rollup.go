@@ -21,9 +21,11 @@ type ProductSummary struct {
 	// Product identifies the host, VLAN, software name, and observed version.
 	Product Product `json:"product"`
 
-	// Confidence is either ConfidenceExact (observed version matched) or
-	// ConfidencePotential (product matched, version unknown).
+	// Confidence describes the evidence for the grouped CVE matches.
 	Confidence Confidence `json:"confidence"`
+
+	// NeedsContext reports whether a matched range requires platform verification.
+	NeedsContext bool `json:"needs_context,omitempty"`
 
 	// TotalCVEs is the total number of matching CVEs in this rollup.
 	TotalCVEs int `json:"total_cves"`
@@ -97,6 +99,7 @@ func RollupMatches(matches []Match) []ProductSummary {
 		sum := st.summary
 
 		sum.TotalCVEs++
+		sum.NeedsContext = sum.NeedsContext || m.MatchedCPE.NeedsContext
 		if m.Record.KEV {
 			sum.KEVCount++
 		}
@@ -116,6 +119,10 @@ func RollupMatches(matches []Match) []ProductSummary {
 			sum.TopCVEs = append(sum.TopCVEs, m.Record.ID)
 		}
 
+		// Upstream fixed versions cannot establish the patch level of a distro package.
+		if sum.Confidence == ConfidenceVersionAmbiguous {
+			continue
+		}
 		// Track both exclusive (EndExcl) and inclusive (EndIncl / exact Version)
 		// upper bounds so upgrade advice never recommends a still-vulnerable version.
 		if fix := m.MatchedCPE.EndExcl; fix != "" {
@@ -147,7 +154,7 @@ func RollupMatches(matches []Match) []ProductSummary {
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Confidence != out[j].Confidence {
-			return out[i].Confidence == ConfidenceExact
+			return out[i].Confidence.rank() > out[j].Confidence.rank()
 		}
 		if (out[i].KEVCount > 0) != (out[j].KEVCount > 0) {
 			return out[i].KEVCount > 0
@@ -177,7 +184,12 @@ func (s ProductSummary) Headline() string {
 	if s.KEVCount > 0 {
 		extra += fmt.Sprintf(", %d KEV", s.KEVCount)
 	}
-	if s.MinFixedVersion != "" {
+	if s.NeedsContext {
+		extra += ", verify platform applicability"
+	}
+	if s.Confidence == ConfidenceVersionAmbiguous {
+		extra += ", verify distribution package fixes"
+	} else if s.MinFixedVersion != "" {
 		extra += fmt.Sprintf(", verify >= %s", s.MinFixedVersion)
 	} else if s.MaxAffectedVersion != "" {
 		// When a 4-part UniFi build (e.g. 6.6.55.15189) matched a 3-part

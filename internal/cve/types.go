@@ -15,8 +15,7 @@ import (
 	"github.com/karalabe/uniblue/internal/checks"
 )
 
-// Confidence distinguishes CVEs confirmed against an observed version string
-// from broader product-level matches where the device did not reveal a version.
+// Confidence describes how precisely the available evidence establishes CVE applicability.
 type Confidence string
 
 const (
@@ -24,10 +23,28 @@ const (
 	// CVE's vulnerable CPE version range.
 	ConfidenceExact Confidence = "exact"
 
-	// ConfidencePotential indicates the vendor and product matched, but no
-	// version string could be observed on the device to confirm or rule it out.
+	// ConfidenceVersionAmbiguous means the upstream version matches, but a
+	// distribution may already have backported the fix to its package.
+	ConfidenceVersionAmbiguous Confidence = "version-ambiguous"
+
+	// ConfidencePotential indicates the vendor and product matched, but the
+	// version or platform evidence is insufficient to establish applicability.
 	ConfidencePotential Confidence = "potential"
 )
+
+// rank orders matches for display and selects the strongest applicable CPE.
+func (c Confidence) rank() int {
+	switch c {
+	case ConfidenceExact:
+		return 3
+	case ConfidenceVersionAmbiguous:
+		return 2
+	case ConfidencePotential:
+		return 1
+	default:
+		return 0
+	}
+}
 
 // Record is the slimmed, indexed representation of a single NVD CVE stored in
 // UniBlue's local vendor-sharded cache.
@@ -41,12 +58,30 @@ type Record struct {
 	// Severity is the normalized CVSS severity bucket.
 	Severity checks.Severity `json:"severity"`
 
-	// CVSS holds the highest available numeric CVSS base score (v4.0, v3.1, v3.0, or v2.0).
+	// CVSS holds the base score from the newest available CVSS metric version.
 	CVSS float64 `json:"cvss,omitempty"`
+
+	// CVSSVector is the vector associated with the selected base score.
+	CVSSVector string `json:"cvss_vector,omitempty"`
+	// AttackVector is the compact AV metric from that vector.
+	AttackVector string `json:"av,omitempty"`
+	// PrivilegesRequired is the compact PR metric when the metric defines it.
+	PrivilegesRequired string `json:"pr,omitempty"`
+	// UserInteraction is the compact UI metric when the source supplies it.
+	UserInteraction string `json:"ui,omitempty"`
+	// CWEs lists the distinct weakness identifiers assigned to this CVE.
+	CWEs []string `json:"cwes,omitempty"`
 
 	// KEV reports whether this CVE appears in CISA's Known Exploited
 	// Vulnerabilities catalog (actively exploited in the wild).
 	KEV bool `json:"kev,omitempty"`
+	// KEVDateAdded is the date CISA added this CVE to its catalog.
+	KEVDateAdded string `json:"kev_date_added,omitempty"`
+	// KEVRansomware reports known use in ransomware campaigns according to CISA.
+	KEVRansomware bool `json:"kev_ransomware,omitempty"`
+
+	// NeedsContext reports whether any indexed range has a platform prerequisite.
+	NeedsContext bool `json:"needs_context,omitempty"`
 
 	// Description holds a concise English summary of the vulnerability.
 	Description string `json:"description,omitempty"`
@@ -58,6 +93,9 @@ type Record struct {
 
 // CPEMatch represents one vulnerable CPE 2.3 criteria node extracted from NVD.
 type CPEMatch struct {
+	// NeedsContext indicates that this range requires additional platform evidence.
+	NeedsContext bool `json:"needs_context,omitempty"`
+
 	// Part is the CPE component type: "a" (application), "o" (OS), or "h" (hardware).
 	Part string `json:"part,omitempty"`
 
@@ -79,6 +117,17 @@ type CPEMatch struct {
 	EndExcl string `json:"end_excl,omitempty"`
 }
 
+// CurrentIndexSchemaVersion identifies the format compiled from the cached feeds.
+const CurrentIndexSchemaVersion = 2
+
+// YearCoverageStats measures NVD enrichment for a publication year.
+type YearCoverageStats struct {
+	// Total counts published, non-rejected CVEs.
+	Total int `json:"total"`
+	// WithCPE counts CVEs with at least one indexable vulnerable product.
+	WithCPE int `json:"with_cpe"`
+}
+
 // FeedFileMeta records the size and modification timestamp of a verified local
 // yearly NVD feed archive so unchanged hourly refreshes can skip re-hashing
 // the full uncompressed payload.
@@ -90,6 +139,11 @@ type FeedFileMeta struct {
 // CacheStats records disk footprint, counts, and per-year NVD SHA256 hashes so
 // incremental syncs only re-download feeds that actually changed upstream.
 type CacheStats struct {
+	// SchemaVersion identifies the format of the compiled vendor shards.
+	SchemaVersion int `json:"schema_version,omitempty"`
+	// YearCoverage groups CPE enrichment counts by publication year.
+	YearCoverage map[string]YearCoverageStats `json:"year_coverage,omitempty"`
+
 	// SyncedAt records when the last full or incremental sync completed.
 	SyncedAt time.Time `json:"synced_at"`
 
@@ -130,6 +184,14 @@ type CacheStats struct {
 	YearMeta map[string]FeedFileMeta `json:"year_meta,omitempty"`
 }
 
+// EndpointPort identifies the service endpoint that supplied a fingerprint.
+type EndpointPort struct {
+	// Transport is the lowercase layer 4 protocol.
+	Transport string `json:"transport"`
+	// Port is the internal service port number.
+	Port int `json:"port"`
+}
+
 // Product describes a software service or hardware appliance identified on a
 // specific LAN host or UniFi infrastructure device.
 type Product struct {
@@ -149,15 +211,26 @@ type Product struct {
 	// only the product identity is known.
 	Version string `json:"version,omitempty"`
 
+	// Ports lists observed service endpoints. Host inventory has no port binding.
+	Ports []EndpointPort `json:"ports,omitempty"`
+	// VersionAmbiguous indicates that distribution packaging obscures patch status.
+	VersionAmbiguous bool `json:"version_ambiguous,omitempty"`
+	// HighConfidence reports whether the product identity came from controller
+	// inventory or a protocol-level fingerprint rather than a generic banner.
+	HighConfidence bool `json:"high_confidence,omitempty"`
+
 	// Source notes which passive signal identified the product (e.g., "unifi-firmware",
 	// "ssh-banner", "http-server", "hostname").
 	Source string `json:"source"`
 
-	// HostName, HostIP, and VLAN identify which network endpoint runs this product.
-	HostName   string `json:"host_name"`
-	HostIP     string `json:"host_ip"`
-	VLAN       string `json:"vlan,omitempty"`
-	WANExposed bool   `json:"wan_exposed,omitempty"`
+	// HostName is the display name of the host running this product.
+	HostName string `json:"host_name"`
+	// HostIP is the address associated with the observation.
+	HostIP string `json:"host_ip"`
+	// VLAN identifies the host's network.
+	VLAN string `json:"vlan,omitempty"`
+	// WANExposed indicates that a forward reaches a bound endpoint or an unbound host.
+	WANExposed bool `json:"wan_exposed,omitempty"`
 }
 
 // MatchOptions controls filtering when matching detected Products against the
@@ -181,7 +254,7 @@ type Match struct {
 	// Product is the fingerprinted host/software that matched.
 	Product Product `json:"product"`
 
-	// Confidence records whether an exact version matched or only the product name.
+	// Confidence records the strength of the version and platform evidence.
 	Confidence Confidence `json:"confidence"`
 
 	// MatchedCPE records the specific CPE vendor/product/range that triggered.

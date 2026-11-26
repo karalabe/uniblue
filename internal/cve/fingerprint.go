@@ -7,10 +7,13 @@
 package cve
 
 import (
+	"cmp"
 	"fmt"
 	"io/fs"
+	"maps"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -35,7 +38,7 @@ type FingerprintRule struct {
 	// HTTPServerRegex matches against any fingerprinted HTTP Server header.
 	HTTPServerRegex string `yaml:"http_server_regex"`
 
-	// SSHBannerRegex matches against the passive SSH greeting line on port 22.
+	// SSHBannerRegex matches the passive SSH greeting on its observed TCP port.
 	SSHBannerRegex string `yaml:"ssh_banner_regex"`
 
 	// MACPrefix matches against colon-separated lowercase MAC prefixes.
@@ -141,64 +144,75 @@ func (r *FingerprintRule) compile() error {
 // Identify extracts canonical Products from both UniFi infrastructure devices
 // (which already carry exact firmware versions) and fingerprinted LAN hosts.
 func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProfile) []Product {
-	wanExposedIPs := make(map[string]bool)
+	// A host-only observation may use any inventory address. A service observation
+	// belongs to the address actually probed and the port that supplied the signal.
+	forwards := make(map[string][]unifi.PortForward)
 	if snap != nil {
 		for _, pf := range snap.PortForwards {
 			if pf.Enabled && pf.FwdIP != "" {
-				wanExposedIPs[pf.FwdIP] = true
+				forwards[pf.FwdIP] = append(forwards[pf.FwdIP], pf)
 			}
 		}
 	}
-
-	var products []Product
-	seenPairs := make(map[string]struct{})
-	seenFallback := make(map[string]struct{})
-	add := func(p Product) {
-		hostKey := strings.ToLower(strings.TrimSpace(p.HostIP))
-		if hostKey == "" {
-			hostKey = strings.ToLower(strings.TrimSpace(p.HostName))
+	type hostVersion struct {
+		host, version      string
+		unbound, ambiguous bool
+	}
+	groups := make(map[hostVersion][]Product)
+	var groupOrder []hostVersion
+	hostIPs := make(map[string][]string)
+	computeWAN := func(p *Product) {
+		p.WANExposed = false
+		ips := []string{p.HostIP}
+		if len(p.Ports) == 0 && len(hostIPs[p.HostIP]) > 0 {
+			ips = hostIPs[p.HostIP]
 		}
-		verKey := strings.ToLower(strings.TrimSpace(p.Version))
-
-		// Dedupe by host + canonical vendor/product + version rather than display
-		// label so a built-in rule and a Nerva CPE never produce duplicate rollups.
-		var keys []string
-		for _, v := range p.Vendors {
-			v = strings.ToLower(strings.TrimSpace(v))
-			if v == "" {
+		for _, ip := range ips {
+			for _, pf := range forwards[ip] {
+				if len(p.Ports) == 0 || slices.ContainsFunc(p.Ports, func(ep EndpointPort) bool {
+					return pf.ExposesEndpoint(ep.Port, ep.Transport)
+				}) {
+					p.WANExposed = true
+					return
+				}
+			}
+		}
+	}
+	mergeInto := func(groups map[hostVersion][]Product, order *[]hostVersion, k hostVersion, p Product) {
+		group, exists := groups[k]
+		if !exists {
+			*order = append(*order, k)
+		}
+		for i := len(group) - 1; i >= 0; i-- {
+			prev := group[i]
+			if !productsOverlapVendorProduct(prev, p) {
 				continue
 			}
-			for _, prod := range p.Products {
-				prod = strings.ToLower(strings.TrimSpace(prod))
-				if prod == "" {
-					continue
-				}
-				keys = append(keys, fmt.Sprintf("%s|%s|%s|%s", hostKey, v, prod, verKey))
-			}
+			// Keep the first rule's display label while preserving evidence from
+			// every endpoint and CPE alias that identified this version.
+			prev.Ports = append(prev.Ports, p.Ports...)
+			prev.Vendors = mergeUniqueStringsCI(prev.Vendors, p.Vendors)
+			prev.Products = mergeUniqueStringsCI(prev.Products, p.Products)
+			prev.HighConfidence = prev.HighConfidence || p.HighConfidence
+			prev.VersionAmbiguous = prev.VersionAmbiguous || p.VersionAmbiguous
+			prev.WANExposed = prev.WANExposed || p.WANExposed
+			p = prev
+			group = slices.Delete(group, i, i+1)
 		}
-		if len(keys) == 0 {
-			fb := fmt.Sprintf("%s|%s|%s", hostKey, strings.ToLower(strings.TrimSpace(p.Label)), verKey)
-			if _, dup := seenFallback[fb]; dup {
-				return
-			}
-			seenFallback[fb] = struct{}{}
-			products = append(products, p)
-			return
+		groups[k] = append(group, p)
+	}
+	add := func(p Product) {
+		computeWAN(&p)
+		// Keep versionless host-only and distro-ambiguous observations separate
+		// until supersession so host-wide WAN exposure and per-port distro flags
+		// do not bleed across unrelated listeners.
+		k := hostVersion{
+			host:      productHostKey(p),
+			version:   strings.ToLower(p.Version),
+			unbound:   p.Version == "" && len(p.Ports) == 0,
+			ambiguous: p.Version == "" && p.VersionAmbiguous,
 		}
-		allSeen := true
-		for _, k := range keys {
-			if _, ok := seenPairs[k]; !ok {
-				allSeen = false
-				break
-			}
-		}
-		if allSeen {
-			return
-		}
-		for _, k := range keys {
-			seenPairs[k] = struct{}{}
-		}
-		products = append(products, p)
+		mergeInto(groups, &groupOrder, k, p)
 	}
 
 	// 1. Identify UniFi infrastructure gear directly from controller metadata.
@@ -211,46 +225,59 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 				continue
 			}
 			add(Product{
-				Label:    fmt.Sprintf("UniFi %s (%s)", dev.Name, dev.Model),
-				Vendors:  []string{"ui"},
-				Products: cpeProducts,
-				Version:  strings.TrimSpace(dev.Version),
-				Source:   "unifi-firmware",
-				HostName: dev.Name,
-				HostIP:   dev.IP,
-				VLAN:     "UniFi Infrastructure",
+				Label:          fmt.Sprintf("UniFi %s (%s)", dev.Name, dev.Model),
+				Vendors:        []string{"ui"},
+				Products:       cpeProducts,
+				Version:        strings.TrimSpace(dev.Version),
+				Source:         "unifi-firmware",
+				HighConfidence: true,
+				HostName:       dev.Name,
+				HostIP:         dev.IP,
+				VLAN:           "UniFi Infrastructure",
 			})
 		}
 	}
 
-	// 2. Apply declarative fingerprint rules to every probed LAN host, plus
-	// extract exact software versions directly from Nerva's Service discoveries
-	// (e.g., "<product>:<version>-<finding>").
-	for _, hp := range profiles {
-		hostIP := hp.Client.PrimaryIP()
-		wan := false
-		for _, ip := range hp.Client.AllIPs() {
-			if wanExposedIPs[ip] {
-				wan = true
-				break
+	// Unprobed clients, including sleeping devices, can still supply hostname and MAC evidence.
+	if snap != nil {
+		probed := make(map[string]bool, len(profiles))
+		for _, hp := range profiles {
+			probed[hp.Client.MAC] = true
+		}
+		profiles = slices.Clone(profiles)
+		for _, cl := range snap.Clients {
+			if !probed[cl.MAC] {
+				profiles = append(profiles, probe.HostProfile{Client: cl})
 			}
 		}
+	}
+	for _, hp := range profiles {
+		hostIP := hp.Client.PrimaryIP()
+		hostIPs[hostIP] = hp.Client.AllIPs()
+		probeIP := cmp.Or(hp.ProbeIP, hostIP)
 		for _, rule := range f.rules {
 			for _, hit := range rule.matchAll(hp) {
 				label := rule.Name
 				if hit.model != "" {
 					label = fmt.Sprintf("%s %s", rule.Name, strings.ToUpper(hit.model))
 				}
+				var ports []EndpointPort
+				ip := hostIP
+				if hit.port > 0 {
+					ip = probeIP
+					ports = []EndpointPort{{Transport: "tcp", Port: hit.port}}
+				}
 				add(Product{
-					Label:      label,
-					Vendors:    rule.Vendors,
-					Products:   expandProductPatterns(rule.Products, hit.model),
-					Version:    hit.version,
-					Source:     hit.source,
-					HostName:   hp.Client.DisplayName(),
-					HostIP:     hostIP,
-					VLAN:       hp.Client.NetworkName,
-					WANExposed: wan,
+					Label:            label,
+					Vendors:          rule.Vendors,
+					Products:         expandProductPatterns(rule.Products, hit.model),
+					Version:          hit.version,
+					Source:           hit.source,
+					HostName:         hp.Client.DisplayName(),
+					HostIP:           ip,
+					VLAN:             hp.Client.NetworkName,
+					Ports:            ports,
+					VersionAmbiguous: hit.ambiguous,
 				})
 			}
 		}
@@ -258,63 +285,66 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 		// Extract exact-version products directly from any versioned CPE 2.3
 		// identifiers reported by Nerva's protocol fingerprinters.
 		for _, svc := range hp.Services {
+			transport := strings.ToLower(strings.TrimSpace(svc.Transport))
+			if transport == "" {
+				transport = "tcp"
+			}
 			for _, rawCPE := range svc.CPEs {
 				vendor, product, ver, ok := parseVersionedCPE23(rawCPE)
 				if !ok {
 					continue
 				}
+				packaged := distroPackage.MatchString(svc.Banner) || distroPackage.MatchString(svc.Version) || distroPackage.MatchString(ver)
 				add(Product{
-					Label:      formatProductLabel(product),
-					Vendors:    []string{vendor},
-					Products:   []string{product},
-					Version:    ver,
-					Source:     "nerva-cpe",
-					HostName:   hp.Client.DisplayName(),
-					HostIP:     hostIP,
-					VLAN:       hp.Client.NetworkName,
-					WANExposed: wan,
+					Label:            formatProductLabel(product),
+					HighConfidence:   protocolIdentity(svc),
+					Vendors:          []string{vendor},
+					Products:         []string{product},
+					Version:          upstreamVersion(ver, packaged),
+					Source:           "nerva-cpe",
+					HostName:         hp.Client.DisplayName(),
+					HostIP:           probeIP,
+					VLAN:             hp.Client.NetworkName,
+					Ports:            []EndpointPort{{Transport: transport, Port: svc.Port}},
+					VersionAmbiguous: packaged,
 				})
 			}
 		}
 	}
 
-	// Also match idle clients without an active IP (e.g., sleeping printers)
-	// purely by hostname/MAC so they still appear in `uniblue cve explore`.
-	if snap != nil {
-		probedMACs := make(map[string]struct{}, len(profiles))
-		for _, hp := range profiles {
-			probedMACs[hp.Client.MAC] = struct{}{}
-		}
-		for _, cl := range snap.Clients {
-			if _, ok := probedMACs[cl.MAC]; ok {
-				continue
-			}
-			hp := probe.HostProfile{Client: cl}
-			for _, rule := range f.rules {
-				for _, hit := range rule.matchAll(hp) {
-					label := rule.Name
-					if hit.model != "" {
-						label = fmt.Sprintf("%s %s", rule.Name, strings.ToUpper(hit.model))
-					}
-					add(Product{
-						Label:    label,
-						Vendors:  rule.Vendors,
-						Products: expandProductPatterns(rule.Products, hit.model),
-						Version:  hit.version,
-						Source:   hit.source,
-						HostName: cl.DisplayName(),
-						HostIP:   cl.PrimaryIP(),
-						VLAN:     cl.NetworkName,
-					})
-				}
-			}
+	var products []Product
+	for _, k := range groupOrder {
+		for _, p := range groups[k] {
+			slices.SortFunc(p.Ports, func(a, b EndpointPort) int {
+				return cmp.Or(cmp.Compare(a.Transport, b.Transport), cmp.Compare(a.Port, b.Port))
+			})
+			p.Ports = slices.Compact(p.Ports)
+			products = append(products, p)
 		}
 	}
 
-	// Drop any versionless Product on a host when the same (vendor, product) is
-	// already represented by a concrete versioned Product on that host (for
-	// example, a versionless HTTP-title rule alongside a versioned Nerva CPE).
-	products = dropSupersededVersionlessProducts(products)
+	products = dropSupersededVersionlessProducts(products, computeWAN)
+	// Collapse any surviving versionless products that were kept split only for
+	// supersession (e.g., an unbound hostname match and a port-bound HTTP title
+	// when no versioned CPE superseded either).
+	finalGroups := make(map[hostVersion][]Product, len(products))
+	var finalOrder []hostVersion
+	for _, p := range products {
+		if p.Version == "" {
+			p.VersionAmbiguous = false
+		}
+		mergeInto(finalGroups, &finalOrder, hostVersion{host: productHostKey(p), version: strings.ToLower(p.Version)}, p)
+	}
+	products = products[:0]
+	for _, k := range finalOrder {
+		for _, p := range finalGroups[k] {
+			slices.SortFunc(p.Ports, func(a, b EndpointPort) int {
+				return cmp.Or(cmp.Compare(a.Transport, b.Transport), cmp.Compare(a.Port, b.Port))
+			})
+			p.Ports = slices.Compact(p.Ports)
+			products = append(products, p)
+		}
+	}
 
 	sort.Slice(products, func(i, j int) bool {
 		if products[i].HostIP != products[j].HostIP {
@@ -326,6 +356,17 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 		return products[i].Version < products[j].Version
 	})
 	return products
+}
+
+// protocolIdentity reserves high confidence for an observed protocol fingerprint.
+// A CPE parsed from a self-reported web or SSH banner adds no independent evidence.
+func protocolIdentity(svc probe.Service) bool {
+	switch strings.ToLower(svc.Protocol) {
+	case "", "http", "https", "ssh":
+		return false
+	default:
+		return svc.State == probe.ServiceStateObservedProtocol
+	}
 }
 
 // productHostKey returns the canonical lowercase host identifier used to
@@ -342,7 +383,7 @@ func productHostKey(p Product) string {
 // on the same host, merging any uncovered vendor and exact product aliases from
 // the versionless rule into each matching versioned Product so multi-vendor
 // NVD shards (such as nginx alongside f5) still match with the exact version.
-func dropSupersededVersionlessProducts(products []Product) []Product {
+func dropSupersededVersionlessProducts(products []Product, recomputeWAN func(*Product)) []Product {
 	work := make([]Product, len(products))
 	copy(work, products)
 
@@ -368,9 +409,25 @@ func dropSupersededVersionlessProducts(products []Product) []Product {
 			continue
 		}
 		matchedAny := false
+		remaining := slices.Clone(p.Ports)
 		for _, vi := range vIdxs {
 			if !productsOverlapVendorProduct(p, work[vi]) {
 				continue
+			}
+			// A version observed on one listener cannot supersede a versionless
+			// fingerprint on another, even when both run the same product.
+			if len(p.Ports) > 0 {
+				ports := work[vi].Ports
+				if !slices.ContainsFunc(p.Ports, func(ep EndpointPort) bool { return slices.Contains(ports, ep) }) {
+					continue
+				}
+				work[vi].VersionAmbiguous = work[vi].VersionAmbiguous || p.VersionAmbiguous
+				remaining = slices.DeleteFunc(remaining, func(ep EndpointPort) bool { return slices.Contains(ports, ep) })
+			}
+			// Preserve host-wide WAN exposure when an unbound host identity is
+			// superseded by an overlapping versioned product.
+			if len(p.Ports) == 0 {
+				work[vi].WANExposed = work[vi].WANExposed || p.WANExposed
 			}
 			matchedAny = true
 			work[vi].Vendors = mergeUniqueStringsCI(work[vi].Vendors, p.Vendors)
@@ -385,7 +442,11 @@ func dropSupersededVersionlessProducts(products []Product) []Product {
 			}
 		}
 		if matchedAny {
-			drop[i] = true
+			work[i].Ports = remaining
+			drop[i] = len(remaining) == 0
+			if !drop[i] && recomputeWAN != nil {
+				recomputeWAN(&work[i])
+			}
 		}
 	}
 
@@ -398,6 +459,7 @@ func dropSupersededVersionlessProducts(products []Product) []Product {
 	return out
 }
 
+// productsOverlapVendorProduct recognizes aliases shared by fingerprints on the same host.
 func productsOverlapVendorProduct(ruleProd, versionedProd Product) bool {
 	for _, rv := range ruleProd.Vendors {
 		rv = strings.ToLower(strings.TrimSpace(rv))
@@ -423,6 +485,7 @@ func productsOverlapVendorProduct(ruleProd, versionedProd Product) bool {
 	return false
 }
 
+// mergeUniqueStringsCI preserves the preferred spelling and order of existing aliases.
 func mergeUniqueStringsCI(base, extra []string) []string {
 	seen := make(map[string]struct{}, len(base)+len(extra))
 	out := make([]string, 0, len(base)+len(extra))
@@ -444,9 +507,11 @@ func mergeUniqueStringsCI(base, extra []string) []string {
 
 // ruleHit records one deterministic match emitted by FingerprintRule.matchAll.
 type ruleHit struct {
-	version string
-	model   string
-	source  string
+	port      int
+	ambiguous bool
+	version   string
+	model     string
+	source    string
 }
 
 // matchAll checks whether any configured identity signal on a FingerprintRule
@@ -468,48 +533,72 @@ func (r *FingerprintRule) matchAll(hp probe.HostProfile) []ruleHit {
 		}
 	}
 
-	if r.sshBannerRe != nil && hp.SSHBanner != "" {
-		if m := r.sshBannerRe.FindStringSubmatch(hp.SSHBanner); m != nil {
-			return []ruleHit{{
-				version: captureGroup(m, r.VersionGroup),
-				model:   captureGroup(m, r.ModelGroup),
-				source:  "ssh-banner",
-			}}
+	var hits []ruleHit
+	if r.sshBannerRe != nil {
+		// Nerva can backfill the host's SSHBanner from a nonstandard port.
+		// Prefer its endpoint when it supplied the same greeting.
+		located := false
+		for _, svc := range hp.Services {
+			if svc.Banner == "" || (svc.Transport != "" && !strings.EqualFold(svc.Transport, "tcp")) {
+				continue
+			}
+			if m := r.sshBannerRe.FindStringSubmatch(svc.Banner); m != nil &&
+				(strings.EqualFold(svc.Protocol, "ssh") || strings.HasPrefix(svc.Banner, "SSH-")) {
+				hits = append(hits, r.serviceHit(m, svc.Banner, "ssh-banner", svc.Port))
+				located = located || svc.Banner == hp.SSHBanner
+			}
+		}
+		if !located && hp.SSHBanner != "" {
+			if m := r.sshBannerRe.FindStringSubmatch(hp.SSHBanner); m != nil {
+				hits = append(hits, r.serviceHit(m, hp.SSHBanner, "ssh-banner", 22))
+			}
 		}
 	}
-
 	var ports []int
-	if (r.httpServerRe != nil || r.httpTitleRe != nil) && len(hp.HTTP) > 0 {
-		ports = make([]int, 0, len(hp.HTTP))
-		for port := range hp.HTTP {
-			ports = append(ports, port)
-		}
-		sort.Ints(ports)
+	if r.httpServerRe != nil || r.httpTitleRe != nil {
+		ports = slices.Sorted(maps.Keys(hp.HTTP))
 	}
+	for _, port := range ports {
+		banner := hp.HTTP[port]
+		if r.httpServerRe != nil && banner.Server != "" {
+			if m := r.httpServerRe.FindStringSubmatch(banner.Server); m != nil {
+				hits = append(hits, r.serviceHit(m, banner.Server, "http-server", port))
+				continue
+			}
+		}
+		if r.httpTitleRe != nil && banner.Title != "" {
+			if m := r.httpTitleRe.FindStringSubmatch(banner.Title); m != nil {
+				hits = append(hits, r.serviceHit(m, banner.Title, "http-title", port))
+			}
+		}
+	}
+	if len(hits) > 0 {
+		// Also emit a host-level hit when a versionless appliance rule matches
+		// hostname or MAC so host-wide exposure is preserved alongside the web port.
+		if !slices.ContainsFunc(hits, func(h ruleHit) bool { return h.version != "" || h.model != "" }) {
+			if h, ok := r.matchHostIdentity(hp); ok && h.version == "" && h.model == "" {
+				hits = append(hits, h)
+			}
+		}
+		return hits
+	}
+	if h, ok := r.matchHostIdentity(hp); ok {
+		return []ruleHit{h}
+	}
+	return nil
+}
 
-	if r.httpServerRe != nil && len(ports) > 0 {
-		if hits := matchHTTPField(ports, hp.HTTP, r.httpServerRe, r.VersionGroup, r.ModelGroup, "http-server", func(b probe.HTTPBanner) string {
-			return b.Server
-		}); len(hits) > 0 {
-			return hits
-		}
-	}
-	if r.httpTitleRe != nil && len(ports) > 0 {
-		if hits := matchHTTPField(ports, hp.HTTP, r.httpTitleRe, r.VersionGroup, r.ModelGroup, "http-title", func(b probe.HTTPBanner) string {
-			return b.Title
-		}); len(hits) > 0 {
-			return hits
-		}
-	}
+// matchHostIdentity checks host-level hostname and MAC OUI selectors.
+func (r *FingerprintRule) matchHostIdentity(hp probe.HostProfile) (ruleHit, bool) {
 	if r.hostnameRe != nil {
 		for _, candidate := range []string{hp.Client.Name, hp.Client.Hostname} {
 			if candidate != "" {
 				if m := r.hostnameRe.FindStringSubmatch(candidate); m != nil {
-					return []ruleHit{{
+					return ruleHit{
 						version: captureGroup(m, r.VersionGroup),
 						model:   captureGroup(m, r.ModelGroup),
 						source:  "hostname",
-					}}
+					}, true
 				}
 			}
 		}
@@ -518,59 +607,43 @@ func (r *FingerprintRule) matchAll(hp probe.HostProfile) []ruleHit {
 		macLower := strings.ToLower(hp.Client.MAC)
 		for _, pfx := range r.MACPrefix {
 			if strings.HasPrefix(macLower, strings.ToLower(pfx)) {
-				return []ruleHit{{source: "mac-prefix"}}
+				return ruleHit{source: "mac-prefix"}, true
 			}
 		}
 	}
-	return nil
+	return ruleHit{}, false
 }
 
-// matchHTTPField scans HTTP banners in ascending port order, preferring banners
-// that yield a non-empty version (or model) capture and emitting one hit per
-// distinct (version, model) pair so multi-port hosts stay deterministic.
-func matchHTTPField(
-	ports []int,
-	banners map[int]probe.HTTPBanner,
-	re *regexp.Regexp,
-	verGroup, modelGroup int,
-	source string,
-	extract func(probe.HTTPBanner) string,
-) []ruleHit {
-	var versioned []ruleHit
-	var fallback *ruleHit
-	seen := make(map[string]struct{})
+// distroPackage recognizes Linux/BSD distribution names and package revision
+// markers in the original banner or version string (such as Debian, Ubuntu,
+// RHEL/CentOS/Rocky/AlmaLinux/Fedora/Amazon Linux, Alpine, SUSE, and FreeBSD).
+var distroPackage = regexp.MustCompile(`(?i)(?:^|[^a-z])(deb[0-9]+|el[0-9]+|fc[0-9]+|amzn[0-9]+|(?:debian|ubuntu|rhel|red[ -]?hat|centos|rocky|alma(?:linux)?|oracle[ -]?linux|amazon|fedora|alpine|(?:open)?suse|freebsd)(?:[^a-z]|$))`)
 
-	for _, port := range ports {
-		val := extract(banners[port])
-		if val == "" {
-			continue
-		}
-		m := re.FindStringSubmatch(val)
-		if m == nil {
-			continue
-		}
-		ver := captureGroup(m, verGroup)
-		model := captureGroup(m, modelGroup)
-		hit := ruleHit{version: ver, model: model, source: source}
-		if ver != "" || model != "" {
-			k := strings.ToLower(ver) + "|" + strings.ToLower(model)
-			if _, dup := seen[k]; !dup {
-				seen[k] = struct{}{}
-				versioned = append(versioned, hit)
-			}
-			continue
-		}
-		if fallback == nil {
-			fallback = &hit
-		}
+// packageRevision separates numeric distribution revisions while preserving upstream prereleases.
+var packageRevision = regexp.MustCompile(`[-+~]r?[0-9]`)
+
+// upstreamVersion removes the packaging revision before checking upstream CPE ranges.
+func upstreamVersion(version string, packaged bool) string {
+	if !packaged {
+		return version
 	}
-	if len(versioned) > 0 {
-		return versioned
+	// Debian and RPM revisions follow a hyphen. Attached markers such as
+	// ".el9" can also appear directly in the captured version.
+	if loc := distroPackage.FindStringSubmatchIndex(version); loc != nil {
+		version = strings.TrimRight(version[:loc[2]], ".+~_-")
 	}
-	if fallback != nil {
-		return []ruleHit{*fallback}
+	if loc := packageRevision.FindStringIndex(version); loc != nil {
+		version = version[:loc[0]]
 	}
-	return nil
+	return version
+}
+
+// serviceHit retains the endpoint and packaging evidence that the regex capture omits.
+func (r *FingerprintRule) serviceHit(m []string, raw, source string, port int) ruleHit {
+	version := captureGroup(m, r.VersionGroup)
+	packaged := distroPackage.MatchString(raw)
+	return ruleHit{version: upstreamVersion(version, packaged), model: captureGroup(m, r.ModelGroup),
+		source: source, port: port, ambiguous: packaged}
 }
 
 // expandProductPatterns substitutes "{model}" placeholders with the captured
