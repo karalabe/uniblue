@@ -9,6 +9,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -28,6 +29,61 @@ func TestLoadZeroConfigFromEnv(t *testing.T) {
 	}
 	if len(cfg.Scan.Ports) != len(DefaultPorts) {
 		t.Fatalf("got %d default ports, want %d", len(cfg.Scan.Ports), len(DefaultPorts))
+	}
+}
+
+// TestAssetOverrides checks the YAML representation and validation of exact
+// selectors, including aliases that differ only in MAC address punctuation.
+func TestAssetOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "assets")
+	raw := `
+unifi:
+  url: https://controller.example
+  api_key: test
+network:
+  assets:
+    - mac: "DA-00-00-00-00-01"
+      id: Storage-A
+      label: Backup NAS
+      tier: crown
+      consequences: [data, continuity]
+      manages: ["0200.0000.0002", Host-B]
+      hosts: ["020000000003", Guest-C]
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []AssetOverride{{
+		MAC: "da:00:00:00:00:01", ID: "Storage-A", Label: "Backup NAS", Tier: "crown",
+		Consequences: []string{"data", "continuity"},
+		Manages:      []string{"02:00:00:00:00:02", "Host-B"}, Hosts: []string{"02:00:00:00:00:03", "Guest-C"},
+	}}
+	if !reflect.DeepEqual(cfg.Network.Assets, want) {
+		t.Fatalf("loaded assets = %+v, want %+v", cfg.Network.Assets, want)
+	}
+	for _, tc := range []struct {
+		name   string
+		assets []AssetOverride
+	}{
+		{"missing selector", []AssetOverride{{Label: "Server"}}},
+		{"invalid MAC with valid ID", []AssetOverride{{ID: "A", MAC: "bad"}}},
+		{"duplicate MAC", []AssetOverride{{MAC: "da0000000001"}, {MAC: "DA-00-00-00-00-01"}}},
+		{"duplicate ID", []AssetOverride{{ID: "A"}, {ID: "A", MAC: "da0000000001"}}},
+		{"invalid tier", []AssetOverride{{ID: "A", Tier: "critical"}}},
+		{"invalid consequence", []AssetOverride{{ID: "A", Consequences: []string{"data", "damage"}}}},
+		{"self manage", []AssetOverride{{MAC: "da0000000001", Manages: []string{"DA00.0000.0001"}}}},
+		{"self host", []AssetOverride{{ID: "Guest-A", Hosts: []string{"Guest-A"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg.Network.Assets = tc.assets
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "network.assets") {
+				t.Errorf("Validate() = %v, want an asset configuration error", err)
+			}
+		})
 	}
 }
 

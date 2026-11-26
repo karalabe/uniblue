@@ -114,6 +114,9 @@ type PhysicalPortRule struct {
 // NetworkConfig defines local network segmentation hints so UniBlue can weigh
 // findings by where a device actually lives.
 type NetworkConfig struct {
+	// Assets declares the impact and platform relations of individual devices and clients.
+	Assets []AssetOverride `yaml:"assets,omitempty"`
+
 	// TrustedVLANs lists VLAN names (case-insensitive) or numeric VLAN IDs whose
 	// hosts have elevated trust. Findings on these networks are escalated.
 	TrustedVLANs []string `yaml:"trusted_vlans"`
@@ -155,6 +158,25 @@ type NetworkConfig struct {
 	// Admin Workstation -> BMC allowed) so UniBlue preserves legitimate
 	// dependencies and leaves approved paths out of the action queue.
 	IsolationPolicy IsolationIntent `yaml:"isolation_policy,omitempty"`
+}
+
+// AssetOverride pins the impact and platform relations of a device or client
+// identified by its hardware address or stable controller ID.
+type AssetOverride struct {
+	// MAC identifies the host by its hardware address.
+	MAC string `yaml:"mac,omitempty"`
+	// ID identifies the host by its case-sensitive controller ID.
+	ID string `yaml:"id,omitempty"`
+	// Label is an optional reminder of the host's purpose.
+	Label string `yaml:"label,omitempty"`
+	// Tier replaces the inferred asset value tier when specified.
+	Tier string `yaml:"tier,omitempty"`
+	// Consequences replaces the inferred dimensions when specified.
+	Consequences []string `yaml:"consequences,omitempty"`
+	// Manages lists the MACs or IDs of hosts this device controls.
+	Manages []string `yaml:"manages,omitempty"`
+	// Hosts lists the MACs or IDs of guests running on this device.
+	Hosts []string `yaml:"hosts,omitempty"`
 }
 
 // BridgeInventoryConfig points to one owner-supplied bridge/recorder inventory file.
@@ -512,6 +534,83 @@ func (c *Config) Validate() error {
 		case "external", "internal", "unused":
 		default:
 			return fmt.Errorf("config: unsupported physical_ports zone %q for %s port %d (want external, internal, or unused)", pr.Zone, pr.Device, pr.Port)
+		}
+	}
+	return validateAssets(c.Network.Assets)
+}
+
+// ValidAssetTier reports whether tier names a supported asset value tier.
+func ValidAssetTier(tier string) bool {
+	switch tier {
+	case "crown", "high", "medium", "low", "disposable":
+		return true
+	}
+	return false
+}
+
+// ValidConsequence reports whether dimension names a supported kind of impact.
+func ValidConsequence(dimension string) bool {
+	switch dimension {
+	case "control-plane", "data", "identity", "privacy", "physical", "continuity":
+		return true
+	}
+	return false
+}
+
+// validateAssets canonicalizes hardware addresses before comparing selectors
+// and relations so alternate spellings cannot hide duplicates or self-references.
+func validateAssets(assets []AssetOverride) error {
+	macs, ids := make(map[string]bool), make(map[string]bool)
+	for i := range assets {
+		a := &assets[i]
+		a.MAC = strings.TrimSpace(a.MAC)
+		a.ID = strings.TrimSpace(a.ID)
+		if a.MAC == "" && a.ID == "" {
+			return fmt.Errorf("config: network.assets[%d] requires a MAC or ID", i)
+		}
+		if a.MAC != "" {
+			mac, ok := ParseCanonicalMAC(a.MAC)
+			if !ok {
+				return fmt.Errorf("config: network.assets[%d] has invalid MAC %q", i, a.MAC)
+			}
+			if macs[mac] {
+				return fmt.Errorf("config: network.assets[%d] repeats MAC %q", i, mac)
+			}
+			a.MAC = mac
+			macs[mac] = true
+		}
+		if a.ID != "" {
+			if ids[a.ID] {
+				return fmt.Errorf("config: network.assets[%d] repeats ID %q", i, a.ID)
+			}
+			ids[a.ID] = true
+		}
+		a.Tier = strings.ToLower(strings.TrimSpace(a.Tier))
+		if a.Tier != "" && !ValidAssetTier(a.Tier) {
+			return fmt.Errorf("config: network.assets[%d] has invalid tier %q", i, a.Tier)
+		}
+		for j, dim := range a.Consequences {
+			dim = strings.ToLower(strings.TrimSpace(dim))
+			if !ValidConsequence(dim) {
+				return fmt.Errorf("config: network.assets[%d] has invalid consequence %q", i, a.Consequences[j])
+			}
+			a.Consequences[j] = dim
+		}
+		for _, targets := range [][]string{a.Manages, a.Hosts} {
+			for j, target := range targets {
+				target = strings.TrimSpace(target)
+				if target == "" {
+					return fmt.Errorf("config: network.assets[%d] has an empty target", i)
+				}
+				mac, isMAC := ParseCanonicalMAC(target)
+				if target == a.ID || (isMAC && mac == a.MAC) {
+					return fmt.Errorf("config: network.assets[%d] cannot manage or host itself", i)
+				}
+				if isMAC {
+					target = mac
+				}
+				targets[j] = target
+			}
 		}
 	}
 	return nil

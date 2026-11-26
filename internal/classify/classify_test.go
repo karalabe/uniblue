@@ -14,6 +14,7 @@ import (
 
 	classifydata "github.com/karalabe/uniblue/classify"
 	"github.com/karalabe/uniblue/internal/checks"
+	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -335,5 +336,151 @@ func TestProtocolTraits(t *testing.T) {
 		if _, err := LoadProtocols(fsys); err == nil {
 			t.Errorf("accepted invalid protocol traits %q", fields)
 		}
+	}
+}
+
+// TestInferDeviceAsset distinguishes network-wide control from individual access links.
+func TestInferDeviceAsset(t *testing.T) {
+	for _, tc := range []struct {
+		dev  unifi.Device
+		tier AssetTier
+	}{
+		{unifi.Device{Type: "udm"}, TierCrown},
+		{unifi.Device{Type: "UCG"}, TierCrown},
+		{unifi.Device{Type: "uxg"}, TierCrown},
+		{unifi.Device{Type: "usg"}, TierCrown},
+		{unifi.Device{Type: "uck"}, TierCrown},
+		{unifi.Device{Type: "usw", Name: "Core Switch"}, TierCrown},
+		{unifi.Device{Type: "usw", Model: "USW-Pro-Aggregation"}, TierCrown},
+		{unifi.Device{Type: "usw", Name: "Office Switch"}, TierHigh},
+		{unifi.Device{Type: "uap"}, TierHigh},
+	} {
+		got := InferDeviceAsset(tc.dev)
+		if got.Tier != tc.tier || !slices.Equal(got.Consequences, []Consequence{ConsequenceControlPlane, ConsequenceContinuity}) || got.Reason == "" {
+			t.Errorf("InferDeviceAsset(%+v) = %+v, want %s with network control and continuity", tc.dev, got, tc.tier)
+		}
+	}
+}
+
+// TestInferClientAsset exercises real taxonomy roles, including broad product
+// families where the hostname is needed to identify a higher-impact device.
+func TestInferClientAsset(t *testing.T) {
+	c, err := Load(classifydata.BuiltinFS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		host, vendor string
+		tier         AssetTier
+		dims         []Consequence
+	}{
+		{"rack-bmc", "", TierCrown, []Consequence{ConsequenceControlPlane, ConsequenceContinuity}},
+		{"switch", "Mikrotik", TierHigh, []Consequence{ConsequenceControlPlane, ConsequenceContinuity}},
+		{"pi-hole", "", TierHigh, []Consequence{ConsequenceControlPlane, ConsequenceContinuity}},
+		{"nas01", "", TierHigh, []Consequence{ConsequenceData, ConsequenceContinuity}},
+		{"pve01", "", TierCrown, []Consequence{ConsequenceData, ConsequenceContinuity, ConsequenceControlPlane}},
+		{"proxmox-backup", "", TierCrown, []Consequence{ConsequenceData, ConsequenceContinuity}},
+		{"work-laptop", "", TierHigh, []Consequence{ConsequenceData, ConsequenceIdentity, ConsequencePrivacy}},
+		{"porch-camera", "Axis Communications", TierMedium, []Consequence{ConsequencePrivacy}},
+		{"unvr01", "Axis Communications", TierHigh, []Consequence{ConsequencePrivacy, ConsequenceData}},
+		{"shelly-plug", "", TierLow, []Consequence{ConsequencePhysical}},
+		{"hall-thermostat", "", TierMedium, []Consequence{ConsequencePhysical}},
+		{"node-red", "", TierHigh, []Consequence{ConsequenceControlPlane, ConsequencePhysical, ConsequencePrivacy}},
+		{"zigbee-bridge", "Signify", TierHigh, []Consequence{ConsequenceControlPlane, ConsequencePhysical, ConsequencePrivacy}},
+		{"roomba", "", TierLow, []Consequence{ConsequencePhysical, ConsequencePrivacy}},
+		{"laserjet", "", TierLow, []Consequence{ConsequenceData}},
+		{"prusa", "", TierLow, []Consequence{ConsequencePhysical}},
+		{"sonos", "", TierLow, []Consequence{ConsequencePrivacy}},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			cl := unifi.Client{Hostname: tc.host, OUI: tc.vendor}
+			got := InferClientAsset(cl, c.ClassifyClient(cl, nil, false))
+			if got.Tier != tc.tier || !slices.Equal(got.Consequences, tc.dims) || got.Unclassified || got.Reason == "" {
+				t.Errorf("got %+v, want %s %v", got, tc.tier, tc.dims)
+			}
+		})
+	}
+	for _, category := range []Category{"", CategoryUnknown} {
+		got := InferClientAsset(unifi.Client{}, DeviceInfo{Category: category})
+		if got.Tier != TierMedium || !got.Unclassified || got.Reason != "Unclassified device (defaulting to medium until identified)" {
+			t.Errorf("fallback for %q = %+v", category, got)
+		}
+	}
+}
+
+// TestResolveAssets checks exact matching even when clients share an IP and
+// verifies that relation targets use the same profile keys as their owners.
+func TestResolveAssets(t *testing.T) {
+	const gateway = "00:00:5e:00:53:01"
+	const client = "02:00:00:00:00:02"
+	vm := unifi.Client{ID: "Guest-A", IP: "192.0.2.1"}
+	snap := &unifi.Snapshot{
+		Devices: []unifi.Device{{ID: "Gateway", MAC: gateway, Type: "udm"}},
+		Clients: []unifi.Client{vm, {MAC: client, ID: "Phone", IP: vm.IP}, {ID: "Spare"}},
+	}
+	profiles := []probe.HostProfile{{Client: vm, OpenPorts: []int{8006}}, {Client: snap.Clients[1]}}
+	assets, warnings := ResolveAssets(snap, profiles, []config.AssetOverride{
+		{ID: "Gateway", Manages: []string{"Phone"}, Hosts: []string{"Guest-A", "Offline"}},
+		{MAC: "02-00-00-00-00-02", Tier: "low", Consequences: []string{"privacy"}},
+		{ID: "Spare", Label: "Spare client", Tier: "disposable"},
+		{ID: "guest-a"},
+		{MAC: "DA0000000003", Manages: []string{"Missing"}},
+	})
+	gw := assets[gateway]
+	if len(assets) != 4 || !gw.Override || gw.Tier != TierCrown || !slices.Equal(gw.Manages, []string{client}) || !slices.Equal(gw.Hosts, []string{"Guest-A", "Offline"}) ||
+		!slices.Equal(gw.Consequences, []Consequence{ConsequenceControlPlane, ConsequenceContinuity}) {
+		t.Errorf("gateway and relations = %+v (in %d profiles)", gw, len(assets))
+	}
+	phone := assets[client]
+	if !phone.Override || phone.Tier != TierLow || !slices.Equal(phone.Consequences, []Consequence{ConsequencePrivacy}) {
+		t.Errorf("phone override = %+v", phone)
+	}
+	if got := assets["Guest-A"]; got.Override || got.Tier != TierCrown || !slices.Contains(got.Consequences, ConsequenceControlPlane) {
+		t.Errorf("probed hypervisor = %+v", got)
+	}
+	if got := assets["Spare"]; got.Tier != TierDisposable || got.Unclassified || !got.Override || !strings.Contains(got.Reason, "Spare client") {
+		t.Errorf("owner-identified client = %+v", got)
+	}
+	want := []string{
+		"Asset override for Gateway lists Offline under hosts, but that target did not match any device or client in the current scan",
+		"Asset override for " + client + " uses a randomized (locally administered) MAC address and may stop matching after a reconnect",
+		"Asset override for guest-a did not match any device or client in the current scan",
+		"Asset override for da:00:00:00:00:03 uses a randomized (locally administered) MAC address and may stop matching after a reconnect",
+		"Asset override for da:00:00:00:00:03 did not match any device or client in the current scan",
+	}
+	if !slices.Equal(warnings, want) {
+		t.Errorf("warnings = %q, want %q", warnings, want)
+	}
+}
+
+// TestResolveAssetAliases checks MAC/ID conflicts (including offline MACs),
+// duplicate overrides across MAC and ID, self-references, and session-mode
+// compact core-switch model codes.
+func TestResolveAssetAliases(t *testing.T) {
+	const mac = "00:00:5e:00:53:02"
+	snap := &unifi.Snapshot{Devices: []unifi.Device{
+		{ID: "AP", MAC: mac, Type: "uap"},
+		{ID: "Switch", Type: "usw", Model: "USAGGPRO"},
+		{ID: "Agg8", MAC: "00:00:5e:00:53:03", Type: "usw", Model: "USL8A"},
+	}}
+	assets, warnings := ResolveAssets(snap, nil, []config.AssetOverride{
+		{MAC: mac, ID: "Switch", Tier: "disposable"},
+		{MAC: "00:00:5e:00:53:99", ID: "AP", Tier: "disposable"},
+		{ID: "AP", Hosts: []string{mac}, Consequences: []string{}},
+		{MAC: mac, Tier: "low"},
+	})
+	ap := assets[mac]
+	if !ap.Override || ap.Tier != TierHigh || len(ap.Hosts) != 0 || len(ap.Consequences) != 0 || assets["Switch"].Override {
+		t.Errorf("conflicting selectors, duplicate override, or self-host relation applied: %+v", assets)
+	}
+	if assets["Switch"].Tier != TierCrown || assets["00:00:5e:00:53:03"].Tier != TierCrown {
+		t.Errorf("compact session-mode aggregation switch codes must infer TierCrown: %+v", assets)
+	}
+	if len(warnings) != 4 ||
+		!strings.Contains(warnings[0], "different device") ||
+		!strings.Contains(warnings[1], "different device") ||
+		!strings.Contains(warnings[2], "itself") ||
+		!strings.Contains(warnings[3], "already matched") {
+		t.Errorf("warnings = %q", warnings)
 	}
 }

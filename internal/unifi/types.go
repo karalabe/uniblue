@@ -269,6 +269,9 @@ func expandPortSpec(spec string, maxRange int) []int {
 // Client represents a connected endpoint on the local network as observed by
 // UniFi (laptops, servers, IoT appliances, cameras, etc.).
 type Client struct {
+	// ID is the controller's inventory identifier when available.
+	ID string `json:"id,omitempty"`
+
 	// MAC is the normalized lowercase hardware address of the client.
 	MAC string `json:"mac"`
 
@@ -391,6 +394,9 @@ func (c Client) AllIPs() []string {
 // Device represents a piece of Ubiquiti infrastructure managed by the site
 // (gateway, switch, or wireless access point).
 type Device struct {
+	// ID is the controller's inventory identifier when available.
+	ID string `json:"id,omitempty"`
+
 	// MAC is the device's hardware address.
 	MAC string `json:"mac"`
 
@@ -1019,6 +1025,10 @@ type apiEnvelope[T any] struct {
 
 // rawClient maps the wire fields returned by /api/s/<site>/stat/sta.
 type rawClient struct {
+	// ID is the local station record identifier.
+	ID string `json:"_id"`
+	// UserID identifies the known client across station sessions.
+	UserID        string     `json:"user_id"`
 	MAC           string     `json:"mac"`
 	IP            string     `json:"ip"`
 	IPv6Addresses []string   `json:"ipv6_addresses"`

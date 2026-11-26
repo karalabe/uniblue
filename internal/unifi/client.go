@@ -884,6 +884,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			seenMAC[mac] = struct{}{}
 		}
 		cl := Client{
+			ID:       strings.TrimSpace(rc.ID),
 			MAC:      mac,
 			IP:       strings.TrimSpace(rc.IPAddress),
 			IPv6:     dedupeIPs(rc.IPv6Addresses),
@@ -892,6 +893,9 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			IsWired:  strings.EqualFold(rc.Type, "WIRED"),
 		}
 		if lc, ok := legacyClientByMAC[mac]; ok {
+			// Prefer the legacy user_id/_id when available so client IDs stay
+			// stable across API-key and session auth modes.
+			cl.ID = firstNonEmpty(lc.UserID, lc.ID, cl.ID)
 			if h := strings.TrimSpace(lc.Hostname); h != "" {
 				cl.Hostname = h
 			}
@@ -947,6 +951,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		}
 		txBytes, rxBytes := clientByteCounters(lc.IsWired, lc.TxBytes, lc.RxBytes, lc.WiredTxBytes, lc.WiredRxBytes)
 		cl := Client{
+			ID:         firstNonEmpty(lc.UserID, lc.ID),
 			MAC:        mac,
 			IP:         ip,
 			IPv6:       dedupeIPs(lc.IPv6Addresses),
@@ -985,6 +990,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	for _, rd := range dr.items {
 		mac := strings.ToLower(strings.TrimSpace(rd.MACAddress))
 		dev := Device{
+			ID:         strings.TrimSpace(rd.ID),
 			MAC:        mac,
 			IP:         strings.TrimSpace(rd.IPAddress),
 			Name:       strings.TrimSpace(rd.Name),
@@ -994,6 +1000,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			Upgradable: rd.FirmwareUpdatable,
 		}
 		if ld, ok := legacyDevByMAC[mac]; ok {
+			dev.ID = firstNonEmpty(dev.ID, ld.ExternalID, ld.ID, ld.DeviceID)
 			if ld.Type != "" {
 				dev.Type = strings.ToLower(ld.Type)
 			}
@@ -1220,6 +1227,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 	for _, rc := range cr.items {
 		txBytes, rxBytes := clientByteCounters(rc.IsWired, rc.TxBytes, rc.RxBytes, rc.WiredTxBytes, rc.WiredRxBytes)
 		cl := Client{
+			ID:          firstNonEmpty(rc.UserID, rc.ID),
 			MAC:         strings.ToLower(strings.TrimSpace(rc.MAC)),
 			IP:          strings.TrimSpace(rc.IP),
 			IPv6:        dedupeIPs(rc.IPv6Addresses),
@@ -1259,6 +1267,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			devType = inferDeviceTypeFromModel(rd.Model)
 		}
 		dev := Device{
+			ID:         firstNonEmpty(rd.ExternalID, rd.ID, rd.DeviceID),
 			MAC:        strings.ToLower(strings.TrimSpace(rd.MAC)),
 			IP:         strings.TrimSpace(rd.IP),
 			Name:       strings.TrimSpace(rd.Name),

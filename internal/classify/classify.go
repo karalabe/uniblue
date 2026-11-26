@@ -187,9 +187,27 @@ func (c *Classifier) ClassifyAll(snap *unifi.Snapshot, profiles []probe.HostProf
 	if snap == nil {
 		return nil
 	}
+	out := make(map[string]Result, len(snap.Clients))
+	c.classifyClients(snap, profiles, func(cl unifi.Client, info Result) {
+		key := cl.PrimaryIP()
+		if key == "" {
+			key = cl.MAC
+		}
+		out[key] = info
+	})
+	return out
+}
+
+// classifyClients keeps each result paired with its client so asset lookups
+// can distinguish clients that share an IP address or have only a controller ID.
+func (c *Classifier) classifyClients(snap *unifi.Snapshot, profiles []probe.HostProfile, visit func(unifi.Client, Result)) {
 	profileByMAC := make(map[string]*probe.HostProfile, len(profiles))
+	profileByID := make(map[string]*probe.HostProfile, len(profiles))
 	profileByIP := make(map[string]*probe.HostProfile, len(profiles)*2)
 	for i := range profiles {
+		if id := profiles[i].Client.ID; id != "" {
+			profileByID[id] = &profiles[i]
+		}
 		if m := strings.ToLower(strings.TrimSpace(profiles[i].Client.MAC)); m != "" {
 			profileByMAC[m] = &profiles[i]
 		}
@@ -213,11 +231,13 @@ func (c *Classifier) ClassifyAll(snap *unifi.Snapshot, profiles []probe.HostProf
 		}
 	}
 
-	out := make(map[string]Result, len(snap.Clients))
 	for _, cl := range snap.Clients {
 		var hp *probe.HostProfile
 		if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
 			hp = profileByMAC[m]
+		}
+		if hp == nil {
+			hp = profileByID[cl.ID]
 		}
 		if hp == nil {
 			for _, ip := range cl.AllIPs() {
@@ -234,13 +254,8 @@ func (c *Classifier) ClassifyAll(snap *unifi.Snapshot, profiles []probe.HostProf
 				break
 			}
 		}
-		key := cl.PrimaryIP()
-		if key == "" {
-			key = cl.MAC
-		}
-		out[key] = c.ClassifyClient(cl, hp, isWANWeb)
+		visit(cl, c.ClassifyClient(cl, hp, isWANWeb))
 	}
-	return out
 }
 
 // isDedicatedApplianceCategory reports whether a vendor-OUI category represents
