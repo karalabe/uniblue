@@ -31,6 +31,17 @@ unifi:
 #   isolated_vlans: ["IoT", "Guest"]
 #   exclude_ips: []
 #
+#   # Override asset value and record physical or virtual ownership by MAC or ID.
+#   assets:
+#     - mac: "02:00:00:00:00:01"
+#       label: "Rack management card"
+#       tier: "high"           # crown | high | medium | low | disposable
+#       manages: ["02:00:00:00:00:02"]
+#     - mac: "02:00:00:00:00:02"
+#       label: "Virtualization server"
+#       tier: "crown"
+#       hosts: ["02:00:00:00:00:03"]
+#
 #   # Assign entire switches/APs outside your secured physical building perimeter
 #   # (by UniFi device name or MAC). UniBlue automatically flags unrestricted
 #   # ports on these devices AND traces their indoor parent-switch feeder cable!

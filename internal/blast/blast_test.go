@@ -1749,6 +1749,170 @@ func TestSimulationWeakAuth(t *testing.T) {
 	}
 }
 
+// TestParseSimulationMode verifies the shared API and dashboard vocabulary.
+func TestParseSimulationMode(t *testing.T) {
+	for raw, want := range map[string]SimulationMode{
+		"": ModeRealistic, "pRoVeN": ModeProven, "REALISTIC": ModeRealistic, "worst": ModeWorstCase,
+	} {
+		if got, err := ParseSimulationMode(raw); err != nil || got != want {
+			t.Errorf("ParseSimulationMode(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"strict", "worst-case", "typo"} {
+		if _, err := ParseSimulationMode(raw); err == nil {
+			t.Errorf("accepted unknown mode %q", raw)
+		}
+	}
+}
+
+// TestSimulateHost exercises competing witnesses, equal-length paths, cycles
+// and terminal exposure before and after applying hypothetical controls.
+func TestSimulateHost(t *testing.T) {
+	s := Simulation{Nodes: []SimNode{
+		{ID: "root", Name: "Proxy", EgressCutIDs: []string{"egress"}},
+		{ID: "b", Name: "BMC", Tier: "high"}, {ID: "a"}, {ID: "server", Tier: "crown"},
+		{ID: "admin"}, {ID: "local", Tier: "high"}, {ID: "unseen"}, {ID: "conditional"}, {ID: "uncertain"},
+	}}
+	edge := func(from, to, tier string, cuts ...string) {
+		s.Edges = append(s.Edges, SimEdge{From: from, To: to, Tier: tier, CutIDs: cuts})
+	}
+	edge("internet", "root", "wan", "wan")
+	edge("internet", "b", "wan", "other-wan")
+	edge("root", "a", "likely", "auth")
+	edge("root", "b", "likely", "auth")
+	edge("root", "b", "takeover", "patch")
+	edge("root", "server", "l2", "isolate")
+	edge("a", "server", "takeover", "second")
+	s.Edges = append(s.Edges, SimEdge{From: "b", To: "server", Tier: "takeover",
+		Label: "Manages server", Via: "Management relationship", CutIDs: []string{"managed"}})
+	edge("b", "root", "takeover")
+	edge("server", "admin", "pivot", "admin-login")
+	edge("admin", "local", "l2", "isolate")
+	edge("local", "unseen", "takeover", "out-of-scope")
+	edge("local", "unseen", "unknown-takeover", "also-out-of-scope")
+	edge("root", "b", "unknown-takeover")
+	edge("b", "unseen", "unknown-takeover", "verify")
+	edge("a", "conditional", "unknown-likely", "conditional-rule")
+	edge("admin", "uncertain", "unknown", "unknown-rule")
+
+	for _, tc := range []struct {
+		mode                            SimulationMode
+		cuts                            []string
+		direct, cascade, l2             int
+		paths, critical, unknown, fixes []string
+	}{
+		{ModeProven, nil, 1, 1, 0, []string{"b", "server"}, []string{"b", "server"}, []string{"unseen"},
+			[]string{"egress", "managed", "patch", "verify", "wan"}},
+		{ModeRealistic, nil, 2, 1, 0, []string{"b", "a", "server"}, []string{"b", "server"}, []string{"unseen", "conditional"},
+			[]string{"auth", "conditional-rule", "egress", "managed", "patch", "second", "verify", "wan"}},
+		{ModeWorstCase, nil, 2, 2, 1, []string{"b", "a", "server", "admin", "local"}, []string{"b", "server", "local"}, []string{"unseen", "conditional", "uncertain"},
+			[]string{"admin-login", "auth", "conditional-rule", "egress", "isolate", "managed", "patch", "second", "unknown-rule", "verify", "wan"}},
+		{ModeRealistic, []string{"patch", "verify"}, 2, 1, 0, []string{"b", "a", "server"}, []string{"b", "server"}, []string{"conditional"},
+			[]string{"auth", "conditional-rule", "egress", "managed", "patch", "second", "verify", "wan"}},
+		{ModeRealistic, []string{"patch", "auth", "patch"}, 0, 0, 0, nil, nil, []string{"b"},
+			[]string{"auth", "conditional-rule", "egress", "managed", "patch", "second", "verify", "wan"}},
+	} {
+		t.Run(string(tc.mode)+"/"+strings.Join(tc.cuts, "+"), func(t *testing.T) {
+			before := slices.Clone(tc.cuts)
+			got, ok := s.SimulateHost("root", tc.mode, tc.cuts)
+			if !ok || got.Host.ID != "root" || got.Mode != tc.mode || got.PeerCount != len(s.Nodes)-1 ||
+				got.DirectReach != tc.direct || got.CascadedReach != tc.cascade || got.L2Exposed != tc.l2 || got.TotalReach != len(tc.paths) {
+				t.Fatalf("unexpected reach: %+v", got)
+			}
+			if !slices.Equal(tc.cuts, before) || !slices.Equal(got.AppliedFixes, slices.Compact(slices.Sorted(slices.Values(before)))) {
+				t.Fatalf("applied fixes %v for input %v", got.AppliedFixes, tc.cuts)
+			}
+			var paths, critical, unknown []string
+			for _, p := range got.Paths {
+				paths = append(paths, p.Target.ID)
+				switch p.Target.ID {
+				case "b":
+					wantTier := "takeover"
+					if slices.Contains(tc.cuts, "patch") {
+						wantTier = "likely"
+					}
+					if p.Tier != wantTier || p.Hop != 1 {
+						t.Errorf("parallel route = %+v", p)
+					}
+				case "server":
+					if p.From != "b" || p.FromName != "BMC" || p.Hop != 2 || p.Tier != "takeover" || p.TerminalL2 ||
+						p.Label != "Manages server" || p.Via != "Management relationship" || !slices.Equal(p.CutIDs, []string{"managed"}) {
+						t.Errorf("management path = %+v", p)
+					}
+				case "local":
+					if !p.TerminalL2 || p.Tier != "l2" || p.From != "admin" || p.Hop != 4 {
+						t.Errorf("terminal path = %+v", p)
+					}
+				}
+			}
+			for _, n := range got.CriticalThreatened {
+				critical = append(critical, n.ID)
+			}
+			for _, n := range got.UnknownTargets {
+				unknown = append(unknown, n.ID)
+			}
+			if !slices.Equal(paths, tc.paths) || !slices.Equal(critical, tc.critical) ||
+				!slices.Equal(unknown, tc.unknown) || !slices.Equal(got.RelevantFixes, tc.fixes) {
+				t.Errorf("paths %v, critical %v, unknown %v, relevant fixes %v", paths, critical, unknown, got.RelevantFixes)
+			}
+		})
+	}
+	empty, ok := s.SimulateHost("unseen", ModeWorstCase, nil)
+	if !ok || empty.Paths == nil || empty.UnknownTargets == nil || empty.CriticalThreatened == nil || empty.RelevantFixes == nil {
+		t.Errorf("isolated host: %+v", empty)
+	}
+	if _, ok := s.SimulateHost("absent", ModeRealistic, nil); ok {
+		t.Error("simulated absent host")
+	}
+	t.Run("equal-tier witnesses", func(t *testing.T) {
+		s := s
+		s.Edges = append(slices.Clone(s.Edges), SimEdge{From: "b", To: "server", Tier: "takeover", Label: "Second witness"})
+		for _, tc := range []struct {
+			cuts []string
+			want string
+		}{{nil, "Manages server"}, {[]string{"managed"}, "Second witness"}} {
+			got, _ := s.SimulateHost("b", ModeProven, tc.cuts)
+			if !slices.ContainsFunc(got.Paths, func(p HostBlastPath) bool {
+				return p.Target.ID == "server" && p.From == "b" && p.Label == tc.want
+			}) {
+				t.Errorf("fixes %v: missing witness %q in %+v", tc.cuts, tc.want, got.Paths)
+			}
+		}
+	})
+	t.Run("entry and egress", func(t *testing.T) {
+		s := Simulation{
+			Nodes: []SimNode{{ID: "proxy", Tier: "high", EntryExposure: "WAN TCP/443", LocalExposure: "Local LAN",
+				InternetState: cloudCapable, EgressCutIDs: []string{"lan", "wifi"}}, {ID: "peer"}, {ID: "uncertain"}},
+			Edges: []SimEdge{
+				{From: "internet", To: "proxy", Tier: "wan", Label: "WAN TCP/22 (restricted)", CutIDs: []string{"ssh"}},
+				{From: "internet", To: "proxy", Tier: "wan", Label: "WAN TCP/443", CutIDs: []string{"https"}},
+				{From: "peer", To: "proxy", Tier: "takeover"},
+				{From: "uncertain", To: "proxy", Tier: "unknown-takeover"},
+			},
+		}
+		for _, tc := range []struct {
+			cuts          []string
+			entry, egress string
+		}{
+			{[]string{"https", "lan"}, "WAN TCP/22 (restricted)", cloudCapable},
+			{[]string{"https", "ssh", "lan", "wifi"}, "Local LAN", localOnly},
+			{nil, "WAN TCP/443", cloudCapable},
+		} {
+			got, _ := s.SimulateHost("proxy", ModeRealistic, tc.cuts)
+			peer, _ := s.SimulateHost("peer", ModeRealistic, tc.cuts)
+			uncertain, _ := s.SimulateHost("uncertain", ModeRealistic, tc.cuts)
+			if len(peer.Paths) != 1 || len(peer.CriticalThreatened) != 1 || len(uncertain.UnknownTargets) != 1 {
+				t.Fatal("expected proxy as a reached, critical, and unknown target")
+			}
+			for _, n := range []SimNode{got.Host, peer.Paths[0].Target, peer.CriticalThreatened[0], uncertain.UnknownTargets[0]} {
+				if n.ID != "proxy" || n.EntryExposure != tc.entry || n.InternetState != tc.egress {
+					t.Errorf("fixes %v: %s has entry %q and egress %q, want %q and %q", tc.cuts, n.ID, n.EntryExposure, n.InternetState, tc.entry, tc.egress)
+				}
+			}
+		}
+	})
+}
+
 // TestSimulationManagementControl checks that hardware ownership survives network isolation.
 func TestSimulationManagementControl(t *testing.T) {
 	bmc, host, vm := client("bmc", "192.0.2.1", "management"), client("server", "198.51.100.1", "servers"), client("vm", "203.0.113.1", "guests")

@@ -235,7 +235,7 @@ func (b *builder) resolvePublishedIP(raw string) (string, bool) {
 		return hosts[0], true
 	}
 	if len(hosts) > 1 {
-		b.verify(root(Internet), "duplicate-ip", ip, "Check duplicate IP address "+ip, "More than one device in the inventory reports this IP address, so UniBlue cannot tell which device receives forwarded traffic.")
+		b.verify(root(Internet), "duplicate-ip", ip, "Check duplicate IP address "+ip, "More than one device in the inventory reports this IP address, so UniBlue cannot tell which device receives forwarded traffic.", hosts...)
 		for _, h := range hosts {
 			b.link(root(Internet), fact{permission, h, "network access"}, unknown, 0, 0)
 		}
@@ -363,7 +363,7 @@ func (b *builder) services() {
 		host := hostKey(f.Client)
 		ips := f.EndpointIPs()
 		if len(ips) == 0 && (!inventoryOnly || len(grants) != 0) {
-			b.verify(root(TrustedLAN), "service-address", host+":"+serviceName(f.EffectiveTransport(), f.Port), "Check which IP serves "+b.assets[host].name, "This finding does not include an IP address, so it cannot be tied to a specific network path.")
+			b.verify(root(TrustedLAN), "service-address", host+":"+serviceName(f.EffectiveTransport(), f.Port), "Check which IP serves "+b.assets[host].name, "This finding does not include an IP address, so it cannot be tied to a specific network path.", host)
 		}
 		for _, ip := range ips {
 			s, ok := b.socket(host, ip, f.EffectiveTransport(), f.Port)
@@ -525,7 +525,7 @@ func (b *builder) cve(m cve.Match, bundles serviceBundles) {
 			code, reason = "potential", "A version was reported, but the advisory could apply to a different build or platform. Check the affected versions and platform with the vendor."
 		}
 		if _, ok := b.actionIDs["act:verify:"+code+":"+target]; !ok {
-			b.verify(root(TrustedLAN), code, target, "Verify "+label+" patches on "+b.assets[host].name, reason)
+			b.verify(root(TrustedLAN), code, target, "Verify "+label+" patches on "+b.assets[host].name, reason, host)
 		}
 		return
 	}
@@ -533,7 +533,7 @@ func (b *builder) cve(m cve.Match, bundles serviceBundles) {
 		return
 	}
 	if len(hosts) > 1 {
-		b.verify(root(TrustedLAN), "duplicate-ip", ip, "Check duplicate IP address "+ip, "More than one device in the inventory reports this IP address, so UniBlue cannot confirm which device has "+r.ID+".")
+		b.verify(root(TrustedLAN), "duplicate-ip", ip, "Check duplicate IP address "+ip, "More than one device in the inventory reports this IP address, so UniBlue cannot confirm which device has "+r.ID+".", hosts...)
 		return
 	}
 	if len(hosts) != 1 {

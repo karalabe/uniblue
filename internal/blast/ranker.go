@@ -166,6 +166,17 @@ func (g *graph) activeByRoot(states [][]uint8, cuts []bool) ([len(starts)][]bool
 // rather than silently applying arbitrary zero-credit cuts; remaining actions
 // and verification items are appended in deterministic order with zero credit.
 func (g *graph) rank(states [][]uint8) []Action {
+	// Record direct targets before ranking removes overlapping benefits. Bundles
+	// cover each of their member edges even when a narrower fix ranks first.
+	for _, edges := range g.edges {
+		for _, e := range edges {
+			for _, id := range [...]int{e.cut, e.bundle, e.tagCut} {
+				if id != 0 {
+					g.actions[id].addTarget(g.facts[e.to].asset)
+				}
+			}
+		}
+	}
 	cuts := make([]bool, len(g.actions))
 	byRoot, notices := g.activeByRoot(states, cuts)
 	var remaining, verify []int
@@ -288,6 +299,7 @@ func (g *graph) rank(states [][]uint8) []Action {
 		}
 		protected := make([]protectedAsset, 0, len(bestByAsset))
 		for ak, p := range bestByAsset {
+			g.actions[winner].addTarget(ak)
 			protected = append(protected, protectedAsset{key: ak, name: cmp.Or(g.assets[ak].name, ak), pri: p})
 		}
 		slices.SortFunc(protected, func(a, b protectedAsset) int {

@@ -209,7 +209,7 @@ func (b *builder) egress(a attachment, deps []probe.OutboundDependency, isApplia
 		}
 	}
 	if !allowed && missing {
-		b.verify(root(CloudEgress), "egress", cmp.Or(networkKey(n), a.host), "Check outbound internet rules for "+netName, "Not enough firewall or address data was available to verify whether devices on "+netName+" can reach the internet.")
+		b.verify(root(CloudEgress), "egress", cmp.Or(networkKey(n), a.host), "Check outbound internet rules for "+netName, "Not enough firewall or address data was available to verify whether devices on "+netName+" can reach the internet.", a.host)
 	}
 	return e
 }
@@ -262,6 +262,7 @@ func (b *builder) outdoor() {
 		bundle := 0
 		if len(outdoor) > 1 {
 			bundle = b.action("act:port-ext-switch:"+canonicalMAC(sw.MAC), "Lock down outdoor ports on "+cmp.Or(sw.Name, sw.MAC), "Secure every outdoor socket on this switch to close the remaining physical entry points.", LaneReduceExposure, 2)
+			b.actions[bundle].addTarget(canonicalMAC(sw.MAC))
 		}
 		for _, p := range outdoor {
 			key := ref(sw.MAC, p.PortIdx)
@@ -272,17 +273,18 @@ func (b *builder) outdoor() {
 				reason += " MAC pinning is only a speed bump because the camera's MAC address can be copied."
 			}
 			secure := b.action("act:port-ext:"+key, "Secure outdoor "+name, reason, LaneReduceExposure, 3)
+			b.actions[secure].addTarget(canonicalMAC(sw.MAC))
 			native := b.network(sp.NativeNetworkID, cmp.Or(p.NativeVLAN, sp.NativeNetworkName))
 			if native.Name == "" || sp.IsolationUnknown {
 				b.unknownPhysical = true
-				b.verify(root(Physical), "port-profile", key, "Check the switch port profile for "+name, "The controller did not report which networks are assigned to this socket.")
+				b.verify(root(Physical), "port-profile", key, "Check the switch port profile for "+name, "The controller did not report which networks are assigned to this socket.", canonicalMAC(sw.MAC))
 			}
 			unresolved := func(id string) bool { return b.network(id, "").Name == "" }
 			missingMembers := slices.ContainsFunc(sp.TaggedNetworkIDs, unresolved) || slices.ContainsFunc(sp.ExcludedNetworkIDs, unresolved)
 			customUnknown := sp.TaggedVLANUnknown || p.TaggedPolicy == "unknown" || missingMembers || (p.TaggedPolicy == "custom" && sp.TaggedNetworkIDs == nil && sp.ExcludedNetworkIDs == nil)
 			if customUnknown {
 				b.unknownPhysical = true
-				b.verify(root(Physical), "tagged-vlans", key, "Check allowed VLANs on "+name, "The controller did not report the complete set of tagged VLANs on this port.")
+				b.verify(root(Physical), "tagged-vlans", key, "Check allowed VLANs on "+name, "The controller did not report the complete set of tagged VLANs on this port.", canonicalMAC(sw.MAC))
 			}
 			for _, n := range b.Snapshot.Networks {
 				if strings.EqualFold(n.ZoneName, "External") || strings.HasPrefix(strings.ToLower(n.Purpose), "wan") {
@@ -305,6 +307,7 @@ func (b *builder) outdoor() {
 						level = unknown
 					}
 					tag = b.action("act:port-tags:"+key, "Remove unused tagged VLANs from "+name, "Extra tagged VLANs on this outdoor port can be reached from outside. Keep only the VLAN this device needs.", LaneReduceExposure, 1)
+					b.actions[tag].addTarget(canonicalMAC(sw.MAC))
 				}
 				pos := risk.Position{NetworkID: n.ID, NetworkName: n.Name, SwitchMAC: sw.MAC, SwitchPort: p.PortIdx, IsWired: true}
 				b.link(root(Physical), b.position(pos), level, secure, bundle).tagCut = tag

@@ -88,6 +88,9 @@ type ServiceView struct {
 //	rule:<id>
 //	wlan:<name>
 type Entity struct {
+	// controllerID preserves the adopted device ID alongside its MAC-based drawer ID.
+	controllerID string
+
 	ID               string               `json:"id"`
 	Kind             string               `json:"kind"` // "device" | "port" | "network" | "host" | "rule" | "wlan"
 	Label            string               `json:"label"`
@@ -653,7 +656,7 @@ func hostEntityID(cl unifi.Client) string {
 	if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
 		return "host:" + m
 	}
-	return "host:ip/" + strings.TrimSpace(cl.IP)
+	return "host:ip/" + strings.TrimSpace(cl.PrimaryIP())
 }
 func netEntityID(id, name string) string {
 	if strings.TrimSpace(id) != "" {
@@ -911,6 +914,8 @@ func BuildPresentationModel(
 			MAC:         mac,
 			Model:       d.Model,
 			Firmware:    d.Version,
+
+			controllerID: d.ID,
 		}
 		if d.Upgradable {
 			ent.Reasons = append(ent.Reasons, Reason{

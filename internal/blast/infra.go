@@ -27,6 +27,8 @@ type InfraReport struct {
 	Scope string `json:"scope"`
 	// HostedOn identifies the known physical host of the Network application.
 	HostedOn string `json:"hosted_on,omitempty"`
+	// HostedOnID identifies the controller host even when devices share its name.
+	HostedOnID string `json:"hosted_on_id,omitempty"`
 	// Manages lists adopted equipment the controller can reconfigure.
 	Manages []string `json:"manages,omitempty"`
 	// Ports lists the physical ports under the selected switch's control.
@@ -78,7 +80,7 @@ func controllerHost(in Input) unifi.Device {
 	}
 	for _, cl := range s.Clients {
 		if in.ControllerHost != "" && (slices.Contains(cl.AllIPs(), in.ControllerHost) || strings.EqualFold(cl.Hostname, in.ControllerHost)) {
-			return unifi.Device{MAC: cl.MAC, Name: cl.DisplayName(), Type: "controller"}
+			return unifi.Device{ID: cl.ID, MAC: cl.MAC, IP: cl.PrimaryIP(), Name: cl.DisplayName(), Type: "controller"}
 		}
 	}
 	if console.MAC == "" {
@@ -293,6 +295,7 @@ func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
 	}
 	if control {
 		r.HostedOn = deviceLabel(host)
+		r.HostedOnID = cmp.Or(canonicalMAC(host.MAC), host.ID, host.IP)
 		r.Effects = append(r.Effects, "The controller can reconfigure adopted equipment. Site Wi-Fi passphrases, device SSH credentials, and controller administrator credentials are at risk.")
 		for _, dev := range s.Devices {
 			devMAC := canonicalMAC(dev.MAC)

@@ -182,9 +182,13 @@ func (g *graph) action(id, title, reason string, lane Lane, effort int) int {
 
 // verify ties missing evidence to its reachable source. Collecting it earns no
 // hypothetical protection because its answer might be either allow or deny.
-func (g *graph) verify(from fact, code, target, title, reason string) {
+func (g *graph) verify(from fact, code, target, title, reason string, assets ...string) {
 	id := "act:verify:" + code + ":" + target
-	g.action(id, title, reason, LaneVerify, 0)
+	a := g.action(id, title, reason, LaneVerify, 0)
+	g.actions[a].addTarget(from.asset)
+	for _, key := range assets {
+		g.actions[a].addTarget(key)
+	}
 	g.link(from, fact{notice, target, id}, unknown, 0, 0)
 }
 

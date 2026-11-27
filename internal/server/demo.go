@@ -312,7 +312,7 @@ func buildDemoDataset(now time.Time) (
 			p.Up = true
 			p.Speed = 1000
 			p.MACTableCount = 1
-		case 16, 17, 18, 19, 20:
+		case 16, 17, 18, 19, 20, 21:
 			p.Up = true
 			p.Speed = 1000
 			p.NativeNetworkID = "net-srv"
@@ -424,6 +424,18 @@ func buildDemoDataset(now time.Time) (
 		Hostname: "rack-idrac", Name: "Rack Server iDRAC", OUI: "Dell Inc.",
 		NetworkID: "net-srv", NetworkName: "Lab & Storage", VLAN: "10",
 		IsWired: true, SwitchMAC: macCoreSW, SwitchPort: 17,
+	}
+	clRack := unifi.Client{
+		MAC: "02:11:22:00:10:06", IP: "192.168.10.6",
+		Hostname: "pve-rack", Name: "Rack Virtualization Server", OUI: "Dell Inc.",
+		NetworkID: "net-srv", NetworkName: "Lab & Storage", VLAN: "10",
+		IsWired: true, SwitchMAC: macCoreSW, SwitchPort: 21,
+	}
+	// The management card controls the physical host even when its hypervisor
+	// requires an authenticated login on the network.
+	netCfg.Assets = []config.AssetOverride{
+		{MAC: clBMC.MAC, Manages: []string{clRack.MAC}},
+		{MAC: clRack.MAC, Tier: "high", Label: clRack.Name},
 	}
 	clLab := unifi.Client{
 		MAC: "02:11:22:00:10:10", IP: "192.168.10.10", IPv6: []string{"fd00:10::10"},
@@ -680,7 +692,7 @@ func buildDemoDataset(now time.Time) (
 			},
 		},
 		Clients: []unifi.Client{
-			clBMC, clLab, clNAS, clProxy, clNVR,
+			clBMC, clRack, clLab, clNAS, clProxy, clNVR,
 			clCamFront, clCamPatio, clHA, clOcto, clPrinter, clRoku, clLaptop, clPhone,
 			clIrrigation, clThermostat, clShelly,
 			clGuestPhone, clGuestLaptop,
@@ -702,6 +714,14 @@ func buildDemoDataset(now time.Time) (
 				{Port: 22, Transport: "tcp", Protocol: "ssh", State: probe.ServiceStateObservedProtocol, Version: "OpenSSH_7.4p1"},
 				{Port: 443, Transport: "tcp", Protocol: "https", State: probe.ServiceStateObservedProtocol, TLS: true, Title: "Dell iDRAC9 Management"},
 				{Port: 623, Transport: "udp", Protocol: "ipmi", State: probe.ServiceStateObservedProtocol},
+			},
+			ScannedAt: now,
+		},
+		{
+			Client:    clRack,
+			OpenPorts: []int{8006},
+			Services: []probe.Service{
+				{Port: 8006, Transport: "tcp", Protocol: "https", State: probe.ServiceStateObservedProtocol, TLS: true, Title: "Proxmox Virtual Environment"},
 			},
 			ScannedAt: now,
 		},

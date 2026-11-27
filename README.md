@@ -34,11 +34,12 @@ You can quickly look around in demo mode: `./uniblue demo -listen 127.0.0.1:8080
 
 ## What makes UniBlue different?
 
-- **Human-first UI with full technical proof one click away:** The built-in web dashboard organizes your network into four calm tabs: **Checkup**, **House & Cables**, **Devices & Wi-Fi**, and **Activity**. Click any alert, device, switch port, or isolation check for clear fix steps, with collapsible raw technical details underneath.
+- **Human-first UI with full technical proof one click away:** The built-in web dashboard organizes your network into five calm tabs: **Checkup**, **House & Cables**, **Blast Radius**, **Devices & Wi-Fi**, and **Activity**. Click any alert, device, switch port, or isolation check for clear fix steps, with collapsible raw technical details underneath.
+- **Blast-radius simulation & What-If fixes:** Trace lateral reach across your VLANs in **Proven**, **Realistic**, or **Worst-Case** mode, and toggle simulatable fixes to see which firewall rule, switch port, or software update cuts the most exposure.
 - **UniFi-aware risk scoring:** An exposed service on an isolated IoT VLAN is very different from the same service sitting next to your personal laptop or forwarded to the internet. UniBlue reads your UniFi networks, Firewall Zones, port forwards (distinguishing TCP vs. UDP), and switch ports automatically.
 - **Honest about what it knows:** UniBlue never flashes a fake green "all clear" while devices are still being checked, never assumes "blocked" when firewall or switch ACL telemetry is missing, and never guesses an application name behind opaque TLS or a shared CDN.
 - **Gentle and strictly read-only:** Probes are rate-paced and read-only so fragile IoT gear (HVAC controllers, solar inverters, cameras) stays undisturbed. Raw print ports (`9100`, `515`, `_pdl-datastream`) have a hard zero-byte guard so UniBlue never prints garbage pages.
-- **122 built-in checks + 170+ protocol recognizers:** Combines Praetorian's `nerva` fingerprinter with 122 declarative YAML checks and wire protocol probes covering smart-home gear, cameras/NVRs, printers, server BMCs, UPSs, projectors, Bitcoin/Ethereum nodes, DNS/NTP/PCP/STUN, and more.
+- **124 built-in checks + 170+ protocol recognizers:** Combines Praetorian's `nerva` fingerprinter with 124 declarative YAML checks and wire protocol probes covering smart-home gear, cameras/NVRs, printers, server BMCs, UPSs, projectors, Bitcoin/Ethereum nodes, DNS/NTP/PCP/STUN, and more.
 
 ## Quickstart
 
@@ -74,6 +75,9 @@ Prefer the terminal or scheduled checks? Every feature works from the CLI too:
 # Full one-shot security checkup in your terminal (add -json for structured output)
 ./uniblue scan -config config.yaml
 
+# Rank which firewall, port, or update changes cut the most blast radius
+./uniblue blast -config config.yaml
+
 # Audit every physical switch port, outdoor cable, and PoE drop
 ./uniblue ports -config config.yaml
 
@@ -100,7 +104,14 @@ UniBlue inspects every switch, gateway, and In-Wall AP port, including link stat
 - **Outdoor switches & feeder cables (`network.external_devices`):** Mark any switch or AP installed outside (garage, shed, exterior wall). UniBlue flags active unused sockets on it **and** traces the indoor feeder cable back to the parent switch so you know whether an outdoor cable carries all of your home networks.
 - **Live tamper & health alerts (`uniblue serve`):** Watches for physical link changes, PoE power drops (cable-swap indicator), inline hub MAC-table surges, STP loops, Evil-Twin Wi-Fi SSIDs, dormant devices waking up, wired/Wi-Fi swaps, and UniFi firewall or port-forward drift.
 
-### 3. Declarative checks & safe protocol probes
+### 3. Blast radius & counterfactual action queue
+
+UniBlue builds a reachability graph from your UniFi policies, port forwards, observed services, and matched CVEs to rank which fixes shrink exposure most:
+
+- **Three simulation modes:** **Proven** (confirmed zero-click takeovers and hardware control), **Realistic** (default; adds conditional control checks, unversioned critical/KEV CVEs, SMBv1/unsigned SMB, and weak SSH auth/crypto), and **Worst-Case** (adds admin-port credential pivots, compromised-gear client pivots, unverified routes, and non-cascading same-VLAN L2 exposure).
+- **What-If fixes & asset value:** Toggle simulatable fixes in the dashboard or pass repeatable `?fix=<action-id>` params to the API to preview exposure cuts. Ranking weighs device value tiers (`network.assets`) and frequently targeted stacks, and flags fixes that would interrupt approved paths.
+
+### 4. Declarative checks & safe protocol probes
 
 Built-in checks live in `checks/generic/` and `checks/community/` and are compiled directly into the binary. You can add your own read-only YAML checks via `scan.checks_dir`:
 
@@ -121,7 +132,7 @@ scan:
 
 `uniblue check test` honors `scan.disable_ssh_auth_probe` and skips `scan.ssh_key_audit`. During full and targeted rescans, an explicitly configured key audit still runs on its selected targets. Those rescans share answers for one hour and keep the last answer during the five-minute cooldown after a failed refresh.
 
-### 4. Offline security bug (CVE) & hardware vendor databases
+### 5. Offline security bug (CVE) & hardware vendor databases
 
 UniBlue matches your UniFi firmware and LAN services offline against the official NVD + CISA KEV vulnerability catalog and IEEE MAC vendor tables (~550 KB).
 
@@ -145,7 +156,7 @@ You can also sync or query the databases manually from the CLI:
 ./uniblue oui sync
 ```
 
-### 5. Optional local feeds (NVRs, smart-home bridges, flows & switch ACLs)
+### 6. Optional local feeds (NVRs, smart-home bridges, flows & switch ACLs)
 
 Everything works out of the box with just your UniFi console. For deeper visibility into things UniFi cannot see directly, `config.example.yaml` shows how to attach optional read-only local files:
 
@@ -197,7 +208,7 @@ Common `uniblue serve` flags:
 Running UniBlue 24/7 pairs naturally with an AI agent (such as Hermes) so you get notified of changes in real time, discuss findings in chat (Telegram, Slack, Discord), and verify fixes automatically:
 
 - **Signed push alerts:** Set `UNIBLUE_WEBHOOK_URL` (`format: "json"`) and `UNIBLUE_WEBHOOK_SECRET`. Each POST uses Standard Webhooks v1 headers (`webhook-id`, `webhook-timestamp`, `webhook-signature: v1,<base64 HMAC-SHA256>`), with durable retries keeping the same `webhook-id` and fresh timestamps. Agents do not need to poll `/api/v1/state`.
-- **On-demand inspection & verification:** Give your agent `UNIBLUE_API_TOKEN` (`Authorization: Bearer <token>`) to check `GET /api/v1/health`, query focused endpoints (`findings`, `cves`, `hosts`, `isolation`, `events`), stream `GET /api/v1/events/stream`, and trigger rescans via `POST /api/v1/hosts/{id}/scan` after you approve a fix.
+- **On-demand inspection & verification:** Give your agent `UNIBLUE_API_TOKEN` (`Authorization: Bearer <token>`) to check `GET /api/v1/health`, query focused endpoints (`findings`, `cves`, `hosts`, `isolation`, `blast`, `events`), stream `GET /api/v1/events/stream`, and trigger rescans via `POST /api/v1/hosts/{id}/scan` after you approve a fix.
 
 ### HTTP API (`/api/v1`)
 
@@ -210,9 +221,11 @@ All `/api/v1/*` endpoints return JSON (except the SSE stream) and share one erro
 | `GET /api/v1/cves` | Exact and potential CVE rollups (`?host=<ip\|mac>&kev=true&severity=...`) |
 | `GET /api/v1/hosts` | Host inventory (`?vlan=<name>&state=exposed\|review\|ok\|unknown&role=...`) |
 | `GET /api/v1/hosts/{id}` | Single host or UniFi device detail by entity ID (`host:<mac>` / `dev:<mac>`), MAC, or IPv4/IPv6 (including gateway WAN IP) |
+| `GET /api/v1/hosts/{id}/blast` | Per-host blast simulation (`?mode=realistic\|proven\|worst`, repeatable `&fix=<action-id>`) with reached paths, L2 exposure, and applicable What-If actions |
 | `GET /api/v1/devices` | UniFi infrastructure device inventory (gateways, switches, APs) |
 | `GET /api/v1/devices/{id}` | Single UniFi device detail by entity ID (`dev:<mac>`), MAC, or LAN/WAN IP |
 | `GET /api/v1/isolation` | Effective VLAN/zone isolation matrix (`?verdict=violation&source=...&dest=...`) |
+| `GET /api/v1/blast` | Prioritized action queue, exposures, cloud egress, and UniFi gear scopes (`?lane=fix-now\|reduce-exposure\|verify&priority=P1..P5&host=<id\|mac\|ip>&include_simulation=true`) |
 | `GET /api/v1/events` | Recent live events as JSON (`?since_id=42&type=...&severity=...&limit=50`) |
 | `GET /api/v1/events/stream` | Live Server-Sent Events stream (`Last-Event-ID` replay supported) |
 | `GET /api/v1/state` | Full atomic snapshot powering the built-in web dashboard |
@@ -222,10 +235,12 @@ All `/api/v1/*` endpoints return JSON (except the SSE stream) and share one erro
 
 ### Webhook events
 
-In `json` format, each POST sends `{"version": 1, "id", "timestamp", "site", "summary", "diff"}` filtered by `min_severity` (default `medium`), with `resolved_keys` omitted. Rapid live-event bursts coalesce over 15 seconds into one delivery; new findings, CVEs, trusted devices, and port forwards dispatch immediately and merge any buffered live events.
+In `json` format, each POST sends `{"version": 1, "id", "timestamp", "site", "summary", "diff"}` filtered by `min_severity` (default `medium`), with `resolved_keys` omitted. Rapid live-event bursts coalesce over 15 seconds into one delivery; new actions, findings, CVEs, trusted devices, and port forwards dispatch immediately and merge any buffered live events.
 
 | Event / Field | Trigger |
 | --- | --- |
+| `diff.new_actions` | New prioritized remediation in the action queue at or above `min_severity` |
+| `diff.escalated_actions` | Existing remediation whose urgency tier increased |
 | `diff.new_findings` | New security or posture finding at or above `min_severity` |
 | `diff.escalated_findings` | Existing finding whose effective severity increased |
 | `diff.new_cves` | Newly matched High/Critical exact CVE or CISA KEV promotion (includes `min_fixed_version`) |

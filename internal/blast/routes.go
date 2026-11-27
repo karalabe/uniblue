@@ -466,13 +466,17 @@ func (b *builder) routes() {
 	}
 	upnpUnknown := b.Snapshot.SecuritySettings != nil && b.Snapshot.SecuritySettings.UPnPEnabled && len(b.Snapshot.DynamicMappings) == 0
 	if upnpUnknown {
-		b.verify(root(Internet), "upnp-leases", "site", "Check automatic UPnP and NAT-PMP port mappings", "UPnP or NAT-PMP is turned on at the gateway, but active port mappings are unavailable, so UniBlue cannot confirm that LAN devices are unreachable from the internet.")
+		hosts := make([]string, 0, len(b.clients))
+		for _, a := range b.clients {
+			hosts = append(hosts, a.host)
+		}
+		b.verify(root(Internet), "upnp-leases", "site", "Check automatic UPnP and NAT-PMP port mappings", "UPnP or NAT-PMP is turned on at the gateway, but active port mappings are unavailable, so UniBlue cannot confirm that LAN devices are unreachable from the internet.", hosts...)
 	}
 	for _, a := range b.clients {
 		cl := a.client
 		b.addPolicySockets(a)
 		if visibility != nil && !visibility.PortForwardsAvailable {
-			b.missing(root(Internet), risk.IsolationCell{MissingInput: "port-forward telemetry unavailable"})
+			b.missing(root(Internet), risk.IsolationCell{MissingInput: "port-forward telemetry unavailable"}, a.host)
 			b.link(root(Internet), fact{permission, a.host, "network access"}, unknown, 0, 0)
 		}
 		if upnpUnknown {
@@ -492,7 +496,7 @@ func (b *builder) routes() {
 				return o.InternetPolicy(cl, fam)
 			}, skipAuto) {
 				if c.Effective == "unknown" {
-					b.missing(root(Internet), c)
+					b.missing(root(Internet), c, a.host)
 					b.link(root(Internet), fact{permission, a.host, "network access"}, unknown, 0, 0)
 				}
 				if c.Effective == "allow" {
@@ -792,7 +796,7 @@ func (b *builder) approved(id int, name string) {
 }
 
 // missing records a verification item for incomplete controller telemetry.
-func (b *builder) missing(from fact, c risk.IsolationCell) {
+func (b *builder) missing(from fact, c risk.IsolationCell, host string) {
 	label := cmp.Or(c.DestNetwork, c.SourceNetwork, "site")
 	n := b.network("", cmp.Or(c.DestNetwork, c.SourceNetwork))
 	key := cmp.Or(networkKey(n), label)
@@ -817,7 +821,7 @@ func (b *builder) missing(from fact, c risk.IsolationCell) {
 		title = "Check internet port forwards"
 		reason = "The controller did not supply the port-forward list, so UniBlue cannot confirm which services are exposed."
 	}
-	b.verify(from, code, key, title, reason)
+	b.verify(from, code, key, title, reason, host)
 }
 
 func (b *builder) lateral(pos risk.Position, from, to fact, dstID string, c risk.IsolationCell, deferred *[]egressLink) {
@@ -832,7 +836,7 @@ func (b *builder) lateral(pos risk.Position, from, to fact, dstID string, c risk
 		}
 		b.link(from, to, trivial, cut, 0)
 	default:
-		b.missing(from, c)
+		b.missing(from, c, to.asset)
 		b.link(from, to, unknown, 0, 0)
 	}
 }
@@ -861,7 +865,7 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 			b.link(root(Internet), fact{consequence, a.host, "public access to " + serviceName(s.proto, s.port)}, unknown, 0, 0)
 		}
 		if len(b.byIP[s.ip]) > 1 {
-			b.verify(root(Internet), "duplicate-ip", s.ip, "Check duplicate IP address "+s.ip, "More than one device in the inventory reports this IP address, so UniBlue cannot tell which device receives forwarded traffic.")
+			b.verify(root(Internet), "duplicate-ip", s.ip, "Check duplicate IP address "+s.ip, "More than one device in the inventory reports this IP address, so UniBlue cannot tell which device receives forwarded traffic.", b.byIP[s.ip]...)
 			b.link(root(Internet), s.fact(), unknown, 0, 0)
 			b.link(root(Internet), fact{consequence, a.host, "public access to " + serviceName(s.proto, s.port)}, unknown, 0, 0)
 			b.link(root(Internet), fact{permission, a.host, "network access"}, unknown, 0, 0)
@@ -898,10 +902,10 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 			anyIngress = true
 			entry, level := b.scope(s, c)
 			if level == unknown && c.Effective == "allow" {
-				b.verify(root(entry), "public-login", cmp.Or(c.DecisiveRuleName, s.host), "Check login protection on "+cmp.Or(c.DecisiveRuleName, b.assets[s.host].name), "This service is published online, but the inventory does not say whether visitors must sign in.")
+				b.verify(root(entry), "public-login", cmp.Or(c.DecisiveRuleName, s.host), "Check login protection on "+cmp.Or(c.DecisiveRuleName, b.assets[s.host].name), "This service is published online, but the inventory does not say whether visitors must sign in.", s.host)
 			}
 			if c.Effective != "allow" {
-				b.missing(root(entry), c)
+				b.missing(root(entry), c, s.host)
 				b.link(root(entry), s.fact(), unknown, 0, 0)
 				b.link(root(entry), fact{consequence, a.host, "public access to " + serviceName(s.proto, s.port)}, unknown, 0, 0)
 				b.link(root(entry), fact{permission, a.host, "network access"}, unknown, 0, 0)
@@ -973,7 +977,7 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 					if auth == "publickey" {
 						reason = "The probed account offered only public-key login. SSH Match User rules can allow passwords for other accounts."
 					}
-					b.verify(root(entry), "ssh-auth", s.host+":"+s.ip, "Confirm password login is disabled on "+label, reason)
+					b.verify(root(entry), "ssh-auth", s.host+":"+s.ip, "Confirm password login is disabled on "+label, reason, s.host)
 				}
 			}
 			if expected && clean {

@@ -8,6 +8,8 @@
 package blast
 
 import (
+	"slices"
+
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
@@ -133,12 +135,35 @@ type Action struct {
 	// Benefits names up to three devices helped most by this change, ordered by
 	// highest priority reduced first.
 	Benefits []string `json:"benefits,omitempty"`
-	// AffectedAssets holds stable asset keys (MAC or ID) for devices helped by this change.
+	// AffectedAssets lists up to six devices with a marginal benefit, in priority order.
 	AffectedAssets []string `json:"affected_assets,omitempty"`
 	// HighProfile marks actions that help protect a frequently targeted software stack.
 	HighProfile bool `json:"high_profile,omitempty"`
 	// BreaksApproved names approved workflows affected by this change.
 	BreaksApproved []string `json:"breaks_approved,omitempty"`
+
+	// targetAssets includes direct targets and all devices helped by this change.
+	targetAssets map[string]bool
+}
+
+// TargetsAsset reports whether the action applies to a host, including when an
+// earlier action in the queue already accounts for its benefit.
+func (a Action) TargetsAsset(key string) bool {
+	if a.targetAssets == nil {
+		return slices.Contains(a.AffectedAssets, key)
+	}
+	return a.targetAssets[key]
+}
+
+// addTarget keeps host filtering independent of the ranked benefit chips.
+func (a *Action) addTarget(key string) {
+	if key == "" {
+		return
+	}
+	if a.targetAssets == nil {
+		a.targetAssets = make(map[string]bool)
+	}
+	a.targetAssets[key] = true
 }
 
 // ClientEgress describes one client's policy and evidence of cloud use.

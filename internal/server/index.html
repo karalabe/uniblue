@@ -3099,7 +3099,7 @@ const blastTiers = {
 
 // Unverified routes follow the same evidence threshold as their reachable counterparts.
 const blastModeTiers = {
-  strict: new Set(["takeover", "unknown-takeover"]),
+  proven: new Set(["takeover", "unknown-takeover"]),
   realistic: new Set(["takeover", "likely", "unknown-takeover", "unknown-likely"]),
   worst: new Set(["takeover", "likely", "pivot", "l2", "unknown-takeover", "unknown-likely", "unknown"])
 };
@@ -3162,7 +3162,9 @@ function blastGraph(sim, applied = blastAppliedFixes) {
     const prev = outgoing[from].get(to);
     if (!prev || blastTiers[edge.tier].rank < blastTiers[prev.tier].rank) outgoing[from].set(to, edge);
   }
-  return {nodes, wan, unknown, adjacency: outgoing.map(row => Array.from(row, ([to, edge]) => ({to, edge})))};
+  // Inventory order breaks ties between shortest paths in both the UI and API.
+  const adjacency = outgoing.map(row => Array.from(row, ([to, edge]) => ({to, edge})).sort((a, b) => a.to - b.to));
+  return {nodes, wan, unknown, adjacency};
 }
 
 // A visit records one shortest path. Dense numeric indices bound the traversal
@@ -3478,7 +3480,7 @@ function renderBlast() {
   let html = `<section class="br-panel br-controls" aria-label="Blast Radius Simulator">
     <label for="blast-device">Simulate:</label><select id="blast-device" ${rows.length ? "" : "disabled"}>
       ${rows.map(r => `<option value="${esc(r.node.id)}" ${r === row ? "selected" : ""}>${esc(r.node.name)} (${esc(r.node.vlan)})</option>`).join("")}</select>
-    <div class="br-segment" role="group" aria-label="Simulation mode">${blastControl("mode", "strict", "Proven", blastMode === "strict")}
+    <div class="br-segment" role="group" aria-label="Simulation mode">${blastControl("mode", "proven", "Proven", blastMode === "proven")}
     ${blastControl("mode", "realistic", "Realistic", blastMode === "realistic")}
     ${blastControl("mode", "worst", "Worst-Case", blastMode === "worst")}</div>
     <div class="br-status">${blastTag(applied ? "ok" : "neutral", applied ? applied + " What-If " + (applied === 1 ? "fix" : "fixes") + " active" : "Live baseline")}

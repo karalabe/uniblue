@@ -8,6 +8,7 @@ package server
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -26,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,7 +35,9 @@ import (
 	"time"
 
 	"github.com/karalabe/uniblue/docs"
+	"github.com/karalabe/uniblue/internal/blast"
 	"github.com/karalabe/uniblue/internal/checks"
+	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/cve"
 	"github.com/karalabe/uniblue/internal/risk"
 )
@@ -443,9 +447,11 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/session", e.handleSessionDelete)
 	mux.HandleFunc("GET /api/v1/state", e.handleState)
 	mux.HandleFunc("GET /api/v1/findings", e.handleFindings)
+	mux.HandleFunc("GET /api/v1/blast", e.handleBlast)
 	mux.HandleFunc("GET /api/v1/cves", e.handleCVEs)
 	mux.HandleFunc("GET /api/v1/hosts", e.handleHosts)
 	mux.HandleFunc("GET /api/v1/hosts/{id}", e.handleHostByID)
+	mux.HandleFunc("GET /api/v1/hosts/{id}/blast", e.handleHostBlast)
 	mux.HandleFunc("GET /api/v1/devices", e.handleDevices)
 	mux.HandleFunc("GET /api/v1/devices/{id}", e.handleDeviceByID)
 	mux.HandleFunc("GET /api/v1/isolation", e.handleIsolation)
@@ -1118,8 +1124,8 @@ func collectDeviceEntities(snap StateSnapshot) []Entity {
 		if ri != rj {
 			return ri > rj
 		}
-		if devices[i].Label != devices[j].Label {
-			return strings.ToLower(devices[i].Label) < strings.ToLower(devices[j].Label)
+		if label := strings.Compare(strings.ToLower(devices[i].Label), strings.ToLower(devices[j].Label)); label != 0 {
+			return label < 0
 		}
 		return devices[i].ID < devices[j].ID
 	})
@@ -1146,22 +1152,267 @@ func (e *Engine) handleHostByID(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "host identifier is required")
 		return
 	}
-	snap := e.Snapshot()
+	host, ok := resolveHostEntity(e.Snapshot(), id)
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("host %q not found", id))
+		return
+	}
+	writeJSON(w, http.StatusOK, host)
+}
+
+// resolveHostEntity prefers clients and recognizes the gateway's external address.
+func resolveHostEntity(snap StateSnapshot, id string) (Entity, bool) {
 	for _, h := range collectHostEntities(snap) {
 		if entityMatchesIdentifier(h, id) {
-			writeJSON(w, http.StatusOK, h)
-			return
+			return h, true
 		}
 	}
-	// Fall back to UniFi infrastructure devices (gateway, switches, APs) so any
-	// IP or MAC referenced in /api/v1/findings resolves cleanly.
 	for _, d := range collectDeviceEntities(snap) {
 		if deviceMatchesIdentifier(d, snap, id) {
-			writeJSON(w, http.StatusOK, d)
+			return d, true
+		}
+	}
+	return Entity{}, false
+}
+
+// resolveBlastHost prefers live inventory aliases over simulation nodes and offline backends.
+func resolveBlastHost(snap StateSnapshot, id string) (string, *Entity) {
+	id = strings.TrimSpace(id)
+	if id == "" || strings.EqualFold(id, "host:ip/") {
+		return "", nil
+	}
+	for _, cv := range snap.Clients {
+		cl := cv.Client
+		host := Entity{ID: hostEntityID(cl), MAC: cl.MAC, IP: cl.IP, IPv6: cl.IPv6}
+		if strings.EqualFold(cl.ID, id) || entityMatchesIdentifier(host, id) {
+			key := cmp.Or(config.CanonicalMAC(cl.MAC), cl.ID, cl.PrimaryIP())
+			if snap.View != nil && cl.MAC != "" {
+				return key, snap.View.Entities[devEntityID(cl.MAC)]
+			}
+			return key, nil
+		}
+	}
+	if snap.View == nil {
+		return "", nil
+	}
+	for _, d := range collectDeviceEntities(snap) {
+		if strings.EqualFold(d.controllerID, id) || deviceMatchesIdentifier(d, snap, id) {
+			return cmp.Or(config.CanonicalMAC(d.MAC), d.controllerID, d.IP), &d
+		}
+	}
+	report := snap.View.Blast
+	if report == nil {
+		return "", nil
+	}
+	if report.Simulation != nil {
+		for _, n := range report.Simulation.Nodes {
+			h := Entity{ID: n.EntityID, MAC: n.ID, IP: n.IP, Label: n.Name, Role: n.Role}
+			if n.IsDevice && deviceMatchesIdentifier(h, snap, id) {
+				return n.ID, &h
+			}
+			if entityMatchesIdentifier(h, id) {
+				return n.ID, nil
+			}
+		}
+	}
+	// Offline forwarding targets have an IP asset key but no inventory drawer.
+	if ip, err := netip.ParseAddr(id); err == nil {
+		key := ip.Unmap().String()
+		if slices.ContainsFunc(report.Exposures, func(x blast.Exposure) bool { return x.Asset == key }) ||
+			slices.ContainsFunc(report.Actions, func(a blast.Action) bool { return a.TargetsAsset(key) }) {
+			return key, nil
+		}
+	}
+	return "", nil
+}
+
+// deviceInfraBlast matches the logical controller to its host independently of device names.
+func deviceInfraBlast(reports []blast.InfraReport, device *Entity, key string) []blast.InfraReport {
+	out := []blast.InfraReport{}
+	matchesDevice := func(s string) bool {
+		return device != nil && s != "" && (strings.EqualFold(s, cmp.Or(device.Label, device.Model)) || strings.EqualFold(s, device.ID) ||
+			strings.EqualFold(s, device.controllerID) || strings.EqualFold(s, key))
+	}
+	for _, r := range reports {
+		if r.Scope == "Controller" {
+			if strings.EqualFold(r.HostedOnID, key) {
+				out = append(out, r)
+			}
+		} else if strings.EqualFold(r.TargetID, key) || r.TargetID == "" && matchesDevice(r.Target) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// handleBlast serves the ranked queue and assessments from a single scan.
+// The full graph is opt-in so polling the queue does not transfer every route.
+func (e *Engine) handleBlast(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	lane := blast.Lane(strings.ToLower(strings.TrimSpace(q.Get("lane"))))
+	switch lane {
+	case "", blast.LaneFixNow, blast.LaneReduceExposure, blast.LaneVerify:
+	default:
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", fmt.Sprintf("unknown action lane %q", lane))
+		return
+	}
+	priority := blast.Priority(strings.ToUpper(strings.TrimSpace(q.Get("priority"))))
+	switch priority {
+	case "", blast.P1, blast.P2, blast.P3, blast.P4, blast.P5:
+	default:
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", fmt.Sprintf("unknown priority %q", priority))
+		return
+	}
+	var includeSimulation bool
+	if q.Has("include_simulation") {
+		switch strings.ToLower(strings.TrimSpace(q.Get("include_simulation"))) {
+		case "true", "1":
+			includeSimulation = true
+		case "false", "0":
+		default:
+			writeAPIError(w, http.StatusBadRequest, "invalid_parameter", "include_simulation must be true, false, 1, or 0")
 			return
 		}
 	}
-	writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("host %q not found", id))
+	writeJSON(w, http.StatusOK, siteBlast(e.Snapshot(), lane, priority, strings.TrimSpace(q.Get("host")), includeSimulation))
+}
+
+// siteBlastResponse adds scan metadata and infrastructure scopes to the software exposure report.
+type siteBlastResponse struct {
+	// Report contains the selected actions, exposures, egress assessments and optional graph.
+	blast.Report
+	// Site identifies the inventory used to assess exposure.
+	Site string `json:"site"`
+	// UpdatedAt timestamps the assessment and its optional graph.
+	UpdatedAt time.Time `json:"updated_at"`
+	// InfraBlast describes the selected infrastructure compromise scopes.
+	InfraBlast []blast.InfraReport `json:"infra_blast"`
+}
+
+// siteBlast filters one published snapshot without changing the dashboard's shared slices.
+func siteBlast(snap StateSnapshot, lane blast.Lane, priority blast.Priority, hostID string, includeSimulation bool) siteBlastResponse {
+	out := siteBlastResponse{
+		Site: snap.Site, UpdatedAt: snap.UpdatedAt, InfraBlast: []blast.InfraReport{},
+		Report: blast.Report{Actions: []blast.Action{}, Exposures: []blast.Exposure{}, Cloud: []blast.ClientEgress{}},
+	}
+	if snap.View == nil {
+		return out
+	}
+	report := snap.View.Blast
+	if includeSimulation && report != nil {
+		out.Simulation = report.Simulation
+		if out.Simulation != nil && out.Simulation.Edges == nil {
+			graph := *out.Simulation
+			graph.Edges = []blast.SimEdge{}
+			out.Simulation = &graph
+		}
+	}
+	var key string
+	if hostID != "" {
+		var device *Entity
+		key, device = resolveBlastHost(snap, hostID)
+		if key == "" {
+			return out
+		}
+		out.InfraBlast = deviceInfraBlast(snap.View.InfraBlast, device, key)
+	} else {
+		out.InfraBlast = append(out.InfraBlast, snap.View.InfraBlast...)
+	}
+	if report == nil {
+		return out
+	}
+	matches := func(l blast.Lane, p blast.Priority) bool {
+		return (lane == "" || l == lane) && (priority == "" || p == priority)
+	}
+	for _, a := range report.Actions {
+		if matches(a.Lane, a.HighestTierReduced) && (key == "" || a.TargetsAsset(key)) {
+			out.Actions = append(out.Actions, a)
+		}
+	}
+	for _, x := range report.Exposures {
+		if matches(x.Lane, x.Priority) && (key == "" || x.Asset == key) {
+			out.Exposures = append(out.Exposures, x)
+		}
+	}
+	for _, c := range report.Cloud {
+		if key == "" || c.Asset == key {
+			out.Cloud = append(out.Cloud, c)
+		}
+	}
+	return out
+}
+
+// validateBlastFixes accepts controls anywhere on the graph so callers can
+// reuse the same hypothetical changes when switching hosts.
+func validateBlastFixes(graph *blast.Simulation, fixes []string) error {
+	if len(fixes) == 0 {
+		return nil
+	}
+	valid := make(map[string]bool)
+	if graph != nil {
+		for _, e := range graph.Edges {
+			for _, id := range e.CutIDs {
+				valid[id] = true
+			}
+		}
+		for _, n := range graph.Nodes {
+			for _, id := range n.EgressCutIDs {
+				valid[id] = true
+			}
+		}
+	}
+	for _, id := range fixes {
+		if id == "" || !valid[id] {
+			return fmt.Errorf("unknown simulation fix %q", id)
+		}
+	}
+	return nil
+}
+
+// handleHostBlast evaluates hypothetical cuts against the published graph and
+// includes the corresponding actions in their original remediation order.
+func (e *Engine) handleHostBlast(w http.ResponseWriter, r *http.Request) {
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", err.Error())
+		return
+	}
+	mode, err := blast.ParseSimulationMode(q.Get("mode"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", err.Error())
+		return
+	}
+	id := r.PathValue("id")
+	snap := e.Snapshot()
+	var graph *blast.Simulation
+	if snap.View != nil && snap.View.Blast != nil {
+		graph = snap.View.Blast.Simulation
+	}
+	fixes := q["fix"]
+	if err := validateBlastFixes(graph, fixes); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_parameter", err.Error())
+		return
+	}
+	key, device := resolveBlastHost(snap, id)
+	if key == "" {
+		writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("host %q not found", id))
+		return
+	}
+	sim, ok := graph.SimulateHost(key, mode, fixes)
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("blast simulation unavailable for host %q", id))
+		return
+	}
+	actions := []blast.Action{}
+	for _, a := range snap.View.Blast.Actions {
+		if slices.Contains(sim.RelevantFixes, a.ID) || slices.Contains(sim.AppliedFixes, a.ID) {
+			actions = append(actions, a)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"site": snap.Site, "updated_at": snap.UpdatedAt, "simulation": sim,
+		"relevant_actions": actions, "infra_blast": deviceInfraBlast(snap.View.InfraBlast, device, key),
+	})
 }
 
 func (e *Engine) handleDevices(w http.ResponseWriter, r *http.Request) {
