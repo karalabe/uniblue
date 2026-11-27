@@ -576,7 +576,7 @@ func TestWirelessLeaveGraceEvictsProfileAndFindings(t *testing.T) {
 		lastPorts:      map[string]portLiveState{},
 		anomalies:      newAnomalyTracker(),
 		lastClasses:    map[string]classify.Result{},
-		prevRiskState:  &risk.State{Findings: map[string]checks.Severity{}},
+		prevRiskState:  &risk.State{ScoringVersion: risk.CurrentScoringVersion, Findings: map[string]checks.Severity{}},
 		fullRescanCh:   make(chan string, 1),
 		hostScanCh:     make(chan hostScanTask, 4),
 		subscribers:    map[chan LiveEvent]struct{}{},

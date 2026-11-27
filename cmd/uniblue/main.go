@@ -189,7 +189,9 @@ func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			warnLegacyCWDState(slog.New(slog.NewTextHandler(stderr, nil)), cfg.State.Path)
 		}
 		prev, _ := risk.LoadState(cfg.State.Path)
-		st := risk.BuildStateWithPrev(prev, snap, report, cfg.Network, probedHostKeys(profiles))
+		probedKeys := probedHostKeys(profiles)
+		st := risk.BuildStateWithPrev(prev, snap, report, cfg.Network, probedKeys)
+		_, _, _, st.Actions, st.ActionLastSeen, st.ActionPeakAt, st.CarriedActions, st.ActionAssets, st.KnownClientIPs = risk.ComputeActionDiff(prev, snap, server.ActionAlertsFromBlast(blastRep.Actions), probedKeys, cveLoaded)
 		if err := risk.SaveState(cfg.State.Path, st); err != nil {
 			return err
 		}
@@ -584,8 +586,19 @@ func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		cfg:    cfg,
 		minSev: minSev,
 		logger: logger,
-		scanFn: func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
-			return executeCycleWithPrev(ctx, cfg, checkList, session.lastSnap, session.prevState)
+		scanBlastFn: func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, *blast.Report, bool, error) {
+			snap, profiles, rawFindings, children, report, err := executeCycleDetailed(ctx, cfg, checkList, session.lastSnap, session.prevState)
+			if err != nil {
+				return nil, nil, risk.Report{}, nil, false, err
+			}
+			matches, signals, cveErr := localCVEMatchesAndSignals(cfg, snap, profiles)
+			blastProfiles := server.AppendDeviceChildProfiles(snap, profiles, children)
+			ctrlHost := ""
+			if u, err := url.Parse(cfg.UniFi.URL); err == nil {
+				ctrlHost = u.Hostname()
+			}
+			blastRep, _ := server.EvaluateSiteBlast(snap, blastProfiles, rawFindings, report, cfg.Network, checkList, matches, signals, ctrlHost)
+			return snap, profiles, report, &blastRep, cveErr == nil, nil
 		},
 		sendFn:       notifier.Send,
 		sendWithIDFn: notifier.SendWithID,
@@ -626,6 +639,7 @@ type watchSession struct {
 	pendingWebhookKey string
 	pendingDiff       risk.Diff
 
+	scanBlastFn  func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, *blast.Report, bool, error)
 	scanFn       func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
 	sendFn       func(ctx context.Context, site string, diff risk.Diff) error
 	sendWithIDFn func(ctx context.Context, id, site string, diff risk.Diff) error
@@ -641,6 +655,12 @@ func watchDiffFingerprint(site string, diff risk.Diff) string {
 	add := func(kind string, value any) {
 		raw, _ := json.Marshal(value)
 		parts = append(parts, kind+string(raw))
+	}
+	for _, a := range diff.NewActions {
+		add("new_action", []string{a.ID, a.Priority})
+	}
+	for _, a := range diff.EscalatedActions {
+		add("escalated_action", []string{a.ID, a.Priority, a.Previous})
 	}
 	for _, f := range diff.NewFindings {
 		add("new", []string{f.Key(), f.EffectiveSeverity.String()})
@@ -684,7 +704,19 @@ func (w *watchSession) runCycle(ctx context.Context) {
 		w.stateLoaded = true
 	}
 
-	snap, profiles, report, err := w.scanFn(ctx)
+	var (
+		snap       *unifi.Snapshot
+		profiles   []probe.HostProfile
+		report     risk.Report
+		blastRep   *blast.Report
+		cveMatched bool
+		err        error
+	)
+	if w.scanBlastFn != nil {
+		snap, profiles, report, blastRep, cveMatched, err = w.scanBlastFn(ctx)
+	} else {
+		snap, profiles, report, err = w.scanFn(ctx)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return
@@ -698,9 +730,19 @@ func (w *watchSession) runCycle(ctx context.Context) {
 	}
 	w.lastSnap = cloneWatchTelemetrySnapshot(snap)
 
+	if w.prevState.NeedsScoringRebaseline() {
+		w.logger.Info("upgrading state baseline to scoring version 2 (silent first-run re-baseline)")
+	}
 	probedKeys := probedHostKeys(profiles)
 	diff := risk.ComputeDiffWithProbed(w.prevState, snap, report, w.cfg.Network, probedKeys)
+	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedKeys)
+	if blastRep != nil {
+		nextState.Actions, nextState.ActionLastSeen, nextState.ActionPeakAt, nextState.CarriedActions, nextState.ActionAssets, nextState.KnownClientIPs = server.ApplyBlastActionsToDiff(&diff, w.prevState, snap, *blastRep, probedKeys, nil, cveMatched)
+	}
 	w.logger.Info("scan cycle complete",
+		"new_actions", len(diff.NewActions),
+		"escalated_actions", len(diff.EscalatedActions),
+		"resolved_actions", len(diff.ResolvedActionIDs),
 		"clients", report.ClientCount,
 		"findings", len(report.Findings),
 		"new", len(diff.NewFindings),
@@ -736,7 +778,6 @@ func (w *watchSession) runCycle(ctx context.Context) {
 		w.pendingDiff = risk.Diff{}
 	}
 
-	nextState := risk.BuildStateWithPrev(w.prevState, snap, report, w.cfg.Network, probedKeys)
 	// Always advance the in-memory baseline after notifications succeed so a
 	// runtime persistence error does not trigger duplicate alerts every cycle.
 	w.prevState = nextState
@@ -1408,12 +1449,7 @@ func verifyStatePathWritable(path string) error {
 func probedHostKeys(profiles []probe.HostProfile) map[string]struct{} {
 	out := make(map[string]struct{}, len(profiles)*2)
 	for _, hp := range profiles {
-		if m := strings.ToLower(strings.TrimSpace(hp.Client.MAC)); m != "" {
-			out[m] = struct{}{}
-		}
-		for _, ip := range hp.Client.AllIPs() {
-			out[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
-		}
+		risk.AddClientHostKeys(out, hp.Client)
 	}
 	return out
 }

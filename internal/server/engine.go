@@ -1945,9 +1945,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	for k, hp := range e.profilesByMAC {
 		profiles = append(profiles, hp.Clone())
 		probedHostKeys[k] = struct{}{}
-		for _, ip := range hp.Client.AllIPs() {
-			probedHostKeys[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
-		}
+		risk.AddClientHostKeys(probedHostKeys, hp.Client)
 		if fl := e.findingsByMAC[k]; len(fl) > 0 {
 			cachedFindings = append(cachedFindings, fl...)
 		}
@@ -1999,6 +1997,12 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 			MinSeverity:          checks.SeverityHigh,
 			PotentialMaxAgeYears: 2,
 		})
+		if err == nil {
+			// Missing vendor shards yield no matches. Check the cache metadata
+			// before treating an empty result as evidence that a CVE cleared.
+			_, err = cveCache.Stats()
+			cveLoaded = err == nil
+		}
 		if err != nil {
 			e.logger.Warn("failed to match products against local CVE cache; preserving CVE baseline", "err", err)
 		} else {
@@ -2078,6 +2082,15 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		return clientViews[i].Client.PrimaryIP() < clientViews[j].Client.PrimaryIP()
 	})
 
+	ctrlHost := ""
+	if e.cfg != nil && e.cfg.UniFi.URL != "" {
+		if u, err := url.Parse(e.cfg.UniFi.URL); err == nil {
+			ctrlHost = u.Hostname()
+		}
+	}
+	blastProfiles := AppendDeviceChildProfiles(snap, profiles, devChildren)
+	blastRep, infraReps := EvaluateSiteBlast(snap, blastProfiles, rawFindings, report, e.cfg.Network, e.checkList, allCVEMatches, targetSignals, ctrlHost)
+
 	// Diff against previous baseline for webhook alerting and live finding events
 	// ONLY after the initial baseline probe has completed, so restarting `serve`
 	// never wipes existing host findings from uniblue-state.json or fires a storm
@@ -2089,15 +2102,21 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	var webhooksToSend []pendingWebhook
 	var liveEventsToPush []risk.AlertEvent
 	if baselineReady {
+		rebaselining := prevRisk.NeedsScoringRebaseline()
+		if rebaselining {
+			e.logger.Info("upgrading state baseline to scoring version 2 (silent first-run re-baseline)")
+		}
 		diff := risk.ComputeDiffWithProbed(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
 		var nextExactCVEs map[string]string
 		var nextExactCVELastSeen map[string]time.Time
 		if cveMatched {
 			var newCVEs []risk.CVEAlert
 			newCVEs, nextExactCVEs, nextExactCVELastSeen = diffExactCVEs(prevRisk, snap, probedHostKeys, rawExactMatches, exactCVEs)
-			diff.NewCVEs = newCVEs
+			if !rebaselining {
+				diff.NewCVEs = newCVEs
+			}
 		}
-		if prevRisk != nil {
+		if prevRisk != nil && !rebaselining {
 			for _, nf := range diff.NewFindings {
 				postEvents = append(postEvents, LiveEvent{
 					Type:      "finding_new",
@@ -2108,17 +2127,18 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 					Summary:   fmt.Sprintf("New [%s] %s: %s", strings.ToUpper(nf.EffectiveSeverity.String()), nf.CheckID, nf.Title),
 				})
 			}
-			pushEvents := selectPushWorthyEvents(extraEvents, snap, e.cfg.Network, e.minNotify)
-			if e.notifier != nil {
-				if diff.HasAlerts(e.minNotify) {
-					diff.Events = append(diff.Events, pushEvents...)
-					webhooksToSend = splitWebhookByCVEs(snap.Site, diff, maxWebhookCVEsPerBatch)
-				} else if len(pushEvents) > 0 {
-					liveEventsToPush = pushEvents
-				}
-			}
 		}
 		nextState = risk.BuildStateWithPrev(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
+		nextState.Actions, nextState.ActionLastSeen, nextState.ActionPeakAt, nextState.CarriedActions, nextState.ActionAssets, nextState.KnownClientIPs = ApplyBlastActionsToDiff(&diff, prevRisk, snap, blastRep, probedHostKeys, diff.NewCVEs, cveMatched)
+		if prevRisk != nil && e.notifier != nil {
+			pushEvents := selectPushWorthyEvents(extraEvents, snap, e.cfg.Network, e.minNotify)
+			if diff.HasAlerts(e.minNotify) {
+				diff.Events = append(diff.Events, pushEvents...)
+				webhooksToSend = splitWebhookByCVEs(snap.Site, diff, maxWebhookCVEsPerBatch)
+			} else if len(pushEvents) > 0 {
+				liveEventsToPush = pushEvents
+			}
+		}
 		if cveMatched {
 			nextState.ExactCVEs = nextExactCVEs
 			nextState.ExactCVELastSeen = nextExactCVELastSeen
@@ -2142,14 +2162,6 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	}
 	viewModel := BuildPresentationModel(snap, report, topoModel, clientViews, exactCVEs, potentialCVEs, profiles)
 	AttachDeviceChildren(viewModel, devChildren)
-	ctrlHost := ""
-	if e.cfg != nil && e.cfg.UniFi.URL != "" {
-		if u, err := url.Parse(e.cfg.UniFi.URL); err == nil {
-			ctrlHost = u.Hostname()
-		}
-	}
-	blastProfiles := AppendDeviceChildProfiles(snap, profiles, devChildren)
-	blastRep, infraReps := EvaluateSiteBlast(snap, blastProfiles, rawFindings, report, e.cfg.Network, e.checkList, allCVEMatches, targetSignals, ctrlHost)
 	AttachBlast(viewModel, blastRep, infraReps)
 
 	now := time.Now().UTC()
@@ -2364,7 +2376,8 @@ func splitWebhookByCVEs(site string, diff risk.Diff, maxCVEs int) []pendingWebho
 }
 
 func isLiveEventOnlyDiff(d risk.Diff) bool {
-	return len(d.NewFindings) == 0 &&
+	return len(d.NewActions) == 0 && len(d.EscalatedActions) == 0 &&
+		len(d.NewFindings) == 0 &&
 		len(d.EscalatedFindings) == 0 &&
 		len(d.NewTrustedClients) == 0 &&
 		len(d.NewPortForwards) == 0 &&
@@ -2373,7 +2386,8 @@ func isLiveEventOnlyDiff(d risk.Diff) bool {
 }
 
 func isCVEOnlyDiff(d risk.Diff) bool {
-	return len(d.NewFindings) == 0 &&
+	return len(d.NewActions) == 0 && len(d.EscalatedActions) == 0 &&
+		len(d.NewFindings) == 0 &&
 		len(d.EscalatedFindings) == 0 &&
 		len(d.NewTrustedClients) == 0 &&
 		len(d.NewPortForwards) == 0 &&

@@ -124,8 +124,37 @@ func (c *Cache) Dir() string {
 	return c.dir
 }
 
-// Stats reads the summary metadata produced by the most recent Sync.
+// Stats reads the summary metadata for the local vendor index.
 func (c *Cache) Stats() (*CacheStats, error) {
+	st, err := c.readStats()
+	if err != nil {
+		return nil, err
+	}
+	// The metadata can survive the loss of the shards used for matching.
+	vendors := filepath.Join(c.dir, "vendors")
+	info, err := os.Stat(vendors)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("CVE vendor index %q is not a directory", vendors)
+	}
+	if st.VendorCount > 0 && !hasVendorShards(vendors) {
+		return nil, fmt.Errorf("cve cache vendor shards missing (%d expected)", st.VendorCount)
+	}
+	return st, nil
+}
+
+// hasVendorShards checks that at least one regular shard remains available for matching.
+func hasVendorShards(vendorsDir string) bool {
+	entries, err := os.ReadDir(vendorsDir)
+	return err == nil && slices.ContainsFunc(entries, func(e os.DirEntry) bool {
+		return e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".json.gz")
+	})
+}
+
+// readStats lets Sync reuse verified feed metadata when the vendor index needs rebuilding.
+func (c *Cache) readStats() (*CacheStats, error) {
 	raw, err := os.ReadFile(filepath.Join(c.dir, "stats.json"))
 	if err != nil {
 		return nil, err
@@ -180,7 +209,7 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	// from an earlier interrupted/OOM-killed sync while holding the sync lock.
 	cleanupStaleSyncArtifacts(c.dir, feedsDir, vendorsDir)
 
-	prevStats, _ := c.Stats()
+	prevStats, _ := c.readStats()
 	prevSHAs := map[string]string{}
 	prevMeta := map[string]FeedFileMeta{}
 	if prevStats != nil {
@@ -280,7 +309,7 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	// catalog match the last successful build of the current schema.
 	if downloaded == 0 && !opts.Force && !migrating && prevStats != nil &&
 		prevStats.KEVSHA != "" && prevStats.KEVSHA == kevSHA &&
-		equalFeedSHAs(prevStats.YearSHAs, newSHAs) {
+		equalFeedSHAs(prevStats.YearSHAs, newSHAs) && (prevStats.VendorCount == 0 || hasVendorShards(vendorsDir)) {
 		if len(prevStats.YearMeta) == 0 && len(newMeta) > 0 {
 			updated := *prevStats
 			updated.YearMeta = newMeta

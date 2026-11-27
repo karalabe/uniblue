@@ -71,10 +71,10 @@
     <text x="128" y="135" text-anchor="middle" class="font pill" fill="#7F1D1D"><tspan class="pill-b" fill="#7F1D1D">WAN Forward</tspan><tspan fill="#991B1B" dx="5">→</tspan><tspan class="pill-b" fill="#DC2626" dx="5">CRITICAL</tspan></text>
 
     <rect x="18" y="162" width="220" height="42" rx="10" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1.2"/>
-    <text x="128" y="187" text-anchor="middle" class="font pill" fill="#78350F"><tspan class="pill-b" fill="#78350F">Trusted VLAN</tspan><tspan fill="#92400E" dx="5">→</tspan><tspan class="pill-b" fill="#B45309" dx="5">Escalated +1</tspan></text>
+    <text x="128" y="187" text-anchor="middle" class="font pill" fill="#78350F"><tspan class="pill-b" fill="#78350F">Lateral Pivot</tspan><tspan fill="#92400E" dx="5">→</tspan><tspan class="pill-b" fill="#B45309" dx="5">High</tspan></text>
 
     <rect x="18" y="214" width="220" height="42" rx="10" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.2"/>
-    <text x="128" y="239" text-anchor="middle" class="font pill" fill="#14532D"><tspan class="pill-b" fill="#14532D">Isolated IoT</tspan><tspan fill="#166534" dx="5">→</tspan><tspan class="pill-b" fill="#15803D" dx="5">Contained -1</tspan></text>
+    <text x="128" y="239" text-anchor="middle" class="font pill" fill="#14532D"><tspan class="pill-b" fill="#14532D">Verified Contained</tspan><tspan fill="#166534" dx="5">→</tspan><tspan class="pill-b" fill="#15803D" dx="5">Reduced</tspan></text>
   </g>
 
   <!-- Arrow 3 -> 4 -->

@@ -7,9 +7,13 @@
 package risk
 
 import (
+	"maps"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/karalabe/uniblue/internal/checks"
@@ -17,8 +21,8 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
-// TestEvaluateBlastRadiusScoring verifies severity escalation on trusted VLANs,
-// base severity on an unverified VLAN, and Critical promotion on WAN port forwards.
+// TestEvaluateBlastRadiusScoring checks that only a matching WAN forward raises the
+// severity of a service finding.
 func TestEvaluateBlastRadiusScoring(t *testing.T) {
 	netCfg := config.NetworkConfig{
 		TrustedVLANs:  []string{"Default"},
@@ -33,6 +37,7 @@ func TestEvaluateBlastRadiusScoring(t *testing.T) {
 			{IP: "192.168.20.20", MAC: "aa:03", Name: "cam-exposed", NetworkName: "IoT"},
 		},
 		PortForwards: []unifi.PortForward{
+			{ID: "custom", Name: "Custom service", Enabled: true, Proto: "tcp", DstPort: "49500", FwdIP: "192.168.1.10", FwdPort: "49500"},
 			{Name: "Cam-WAN", Enabled: true, Proto: "tcp", DstPort: "554", FwdIP: "192.168.20.20", FwdPort: "554", Src: "any"},
 		},
 	}
@@ -49,13 +54,16 @@ func TestEvaluateBlastRadiusScoring(t *testing.T) {
 		got[f.Key()] = f.EffectiveSeverity
 	}
 
-	// Trusted VLAN bumps high -> critical.
-	if got["UB-0003|aa:01|502"] != checks.SeverityCritical {
-		t.Fatalf("trusted VLAN finding = %v, want critical", got["UB-0003|aa:01|502"])
+	if got["UB-0003|aa:01|502"] != checks.SeverityHigh {
+		t.Fatalf("trusted VLAN finding = %v, want high", got["UB-0003|aa:01|502"])
 	}
 	// A configured VLAN name supplies no containment evidence.
 	if got["UB-0003|aa:02|502"] != checks.SeverityHigh {
 		t.Fatalf("unverified VLAN finding = %v, want high", got["UB-0003|aa:02|502"])
+	}
+	// A forward into the trusted VLAN keeps the classifier's own severity.
+	if sev := got["UB-UNIFI-PORTFWD|aa:01|49500|portfwd:custom"]; sev != checks.SeverityMedium {
+		t.Fatalf("unclassified port forward = %v, want medium", sev)
 	}
 	// WAN port forward forces medium -> critical even on IoT VLAN.
 	if got["UB-0004|aa:03|554"] != checks.SeverityCritical {
@@ -64,14 +72,14 @@ func TestEvaluateBlastRadiusScoring(t *testing.T) {
 }
 
 // TestStatePersistenceAndDiffing verifies state save/load round-trips and diff
-// detection for escalated findings and newly appearing trusted clients.
+// detection for newly appearing trusted clients.
 func TestStatePersistenceAndDiffing(t *testing.T) {
 	netCfg := config.NetworkConfig{
 		TrustedVLANs:  []string{"Default"},
 		IsolatedVLANs: []string{"IoT"},
 	}
 
-	// First scan: device sits safely on IoT VLAN.
+	// The device initially appears on the IoT VLAN.
 	snap1 := &unifi.Snapshot{
 		Site: "default",
 		Clients: []unifi.Client{
@@ -107,8 +115,8 @@ func TestStatePersistenceAndDiffing(t *testing.T) {
 	rep2 := Evaluate(snap2, raw2, netCfg)
 
 	diff := ComputeDiff(loaded, snap2, rep2, netCfg)
-	if len(diff.EscalatedFindings) != 1 {
-		t.Fatalf("expected 1 escalated finding, got %d", len(diff.EscalatedFindings))
+	if len(diff.EscalatedFindings) != 0 {
+		t.Fatalf("moving VLANs escalated findings: %+v", diff.EscalatedFindings)
 	}
 	if len(diff.NewTrustedClients) != 2 {
 		t.Fatalf("expected 2 newly seen trusted clients (moved hvac + rogue-laptop), got %d", len(diff.NewTrustedClients))
@@ -215,8 +223,8 @@ func TestStructuralZoneIsolationAndFlatTopology(t *testing.T) {
 	for _, f := range report.Findings {
 		got[f.Key()] = f.EffectiveSeverity
 	}
-	if got["UB-0001|aa:01|23"] != checks.SeverityCritical {
-		t.Fatalf("expected Internal-zone VLAN to bump high->critical, got %v", got["UB-0001|aa:01|23"])
+	if got["UB-0001|aa:01|23"] != checks.SeverityHigh {
+		t.Fatalf("expected Internal-zone VLAN to retain high severity, got %v", got["UB-0001|aa:01|23"])
 	}
 	if got["UB-0001|aa:02|23"] != checks.SeverityHigh {
 		t.Fatalf("expected Hotspot VLAN with unverified peers to retain high severity, got %v", got["UB-0001|aa:02|23"])
@@ -583,6 +591,7 @@ func TestOnlineUnprobedHostCarryForwardTTL(t *testing.T) {
 
 	// Simulate 8 days elapsed (> offlineFindingTTL): expires once and is pruned.
 	aged := &State{
+		ScoringVersion:  CurrentScoringVersion,
 		UpdatedAt:       time.Now().UTC().Add(-8 * 24 * time.Hour),
 		Findings:        map[string]checks.Severity{key: st3.Findings[key]},
 		FindingLastSeen: map[string]time.Time{key: time.Now().UTC().Add(-8 * 24 * time.Hour)},
@@ -618,6 +627,7 @@ func TestLegacyThreePartStateKeyMigration(t *testing.T) {
 	legacyKey := "NERVA-SMB-V1-ENABLED|aa:bb:cc:dd:ee:30|445"
 	newKey := "NERVA-SMB-V1-ENABLED|aa:bb:cc:dd:ee:30|445|smb-v1"
 	prev := &State{
+		ScoringVersion: CurrentScoringVersion,
 		UpdatedAt:      time.Now().UTC().Add(-10 * time.Minute),
 		Findings:       map[string]checks.Severity{legacyKey: checks.SeverityHigh},
 		TrustedClients: map[string]string{},
@@ -655,17 +665,16 @@ func TestLegacyThreePartStateKeyMigration(t *testing.T) {
 	}
 }
 
-// TestVerifiedContainmentDiscount checks the scored finding against the two
-// containment axes computed from the same controller snapshot.
-func TestVerifiedContainmentDiscount(t *testing.T) {
+// TestVerifiedContainmentPreservesSeverity checks that containment evidence is
+// reported separately from the finding severity.
+func TestVerifiedContainmentPreservesSeverity(t *testing.T) {
 	for _, tt := range []struct {
 		name, peers, egress string
-		want                checks.Severity
 	}{
-		{"contained", "isolated", "blocked", checks.SeverityMedium},
-		{"open peers", "open", "blocked", checks.SeverityHigh},
-		{"LAN leak", "isolated", "open", checks.SeverityHigh},
-		{"missing ACL", "unknown", "blocked", checks.SeverityHigh},
+		{"contained", "isolated", "blocked"},
+		{"open peers", "open", "blocked"},
+		{"LAN leak", "isolated", "open"},
+		{"missing ACL", "unknown", "blocked"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s := wiredPeerSite(2)
@@ -695,14 +704,580 @@ func TestVerifiedContainmentDiscount(t *testing.T) {
 			}
 			for _, f := range r.Findings {
 				if f.CheckID == finding.CheckID {
-					discount := strings.Contains(strings.Join(f.RiskReasons, " "), "mitigated on isolated VLAN")
-					if f.EffectiveSeverity != tt.want || discount != (tt.want < f.BaseSeverity) {
-						t.Fatalf("got %s %v, want %s", f.EffectiveSeverity, f.RiskReasons, tt.want)
+					if f.EffectiveSeverity != checks.SeverityHigh || len(f.RiskReasons) != 0 {
+						t.Fatalf("containment changed severity: %s %v", f.EffectiveSeverity, f.RiskReasons)
 					}
 					return
 				}
 			}
 			t.Fatal("missing scored finding")
 		})
+	}
+}
+
+// TestLegacyStateScoringVersionSilentRebaseline exercises an upgrade on disk,
+// including an empty action queue followed by its first actionable exposure.
+func TestLegacyStateScoringVersionSilentRebaseline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "uniblue-state.json")
+	const legacy = `{"findings":{"service|02:00:00:00:00:01|23":"medium"}}`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prev, err := LoadState(path)
+	if err != nil || !prev.NeedsScoringRebaseline() || prev.Actions != nil {
+		t.Fatalf("legacy baseline = %+v, err = %v", prev, err)
+	}
+	cfg := config.NetworkConfig{IsolatedVLANs: []string{"Sensors"}}
+	cl := unifi.Client{MAC: "02:00:00:00:00:01", IP: "192.0.2.1", VLAN: "20", NetworkName: "Sensors"}
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+	findings := []checks.Finding{{CheckID: "service", Port: 23, Client: cl, BaseSeverity: checks.SeverityHigh}}
+	report := Evaluate(snap, findings, cfg)
+	diff := ComputeDiff(prev, snap, report, cfg)
+	next := BuildStateWithPrev(prev, snap, report, cfg, nil)
+	diff.NewActions, diff.EscalatedActions, diff.ResolvedActionIDs, next.Actions, next.ActionLastSeen, next.ActionPeakAt, next.CarriedActions, next.ActionAssets, next.KnownClientIPs = ComputeActionDiff(prev, snap, nil, nil, true)
+	if diff.HasAlerts(checks.SeverityInfo) || len(diff.ResolvedKeys)+len(diff.ResolvedActionIDs) != 0 || next.Findings[findings[0].Key()] != checks.SeverityHigh {
+		t.Fatalf("upgrade diff = %+v, findings = %v", diff, next.Findings)
+	}
+	if err := SaveState(path, next); err != nil {
+		t.Fatal(err)
+	}
+	prev, err = LoadState(path)
+	if err != nil || prev == nil || prev.ScoringVersion != 2 || prev.Actions == nil || len(prev.Actions) != 0 {
+		t.Fatalf("reloaded baseline = %+v, err = %v", prev, err)
+	}
+	action := ActionAlert{ID: "act:check:service:" + cl.MAC + ":23", Priority: "P3"}
+	diff.NewActions, _, _, prev.Actions, prev.ActionLastSeen, prev.ActionPeakAt, _, _, _ = ComputeActionDiff(prev, snap, []ActionAlert{action}, nil, true)
+	if len(diff.NewActions) != 1 || diff.NewActions[0].ID != action.ID || !diff.HasAlerts(checks.SeverityMedium) {
+		t.Fatalf("first action after empty seed = %+v", diff)
+	}
+	snap.Clients[0].NetworkName = "Building automation"
+	findings[0].Client = snap.Clients[0]
+	report = Evaluate(snap, findings, cfg)
+	diff = ComputeDiff(prev, snap, report, cfg)
+	diff.NewActions, diff.EscalatedActions, diff.ResolvedActionIDs, _, _, _, _, _, _ = ComputeActionDiff(prev, snap, []ActionAlert{action}, nil, true)
+	if diff.HasAlerts(checks.SeverityInfo) || report.Findings[0].EffectiveSeverity != checks.SeverityHigh {
+		t.Fatalf("VLAN rename changed alerts or severity: %+v, %+v", diff, report.Findings)
+	}
+}
+
+// actionCycle advances the action and client identity baselines together, as a saved scan does.
+func actionCycle(prev *State, snap *unifi.Snapshot, current []ActionAlert, probed map[string]struct{}, cveMatched bool) (*State, Diff) {
+	next := BuildStateWithPrev(prev, snap, Report{}, config.NetworkConfig{}, probed)
+	var d Diff
+	d.NewActions, d.EscalatedActions, d.ResolvedActionIDs, next.Actions, next.ActionLastSeen, next.ActionPeakAt, next.CarriedActions, next.ActionAssets, next.KnownClientIPs = ComputeActionDiff(prev, snap, current, probed, cveMatched)
+	return next, d
+}
+
+func TestLegacyOfflineFindingRebaseline(t *testing.T) {
+	cl := unifi.Client{MAC: "02-00-00-00-00-0A", IP: "192.0.2.1", NetworkName: "Sensors"}
+	cfg := config.NetworkConfig{IsolatedVLANs: []string{"Sensors"}}
+	f := checks.Finding{CheckID: "service", Client: cl, Port: 23, BaseSeverity: checks.SeverityHigh}
+	prev := &State{ScoringVersion: 1, Findings: map[string]checks.Severity{f.Key(): checks.SeverityMedium}}
+	online := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+	host := config.CanonicalMAC(cl.MAC)
+	current := []ActionAlert{
+		{ID: "act:check:service:" + host + ":tcp/23", Priority: "P3"},
+		{ID: "act:service:" + host + ":tcp/23", Priority: "P3"},
+		{ID: "act:patch:CVE-1:" + host, Priority: "P3"},
+		{ID: "act:wan-service:" + host + ":tcp/23", Priority: "P3"},
+	}
+	for _, snap := range []*unifi.Snapshot{{}, online} {
+		st, _ := actionCycle(prev, snap, nil, map[string]struct{}{}, true)
+		if st.Findings[f.Key()] != checks.SeverityHigh {
+			t.Fatalf("unobserved legacy score = %v", st.Findings)
+		}
+		d := ComputeDiff(st, online, Evaluate(online, []checks.Finding{f}, cfg), cfg)
+		if len(d.NewFindings)+len(d.EscalatedFindings) != 0 {
+			t.Fatalf("reconnect alerted: %+v", d)
+		}
+		wan := *online
+		wan.PortForwards = []unifi.PortForward{{Enabled: true, ID: "telnet", Proto: "tcp", FwdIP: cl.IP, DstPort: "23", FwdPort: "23"}}
+		d = ComputeDiff(st, &wan, Evaluate(&wan, []checks.Finding{f}, cfg), cfg)
+		if len(d.EscalatedFindings) != 1 || d.EscalatedFindings[0].Key() != f.Key() || d.EscalatedFindings[0].EffectiveSeverity != checks.SeverityCritical {
+			t.Fatalf("new WAN exposure = %+v", d)
+		}
+		probed := map[string]struct{}{host: {}}
+		st, _ = actionCycle(st, online, nil, map[string]struct{}{}, true)
+		if st.UpgradeCarriedHosts[host].IsZero() {
+			t.Fatal("unprobed reconnect lost the upgrade timestamp")
+		}
+		expired := BuildStateWithPrev(st, online, Report{}, cfg, nil)
+		expired.UpgradeCarriedHosts[host] = time.Now().Add(-offlineFindingTTL - time.Hour)
+		expired, d = actionCycle(expired, online, current, nil, true)
+		if len(expired.UpgradeCarriedHosts) != 0 || len(d.NewActions) != len(current) {
+			t.Fatalf("expired upgrade marker: hosts=%v diff=%+v", expired.UpgradeCarriedHosts, d)
+		}
+		st, d = actionCycle(st, online, current, probed, true)
+		if len(d.NewActions) != 0 || len(st.Actions) != len(current) || len(st.UpgradeCarriedHosts) != 0 {
+			t.Fatalf("first probe after upgrade: actions=%v hosts=%v diff=%+v", st.Actions, st.UpgradeCarriedHosts, d)
+		}
+		added := ActionAlert{ID: "act:service:" + host + ":tcp/80", Priority: "P2"}
+		_, d = actionCycle(st, online, append(current, added), probed, true)
+		if len(d.NewActions) != 1 || d.NewActions[0].ID != added.ID {
+			t.Fatalf("new service after reconnect: %+v", d)
+		}
+	}
+}
+
+func TestLegacyUpgradeHostObservations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cl := unifi.Client{ID: "client-a", MAC: "02:00:00:00:00:0a", IP: "192.0.2.10"}
+		seen := time.Now().UTC().Add(-6 * 24 * time.Hour)
+		const cve = "02:00:00:00:00:0b|service|1|CVE-1"
+		prev := &State{
+			UpdatedAt:        seen.Add(-time.Hour),
+			Findings:         map[string]checks.Severity{"service|" + cl.IP + "|23": checks.SeverityMedium},
+			FindingLastSeen:  map[string]time.Time{"service|" + cl.IP + "|23": seen},
+			ExactCVEs:        map[string]string{cve: "high", cl.IP + "|service|1|CVE-2": "high", "gateway|router|1|CVE-3": "high"},
+			ExactCVELastSeen: map[string]time.Time{cve: seen},
+			TrustedClients:   map[string]string{"02-00-00-00-00-0C": "tablet"},
+		}
+		snap := &unifi.Snapshot{Devices: []unifi.Device{{ID: "gateway"}}}
+		st, _ := actionCycle(prev, snap, nil, nil, true)
+		want := map[string]time.Time{cl.IP: seen, "02:00:00:00:00:0b": seen, "02:00:00:00:00:0c": prev.UpdatedAt}
+		if !maps.Equal(st.UpgradeCarriedHosts, want) {
+			t.Fatalf("upgrade observations = %v, want %v", st.UpgradeCarriedHosts, want)
+		}
+		snap.Clients = []unifi.Client{cl, {MAC: "02:00:00:00:00:0b"}, {MAC: "02:00:00:00:00:0c"}}
+		probed := activeClientHostSet(snap)
+		actions := []ActionAlert{
+			{ID: "act:wan-service:" + cl.ID + ":tcp/23", Priority: "P2"},
+			{ID: "act:patch:CVE-1:02:00:00:00:00:0b", Priority: "P2"},
+			{ID: "act:service:02:00:00:00:00:0c:tcp/23", Priority: "P2"},
+		}
+		next, d := actionCycle(st, snap, actions, probed, true)
+		if len(d.NewActions) != 0 || len(next.Actions) != len(actions) || len(next.UpgradeCarriedHosts) != 0 {
+			t.Fatalf("reconnect: actions=%v markers=%v alerts=%v", next.Actions, next.UpgradeCarriedHosts, d.NewActions)
+		}
+		time.Sleep(3 * 24 * time.Hour)
+		_, d = actionCycle(st, snap, actions, probed, true)
+		if len(d.NewActions) != len(actions) {
+			t.Fatalf("reconnect after expiry: alerts=%v", d.NewActions)
+		}
+	})
+}
+
+// TestActionDiffOfflineCarryForwardAndEscalation follows the same controls
+// across a disconnect, an unprobed reconnect, and a fresh observation.
+func TestActionDiffOfflineCarryForwardAndEscalation(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a", IP: "192.0.2.10"}
+	online := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+	ids := []string{"act:check:C:" + cl.MAC + ":53:udp", "act:check:T:" + cl.MAC + ":tcp/80", "act:patch:CVE-1:" + cl.MAC, "act:service:" + cl.MAC + ":tcp/22"}
+	var current []ActionAlert
+	for _, id := range ids {
+		current = append(current, ActionAlert{ID: id, Priority: "P3"})
+	}
+	current = append(current, ActionAlert{ID: "act:vlan-ingress:lab", Priority: "P2"}, ActionAlert{ID: "act:wan-pf:web", Priority: "P4"},
+		ActionAlert{ID: ids[0], Priority: "P5"}, ActionAlert{Priority: "P1"}, ActionAlert{ID: "invalid", Priority: "verify"})
+	prev, d := actionCycle(nil, online, current, nil, true)
+	if len(d.NewActions) != len(ids)+2 || d.NewActions[0].ID != "act:vlan-ingress:lab" || d.NewActions[1].ID != ids[0] || d.NewActions[1].Severity != checks.SeverityMedium {
+		t.Fatalf("first-run action order or priorities = %+v", d.NewActions)
+	}
+	prev.ActionLastSeen[ids[2]] = time.Now().Add(-3 * time.Hour)
+	st, d := actionCycle(prev, &unifi.Snapshot{}, nil, nil, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{"act:vlan-ingress:lab", "act:wan-pf:web"}) || len(st.Actions) != len(ids) || len(st.CarriedActions) != 0 {
+		t.Fatalf("offline actions = %v, resolved = %v, carried = %v", st.Actions, d.ResolvedActionIDs, st.CarriedActions)
+	}
+	for _, id := range ids {
+		if st.Actions[id] != "P3" || !st.ActionLastSeen[id].Equal(prev.ActionLastSeen[id]) {
+			t.Fatalf("offline action %q lost priority or last observation", id)
+		}
+	}
+	prev = st
+	st, d = actionCycle(st, online, nil, map[string]struct{}{}, true)
+	if len(d.ResolvedActionIDs) != 0 || len(st.CarriedActions) != len(ids) || !maps.Equal(st.ActionLastSeen, prev.ActionLastSeen) {
+		t.Fatalf("unprobed reconnect: resolved=%v, seen=%v, carried=%v", d.ResolvedActionIDs, st.ActionLastSeen, st.CarriedActions)
+	}
+	st, d = actionCycle(st, online, nil, nil, true)
+	if len(d.ResolvedActionIDs) != 0 || len(st.CarriedActions) != len(ids) {
+		t.Fatalf("lost previously carried actions without probe evidence: %v %v", d.ResolvedActionIDs, st.CarriedActions)
+	}
+	st.ActionLastSeen[ids[1]] = time.Now().Add(-offlineFindingTTL - time.Hour)
+	_, d = actionCycle(st, online, nil, map[string]struct{}{}, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{ids[1]}) {
+		t.Fatalf("TTL resolved = %v", d.ResolvedActionIDs)
+	}
+	fresh := []ActionAlert{{ID: ids[0], Priority: "P4"}, {ID: ids[0], Priority: "P1"}}
+	st, d = actionCycle(st, online, fresh, map[string]struct{}{cl.MAC: {}}, true)
+	if len(d.NewActions) != 0 || len(d.EscalatedActions) != 1 || d.EscalatedActions[0].ID != ids[0] || d.EscalatedActions[0].Previous != "P3" || d.EscalatedActions[0].Severity != checks.SeverityCritical ||
+		!slices.Equal(d.ResolvedActionIDs, ids[1:]) || len(st.Actions) != 1 || len(st.CarriedActions) != 0 {
+		t.Fatalf("rescanned host: %+v, actions=%v carried=%v", d, st.Actions, st.CarriedActions)
+	}
+}
+
+func TestActionPriorityPeakExpires(t *testing.T) {
+	snap := &unifi.Snapshot{}
+	a := ActionAlert{ID: "act:vlan-ingress:lab", Priority: "P2"}
+	st, _ := actionCycle(nil, snap, []ActionAlert{a}, nil, true)
+	peak := time.Now().Add(-6 * 24 * time.Hour)
+	// A baseline written before peak timestamps used the last-seen time.
+	st.ActionPeakAt = nil
+	st.ActionLastSeen[a.ID] = peak
+	a.Priority = "P4"
+	st, _ = actionCycle(st, snap, []ActionAlert{a}, nil, true)
+	if st.Actions[a.ID] != "P2" || !st.ActionPeakAt[a.ID].Equal(peak) || !st.ActionLastSeen[a.ID].After(peak) {
+		t.Fatalf("weaker observation: peak=%v seen=%v", st.ActionPeakAt, st.ActionLastSeen)
+	}
+	a.Priority = "P2"
+	st, d := actionCycle(st, snap, []ActionAlert{a}, nil, true)
+	if len(d.EscalatedActions) != 0 || !st.ActionPeakAt[a.ID].Equal(st.ActionLastSeen[a.ID]) {
+		t.Fatalf("return to peak = %+v, seen = %v", d, st.ActionLastSeen)
+	}
+	a.Priority = "P4"
+	st.ActionPeakAt[a.ID] = time.Now().Add(-offlineFindingTTL - time.Hour)
+	st, _ = actionCycle(st, snap, []ActionAlert{a}, nil, true)
+	if st.Actions[a.ID] != "P4" || !st.ActionPeakAt[a.ID].Equal(st.ActionLastSeen[a.ID]) {
+		t.Fatalf("expired peak = %v %v", st.Actions, st.ActionLastSeen)
+	}
+}
+
+func TestPatchGraceAfterPriorityDrop(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a"}
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+	a := ActionAlert{ID: "act:patch:CVE-1:" + cl.MAC, Priority: "P1"}
+	st, _ := actionCycle(nil, snap, []ActionAlert{a}, nil, true)
+	peak := time.Now().Add(-3 * time.Hour)
+	st.ActionPeakAt[a.ID], st.ActionLastSeen[a.ID] = peak, peak
+	a.Priority = "P3"
+	st, _ = actionCycle(st, snap, []ActionAlert{a}, nil, true)
+	seen := st.ActionLastSeen[a.ID]
+	st, d := actionCycle(st, snap, nil, map[string]struct{}{cl.MAC: {}}, true)
+	if len(d.ResolvedActionIDs) != 0 || st.Actions[a.ID] != "P1" || !st.ActionPeakAt[a.ID].Equal(peak) || !seen.After(peak) || !st.ActionLastSeen[a.ID].Equal(seen) {
+		t.Fatalf("missed banner after weaker observation: %+v, state=%+v", d, st)
+	}
+	// The client goes offline. Its peak expires three hours before its last observation.
+	st.ActionPeakAt[a.ID] = time.Now().Add(-offlineFindingTTL - time.Hour)
+	st.ActionLastSeen[a.ID] = st.ActionPeakAt[a.ID].Add(3 * time.Hour)
+	snap.Clients = nil
+	st, d = actionCycle(st, snap, nil, nil, true)
+	if st.Actions[a.ID] != "P1" || len(d.ResolvedActionIDs) != 0 {
+		t.Fatalf("offline TTL measured from peak: %+v", d)
+	}
+	st.ActionLastSeen[a.ID] = time.Now().Add(-offlineFindingTTL - time.Minute)
+	_, d = actionCycle(st, snap, nil, nil, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{a.ID}) {
+		t.Fatalf("expired last observation: %+v", d)
+	}
+}
+
+// TestLegacyActionAssetTimestamps checks that the old host list survives a load and save.
+func TestLegacyActionAssetTimestamps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	const id = "act:vlan-egress:lab"
+	const raw = `{"scoring_version":2,"actions":{"act:vlan-egress:lab":"P2"},"action_assets":{"act:vlan-egress:lab":["Guest"]},"action_last_seen":{"act:vlan-egress:lab":"2026-01-01T00:00:00Z"}}`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prev, err := LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := prev.ActionLastSeen[id]
+	if seen.IsZero() || !prev.ActionAssets[id]["guest"].Equal(seen) {
+		t.Fatalf("migrated asset timestamps = %v", prev.ActionAssets)
+	}
+	next := BuildStateWithPrev(prev, &unifi.Snapshot{}, Report{}, config.NetworkConfig{}, nil)
+	next.ActionAssets[id]["guest"] = next.UpdatedAt
+	if !prev.ActionAssets[id]["guest"].Equal(seen) {
+		t.Fatal("updating the next baseline changed the previous observation")
+	}
+	if err := SaveState(path, next); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadState(path)
+	if err != nil || !maps.Equal(loaded.ActionAssets[id], next.ActionAssets[id]) {
+		t.Fatalf("reloaded asset timestamps: state=%v err=%v", loaded, err)
+	}
+}
+
+func TestNetworkActionProtectedAssets(t *testing.T) {
+	const id = "act:vlan-ingress:lab"
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a"}
+	gw := unifi.Device{ID: "Gateway"}
+	snap := &unifi.Snapshot{Devices: []unifi.Device{gw}, Clients: []unifi.Client{cl}}
+	a := ActionAlert{ID: id, Priority: "P2", AffectedAssets: []string{strings.ToUpper(cl.MAC), gw.ID}}
+	st, _ := actionCycle(nil, snap, []ActionAlert{a}, nil, true)
+	seen := st.ActionLastSeen[id]
+	snap.Clients = nil
+	st, d := actionCycle(st, snap, nil, nil, true)
+	if len(d.ResolvedActionIDs) != 0 || st.Actions[id] != "P2" || !st.ActionLastSeen[id].Equal(seen) || !maps.Equal(st.ActionAssets[id], map[string]time.Time{cl.MAC: seen}) {
+		t.Fatalf("offline protected host: %+v, state = %+v", d, st)
+	}
+	snap.Clients = []unifi.Client{cl}
+	st, d = actionCycle(st, snap, nil, map[string]struct{}{}, true)
+	if len(d.ResolvedActionIDs) != 0 || !st.CarriedActions[id] {
+		t.Fatalf("unprobed protected host: %+v, state = %+v", d, st)
+	}
+	st, d = actionCycle(st, snap, nil, map[string]struct{}{cl.MAC: {}}, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{id}) || len(st.ActionAssets) != 0 {
+		t.Fatalf("fixed network control: %+v, assets = %v", d, st.ActionAssets)
+	}
+}
+
+func TestPartialNetworkActionObservation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		guest := unifi.Client{MAC: "02:00:00:00:00:0a"}
+		const stableIP = "2001:db8:abcd::1"
+		stable := unifi.Client{IPv6: []string{stableIP}}
+		const id = "act:vlan-egress:lab"
+		action := ActionAlert{ID: id, Priority: "P2", AffectedAssets: []string{guest.MAC, stableIP, "switch"}}
+		snap := &unifi.Snapshot{Clients: []unifi.Client{guest, stable}, Devices: []unifi.Device{{ID: "switch"}}}
+		st, _ := actionCycle(nil, snap, []ActionAlert{action}, nil, true)
+		seen := st.ActionLastSeen[id]
+		snap.Clients = []unifi.Client{stable}
+		probed := map[string]struct{}{stableIP: {}}
+		action.AffectedAssets = []string{stableIP}
+		for day := 1; day <= 8; day++ {
+			time.Sleep(24 * time.Hour)
+			st, _ = actionCycle(st, snap, []ActionAlert{action}, probed, true)
+			want := map[string]time.Time{stableIP: time.Now().UTC()}
+			if day <= 7 {
+				want[guest.MAC] = seen
+			}
+			if !maps.Equal(st.ActionAssets[id], want) {
+				t.Fatalf("day %d: assets=%v want=%v", day, st.ActionAssets[id], want)
+			}
+			if day == 7 {
+				missing, d := actionCycle(st, snap, nil, probed, true)
+				if len(d.ResolvedActionIDs) != 0 || !maps.Equal(missing.ActionAssets[id], map[string]time.Time{guest.MAC: seen}) {
+					t.Fatalf("missing action at TTL: assets=%v diff=%+v", missing.ActionAssets[id], d)
+				}
+			}
+		}
+		st, d := actionCycle(st, snap, nil, probed, true)
+		if !slices.Equal(d.ResolvedActionIDs, []string{id}) || len(st.ActionAssets) != 0 {
+			t.Fatalf("fixed control: assets=%v diff=%+v", st.ActionAssets, d)
+		}
+		_, d = actionCycle(st, snap, []ActionAlert{action}, probed, true)
+		if len(d.NewActions) != 1 || d.NewActions[0].ID != id {
+			t.Fatalf("regressed control: %+v", d)
+		}
+	})
+}
+
+func TestWANActionsAcrossDualStackDisconnect(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a", IP: "192.0.2.10", IPv6: []string{"2001:db8::a"}}
+	pf := unifi.PortForward{ID: "https", Enabled: true, FwdIP: cl.IP, Proto: "tcp", DstPort: "443"}
+	rule := unifi.FirewallPolicy{Name: "v6", Enabled: true, Action: "ALLOW", IPVersion: "ipv6", Protocol: "tcp",
+		Source: unifi.PolicyEndpoint{ZoneName: "External"}, Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: cl.IPv6, Ports: []int{443}}}
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}, PortForwards: []unifi.PortForward{pf}, FirewallPolicies: []unifi.FirewallPolicy{rule},
+		Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true}}
+	bundle := ActionAlert{ID: "act:wan-service:" + cl.MAC + ":tcp/443", Priority: "P2"}
+	routed := ActionAlert{ID: "act:gateway-routed:v6", Priority: "P2", AffectedAssets: []string{
+		"child:" + cl.MAC + ":zigbee2mqtt:item-1", "managed:" + cl.IPv6[0], "server",
+	}}
+	fallback := ActionAlert{ID: "act:wan-pf:https", Priority: "P2"}
+	online := []ActionAlert{bundle, routed}
+	st, _ := actionCycle(nil, snap, online, nil, true)
+	seen := st.ActionLastSeen[routed.ID]
+	if !maps.Equal(st.ActionAssets[routed.ID], map[string]time.Time{cl.MAC: seen, cl.IPv6[0]: seen}) {
+		t.Fatalf("protected clients = %v", st.ActionAssets[routed.ID])
+	}
+	snap.FirewallPolicies[0].Action = "BLOCK"
+	for _, probed := range []map[string]struct{}{activeClientHostSet(snap), {}} {
+		_, d := actionCycle(st, snap, []ActionAlert{bundle}, probed, true)
+		if !slices.Equal(d.ResolvedActionIDs, []string{routed.ID}) {
+			t.Fatalf("blocked gateway policy: resolved=%v", d.ResolvedActionIDs)
+		}
+	}
+	snap.FirewallPolicies[0].Action = "ALLOW"
+	snap.Clients = nil
+	st, d := actionCycle(st, snap, []ActionAlert{fallback}, nil, true)
+	if len(st.Actions) != 2 || st.Actions[bundle.ID] != "P2" || st.Actions[routed.ID] != "P2" ||
+		len(d.NewActions)+len(d.EscalatedActions)+len(d.ResolvedActionIDs) != 0 {
+		t.Fatalf("disconnect: %+v, actions=%v", d, st.Actions)
+	}
+	snap.Clients = []unifi.Client{cl}
+	_, d = actionCycle(st, snap, online, nil, true)
+	if len(d.NewActions)+len(d.EscalatedActions)+len(d.ResolvedActionIDs) != 0 {
+		t.Fatalf("reconnect: %+v", d)
+	}
+	snap.Clients, snap.PortForwards = nil, nil
+	st, d = actionCycle(st, snap, nil, nil, true)
+	if st.Actions[bundle.ID] != "P2" || len(d.ResolvedActionIDs) != 0 {
+		t.Fatalf("remaining IPv6 publication: %+v", d)
+	}
+	snap.FirewallPolicies[0].Destination.IPs = []string{"2001:db8::b"}
+	st, d = actionCycle(st, snap, nil, nil, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{bundle.ID}) || len(st.KnownClientIPs) != 0 {
+		t.Fatalf("last matching publication removed: %+v, owners=%v", d, st.KnownClientIPs)
+	}
+	snap.FirewallPolicies = nil
+	_, d = actionCycle(st, snap, nil, nil, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{routed.ID}) {
+		t.Fatalf("gateway policy deleted while client offline: %+v", d)
+	}
+}
+
+// TestCarriedWANBundleForwardAlerts checks which forwards a retained bundle can cover.
+func TestCarriedWANBundleForwardAlerts(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a", IPv6: []string{"2001:db8::a"}}
+	bundle := ActionAlert{ID: "act:wan-service:" + cl.MAC + ":tcp/443", Priority: "P3"}
+	for _, tc := range []struct {
+		name, ruleID, ruleName, key, priority string
+		duplicate, alert                      bool
+	}{
+		{"opened forward", "pf", "", "pf", "P2", false, true},
+		{"unique name", "", "web", "web", "P3", false, false},
+		{"socket", "", "", cl.IPv6[0] + ":tcp/443", "P3", false, false},
+		{"ambiguous name", "", "web", "web", "P3", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf := unifi.PortForward{ID: tc.ruleID, Name: tc.ruleName, Enabled: true, FwdIP: "2001:0db8:0000:0000:0000:0000:0000:000a", Proto: "tcp", DstPort: "443", Src: "2001:db8::1"}
+			snap := &unifi.Snapshot{Clients: []unifi.Client{cl}, PortForwards: []unifi.PortForward{pf}}
+			if tc.duplicate {
+				snap.PortForwards = append(snap.PortForwards, unifi.PortForward{Enabled: true, Name: "WEB", FwdIP: "192.0.2.99", Proto: "tcp", DstPort: "80"})
+			}
+			st, _ := actionCycle(nil, snap, []ActionAlert{bundle}, nil, true)
+			snap.Clients = nil
+			if tc.priority == "P2" {
+				snap.PortForwards[0].Src = "any"
+			}
+			fallback := ActionAlert{ID: "act:wan-pf:" + tc.key, Priority: tc.priority}
+			st, d := actionCycle(st, snap, []ActionAlert{fallback}, nil, true)
+			if st.Actions[bundle.ID] != "P3" || (st.Actions[fallback.ID] != "") != tc.alert || len(d.ResolvedActionIDs)+len(d.EscalatedActions) != 0 {
+				t.Fatalf("disconnect: actions=%v diff=%+v", st.Actions, d)
+			}
+			if tc.alert {
+				if len(d.NewActions) != 1 || d.NewActions[0].ID != fallback.ID || d.NewActions[0].Priority != tc.priority {
+					t.Fatalf("missing fallback alert: %+v", d)
+				}
+				return
+			}
+			if len(d.NewActions) != 0 {
+				t.Fatalf("unchanged forward alerted on disconnect: %+v", d)
+			}
+			snap.Clients = []unifi.Client{cl}
+			_, d = actionCycle(st, snap, []ActionAlert{bundle}, nil, true)
+			if len(d.NewActions)+len(d.EscalatedActions)+len(d.ResolvedActionIDs) != 0 {
+				t.Fatalf("unchanged forward alerted on reconnect: %+v", d)
+			}
+		})
+	}
+}
+
+func TestWANBackendOwners(t *testing.T) {
+	cl := unifi.Client{MAC: "02-00-00-00-00-0A", IPv6: []string{"2001:db8::1", "2001:db8::2", "2001:db8::3", "2001:db8::4", "2001:db8::5"}}
+	phone := unifi.Client{MAC: "02:00:00:00:00:0b", IPv6: []string{"2001:db8::b"}}
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl, phone},
+		PortForwards: []unifi.PortForward{{FwdIP: cl.IPv6[0]}}, DynamicMappings: []unifi.DynamicPortMapping{{InternalIP: cl.IPv6[1]}},
+		ProxyRoutes: []unifi.ProxyRoute{{BackendIP: cl.IPv6[2], PublicExposed: true}, {BackendIP: phone.IPv6[0]}}, PublishedTunnels: []unifi.PublishedTunnel{{BackendIP: cl.IPv6[3]}}}
+	want := map[string]string{}
+	for _, ip := range cl.IPv6[:4] {
+		want[ip] = "02:00:00:00:00:0a"
+	}
+	st := BuildStateWithPrev(&State{KnownClientIPs: map[string]string{"2001:db8::abcd": phone.MAC}}, snap, Report{}, config.NetworkConfig{}, nil)
+	if !maps.Equal(st.KnownClientIPs, want) {
+		t.Fatalf("configured backends: %v", st.KnownClientIPs)
+	}
+	a := ActionAlert{ID: "act:wan-service:" + cl.IPv6[4] + ":tcp/443", Priority: "P2"}
+	snap.Clients[1].IPv6 = []string{"2001:db8::c"}
+	st, _ = actionCycle(st, snap, []ActionAlert{a}, nil, true)
+	want[cl.IPv6[4]] = "02:00:00:00:00:0a"
+	if !maps.Equal(st.KnownClientIPs, want) {
+		t.Fatalf("backends and active service: %v", st.KnownClientIPs)
+	}
+	snap.PortForwards, snap.DynamicMappings, snap.ProxyRoutes, snap.PublishedTunnels = nil, nil, nil, nil
+	st, _ = actionCycle(st, snap, nil, nil, true)
+	if len(st.KnownClientIPs) != 0 {
+		t.Fatalf("removed publications retained owners: %v", st.KnownClientIPs)
+	}
+}
+
+func TestOfflineWANBundleRequiresPublicSocket(t *testing.T) {
+	const ip = "192.0.2.10"
+	a := ActionAlert{ID: "act:wan-service:" + ip + ":tcp/443", Priority: "P2"}
+	prev, _ := actionCycle(nil, &unifi.Snapshot{}, []ActionAlert{a}, nil, true)
+	now := time.Now()
+	for _, tc := range []struct {
+		name string
+		snap unifi.Snapshot
+		keep bool
+	}{
+		{"dynamic mapping", unifi.Snapshot{DynamicMappings: []unifi.DynamicPortMapping{{InternalIP: ip, IntPort: 443, Transport: "tcp"}}}, true},
+		{"expired mapping", unifi.Snapshot{CollectedAt: now, DynamicMappings: []unifi.DynamicPortMapping{{InternalIP: ip, IntPort: 443, Transport: "tcp", ExpiresAt: &now}}}, false},
+		{"public proxy", unifi.Snapshot{ProxyRoutes: []unifi.ProxyRoute{{PublicExposed: true, BackendIP: ip, BackendPort: 443}}}, true},
+		{"private proxy", unifi.Snapshot{ProxyRoutes: []unifi.ProxyRoute{{BackendIP: ip, BackendPort: 443}}}, false},
+		{"tunnel", unifi.Snapshot{PublishedTunnels: []unifi.PublishedTunnel{{BackendIP: ip, BackendPort: 443}}}, true},
+		{"other port", unifi.Snapshot{PublishedTunnels: []unifi.PublishedTunnel{{BackendIP: ip, BackendPort: 80}}}, false},
+		{"other transport", unifi.Snapshot{PortForwards: []unifi.PortForward{{Enabled: true, Proto: "udp", FwdIP: ip, FwdPort: "443"}}}, false},
+		{"disabled forward", unifi.Snapshot{PortForwards: []unifi.PortForward{{Proto: "tcp", FwdIP: ip, FwdPort: "443"}}}, false},
+	} {
+		st, d := actionCycle(prev, &tc.snap, nil, nil, true)
+		if (st.Actions[a.ID] != "") != tc.keep || slices.Contains(d.ResolvedActionIDs, a.ID) == tc.keep {
+			t.Errorf("%s: actions=%v resolved=%v", tc.name, st.Actions, d.ResolvedActionIDs)
+		}
+	}
+}
+
+func TestInfrastructureAndPatchActionResolution(t *testing.T) {
+	snap := &unifi.Snapshot{Devices: []unifi.Device{{ID: "Gateway", MAC: "02-00-00-00-00-0A", IP: "2001:db8::A"}}}
+	const patch = "act:patch:CVE-1:02:00:00:00:00:0a"
+	ids := []string{"act:check:admin:gateway:80", "act:service:02-00-00-00-00-0a:tcp/22", "act:service:2001:db8::a:udp/53"}
+	current := []ActionAlert{{ID: patch, Priority: "P1"}}
+	for _, id := range ids {
+		current = append(current, ActionAlert{ID: id, Priority: "P2"})
+	}
+	st, _ := actionCycle(nil, snap, current, nil, true)
+	seen := time.Now().Add(-time.Hour)
+	st.ActionLastSeen[patch] = seen
+	st, d := actionCycle(st, snap, nil, map[string]struct{}{}, true)
+	if !slices.Equal(d.ResolvedActionIDs, ids) || st.Actions[patch] != "P1" || !st.ActionLastSeen[patch].Equal(seen) {
+		t.Fatalf("brief banner miss: %+v, seen = %v", d, st.ActionLastSeen)
+	}
+	st, d = actionCycle(st, snap, current[:1], nil, true)
+	if len(d.NewActions)+len(d.EscalatedActions) != 0 {
+		t.Fatalf("returning banner alerted: %+v", d)
+	}
+	seen = time.Now().Add(-offlineFindingTTL - time.Hour)
+	st.ActionLastSeen[patch] = seen
+	st.CarriedActions = map[string]bool{patch: true}
+	st, d = actionCycle(st, snap, nil, nil, false)
+	if len(d.ResolvedActionIDs) != 0 || st.Actions[patch] != "P1" || !st.CarriedActions[patch] || !st.ActionLastSeen[patch].Equal(seen) {
+		t.Fatalf("cache outage: %+v, state = %+v", d, st)
+	}
+	st.ActionLastSeen[patch] = time.Now().Add(-transientPatchActionGrace - time.Minute)
+	_, d = actionCycle(st, snap, nil, map[string]struct{}{}, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{patch}) {
+		t.Fatalf("patched infrastructure = %+v", d)
+	}
+}
+
+func TestWANServiceActionIdentity(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a", IPv6: []string{"2001:DB8::A"}}
+	online := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+	offline := &unifi.Snapshot{}
+	const suffix = ":tcp/443"
+	ipID := "act:wan-service:" + strings.ToLower(cl.IPv6[0]) + suffix
+	macID := "act:wan-service:" + cl.MAC + suffix
+	a := ActionAlert{ID: ipID, Priority: "P2"}
+	st, _ := actionCycle(nil, offline, []ActionAlert{a}, nil, true)
+	seen := st.ActionLastSeen[ipID]
+	for _, step := range []struct {
+		snap *unifi.Snapshot
+		id   string
+	}{{online, macID}, {offline, ipID}, {online, macID}} {
+		a.ID, a.Priority = step.id, "P4"
+		var d Diff
+		st, d = actionCycle(st, step.snap, []ActionAlert{a}, nil, true)
+		if len(d.NewActions)+len(d.ResolvedActionIDs)+len(d.EscalatedActions) != 0 || len(st.Actions) != 1 ||
+			st.Actions[macID] != "P2" || !st.ActionPeakAt[macID].Equal(seen) || !st.ActionLastSeen[macID].After(seen) || st.KnownClientIPs["2001:db8::a"] != cl.MAC {
+			t.Fatalf("observed %s: %+v, state = %+v", step.id, d, st)
+		}
+	}
+	_, d := actionCycle(st, &unifi.Snapshot{}, nil, nil, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{macID}) {
+		t.Fatalf("removed forward = %+v", d)
+	}
+	online.Clients[0].MAC = "02:00:00:00:00:0b"
+	a.ID = ipID
+	_, d = actionCycle(st, online, []ActionAlert{a}, nil, true)
+	if len(d.NewActions) != 1 || d.NewActions[0].ID != ipID || !slices.Equal(d.ResolvedActionIDs, []string{macID}) {
+		t.Fatalf("IP action for a reassigned address = %+v", d)
+	}
+	a.ID = "act:wan-service:" + online.Clients[0].MAC + suffix
+	st, d = actionCycle(st, online, []ActionAlert{a}, nil, true)
+	if !slices.Equal(d.ResolvedActionIDs, []string{macID}) || len(d.NewActions) != 1 || d.NewActions[0].ID != a.ID || st.KnownClientIPs["2001:db8::a"] != online.Clients[0].MAC {
+		t.Fatalf("reassigned forward = %+v, state = %+v", d, st)
 	}
 }

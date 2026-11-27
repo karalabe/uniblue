@@ -729,3 +729,65 @@ func TestBlastShadowCommand(t *testing.T) {
 		t.Fatalf("shadow command changed scan state: %v", err)
 	}
 }
+
+// TestWatchActionBaselineUpgrade runs a legacy baseline through a restart, a
+// newly observed service and a VLAN rename using the watch notification path.
+func TestWatchActionBaselineUpgrade(t *testing.T) {
+	cfg := config.Default()
+	cfg.State.Path = filepath.Join(t.TempDir(), "uniblue-state.json")
+	if err := os.WriteFile(cfg.State.Path, []byte(`{"findings":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cl := unifi.Client{MAC: "02:00:00:00:00:01", IP: "192.0.2.10", NetworkName: "Sensors"}
+	action := blast.Action{ID: "act:check:service:" + cl.MAC + ":23", Title: "Restrict service", Lane: blast.LaneFixNow, HighestTierReduced: blast.P2}
+	var exposed bool
+	var sent []risk.Diff
+	w := &watchSession{
+		cfg: cfg, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), minSev: checks.SeverityInfo,
+		loadFn: risk.LoadState, saveFn: risk.SaveState,
+		sendFn: func(_ context.Context, _ string, d risk.Diff) error { sent = append(sent, d); return nil },
+		scanBlastFn: func(context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, *blast.Report, bool, error) {
+			snap := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+			report := blast.Report{}
+			raw := []checks.Finding{{CheckID: "existing", Client: cl, Port: 80, BaseSeverity: checks.SeverityMedium}}
+			if exposed {
+				raw = append(raw, checks.Finding{CheckID: "service", Client: cl, Port: 23, BaseSeverity: checks.SeverityHigh})
+				report.Actions = []blast.Action{action}
+			}
+			return snap, []probe.HostProfile{{Client: cl}}, risk.Evaluate(snap, raw, cfg.Network), &report, true, nil
+		},
+	}
+	w.runCycle(t.Context())
+	st, err := risk.LoadState(cfg.State.Path)
+	if err != nil || st == nil || st.ScoringVersion != 2 || st.Actions == nil || len(sent) != 0 {
+		t.Fatalf("upgrade state=%+v err=%v alerts=%+v", st, err, sent)
+	}
+	w.stateLoaded = false
+	exposed = true
+	w.runCycle(t.Context())
+	if len(sent) != 1 || len(sent[0].NewActions) != 1 || sent[0].NewActions[0].ID != action.ID || len(sent[0].NewFindings) != 0 {
+		t.Fatalf("new exposure alerts = %+v", sent)
+	}
+	st, err = risk.LoadState(cfg.State.Path)
+	if err != nil || st == nil || st.Actions[action.ID] != "P2" || st.ActionLastSeen[action.ID].IsZero() {
+		t.Fatalf("exposure baseline=%+v err=%v", st, err)
+	}
+	cl.NetworkName = "Building automation"
+	w.runCycle(t.Context())
+	if len(sent) != 1 {
+		t.Fatalf("VLAN rename triggered alerts: %+v", sent[1:])
+	}
+}
+
+func TestWatchDiffFingerprintIgnoresResolvedActions(t *testing.T) {
+	d := risk.Diff{NewActions: []risk.ActionAlert{{ID: "act:wan-pf:web", Priority: "P2"}}}
+	first := watchDiffFingerprint("lab", d)
+	d.ResolvedActionIDs = []string{"act:wan-pf:old"}
+	if watchDiffFingerprint("lab", d) != first {
+		t.Fatal("an unrelated resolution changed the retry fingerprint")
+	}
+	d.NewActions[0].Priority = "P1"
+	if watchDiffFingerprint("lab", d) == first {
+		t.Fatal("a changed outbound priority reused the retry fingerprint")
+	}
+}

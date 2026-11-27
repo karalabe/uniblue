@@ -7,8 +7,10 @@
 package server
 
 import (
+	"cmp"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -391,6 +393,185 @@ func EvaluateSiteBlast(
 		Oracle:         oracle,
 	}
 	return blast.Evaluate(in), blast.EvaluateAllInfra(in)
+}
+
+// ActionAlertsFromBlast selects remediations with a measured reduction in exposure.
+func ActionAlertsFromBlast(actions []blast.Action) []risk.ActionAlert {
+	var alerts []risk.ActionAlert
+	for _, a := range actions {
+		if a.HighestTierReduced == "" || a.Lane == blast.LaneVerify {
+			continue
+		}
+		priority := string(a.HighestTierReduced)
+		alerts = append(alerts, risk.ActionAlert{
+			ID: a.ID, Title: a.Title, Reason: a.Reason, Lane: string(a.Lane),
+			Priority: priority, Severity: risk.ActionPrioritySeverity(priority),
+			Benefits: a.Benefits, AffectedAssets: a.AffectedAssets, HighProfile: a.HighProfile,
+		})
+	}
+	return alerts
+}
+
+// ApplyBlastActionsToDiff adds action changes to the outbound diff and returns the
+// action baseline to persist. A v2 baseline with no action history keeps its
+// finding alerts for the cycle in which actions are first seeded.
+func ApplyBlastActionsToDiff(diff *risk.Diff, prev *risk.State, snap *unifi.Snapshot, blastRep blast.Report, probedHostKeys map[string]struct{}, newCVEs []risk.CVEAlert, cveMatched bool) (map[string]string, map[string]time.Time, map[string]time.Time, map[string]bool, map[string]map[string]time.Time, map[string]string) {
+	alerts := ActionAlertsFromBlast(blastRep.Actions)
+	newActions, escalated, resolved, next, seen, peakAt, carried, assets, owners := risk.ComputeActionDiff(prev, snap, alerts, probedHostKeys, cveMatched)
+	if len(newCVEs) > 0 && len(newActions) > 0 {
+		patchSevs := alertedPatchIDs(snap, newCVEs)
+		newActions = slices.DeleteFunc(newActions, func(a risk.ActionAlert) bool {
+			sev, ok := patchSevs[strings.ToLower(a.ID)]
+			return ok && sev >= a.Severity
+		})
+	}
+	diff.NewActions, diff.EscalatedActions, diff.ResolvedActionIDs = newActions, escalated, resolved
+	live := prev == nil || (!prev.NeedsScoringRebaseline() && prev.Actions != nil)
+	if live && (len(diff.NewFindings) > 0 || len(diff.EscalatedFindings) > 0) {
+		alertSevByID := make(map[string]checks.Severity, len(alerts))
+		for _, a := range alerts {
+			id := strings.ToLower(a.ID)
+			alertSevByID[id] = max(alertSevByID[id], a.Severity)
+		}
+		covered := func(f checks.Finding) bool { return blastCoversFinding(alertSevByID, snap, f) }
+		diff.NewFindings = slices.DeleteFunc(diff.NewFindings, covered)
+		diff.EscalatedFindings = slices.DeleteFunc(diff.EscalatedFindings, covered)
+	}
+	return next, seen, peakAt, carried, assets, owners
+}
+
+// alertedPatchIDs links exact CVE notifications to patch actions even when a CVE
+// was fingerprinted on a secondary IP and the action identifies the host by MAC.
+func alertedPatchIDs(snap *unifi.Snapshot, alerts []risk.CVEAlert) map[string]checks.Severity {
+	hostByIP := make(map[string]string)
+	if snap != nil {
+		for _, cl := range snap.Clients {
+			for _, ip := range cl.AllIPs() {
+				hostByIP[strings.ToLower(ip)] = blastHostKey(cl)
+			}
+		}
+		for _, d := range snap.Devices {
+			hostByIP[strings.ToLower(d.IP)] = cmp.Or(config.CanonicalMAC(d.MAC), d.ID, d.IP)
+		}
+	}
+	ids := make(map[string]checks.Severity)
+	for _, c := range alerts {
+		ip := strings.ToLower(strings.TrimSpace(c.HostIP))
+		if ip != "" {
+			prefix := "act:patch:" + strings.ToLower(c.CVEID) + ":"
+			sev := c.Severity
+			if c.KEV {
+				sev = checks.SeverityCritical
+			}
+			ids[prefix+ip] = max(ids[prefix+ip], sev)
+			if host := hostByIP[ip]; host != "" {
+				id := prefix + strings.ToLower(host)
+				ids[id] = max(ids[id], sev)
+			}
+		}
+	}
+	return ids
+}
+
+// blastHostKey matches the asset identity used to construct blast action IDs.
+func blastHostKey(cl unifi.Client) string {
+	return cmp.Or(config.CanonicalMAC(cl.MAC), cl.ID, strings.ToLower(cl.PrimaryIP()))
+}
+
+// blastCoversFinding checks whether an action for the same rule or socket
+// would reach every notification threshold that the finding would reach.
+func blastCoversFinding(alertSevByID map[string]checks.Severity, snap *unifi.Snapshot, f checks.Finding) bool {
+	has := func(id string) bool {
+		sev, ok := alertSevByID[strings.ToLower(id)]
+		return ok && sev >= f.EffectiveSeverity
+	}
+	checkID := strings.ToLower(f.CheckID)
+	switch checkID {
+	case "ub-unifi-portfwd":
+		return blastCoversForward(snap, f, has)
+	case "ub-unifi-fw-wan-gw", "ub-unifi-fw-wan-lan", "ub-unifi-fw-iso-leak":
+		id, ok := strings.CutPrefix(strings.ToLower(f.Client.MAC), "fw:")
+		return ok && id != "" && (has("act:gateway-local:"+id) || has("act:gateway-routed:"+id) || has("act:switch-routed:"+id))
+	}
+	host := blastHostKey(f.Client)
+	if host == "" || f.Port <= 0 || strings.HasPrefix(checkID, "ub-unifi-") {
+		return false
+	}
+	key := "act:check:" + checkID + ":" + host + ":"
+	proto, port := strings.ToLower(f.EffectiveTransport()), strconv.Itoa(f.Port)
+	if has(key + proto + "/" + port) {
+		return true
+	}
+	if proto == "tcp" {
+		return has(key + port)
+	}
+	return has(key + port + ":" + proto)
+}
+
+// blastCoversForward resolves ID-less rules by their controller tuple. A bundle
+// can cover the forward only if it closes the same backend service.
+func blastCoversForward(snap *unifi.Snapshot, f checks.Finding, has func(string) bool) bool {
+	id, ok := strings.CutPrefix(strings.ToLower(f.Property), "portfwd:")
+	if !ok || id == "" {
+		return false
+	}
+	if snap == nil {
+		return has("act:wan-pf:" + id)
+	}
+	host := blastHostKey(f.Client)
+	for _, pf := range snap.PortForwards {
+		if !pf.Enabled {
+			continue
+		}
+		key := pf.ID
+		if key == "" {
+			key = fmt.Sprintf("%s-%s-%s-%s", pf.Proto, pf.DstPort, pf.FwdIP, pf.FwdPort)
+		}
+		if strings.ToLower(key) != id {
+			continue
+		}
+		if pf.ID != "" && has("act:wan-pf:"+pf.ID) {
+			return true
+		}
+		if pf.ID == "" && pf.Name != "" && has("act:wan-pf:"+pf.Name) && snap.UniquePortForwardName(pf.Name) {
+			return true
+		}
+		port := f.Port
+		if port <= 0 {
+			if ports := pf.ExpandFwdPorts(1); len(ports) > 0 {
+				port = ports[0]
+			} else {
+				// Blast represents a range by its first backend port.
+				first, _, _ := strings.Cut(cmp.Or(pf.FwdPort, pf.DstPort), ",")
+				first, _, _ = strings.Cut(first, "-")
+				port, _ = strconv.Atoi(strings.TrimSpace(first))
+			}
+		}
+		backend := strings.TrimSpace(pf.FwdIP)
+		if addr, err := netip.ParseAddr(backend); err == nil {
+			backend = addr.Unmap().String()
+		}
+		for _, proto := range []string{"tcp", "udp"} {
+			if port <= 0 || !pf.MatchesTransport(proto) {
+				continue
+			}
+			suffix := ":" + proto + "/" + strconv.Itoa(port)
+			if pf.ID == "" && pf.Name == "" && has("act:wan-pf:"+backend+suffix) {
+				return true
+			}
+			if (host != "" && has("act:wan-service:"+host+suffix)) ||
+				(pf.FwdIP != "" && has("act:wan-service:"+pf.FwdIP+suffix)) {
+				return true
+			}
+			for _, dev := range snap.Devices {
+				if pf.FwdIP != "" && strings.EqualFold(dev.IP, pf.FwdIP) &&
+					has("act:wan-service:"+cmp.Or(config.CanonicalMAC(dev.MAC), dev.ID, dev.IP)+suffix) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // AttachDeviceChildren registers enrolled child devices (for example, UniFi

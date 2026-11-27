@@ -490,6 +490,19 @@ func TestSyncRebuildsOnKEVChange(t *testing.T) {
 	if err != nil || len(recs) != 1 || !recs[0].KEV {
 		t.Fatalf("expected CVE-2026-7777 to be marked KEV after rebuild, got %+v err=%v", recs, err)
 	}
+
+	if err := os.Remove(filepath.Join(cache.Dir(), "vendors", "vendorx.json.gz")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Stats(); err == nil {
+		t.Fatal("empty vendor index reported healthy")
+	}
+	if _, err := cache.Sync(t.Context(), SyncOptions{SinceYear: 2026, EndYear: 2026}); err != nil {
+		t.Fatal(err)
+	}
+	if recs, err := cache.LookupVendor("vendorx"); err != nil || len(recs) != 1 || !recs[0].KEV {
+		t.Fatalf("unchanged feeds did not restore vendor shard: recs=%v err=%v", recs, err)
+	}
 }
 
 // TestFingerprintHTTPDeterminismAndVersionBinding verifies that independent HTTP

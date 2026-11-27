@@ -558,3 +558,72 @@ func TestNotifierFormatsNewCVEsAndSecurityEvents(t *testing.T) {
 		t.Fatalf("expected ntfy urgent priority for KEV CVE, got %q", priority)
 	}
 }
+
+// TestActionWebhookSummaries checks the operator-facing text and priority sent
+// by each transport independently of the structured action priority codes.
+func TestActionWebhookSummaries(t *testing.T) {
+	action := func(p string) risk.ActionAlert {
+		return risk.ActionAlert{Priority: p, Severity: risk.ActionPrioritySeverity(p), Title: "Fix @everyone",
+			Reason: "Block <!channel>", Benefits: []string{"<@123>"}}
+	}
+	escalated := action("P2")
+	escalated.Previous = "P3"
+	low := action("P4")
+	low.Previous = "P5"
+	diff := risk.Diff{
+		NewActions:       []risk.ActionAlert{action("P1"), action("P3"), {Title: "Review", Priority: "P4", Severity: checks.SeverityLow}},
+		EscalatedActions: []risk.ActionAlert{escalated, low},
+	}
+	filtered := filterDiff(diff, checks.SeverityHigh)
+	if len(filtered.NewActions) != 1 || filtered.NewActions[0].Priority != "P1" || len(filtered.EscalatedActions) != 1 || filtered.EscalatedActions[0].Priority != "P2" {
+		t.Fatalf("filtered actions = %+v", filtered)
+	}
+	if ntfyPriority(risk.Diff{EscalatedActions: filtered.EscalatedActions}) != "high" || ntfyPriority(risk.Diff{NewActions: diff.NewActions[1:]}) != "default" {
+		t.Fatal("incorrect ntfy priority for high or medium actions")
+	}
+	for _, format := range []string{"discord", "slack", "ntfy", "json"} {
+		t.Run(format, func(t *testing.T) {
+			var summary string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if format == "ntfy" {
+					body, _ := io.ReadAll(r.Body)
+					summary = string(body)
+					if r.Header.Get("Priority") != "urgent" {
+						t.Errorf("ntfy priority = %q", r.Header.Get("Priority"))
+					}
+					return
+				}
+				var payload struct{ Content, Text, Summary string }
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Error(err)
+				}
+				summary = payload.Content + payload.Text + payload.Summary
+			}))
+			defer srv.Close()
+			n, err := New(config.NotifyConfig{WebhookURL: srv.URL, Format: format, MinSeverity: "low"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := n.Send(context.Background(), "lab", diff); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"[NEW URGENT ACTION]", "[ESCALATED HIGH ACTION]", "(was Medium)", "(was Low)", "[NEW MEDIUM ACTION]", "[NEW LOW ACTION] Review\n", "protects ", "Block "} {
+				if !strings.Contains(summary, want) {
+					t.Errorf("summary missing %q: %s", want, summary)
+				}
+			}
+			for _, p := range []string{"P1", "P2", "P3", "P4", "P5", "OPTIONAL"} {
+				if strings.Contains(strings.ToUpper(summary), p) {
+					t.Errorf("summary contains retired label or priority code %q: %s", p, summary)
+				}
+			}
+			if format == "discord" || format == "slack" {
+				for _, raw := range []string{"@everyone", "<!channel>", "<@123>"} {
+					if strings.Contains(summary, raw) {
+						t.Errorf("summary contains unescaped %q: %s", raw, summary)
+					}
+				}
+			}
+		})
+	}
+}

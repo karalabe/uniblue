@@ -259,6 +259,7 @@ func TestPortsExternalAPDownlinkMACFormatAndPostureDedupe(t *testing.T) {
 
 	// BuildStateWithPrev carries forward offline trusted clients and offline host findings.
 	prev := &State{
+		ScoringVersion: CurrentScoringVersion,
 		TrustedClients: map[string]string{"02:ff:00:00:00:99": "offline-laptop"},
 		Findings: map[string]checks.Severity{
 			"UB-0001|02:ff:00:00:00:99|23": checks.SeverityHigh,
@@ -499,7 +500,7 @@ func TestIsolatedZonePinholesAndLeakingCustomZones(t *testing.T) {
 			}
 		}
 		// New IoT device must NOT trigger NewTrustedClients alert.
-		diff := ComputeDiff(&State{TrustedClients: map[string]string{}}, snap, rep, config.NetworkConfig{})
+		diff := ComputeDiff(&State{ScoringVersion: CurrentScoringVersion, TrustedClients: map[string]string{}}, snap, rep, config.NetworkConfig{})
 		if len(diff.NewTrustedClients) != 0 {
 			t.Fatalf("expected 0 NewTrustedClients for isolated IoT device, got %+v", diff.NewTrustedClients)
 		}
@@ -782,6 +783,7 @@ func TestOfflineHostCarryForwardStableKeysAndTTL(t *testing.T) {
 
 	// Cycle 5: simulate hosts offline longer than offlineFindingTTL (8 days).
 	aged := &State{
+		ScoringVersion:  CurrentScoringVersion,
 		UpdatedAt:       time.Now().UTC().Add(-8 * 24 * time.Hour),
 		Findings:        make(map[string]checks.Severity, len(st3.Findings)),
 		FindingLastSeen: make(map[string]time.Time, len(st3.FindingLastSeen)),
@@ -924,7 +926,7 @@ func TestProtocolNegationInICMPv6CheckAndFirewallAudit(t *testing.T) {
 			},
 			{
 				ID: "p-block-icmpv6", Index: 10, Name: "Drop ICMPv6", Enabled: true, Action: "BLOCK",
-				Protocol: "icmpv6",
+				Protocol:    "icmpv6",
 				Source:      unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true},
 				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
 			},

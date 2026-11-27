@@ -20,6 +20,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/karalabe/uniblue/internal/blast"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
@@ -256,7 +258,8 @@ func TestEngineBaselinePreservationFirstForwardDetectionAndConcurrency(t *testin
 
 	// Seed persisted baseline containing an existing host finding.
 	seedState := &risk.State{
-		UpdatedAt: time.Now().UTC(),
+		ScoringVersion: risk.CurrentScoringVersion,
+		UpdatedAt:      time.Now().UTC(),
 		Findings: map[string]checks.Severity{
 			"UB-0022|02:aa:bb:00:00:01|6379": checks.SeverityHigh,
 		},
@@ -518,7 +521,7 @@ func TestWebhookFailureDoesNotSpamFindingNewOrBlockRecompute(t *testing.T) {
 	eng.mu.Lock()
 	eng.snap = snap
 	eng.baselineComplete = true
-	eng.prevRiskState = &risk.State{UpdatedAt: time.Now().UTC(), Findings: map[string]checks.Severity{}}
+	eng.prevRiskState = &risk.State{ScoringVersion: risk.CurrentScoringVersion, UpdatedAt: time.Now().UTC(), Findings: map[string]checks.Severity{}}
 	eng.profilesByMAC[clientKey(cl)] = probe.HostProfile{Client: cl, ScannedAt: time.Now().UTC()}
 	eng.findingsByMAC[clientKey(cl)] = []checks.Finding{
 		{CheckID: "UB-0001", Title: "Telnet open", EffectiveSeverity: checks.SeverityHigh, Client: cl, Port: 23},
@@ -1659,11 +1662,14 @@ func TestRandomPerLoginSessionCookiesAndLogout(t *testing.T) {
 
 // TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise verifies:
 // (1) initial/upgraded CVE baselines seed silently without blasting old CVEs,
-//     while newly discovered or newly KEV-promoted exact CVEs push immediately;
+//
+//	while newly discovered or newly KEV-promoted exact CVEs push immediately;
+//
 // (2) bursty admin/policy/config events coalesce into a single webhook push;
 // (3) edge physical tamper, evil-twin, honeypot, and trusted medium-swap events
-//     push, whereas WAN IPS blocks, internal link/PoE/STP flaps, dormant wakeups,
-//     and untrusted medium swaps stay off the push.
+//
+//	push, whereas WAN IPS blocks, internal link/PoE/STP flaps, dormant wakeups,
+//	and untrusted medium swaps stay off the push.
 func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing.T) {
 	type receivedWebhook struct {
 		Diff risk.Diff `json:"diff"`
@@ -1837,5 +1843,262 @@ func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing
 	cves := received[1].Diff.NewCVEs
 	if len(cves) != 1 || cves[0].CVEID != "CVE-2026-88002" || !cves[0].KEV || cves[0].MinFixedVersion != "1.26.5" {
 		t.Fatalf("unexpected NewCVEs webhook payload: %+v", cves)
+	}
+}
+
+func TestMissingCVECachePreservesPatchAction(t *testing.T) {
+	cfg := config.Default()
+	cfg.UniFi.URL, cfg.UniFi.APIKey = "https://192.0.2.1", "test"
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	cfg.CVE.CacheDir = t.TempDir()
+	vendors := filepath.Join(cfg.CVE.CacheDir, "vendors")
+	if err := os.Mkdir(vendors, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shard := filepath.Join(vendors, "example.json.gz")
+	f, err := os.Create(shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	if err := json.NewEncoder(gz).Encode([]cve.Record{{ID: "CVE-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.CVE.CacheDir, "stats.json"), []byte(`{"vendor_count":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewEngine(cfg, nil, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.cveCache == nil {
+		t.Fatal("CVE cache did not load at startup")
+	}
+	const patch = "act:patch:CVE-1:gateway"
+	seen := time.Now().UTC().Add(-24 * time.Hour)
+	e.prevRiskState = &risk.State{ScoringVersion: risk.CurrentScoringVersion, Actions: map[string]string{patch: "P1"}, ActionLastSeen: map[string]time.Time{patch: seen}}
+	e.snap = &unifi.Snapshot{Devices: []unifi.Device{{ID: "gateway"}}}
+	for _, removed := range []string{shard, vendors, cfg.CVE.CacheDir} {
+		if err := os.RemoveAll(removed); err != nil {
+			t.Fatal(err)
+		}
+		e.recomputeAndPublish(t.Context(), true, nil)
+		if e.Snapshot().CVELoaded || e.prevRiskState.Actions[patch] != "P1" || !e.prevRiskState.ActionLastSeen[patch].Equal(seen) {
+			t.Fatalf("removed %s: loaded=%t actions=%v seen=%v", removed, e.Snapshot().CVELoaded, e.prevRiskState.Actions, e.prevRiskState.ActionLastSeen)
+		}
+	}
+}
+
+// TestEngineActionBaselineUpgrade follows a saved legacy baseline through the
+// real blast evaluator, dashboard publication and outbound JSON webhook.
+func TestEngineActionBaselineUpgrade(t *testing.T) {
+	delivered := make(chan risk.Diff, 3)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct{ Diff risk.Diff }
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		delivered <- payload.Diff
+	}))
+	defer srv.Close()
+	cfg := config.Default()
+	cfg.UniFi.URL, cfg.UniFi.APIKey = "https://192.0.2.1", "test"
+	cfg.State.Path = filepath.Join(t.TempDir(), "uniblue-state.json")
+	cfg.Notify.WebhookURL, cfg.Notify.Format, cfg.Notify.MinSeverity = srv.URL, "json", "high"
+	if err := os.WriteFile(cfg.State.Path, []byte(`{"scoring_version":0,"findings":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a", IP: "192.0.2.10", NetworkID: "lab", NetworkName: "Sensors"}
+	publish := func(port int) {
+		e.snap = &unifi.Snapshot{Site: "test", Clients: []unifi.Client{cl},
+			Networks: []unifi.Network{{ID: "lab", Name: cl.NetworkName, VLAN: "20", ZoneName: "Internal"}}}
+		e.profilesByMAC[cl.MAC] = probe.HostProfile{Client: cl}
+		e.findingsByMAC[cl.MAC] = []checks.Finding{{
+			CheckID: fmt.Sprintf("service-%d", port), Title: "Review service", Client: cl, Port: port, BaseSeverity: checks.SeverityHigh,
+		}}
+		e.recomputeAndPublish(t.Context(), true, nil)
+	}
+	publish(80)
+	st, err := risk.LoadState(cfg.State.Path)
+	id := "act:check:service-80:" + cl.MAC + ":tcp/80"
+	if err != nil || st == nil || st.ScoringVersion != 2 || st.Actions[id] == "" || st.ActionPeakAt[id].IsZero() || e.webhookSeq != 0 {
+		t.Fatalf("upgrade state=%+v err=%v queued=%d", st, err, e.webhookSeq)
+	}
+	publish(443)
+	select {
+	case d := <-delivered:
+		if len(d.NewActions) != 0 || e.prevRiskState.Actions["act:check:service-443:"+cl.MAC+":tcp/443"] != "P3" ||
+			len(d.NewFindings) != 1 || d.NewFindings[0].EffectiveSeverity != checks.SeverityHigh || len(d.EscalatedFindings) != 0 {
+			t.Fatalf("new service diff = %+v", d)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("no high finding webhook for new service, actions = %+v", e.prevRiskState.Actions)
+	}
+	var findings int
+	for _, ev := range e.Snapshot().Events {
+		if ev.Type == "finding_new" {
+			findings++
+		}
+	}
+	if findings != 1 {
+		t.Fatalf("dashboard reported %d new findings, want only the new service", findings)
+	}
+	cl.NetworkName = "Building automation"
+	publish(443)
+	if e.webhookSeq != 1 {
+		t.Fatalf("VLAN rename queued another webhook, total = %d", e.webhookSeq)
+	}
+}
+
+// TestBlastAlertCoverage exercises the exact rule and socket identities used
+// to replace findings in both the new and escalated parts of a webhook.
+func TestBlastAlertCoverage(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a", IP: "192.0.2.10"}
+	v6 := unifi.Client{IPv6: []string{"2001:DB8::A"}}
+	const expanded = "2001:0db8:0000:0000:0000:0000:0000:000a"
+	device := unifi.Device{MAC: "02-00-00-00-00-0B", IP: "192.0.2.11"}
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}, Devices: []unifi.Device{device}, PortForwards: []unifi.PortForward{
+		{ID: "https", Enabled: true, FwdIP: cl.IP, Proto: "tcp_udp", FwdPort: "443"},
+		{ID: "ssh", Enabled: true, FwdIP: cl.IP, Proto: "tcp", FwdPort: "22"},
+		{Name: "Web", Enabled: true, FwdIP: cl.IP, Proto: "tcp", DstPort: "8443", FwdPort: "443"},
+		{Name: "web", Enabled: false},
+		{Name: "Mail", Enabled: true, FwdIP: cl.IP, Proto: "tcp", DstPort: "25"},
+		{Name: "MAIL", Enabled: true, FwdIP: device.IP, Proto: "tcp", DstPort: "25"},
+		{Enabled: true, FwdIP: device.IP, Proto: "tcp", DstPort: "2525", FwdPort: "25,465"},
+		{Enabled: true, FwdIP: cl.IP, Proto: "tcp", DstPort: "8443", FwdPort: "8000-8002"},
+		{Enabled: true, FwdIP: cl.IP, Proto: "tcp", DstPort: "8000-8002"},
+		{Enabled: true, FwdIP: expanded, Proto: "tcp", DstPort: "18000-18002", FwdPort: "8000-8002"},
+	}}
+	forward := func(id string, port int) checks.Finding {
+		return checks.Finding{CheckID: "UB-UNIFI-PORTFWD", Property: "portfwd:" + id, Client: cl, Port: port}
+	}
+	dns := checks.Finding{CheckID: "DNS", Client: v6, Port: 53, Transport: "UDP"}
+	tcp := dns
+	tcp.Transport = "tcp"
+	vnc := checks.Finding{CheckID: "UB-0002", Client: cl, Port: 5900}
+	high := vnc
+	high.EffectiveSeverity = checks.SeverityHigh
+	deviceForward := forward("tcp-25-"+device.IP+"-", 0)
+	deviceForward.Client = unifi.Client{IP: device.IP}
+	gw := checks.Finding{CheckID: "UB-UNIFI-FW-WAN-GW", Client: unifi.Client{MAC: "fw:Rule"}}
+	for _, tc := range []struct {
+		name, id string
+		tier     blast.Priority
+		lane     blast.Lane
+		f        checks.Finding
+		covered  bool
+	}{
+		{"verify only", "act:verify:UB-0002:" + cl.MAC + ":tcp/5900", blast.P2, blast.LaneVerify, vnc, false},
+		{"verify lane", "act:check:UB-0002:" + cl.MAC + ":5900", blast.P2, blast.LaneVerify, vnc, false},
+		{"zero credit", "act:check:UB-0002:" + cl.MAC + ":5900", "", blast.LaneFixNow, vnc, false},
+		{"high finding with medium action", "act:check:UB-0002:" + cl.MAC + ":5900", blast.P3, blast.LaneFixNow, high, false},
+		{"high finding with low action", "act:check:UB-0002:" + cl.MAC + ":5900", blast.P4, blast.LaneFixNow, high, false},
+		{"high finding with high action", "act:check:UB-0002:" + cl.MAC + ":5900", blast.P2, blast.LaneFixNow, high, true},
+		{"posture", "act:gateway-local:rule", blast.P2, blast.LaneFixNow, checks.Finding{CheckID: "UB-UNIFI-SSH-PASSWORD", Client: gw.Client}, false},
+		{"WAN to gateway", "act:gateway-local:RULE", blast.P2, blast.LaneFixNow, gw, true},
+		{"gateway routed", "act:gateway-routed:rule", blast.P2, blast.LaneFixNow, checks.Finding{CheckID: "UB-UNIFI-FW-WAN-LAN", Client: gw.Client}, true},
+		{"switch routed", "act:switch-routed:rule", blast.P2, blast.LaneFixNow, checks.Finding{CheckID: "UB-UNIFI-FW-ISO-LEAK", Client: gw.Client}, true},
+		{"forward ID", "act:wan-pf:HTTPS", blast.P1, blast.LaneFixNow, forward("https", 443), true},
+		{"forward name", "act:wan-pf:WEB", blast.P1, blast.LaneFixNow, forward("tcp-8443-"+cl.IP+"-443", 443), true},
+		{"duplicate name", "act:wan-pf:mail", blast.P2, blast.LaneFixNow, forward("tcp-25-"+cl.IP+"-", 0), false},
+		{"duplicate name on other backend", "act:wan-pf:mail", blast.P2, blast.LaneFixNow, deviceForward, false},
+		{"socket fallback", "act:wan-pf:" + device.IP + ":tcp/25", blast.P2, blast.LaneFixNow, forward("tcp-2525-"+device.IP+"-25,465", 0), true},
+		{"omitted translated port", "act:wan-service:" + device.IP + ":tcp/25", blast.P2, blast.LaneFixNow, deviceForward, true},
+		{"translated range", "act:wan-service:" + cl.IP + ":tcp/8443", blast.P2, blast.LaneFixNow, forward("tcp-8443-"+cl.IP+"-8000-8002", 0), false},
+		{"untranslated range", "act:wan-pf:" + cl.IP + ":tcp/8000", blast.P2, blast.LaneFixNow, forward("tcp-8000-8002-"+cl.IP+"-", 0), true},
+		{"translated IPv6 range", "act:wan-pf:2001:db8::a:tcp/8000", blast.P2, blast.LaneFixNow, forward("tcp-18000-18002-"+expanded+"-8000-8002", 0), true},
+		{"device bundle", "act:wan-service:02:00:00:00:00:0b:tcp/25", blast.P2, blast.LaneFixNow, deviceForward, true},
+		{"bundle by MAC", "act:wan-service:" + cl.MAC + ":tcp/443", blast.P1, blast.LaneFixNow, forward("https", 443), true},
+		{"bundle by IP and translated port", "act:wan-service:" + cl.IP + ":udp/443", blast.P1, blast.LaneFixNow, forward("https", 0), true},
+		{"different forward", "act:wan-service:" + cl.MAC + ":tcp/443", blast.P1, blast.LaneFixNow, forward("ssh", 22), false},
+		{"different forward transport", "act:wan-service:" + cl.IP + ":udp/22", blast.P1, blast.LaneFixNow, forward("ssh", 22), false},
+		{"TCP grant", "act:check:dns:2001:db8::a:53", blast.P2, blast.LaneFixNow, tcp, true},
+		{"TCP socket", "act:check:dns:2001:db8::a:tcp/53", blast.P2, blast.LaneFixNow, tcp, true},
+		{"UDP grant", "act:check:dns:2001:db8::a:53:udp", blast.P2, blast.LaneFixNow, dns, true},
+		{"UDP socket", "act:check:dns:2001:db8::a:udp/53", blast.P2, blast.LaneFixNow, dns, true},
+		{"different socket transport", "act:check:dns:2001:db8::a:53:udp", blast.P2, blast.LaneFixNow, tcp, false},
+		{"different socket port", "act:check:dns:2001:db8::a:tcp/853", blast.P2, blast.LaneFixNow, tcp, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := risk.Diff{NewFindings: []checks.Finding{tc.f}, EscalatedFindings: []checks.Finding{tc.f}}
+			rep := blast.Report{Actions: []blast.Action{{ID: tc.id, HighestTierReduced: tc.tier, Lane: tc.lane}}}
+			unseeded := risk.State{ScoringVersion: risk.CurrentScoringVersion}
+			ApplyBlastActionsToDiff(&d, &unseeded, snap, rep, nil, nil, true)
+			if len(d.NewActions) != 0 || len(d.NewFindings) != 1 || len(d.EscalatedFindings) != 1 {
+				t.Fatalf("initial seed changed alerts: %+v", d)
+			}
+			ApplyBlastActionsToDiff(&d, nil, snap, rep, nil, nil, true)
+			if (len(d.NewFindings) == 0) != tc.covered || (len(d.EscalatedFindings) == 0) != tc.covered {
+				t.Fatalf("covered = %t, diff = %+v", tc.covered, d)
+			}
+			if tc.f.EffectiveSeverity == checks.SeverityHigh && (!d.HasAlerts(checks.SeverityHigh) || !d.HasAlerts(checks.SeverityMedium)) {
+				t.Fatalf("high finding lost webhook delivery: %+v", d)
+			}
+		})
+	}
+}
+
+func TestPatchActionCoverageAtWebhookThreshold(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0A", IPv6: []string{"2001:db8::A"}}
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+	patch := blast.Action{ID: "act:patch:CVE-1:" + strings.ToLower(cl.MAC), HighestTierReduced: blast.P1, Lane: blast.LaneFixNow}
+	other := patch
+	other.ID = "act:patch:CVE-1:192.0.2.2"
+	rep := blast.Report{Actions: []blast.Action{patch, other}}
+	high := risk.CVEAlert{CVEID: "cve-1", HostIP: "2001:DB8::a", Severity: checks.SeverityHigh}
+	kev := high
+	kev.KEV = true
+	for _, tc := range []struct {
+		name string
+		tier blast.Priority
+		cves []risk.CVEAlert
+		keep bool
+	}{
+		{"higher priority than CVE", blast.P1, []risk.CVEAlert{high}, true},
+		{"equal threshold", blast.P2, []risk.CVEAlert{high}, false},
+		{"KEV promotion", blast.P1, []risk.CVEAlert{kev, high}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep.Actions[0].HighestTierReduced = tc.tier
+			d := risk.Diff{NewCVEs: tc.cves}
+			actions, seen, _, _, _, _ := ApplyBlastActionsToDiff(&d, nil, snap, rep, nil, tc.cves, true)
+			has := func(id string) bool {
+				return slices.ContainsFunc(d.NewActions, func(a risk.ActionAlert) bool { return a.ID == id })
+			}
+			if has(patch.ID) != tc.keep || !has(other.ID) || actions[patch.ID] != string(tc.tier) {
+				t.Fatalf("diff = %+v, actions = %v", d, actions)
+			}
+			if tc.tier == blast.P2 {
+				prev := risk.State{ScoringVersion: risk.CurrentScoringVersion, Actions: actions, ActionLastSeen: seen}
+				rep.Actions[0].HighestTierReduced = blast.P1
+				ApplyBlastActionsToDiff(&d, &prev, snap, rep, nil, tc.cves, true)
+				if len(d.EscalatedActions) != 1 || d.EscalatedActions[0].ID != patch.ID || d.EscalatedActions[0].Previous != "P2" {
+					t.Fatalf("patch exposure escalation = %+v", d)
+				}
+			}
+		})
+	}
+}
+
+func TestActionsPreventWebhookCoalescing(t *testing.T) {
+	for _, d := range []risk.Diff{{NewActions: []risk.ActionAlert{{ID: "new"}}}, {EscalatedActions: []risk.ActionAlert{{ID: "escalated"}}}} {
+		d.Events = []risk.AlertEvent{{Type: "event"}}
+		if isLiveEventOnlyDiff(d) {
+			t.Fatalf("action classified as event only: %+v", d)
+		}
+		d.Events, d.NewCVEs = nil, []risk.CVEAlert{{CVEID: "CVE-1"}}
+		if isCVEOnlyDiff(d) {
+			t.Fatalf("action classified as CVE only: %+v", d)
+		}
 	}
 }

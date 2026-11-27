@@ -240,6 +240,17 @@ func (s *Snapshot) PortHintsByIP() map[string][]int {
 	return out
 }
 
+// UniquePortForwardName reports whether a name identifies exactly one enabled rule.
+func (s *Snapshot) UniquePortForwardName(name string) bool {
+	var matches int
+	for _, pf := range s.PortForwards {
+		if pf.Enabled && strings.EqualFold(pf.Name, name) {
+			matches++
+		}
+	}
+	return matches == 1
+}
+
 // expandPortSpec expands a UniFi port spec ("443", "80,443", "9000-9002") into
 // concrete port numbers, skipping ranges wider than maxRange.
 func expandPortSpec(spec string, maxRange int) []int {

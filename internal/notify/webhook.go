@@ -370,6 +370,16 @@ func filterDiff(d risk.Diff, minSev checks.Severity) risk.Diff {
 		NewTrustedClients: d.NewTrustedClients,
 		NewPortForwards:   d.NewPortForwards,
 	}
+	for _, a := range d.NewActions {
+		if a.Severity >= minSev {
+			out.NewActions = append(out.NewActions, a)
+		}
+	}
+	for _, a := range d.EscalatedActions {
+		if a.Severity >= minSev {
+			out.EscalatedActions = append(out.EscalatedActions, a)
+		}
+	}
 	for _, f := range d.NewFindings {
 		if f.EffectiveSeverity >= minSev {
 			out.NewFindings = append(out.NewFindings, f)
@@ -407,6 +417,29 @@ func formatSummary(site string, d risk.Diff, escape func(string) string) string 
 	var b strings.Builder
 	fmt.Fprintf(&b, "UniBlue alert on site %q:\n", esc(site))
 
+	writeAction := func(kind string, a risk.ActionAlert) {
+		fmt.Fprintf(&b, "- [%s %s ACTION] %s", kind, strings.ToUpper(risk.ActionPriorityLabel(a.Priority)), esc(a.Title))
+		if kind == "ESCALATED" {
+			fmt.Fprintf(&b, " (was %s)", risk.ActionPriorityLabel(a.Previous))
+		}
+		var details []string
+		if len(a.Benefits) > 0 {
+			details = append(details, "protects "+esc(strings.Join(a.Benefits, ", ")))
+		}
+		if a.Reason != "" {
+			details = append(details, esc(a.Reason))
+		}
+		if len(details) > 0 {
+			b.WriteString(": " + strings.Join(details, "; "))
+		}
+		b.WriteByte('\n')
+	}
+	for _, a := range d.NewActions {
+		writeAction("NEW", a)
+	}
+	for _, a := range d.EscalatedActions {
+		writeAction("ESCALATED", a)
+	}
 	for _, f := range d.NewFindings {
 		fmt.Fprintf(&b, "- [NEW %s] %s on %s (%s): %s\n",
 			strings.ToUpper(f.EffectiveSeverity.String()), esc(f.Title), esc(f.Client.DisplayName()), esc(f.Client.PrimaryIP()), esc(f.Evidence))
@@ -451,6 +484,12 @@ func formatSummary(site string, d risk.Diff, escape func(string) string) string 
 // level ("default", "high", or "urgent").
 func ntfyPriority(d risk.Diff) string {
 	highest := checks.SeverityMedium
+	for _, a := range d.NewActions {
+		highest = max(highest, a.Severity)
+	}
+	for _, a := range d.EscalatedActions {
+		highest = max(highest, a.Severity)
+	}
 	for _, f := range append(append([]checks.Finding(nil), d.NewFindings...), d.EscalatedFindings...) {
 		if f.EffectiveSeverity > highest {
 			highest = f.EffectiveSeverity

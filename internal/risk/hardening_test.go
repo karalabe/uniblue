@@ -66,7 +66,8 @@ func TestLegacyFourPartUDPFindingKeyMigratesWithoutReAlert(t *testing.T) {
 	}
 	report := Report{Findings: []checks.Finding{f}}
 	prev := &State{
-		UpdatedAt: time.Now().UTC(),
+		ScoringVersion: CurrentScoringVersion,
+		UpdatedAt:      time.Now().UTC(),
 		Findings: map[string]checks.Severity{
 			"UB-0010|aa:bb:cc:dd:ee:53|53|udp": checks.SeverityLow,
 		},
