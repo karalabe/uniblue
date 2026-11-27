@@ -11,7 +11,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
+	"github.com/karalabe/uniblue/internal/cve"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -53,7 +55,8 @@ type SimEdge struct {
 	From string `json:"from"`
 	// To identifies the destination asset.
 	To string `json:"to"`
-	// Tier distinguishes WAN entry, takeover, admin pivot, L2 peer reach and unknown reachability.
+	// Tier distinguishes WAN entry, takeover, likely risk, admin pivot and terminal L2 exposure.
+	// Unknown reachability retains the evidence tier for mode-specific coverage.
 	Tier string `json:"tier"`
 	// Label describes the service or permission on this route.
 	Label string `json:"label"`
@@ -96,85 +99,255 @@ func (b *builder) listenerRemedies(s socket) []edge {
 	return out
 }
 
-// simListeners indexes takeover evidence by socket so a patch never closes an
-// unrelated service. Known management listeners remain possible credential
-// pivots in worst-case mode after their unauthenticated path has been fixed.
-func (b *builder) simListeners() map[string]map[socket][]SimEdge {
-	out := make(map[string]map[socket][]SimEdge)
-	// Availability-only CVEs still need patches, but they cannot establish a foothold.
-	disruptionOnly := make(map[string]bool)
-	for _, m := range b.CVEMatches {
-		metrics := strings.Split(strings.Trim(m.Record.CVSSVector, "()"), "/")
-		if (slices.Contains(metrics, "C:N") && slices.Contains(metrics, "I:N")) ||
-			(slices.Contains(metrics, "VC:N") && slices.Contains(metrics, "VI:N") && slices.Contains(metrics, "SC:N") && slices.Contains(metrics, "SI:N")) {
-			disruptionOnly[m.Record.ID] = true
-		}
+// simListenerIndex keeps each route bound to the socket the Oracle must evaluate.
+type simListenerIndex map[string]map[socket][]simListener
+
+// simListener retains the grant's network prerequisite until the source is known.
+type simListener struct {
+	edge        SimEdge
+	sameNetwork bool
+}
+
+// add preserves parallel remedies until the operator applies a hypothetical fix.
+func (listeners simListenerIndex) add(s socket, tier, label string, sameNetwork bool, cuts ...string) {
+	if s.host == "" || s.ip == "" || s.port <= 0 || s.port > 65535 {
+		return
 	}
-	add := func(s socket, tier, label string, cuts ...string) {
-		if s.ip == "" {
-			return
-		}
-		if out[s.host] == nil {
-			out[s.host] = make(map[socket][]SimEdge)
-		}
-		e := SimEdge{To: s.host, Tier: tier, Label: label + " · " + serviceName(s.proto, s.port)}
-		e.CutIDs = cuts
-		out[s.host][s] = append(out[s.host][s], e)
+	if listeners[s.host] == nil {
+		listeners[s.host] = make(map[socket][]simListener)
 	}
-	for s := range b.sockets {
-		idx, ok := b.ids[s.fact()]
-		if !ok {
+	listeners[s.host][s] = append(listeners[s.host][s], simListener{
+		edge:        SimEdge{To: s.host, Tier: tier, Label: label + " - " + serviceName(s.proto, s.port), CutIDs: cuts},
+		sameNetwork: sameNetwork,
+	})
+}
+
+// conditionalLabel names the observed interface without claiming its access prerequisites were met.
+func conditionalLabel(f checks.Finding, effect string) string {
+	name := strings.TrimPrefix(strings.TrimPrefix(f.Title, "Unauthenticated "), "Unencrypted ")
+	switch f.CheckID {
+	case "UB-2026-0039":
+		name = "Zehnder ComfoConnect"
+	case "UB-2026-0063":
+		name = "Roku ECP"
+	case "UB-2026-0022":
+		name = "HomeKit"
+	case "UB-0019":
+		name = "IPMI"
+	case "UB-2026-0001":
+		name = "MegaRAC"
+	}
+	label := "Conditional " + effect
+	if name != "" {
+		label += " (" + name + ")"
+	}
+	return label
+}
+
+// simGrant classifies a listener's consequence independently of whether it has a direct fix.
+func (b *builder) simGrant(e edge, disruptionOnly map[string]bool) (tier, label string) {
+	detail := b.facts[e.to].detail
+	id := b.actions[e.cut].ID
+	switch {
+	case strings.HasPrefix(id, "act:patch:") && !disruptionOnly[detail]:
+		if e.level >= moderate {
+			return "likely", detail
+		}
+		return "takeover", detail
+	case detail == "control" || detail == "configure" || detail == "pivot":
+		if e.finding != 0 && e.level == moderate && detail != "configure" {
+			return "likely", conditionalLabel(b.Findings[e.finding-1], detail)
+		}
+		if e.level < moderate && (strings.HasPrefix(id, "act:check:") || strings.HasPrefix(id, "act:service:")) {
+			return "takeover", "Unauthenticated " + detail
+		}
+	case detail == "service setting: NERVA-SMB-SIGNING-NOT-REQUIRED":
+		return "likely", "Unsigned SMB (relay risk)"
+	case detail == "service setting: NERVA-SMB-V1-ENABLED":
+		return "likely", "Legacy SMBv1 enabled"
+	case detail == "service setting: NERVA-SSH-WEAK-KEX":
+		return "likely", "Weak SSH key exchange"
+	case detail == "service setting: NERVA-SSH-WEAK-CIPHER":
+		return "likely", "Weak SSH cipher"
+	}
+	return "", ""
+}
+
+// simCVEs binds uncertain remote vulnerabilities to product endpoints. For an appliance
+// identified from inventory, only observed web and device ports can witness reachability.
+// The returned IDs also exclude availability-only CVEs from exact patch edges.
+func (b *builder) simCVEs(listeners simListenerIndex, observed map[socket]bool) map[string]bool {
+	appliancePorts := map[string][]socket{}
+	for s := range observed {
+		hosts := b.byIP[s.ip]
+		if s.proto != "tcp" || len(hosts) != 1 || hosts[0] != s.host {
 			continue
 		}
-		for _, e := range b.edges[idx] {
-			if e.cut == 0 || b.facts[e.to].kind != consequence {
-				continue
-			}
-			detail := b.facts[e.to].detail
-			tier := "takeover"
-			switch {
-			case strings.HasPrefix(b.actions[e.cut].ID, "act:patch:"):
-				if disruptionOnly[detail] {
-					continue
-				}
-				if e.level >= moderate {
-					tier = "pivot"
-				}
-			case e.level < moderate && (detail == "control" || detail == "configure" || detail == "pivot"):
-				detail = "Unauthenticated " + detail
-			default:
-				continue // Read-only and disruption findings do not grant control.
-			}
-			cuts := []string{b.actions[e.cut].ID}
-			if e.bundle != 0 {
-				cuts = append(cuts, b.actions[e.bundle].ID)
-			}
-			add(s, tier, detail, cuts...)
+		switch s.port {
+		case 443, 80, 631, 8080, 8443, 9100:
+			appliancePorts[s.ip] = append(appliancePorts[s.ip], s)
 		}
 	}
-	addAdmin := func(host, ip, proto string, port int) {
-		switch port {
-		case 22, 80, 443, 445, 623, 3389, 5900, 8006, 8443:
-			add(socket{host, address(ip), cmp.Or(proto, "tcp"), port}, "pivot", "Management service")
+	type witness struct {
+		socket  socket
+		product string
+	}
+	critical := map[witness]bool{}
+	disruptionOnly := map[string]bool{}
+	for _, m := range b.CVEMatches {
+		r := m.Record
+		metrics := strings.Split(strings.Trim(r.CVSSVector, "()"), "/")
+		if (slices.Contains(metrics, "C:N") && slices.Contains(metrics, "I:N")) ||
+			(slices.Contains(metrics, "VC:N") && slices.Contains(metrics, "VI:N") && slices.Contains(metrics, "SC:N") && slices.Contains(metrics, "SI:N")) {
+			disruptionOnly[r.ID] = true
+			continue
+		}
+		// An unbounded advisory is insufficient evidence against a reported version.
+		if m.Confidence != cve.ConfidenceVersionAmbiguous &&
+			(m.Confidence != cve.ConfidencePotential || strings.TrimSpace(m.Product.Version) != "") {
+			continue
+		}
+		if (!r.KEV && r.Severity < checks.SeverityCritical) || (r.AttackVector != "N" && !(r.AttackVector == "" && r.KEV)) {
+			continue
+		}
+		ip := address(m.Product.HostIP)
+		hosts := b.byIP[ip]
+		if len(hosts) != 1 {
+			continue
+		}
+		host := hosts[0]
+		var sockets []socket
+		if len(m.Product.Ports) == 0 {
+			// A software name alone cannot tie a workstation or an unrelated listener to a device CVE.
+			category := b.roles[host].Category
+			if (appliance(category) || category == classify.CategoryBMC) &&
+				(m.Product.Source != "hostname" || m.MatchedCPE.Part == "h" || classify.IsApplianceProduct(m.Product.Label)) {
+				sockets = appliancePorts[ip]
+			}
+		} else {
+			sockets = make([]socket, 0, len(m.Product.Ports))
+			for _, ep := range m.Product.Ports {
+				sockets = append(sockets, socket{host, ip, strings.ToLower(cmp.Or(ep.Transport, "tcp")), ep.Port})
+			}
+		}
+		for _, s := range sockets {
+			key := witness{s, m.Product.Label}
+			critical[key] = critical[key] || r.Severity >= checks.SeverityCritical
+		}
+	}
+	for key, isCritical := range critical {
+		label := "Potential critical CVEs"
+		if !isCritical {
+			label = "Potential known-exploited CVEs"
+		}
+		if key.product != "" {
+			label += " (" + key.product + ")"
+		}
+		listeners.add(key.socket, "likely", label, false)
+	}
+	return disruptionOnly
+}
+
+// simListeners keeps observed attack paths separate from management services that
+// require assumed credential reuse. Fixing one path leaves independent routes intact.
+func (b *builder) simListeners() simListenerIndex {
+	out := simListenerIndex{}
+	observed := map[socket]bool{}
+	observe := func(host, ip, proto string, port int) {
+		s := socket{host, address(ip), strings.ToLower(cmp.Or(proto, "tcp")), port}
+		if s.host != "" && s.ip != "" && port > 0 && port <= 65535 {
+			observed[s] = true
 		}
 	}
 	for _, p := range b.Profiles {
+		host, ip := hostKey(p.Client), p.EffectiveProbeIP()
 		for _, port := range p.OpenPorts {
-			addAdmin(hostKey(p.Client), p.EffectiveProbeIP(), "tcp", port)
+			observe(host, ip, "tcp", port)
+		}
+		for _, port := range p.ConnectOnlyPorts {
+			observe(host, ip, "tcp", port)
+		}
+		for port := range p.HTTP {
+			observe(host, ip, "tcp", port)
+		}
+		if p.SMB != nil {
+			observe(host, ip, "tcp", 445)
+		}
+		if ssh := p.SSH; ssh != nil {
+			observe(host, ip, "tcp", ssh.Port)
+			if !ssh.NoneAuthAccepted {
+				s := socket{host, address(ip), "tcp", ssh.Port}
+				switch {
+				case slices.Contains(ssh.AuthMethods, "password"):
+					out.add(s, "likely", "SSH password auth", false)
+				case slices.Contains(ssh.AuthMethods, "keyboard-interactive"):
+					out.add(s, "likely", "SSH interactive auth", false)
+				}
+			}
 		}
 		for _, svc := range p.Services {
 			if svc.State != "" && svc.State != probe.ServiceStateObservedProtocol && svc.State != probe.ServiceStateTLSUnknownApp {
 				continue
 			}
-			for _, ip := range serviceIPs(p, svc.AddressFamily) {
-				addAdmin(hostKey(p.Client), ip, svc.Transport, svc.Port)
+			observe(host, p.ServiceIP(svc), svc.Transport, svc.Port)
+		}
+	}
+	for _, f := range b.Findings {
+		if f.ClaimKind == checks.ClaimAssetIdentity || f.ClaimKind == checks.ClaimServiceAdvertised {
+			continue
+		}
+		for _, ip := range f.EndpointIPs() {
+			observe(hostKey(f.Client), ip, f.EffectiveTransport(), f.Port)
+		}
+	}
+	// A port-bound product fingerprint establishes a listener even when the
+	// matching probe profile is absent from the simulation input.
+	for _, m := range b.CVEMatches {
+		ip := address(m.Product.HostIP)
+		if hosts := b.byIP[ip]; len(hosts) == 1 {
+			for _, ep := range m.Product.Ports {
+				observe(hosts[0], ip, ep.Transport, ep.Port)
 			}
+		}
+	}
+	disruptionOnly := b.simCVEs(out, observed)
+	for s := range b.sockets {
+		f := s.fact()
+		for _, kind := range []factKind{endpoint, localEndpoint} {
+			f.kind = kind
+			idx, ok := b.ids[f]
+			if !ok {
+				continue
+			}
+			for _, e := range b.edges[idx] {
+				if b.facts[e.to].kind != consequence {
+					continue
+				}
+				tier, label := b.simGrant(e, disruptionOnly)
+				if tier == "" {
+					continue
+				}
+				var cuts []string
+				if e.cut != 0 {
+					cuts = append(cuts, b.actions[e.cut].ID)
+				}
+				if e.bundle != 0 {
+					cuts = append(cuts, b.actions[e.bundle].ID)
+				}
+				out.add(s, tier, label, e.sameNetwork, cuts...)
+			}
+		}
+	}
+	for s := range observed {
+		switch s.port {
+		case 22, 80, 443, 445, 623, 3389, 5900, 8006, 8443:
+			out.add(s, "pivot", "Management service", false)
 		}
 	}
 	for _, d := range b.Snapshot.Devices {
 		if b.Oracle.DeviceClient(d).NetworkID == risk.GatewayNetworkID {
 			for _, port := range []int{22, 443} {
-				addAdmin(canonicalMAC(d.MAC), d.IP, "tcp", port)
+				out.add(socket{canonicalMAC(d.MAC), address(d.IP), "tcp", port}, "pivot", "Management service", false)
 			}
 		}
 	}
@@ -426,8 +599,8 @@ func (b *builder) buildSimulation(report Report) *Simulation {
 	add := func(src attachment, pos risk.Position, dstID string, cell risk.IsolationCell, e SimEdge) {
 		if cell.Effective == "unknown" {
 			tier := "unknown"
-			if e.Tier == "takeover" {
-				tier = "unknown-takeover"
+			if e.Tier == "takeover" || e.Tier == "likely" {
+				tier = "unknown-" + e.Tier
 			}
 			sim.Edges = append(sim.Edges, SimEdge{From: src.host, To: e.To, Tier: tier, Label: "Reachability unverified", Via: cell.MissingInput, CutIDs: slices.Clone(e.CutIDs)})
 			return
@@ -478,19 +651,26 @@ func (b *builder) buildSimulation(report Report) *Simulation {
 					}
 					cell := b.Oracle.Service(pos, pin(dst.client, s.ip), s.proto, s.port, fam)
 					for _, service := range services {
-						add(src, pos, dst.client.NetworkID, cell, service)
+						if !service.sameNetwork || sameNet {
+							add(src, pos, dst.client.NetworkID, cell, service.edge)
+						}
 					}
 				}
 			}
 		}
 	}
-	for _, n := range sim.Nodes {
-		p := b.assets[n.ID].profile
-		for _, to := range append(slices.Clone(p.Manages), p.Hosts...) {
-			if kept[to] && to != n.ID {
-				sim.Edges = append(sim.Edges, SimEdge{From: n.ID, To: to, Tier: "pivot", Label: "Management control", Via: "Declared management relationship"})
+	// Hardware and hypervisor ownership grants control independently of VLAN reachability.
+	addControl := func(from string, targets []string, label string) {
+		for _, to := range targets {
+			if kept[to] && to != from {
+				sim.Edges = append(sim.Edges, SimEdge{From: from, To: to, Tier: "takeover", Label: label, Via: "Management relationship"})
 			}
 		}
+	}
+	for _, n := range sim.Nodes {
+		p := b.assets[n.ID].profile
+		addControl(n.ID, p.Manages, "Manages server")
+		addControl(n.ID, p.Hosts, "Hosts virtual machine")
 	}
 	compare := func(a, b SimEdge) int {
 		label := cmp.Compare(a.Label, b.Label)

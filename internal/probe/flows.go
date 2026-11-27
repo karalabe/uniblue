@@ -252,22 +252,17 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 			labelProto = "unknown"
 		}
 
-		// Keep distinct address families (ipv4 vs ipv6) separate so dual-stack
-		// service evidence is preserved rather than merged away; only merge when
-		// (transport, port, address_family) match.
-		recFam := ipFamilyOf(rec.LocalIP)
-		defaultHostFam := ipFamilyOf(hp.Client.PrimaryIP())
+		// Two addresses on the same host can serve different protocols on the same port.
+		ip := canonicalIPKey(rec.LocalIP)
+		recFam := ipFamilyOf(ip)
 		updated := false
 		for i := range hp.Services {
 			curT := strings.ToLower(strings.TrimSpace(hp.Services[i].Transport))
 			if curT == "" {
 				curT = "tcp"
 			}
-			curFam := strings.ToLower(strings.TrimSpace(hp.Services[i].AddressFamily))
-			if curFam == "" {
-				curFam = defaultHostFam
-			}
-			if hp.Services[i].Port == rec.Port && curT == transport && curFam == recFam {
+			if hp.Services[i].Port == rec.Port && curT == transport && hp.ServiceIP(hp.Services[i]) == ip {
+				hp.Services[i].IP = ip
 				if hp.Services[i].AddressFamily == "" && recFam != "" {
 					hp.Services[i].AddressFamily = recFam
 				}
@@ -286,6 +281,7 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 				Protocol:      labelProto,
 				State:         state,
 				AddressFamily: recFam,
+				IP:            ip,
 				Observer:      rec.Observer,
 				ObservedAt:    rec.ObservedAt,
 				TLS:           proto == "tls" || proto == "https" || proto == "quic" || proto == "dot",
@@ -301,7 +297,10 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 			if profiles[i].Services[a].Transport != profiles[i].Services[b].Transport {
 				return profiles[i].Services[a].Transport < profiles[i].Services[b].Transport
 			}
-			return profiles[i].Services[a].AddressFamily < profiles[i].Services[b].AddressFamily
+			if profiles[i].Services[a].AddressFamily != profiles[i].Services[b].AddressFamily {
+				return profiles[i].Services[a].AddressFamily < profiles[i].Services[b].AddressFamily
+			}
+			return profiles[i].Services[a].IP < profiles[i].Services[b].IP
 		})
 	}
 }

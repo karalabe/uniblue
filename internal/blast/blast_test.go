@@ -191,6 +191,7 @@ func TestMissingEnforcementAndVersionEvidence(t *testing.T) {
 	s := &unifi.Snapshot{Networks: []unifi.Network{network("iot"), network("storage")}, Clients: []unifi.Client{iot, cl}, Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true}}
 	in := Input{Snapshot: s, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot"}}}}
 	observed(&in, cl, 5900, checks.GrantControl)
+	in.Findings = append(in.Findings, checks.Finding{Client: cl, CheckID: "NERVA-SSH-WEAK-KEX", Port: 22, BaseSeverity: checks.SeverityMedium})
 	for _, kind := range []string{"firewall", "switch", "router"} {
 		switch kind {
 		case "switch":
@@ -213,6 +214,11 @@ func TestMissingEnforcementAndVersionEvidence(t *testing.T) {
 			return e.From == iot.ID && e.To == cl.ID && e.Tier == "unknown-takeover" && slices.Contains(e.CutIDs, "act:check:control-storage:storage:5900")
 		}) {
 			t.Fatal("missing unknown takeover", kind)
+		}
+		if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+			return e.From == iot.ID && e.To == cl.ID && e.Tier == "unknown-likely" && slices.Contains(e.CutIDs, "act:check:NERVA-SSH-WEAK-KEX:storage:tcp/22")
+		}) {
+			t.Fatal("missing unverified weak SSH path", kind)
 		}
 		if !slices.ContainsFunc(r.Actions, func(a Action) bool { return a.Lane == LaneVerify && strings.Contains(a.ID, kind) }) {
 			t.Fatal(kind, r.Actions)
@@ -1349,31 +1355,416 @@ func TestGatewayControlTraffic(t *testing.T) {
 	}
 }
 
-// TestSimulationCVEImpact distinguishes availability findings from takeover paths on the same socket.
-func TestSimulationCVEImpact(t *testing.T) {
-	src, dst := client("source", "192.0.2.1", "guest"), client("service", "198.51.100.1", "lan")
+// routedSimulation gives each listener a real inter-VLAN path and a ranked boundary action.
+func routedSimulation() (Input, unifi.Client, unifi.Client) {
+	src, dst := client("guest", "192.0.2.1", "guest"), client("service", "198.51.100.1", "lan")
 	in := Input{Snapshot: &unifi.Snapshot{Networks: []unifi.Network{network("guest"), network("lan")},
-		Clients: []unifi.Client{src, dst}, FirewallPolicies: []unifi.FirewallPolicy{allow("guest", "lan")}}}
-	for id, vector := range map[string]string{
-		"CVE-dos":          "CVSS:3.1/AV:N/C:N/I:N/A:H",
-		"CVE-dos-trailing": "CVSS:3.1/AV:N/A:H/C:N/I:N",
-		"CVE-dos-v4":       "CVSS:4.0/AV:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
-		"CVE-control":      "CVSS:3.1/AV:N/C:N/I:H/A:H",
-	} {
-		in.CVEMatches = append(in.CVEMatches, cve.Match{
-			Confidence: cve.ConfidenceExact, Record: cve.Record{ID: id, Severity: checks.SeverityHigh, AttackVector: "N", CVSSVector: vector},
-			Product: cve.Product{HostIP: dst.IP, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 8000}}},
-		})
-	}
+		Clients: []unifi.Client{src, dst}, FirewallPolicies: []unifi.FirewallPolicy{allow("guest", "lan")}},
+		NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{GuestVLANs: []string{"guest"}}}}
+	return in, src, dst
+}
+
+// TestSimulationProtocolGrants keeps confirmed protocol access tied to its service remedy.
+func TestSimulationProtocolGrants(t *testing.T) {
+	in, src, dst := routedSimulation()
+	in.Profiles = []probe.HostProfile{{Client: dst, ProbeIP: dst.IP, Services: []probe.Service{
+		{Protocol: "modbus", Port: 502, State: probe.ServiceStateObservedProtocol},
+		{Protocol: "upnp", Port: 1900, Transport: "udp", State: probe.ServiceStateObservedProtocol},
+	}}}
 	r := Evaluate(in)
-	var takeover []string
-	for _, e := range r.Simulation.Edges {
-		if e.From == src.ID && e.To == dst.ID && e.Tier == "takeover" {
-			takeover = append(takeover, e.Label)
+	for label, id := range map[string]string{
+		"Unauthenticated control - tcp/502":    "act:service:service:tcp/502",
+		"Unauthenticated configure - udp/1900": "act:service:service:udp/1900",
+	} {
+		action(t, r, id)
+		if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+			return e.From == src.ID && e.To == dst.ID && e.Tier == "takeover" && e.Label == label && slices.Contains(e.CutIDs, id)
+		}) {
+			t.Errorf("missing confirmed route for %s: %+v", id, r.Simulation.Edges)
 		}
 	}
-	if !slices.Equal(takeover, []string{"CVE-control · tcp/8000"}) {
-		t.Fatalf("unexpected takeover paths: %v", takeover)
+}
+
+// TestSimulationCVEImpact distinguishes availability findings, confirmed control, and
+// vulnerabilities that still require credentials or interaction on the same socket.
+func TestSimulationCVEImpact(t *testing.T) {
+	in, src, dst := routedSimulation()
+	for _, r := range []cve.Record{
+		{ID: "CVE-dos", CVSSVector: "CVSS:3.1/AV:N/C:N/I:N/A:H"},
+		{ID: "CVE-dos-trailing", CVSSVector: "CVSS:3.1/AV:N/A:H/C:N/I:N"},
+		{ID: "CVE-dos-v4", CVSSVector: "CVSS:4.0/AV:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N"},
+		{ID: "CVE-control", CVSSVector: "CVSS:3.1/AV:N/C:N/I:H/A:H"},
+		{ID: "CVE-admin", PrivilegesRequired: "H"}, {ID: "CVE-click", UserInteraction: "R"},
+		{ID: "CVE-single-auth", CVSSVector: "(AV:N/AC:L/Au:S/C:C/I:C/A:C)", KEV: true},
+		{ID: "CVE-multiple-auth", CVSSVector: "AV:N/AC:L/Au:M/C:P/I:P/A:P"},
+		{ID: "CVE-no-auth", CVSSVector: "AV:N/AC:L/Au:N/C:C/I:C/A:C"},
+	} {
+		r.Severity, r.AttackVector = checks.SeverityHigh, "N"
+		in.CVEMatches = append(in.CVEMatches, cve.Match{Confidence: cve.ConfidenceExact, Record: r,
+			Product: cve.Product{HostIP: dst.IP, Label: "Web service", Ports: []cve.EndpointPort{{Transport: "tcp", Port: 8000}}}})
+	}
+	want := map[string]string{"CVE-control": "takeover", "CVE-admin": "likely", "CVE-click": "likely",
+		"CVE-single-auth": "likely", "CVE-multiple-auth": "likely", "CVE-no-auth": "takeover"}
+	for _, e := range Evaluate(in).Simulation.Edges {
+		if e.From != src.ID || e.To != dst.ID {
+			continue
+		}
+		id := strings.TrimSuffix(e.Label, " - tcp/8000")
+		if e.Tier != want[id] || !slices.Contains(e.CutIDs, "act:patch:"+id+":service") ||
+			!slices.Contains(e.CutIDs, "act:patch-product:web-service:service") {
+			t.Errorf("unexpected CVE path or missing patch: %+v", e)
+		}
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Fatal("missing CVE paths", want)
+	}
+}
+
+// TestSimulationConditionalGrants retains the boundary fix even when a read-only
+// check cannot establish whether the listener will authorize a control request.
+func TestSimulationConditionalGrants(t *testing.T) {
+	in, src, dst := routedSimulation()
+	catalog, err := checks.LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Checks = catalog
+	peer := client("peer", "198.51.100.2", "lan")
+	dst.ESSID, dst.APMAC = "Home", "02:00:00:00:00:01"
+	peer.ESSID, peer.APMAC = dst.ESSID, dst.APMAC
+	in.Snapshot.Clients = []unifi.Client{src, dst, peer}
+	in.Snapshot.WLANs = []unifi.WLANConfig{{Name: dst.ESSID, NetworkName: dst.NetworkName, Enabled: true}}
+	in.Findings = []checks.Finding{
+		{Client: dst, CheckID: "UB-2026-0039", Port: 56747},
+		{Client: dst, CheckID: "UB-0019", Port: 623},
+		{Client: dst, CheckID: "UB-2026-0001", Port: 443},
+		{Client: dst, CheckID: "UB-0012", Port: 161},
+		{Client: dst, CheckID: "UB-0015", Port: 1900},
+		{Client: dst, CheckID: "UB-2026-0022", Port: 51826},
+		{Client: dst, CheckID: "UB-2026-0063", Title: "Unauthenticated Roku External Control Protocol (ECP)", Port: 8060},
+	}
+	want := map[string]bool{
+		"Conditional control (Zehnder ComfoConnect) - tcp/56747": true,
+		"Conditional control (IPMI) - udp/623":                   true,
+		"Conditional control (MegaRAC) - tcp/443":                true,
+		"Conditional control (Roku ECP) - tcp/8060":              true,
+	}
+	r := Evaluate(in)
+	if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+		return e.From == peer.ID && e.To == dst.ID && e.Tier == "likely" && e.Label == "Conditional control (HomeKit) - tcp/51826"
+	}) {
+		t.Error("missing same-network HomeKit pairing route")
+	}
+	boundary := "act:vlan-egress:guest->lan"
+	action(t, r, boundary)
+	for _, e := range r.Simulation.Edges {
+		if e.From != src.ID || e.To != dst.ID || e.Tier == "pivot" {
+			continue
+		}
+		if e.Tier != "likely" || !want[e.Label] || !slices.Equal(e.CutIDs, []string{boundary}) {
+			t.Errorf("unexpected conditional path: %+v", e)
+		}
+		delete(want, e.Label)
+	}
+	if len(want) != 0 {
+		t.Fatal("missing conditional paths", want)
+	}
+}
+
+// TestRankedHomeKitProximity checks that only a local peer can earn pairing exposure.
+func TestRankedHomeKitProximity(t *testing.T) {
+	in, src, dst := routedSimulation()
+	catalog, err := checks.LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Checks = catalog
+	in.Assets = map[string]classify.AssetProfile{dst.ID: {Tier: classify.TierHigh}}
+	boundary := "act:vlan-egress:guest->lan"
+	before := action(t, Evaluate(in), boundary)
+	in.Findings = []checks.Finding{{Client: dst, CheckID: "UB-2026-0022", Port: 51826}}
+	r := Evaluate(in)
+	for _, e := range r.Exposures {
+		if e.Entry == AssumeBreach && e.Asset == dst.ID && (e.Consequence == "control" || e.Consequence == "configure") {
+			t.Errorf("guest reached a local HomeKit grant: %+v", e)
+		}
+	}
+	if after := action(t, r, boundary); after.PairsByTier != before.PairsByTier {
+		t.Errorf("HomeKit changed guest boundary credit from %v to %v", before.PairsByTier, after.PairsByTier)
+	}
+
+	src.NetworkID, src.NetworkName = dst.NetworkID, dst.NetworkName
+	src.ESSID, dst.ESSID = "Home", "Home"
+	src.APMAC, dst.APMAC = "02:00:00:00:00:01", "02:00:00:00:00:01"
+	in.Snapshot.Clients = []unifi.Client{src, dst}
+	in.Snapshot.WLANs = []unifi.WLANConfig{{Name: dst.ESSID, NetworkName: dst.NetworkName, Enabled: true}}
+	in.NetCfg.IsolationPolicy.GuestVLANs = []string{dst.NetworkName}
+	in.Findings[0].Client = dst
+	r = Evaluate(in)
+	for _, effect := range []string{"control", "configure"} {
+		if e := exposure(t, r, AssumeBreach, dst.ID, effect); e.State != "needs-verification" {
+			t.Errorf("unexpected local pairing exposure: %+v", e)
+		}
+	}
+}
+
+// TestReflectedHomeKitProximity checks that only a direct answer puts pairing
+// on the trusted LAN's verification list.
+func TestReflectedHomeKitProximity(t *testing.T) {
+	in, accessory, reflector := routedSimulation()
+	catalog, err := checks.LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(catalog, func(c *checks.Check) bool { return c.ID == "UB-2026-0022" })
+	if i < 0 {
+		t.Fatal("missing HomeKit check")
+	}
+	in.Checks = []*checks.Check{catalog[i]}
+	hp := probe.HostProfile{Client: accessory, MDNSServices: []probe.MDNSService{{
+		Type: "_hap._tcp", TXT: []string{"sf=1"}, Port: 51826, Transport: "tcp",
+		TargetIPs: []string{accessory.IP}, ResponderIP: reflector.IP, Reflected: true, TrustedReflector: true,
+	}}}
+	in.Profiles = []probe.HostProfile{hp}
+	runner := checks.NewRunner(in.Checks, 1)
+	in.Findings = runner.RunHost(t.Context(), in.Profiles[0])
+	if len(in.Findings) != 1 || !slices.Equal(in.Findings[0].ObservedIPs, []string{accessory.IP}) {
+		t.Fatalf("expected a reflected finding for the guest accessory, got %+v", in.Findings)
+	}
+	for _, e := range Evaluate(in).Exposures {
+		if e.Entry == TrustedLAN && e.Asset == accessory.ID && (e.Consequence == "configure" || e.Consequence == "control") {
+			t.Errorf("reflected advertisement granted local pairing access: %+v", e)
+		}
+	}
+	md := &in.Profiles[0].MDNSServices[0]
+	md.ResponderIP, md.Reflected, md.TrustedReflector = accessory.IP, false, false
+	in.Findings = runner.RunHost(t.Context(), in.Profiles[0])
+	r := Evaluate(in)
+	for _, effect := range []string{"configure", "control"} {
+		if e := exposure(t, r, TrustedLAN, accessory.ID, effect); e.State != "needs-verification" {
+			t.Errorf("direct answer: want pairing verification, got %+v", e)
+		}
+	}
+}
+
+// TestSimulationPotentialCVEs binds each product once per reachable listener.
+// Advertisements and configured forwards alone cannot make a quiet appliance reachable.
+func TestSimulationPotentialCVEs(t *testing.T) {
+	in, src, dst := routedSimulation()
+	dst.Name = "HP LaserJet M453"
+	in.Snapshot.Clients[1] = dst
+	hp := probe.HostProfile{Client: dst, ProbeIP: dst.IP, Services: []probe.Service{
+		{State: probe.ServiceStateAdvertisedService, Protocol: "http", Port: 80},
+	}}
+	in.Snapshot.PortForwards = []unifi.PortForward{{ID: "printer", Enabled: true, Proto: "tcp", FwdIP: dst.IP, FwdPort: "9100", DstPort: "9100"}}
+	appliance := cve.Product{Label: "HP LaserJet M453", Source: "hostname", HostIP: dst.IP}
+	for i := range 7 {
+		in.CVEMatches = append(in.CVEMatches, cve.Match{Product: appliance, Confidence: cve.ConfidencePotential,
+			Record: cve.Record{ID: "CVE-printer-" + strconv.Itoa(i), AttackVector: "N", Severity: checks.SeverityCritical}})
+	}
+	web := client("web", "198.51.100.2", "lan")
+	in.Snapshot.Clients = append(in.Snapshot.Clients, web)
+	bound := cve.Product{Label: "Nginx", HostIP: web.IP, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 9443}}}
+	in.CVEMatches = append(in.CVEMatches, cve.Match{Product: bound, Confidence: cve.ConfidencePotential,
+		Record: cve.Record{ID: "CVE-web", KEV: true, Severity: checks.SeverityHigh}})
+	for _, tc := range []struct {
+		version    string
+		port       int
+		confidence cve.Confidence
+	}{
+		{"10.2p1", 22, cve.ConfidencePotential},
+		{"7.4p1", 2222, cve.ConfidenceVersionAmbiguous},
+	} {
+		in.CVEMatches = append(in.CVEMatches, cve.Match{Confidence: tc.confidence,
+			Product: cve.Product{Label: "OpenSSH", HostIP: web.IP, Version: tc.version, Ports: []cve.EndpointPort{{Port: tc.port}}},
+			Record:  cve.Record{ID: "CVE-ssh", AttackVector: "N", Severity: checks.SeverityCritical}})
+	}
+	in.CVEMatches = append(in.CVEMatches, cve.Match{Confidence: cve.ConfidencePotential,
+		Product: cve.Product{Label: "Ollama", Source: "hostname", HostIP: web.IP},
+		Record:  cve.Record{ID: "CVE-ollama", AttackVector: "N", Severity: checks.SeverityCritical}})
+	for _, r := range []cve.Record{
+		{ID: "CVE-local", KEV: true, AttackVector: "L"},
+		{ID: "CVE-high", Severity: checks.SeverityHigh, AttackVector: "N"},
+		{ID: "CVE-dos", KEV: true, AttackVector: "N", CVSSVector: "CVSS:3.1/AV:N/C:N/I:N/A:H"},
+		{ID: "CVE-unspecified", Severity: checks.SeverityCritical},
+	} {
+		product := bound
+		product.Label = r.ID
+		in.CVEMatches = append(in.CVEMatches, cve.Match{Product: product, Confidence: cve.ConfidencePotential, Record: r})
+	}
+	for _, tc := range []struct {
+		name       string
+		open, want []int
+	}{
+		{"preferred", []int{9100, 443, 631, 2222}, []int{443, 631, 9100}},
+		{"unrelated listeners", []int{22, 2222, 9999}, nil},
+		{"no observation", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hp.OpenPorts = tc.open
+			in.Profiles = []probe.HostProfile{hp}
+			want := []string{"Potential known-exploited CVEs (Nginx) - tcp/9443", "Potential critical CVEs (OpenSSH) - tcp/2222"}
+			for _, port := range tc.want {
+				want = append(want, "Potential critical CVEs (HP LaserJet M453) - tcp/"+strconv.Itoa(port))
+			}
+			slices.Sort(want)
+			var got []string
+			for _, e := range Evaluate(in).Simulation.Edges {
+				if e.From == src.ID && e.Tier != "pivot" {
+					if e.Tier != "likely" {
+						t.Fatal(e)
+					}
+					got = append(got, e.Label)
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("got %v, want %v", got, want)
+			}
+		})
+	}
+	// A rule allowing only the web interface cannot expose the printer socket.
+	policy := &in.Snapshot.FirewallPolicies[0]
+	policy.Protocol, policy.Destination.AnyPort, policy.Destination.Ports = "tcp", false, []int{443}
+	in.Profiles[0].OpenPorts = []int{443, 631}
+	var paths []string
+	for _, e := range Evaluate(in).Simulation.Edges {
+		if e.From == src.ID && e.To == dst.ID && e.Tier == "likely" {
+			paths = append(paths, e.Label)
+		}
+	}
+	if !slices.Equal(paths, []string{"Potential critical CVEs (HP LaserJet M453) - tcp/443"}) {
+		t.Fatal("unexpected permitted listeners", paths)
+	}
+}
+
+// TestWorkstationHostnameCVE keeps a software name from claiming workstation listeners.
+func TestWorkstationHostnameCVE(t *testing.T) {
+	in, src, dst := routedSimulation()
+	dst.Name = "thinkpad-homeassistant"
+	in.Snapshot.Clients[1] = dst
+	in.CVEMatches = []cve.Match{{Confidence: cve.ConfidencePotential,
+		Product: cve.Product{Label: "Home Assistant", Source: "hostname", HostIP: dst.IP},
+		Record:  cve.Record{ID: "CVE-example", AttackVector: "N", Severity: checks.SeverityCritical}}}
+	for _, port := range []int{22, 443} {
+		in.Profiles = []probe.HostProfile{{Client: dst, ProbeIP: dst.IP, OpenPorts: []int{port}}}
+		if role := classify.ClientRoles(in.Snapshot, in.Profiles)[dst.ID]; role.Category != classify.CategoryPersonal {
+			t.Fatalf("expected a personal workstation, got %+v", role)
+		}
+		for _, e := range Evaluate(in).Simulation.Edges {
+			if e.From == src.ID && e.To == dst.ID && e.Tier == "likely" {
+				t.Errorf("hostname fingerprint borrowed port %d: %+v", port, e)
+			}
+		}
+	}
+}
+
+// TestSimulationIPv6Listeners lets policy reach one of two addresses on the
+// same host so a service or CVE attributed to the wrong listener changes the map.
+func TestSimulationIPv6Listeners(t *testing.T) {
+	in, src, dst := routedSimulation()
+	dst.Name = "HP LaserJet M453"
+	first, second := "2001:db8:2::1", "2001:db8:2::2"
+	src.IP, dst.IPv6 = "2001:db8:1::1", []string{first, second}
+	in.Snapshot.Clients = []unifi.Client{src, dst}
+	in.Profiles = []probe.HostProfile{{Client: dst, ProbeIP: first, OpenPorts: []int{443}, Services: []probe.Service{
+		{Port: 502, Protocol: "http", AddressFamily: "ipv6"},
+	}}}
+	probe.ApplyPassiveFlows(in.Profiles, []probe.PassiveFlowRecord{
+		{Direction: "hosted", LocalIP: second, Port: 502, Transport: "tcp", Protocol: "modbus"},
+		{Direction: "hosted", LocalIP: second, Port: 631, Transport: "tcp", Protocol: "ipp"},
+	})
+	for _, p := range []cve.Product{
+		{Label: "HP LaserJet M453", HostIP: first, Source: "hostname"},
+		{Label: "Nginx", HostIP: second, Ports: []cve.EndpointPort{{Port: 9443}}},
+	} {
+		in.CVEMatches = append(in.CVEMatches, cve.Match{Product: p, Confidence: cve.ConfidencePotential,
+			Record: cve.Record{ID: "CVE-example", AttackVector: "N", Severity: checks.SeverityCritical}})
+	}
+	for _, tc := range []struct {
+		ip   string
+		want []string
+	}{
+		{first, []string{"Potential critical CVEs (HP LaserJet M453) - tcp/443"}},
+		{second, []string{"Potential critical CVEs (Nginx) - tcp/9443", "Unauthenticated control - tcp/502"}},
+	} {
+		allow := &in.Snapshot.FirewallPolicies[0]
+		allow.IPVersion, allow.Destination.AnyTarget, allow.Destination.IPs = "ipv6", false, []string{tc.ip}
+		var got []string
+		for _, e := range Evaluate(in).Simulation.Edges {
+			if e.From == src.ID && e.To == dst.ID && (e.Tier == "likely" || e.Tier == "takeover") {
+				got = append(got, e.Label)
+			}
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("allow %s: got %v, want %v", tc.ip, got, tc.want)
+		}
+	}
+}
+
+// TestSimulationWeakAuth keeps relay and SSH authentication risks on their observed sockets.
+// Unrelated SSH hygiene has its own remedy and cannot create a control path.
+func TestSimulationWeakAuth(t *testing.T) {
+	in, src, dst := routedSimulation()
+	in.Findings = []checks.Finding{
+		{Client: dst, CheckID: "NERVA-SMB-SIGNING-NOT-REQUIRED", Port: 445, BaseSeverity: checks.SeverityMedium},
+		{Client: dst, CheckID: "NERVA-SSH-WEAK-KEX", Port: 2222, BaseSeverity: checks.SeverityMedium},
+		{Client: dst, CheckID: "NERVA-SMB-V1-ENABLED", Port: 445, BaseSeverity: checks.SeverityMedium},
+		{Client: dst, CheckID: "NERVA-SSH-WEAK-CIPHER", Port: 2222, BaseSeverity: checks.SeverityMedium},
+		{Client: dst, CheckID: "NERVA-SSH-WEAK-MAC", Port: 2222, BaseSeverity: checks.SeverityLow},
+	}
+	for _, tc := range []struct {
+		methods []string
+		none    bool
+		label   string
+	}{
+		{[]string{"password"}, false, "SSH password auth"},
+		{[]string{"keyboard-interactive"}, false, "SSH interactive auth"},
+		{[]string{"keyboard-interactive", "password"}, false, "SSH password auth"},
+		{[]string{"publickey"}, false, ""}, {[]string{"password"}, true, ""},
+	} {
+		in.Profiles = []probe.HostProfile{{Client: dst, ProbeIP: dst.IP, SSH: &probe.SSHInfo{
+			Port: 2222, AuthMethods: tc.methods, NoneAuthAccepted: tc.none}}}
+		want := map[string][]string{
+			"Unsigned SMB (relay risk) - tcp/445": {"act:check:NERVA-SMB-SIGNING-NOT-REQUIRED:service:tcp/445", "act:vlan-egress:guest->lan"},
+			"Weak SSH key exchange - tcp/2222":    {"act:check:NERVA-SSH-WEAK-KEX:service:tcp/2222", "act:vlan-egress:guest->lan"},
+			"Legacy SMBv1 enabled - tcp/445":      {"act:check:NERVA-SMB-V1-ENABLED:service:tcp/445", "act:vlan-egress:guest->lan"},
+			"Weak SSH cipher - tcp/2222":          {"act:check:NERVA-SSH-WEAK-CIPHER:service:tcp/2222", "act:vlan-egress:guest->lan"},
+		}
+		if tc.label != "" {
+			want[tc.label+" - tcp/2222"] = []string{"act:vlan-egress:guest->lan"}
+		}
+		for _, e := range Evaluate(in).Simulation.Edges {
+			if e.From != src.ID || e.To != dst.ID || e.Tier == "pivot" {
+				continue
+			}
+			if cuts, ok := want[e.Label]; e.Tier != "likely" || !ok || !slices.Equal(cuts, e.CutIDs) {
+				t.Errorf("auth %v: unexpected path %+v", tc, e)
+			}
+			delete(want, e.Label)
+		}
+		if len(want) > 0 {
+			t.Errorf("auth %v: missing paths %v", tc, want)
+		}
+	}
+}
+
+// TestSimulationManagementControl checks that hardware ownership survives network isolation.
+func TestSimulationManagementControl(t *testing.T) {
+	bmc, host, vm := client("bmc", "192.0.2.1", "management"), client("server", "198.51.100.1", "servers"), client("vm", "203.0.113.1", "guests")
+	in := Input{Snapshot: &unifi.Snapshot{Clients: []unifi.Client{bmc, host, vm}},
+		Assets: map[string]classify.AssetProfile{"bmc": {Manages: []string{host.ID}}, "server": {Hosts: []string{vm.ID}}}}
+	want := map[string]string{bmc.ID: host.ID, host.ID: vm.ID}
+	for _, e := range Evaluate(in).Simulation.Edges {
+		if e.Tier == "takeover" {
+			if want[e.From] != e.To || len(e.CutIDs) != 0 {
+				t.Error(e)
+			}
+			delete(want, e.From)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatal("missing hardware control", want)
 	}
 }
 

@@ -264,7 +264,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 				var ports []EndpointPort
 				ip := hostIP
 				if hit.port > 0 {
-					ip = probeIP
+					ip = cmp.Or(hit.ip, probeIP)
 					ports = []EndpointPort{{Transport: "tcp", Port: hit.port}}
 				}
 				add(Product{
@@ -291,7 +291,8 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 			}
 			for _, rawCPE := range svc.CPEs {
 				vendor, product, ver, ok := parseVersionedCPE23(rawCPE)
-				if !ok {
+				ip := hp.ServiceIP(svc)
+				if !ok || ip == "" {
 					continue
 				}
 				packaged := distroPackage.MatchString(svc.Banner) || distroPackage.MatchString(svc.Version) || distroPackage.MatchString(ver)
@@ -303,7 +304,7 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 					Version:          upstreamVersion(ver, packaged),
 					Source:           "nerva-cpe",
 					HostName:         hp.Client.DisplayName(),
-					HostIP:           probeIP,
+					HostIP:           ip,
 					VLAN:             hp.Client.NetworkName,
 					Ports:            []EndpointPort{{Transport: transport, Port: svc.Port}},
 					VersionAmbiguous: packaged,
@@ -507,6 +508,7 @@ func mergeUniqueStringsCI(base, extra []string) []string {
 
 // ruleHit records one deterministic match emitted by FingerprintRule.matchAll.
 type ruleHit struct {
+	ip        string
 	port      int
 	ambiguous bool
 	version   string
@@ -544,7 +546,11 @@ func (r *FingerprintRule) matchAll(hp probe.HostProfile) []ruleHit {
 			}
 			if m := r.sshBannerRe.FindStringSubmatch(svc.Banner); m != nil &&
 				(strings.EqualFold(svc.Protocol, "ssh") || strings.HasPrefix(svc.Banner, "SSH-")) {
-				hits = append(hits, r.serviceHit(m, svc.Banner, "ssh-banner", svc.Port))
+				hit := r.serviceHit(m, svc.Banner, "ssh-banner", svc.Port)
+				hit.ip = hp.ServiceIP(svc)
+				if hit.ip != "" {
+					hits = append(hits, hit)
+				}
 				located = located || svc.Banner == hp.SSHBanner
 			}
 		}

@@ -334,6 +334,7 @@ func convertNervaService(rawSvc plugins.Service, now time.Time) (Service, nervaM
 		Protocol:        proto,
 		State:           svcState,
 		AddressFamily:   ipFamilyOf(rawSvc.IP),
+		IP:              rawSvc.IP,
 		ObservedAt:      &now,
 		TLS:             rawSvc.TLS,
 		Version:         strings.TrimSpace(rawSvc.Version),

@@ -270,6 +270,26 @@ func isDedicatedApplianceCategory(cat Category) bool {
 	}
 }
 
+// IsApplianceProduct applies the device-name taxonomy to product evidence when
+// a fingerprint identifies the appliance more precisely than the host inventory.
+func IsApplianceProduct(label string) bool {
+	r := assetClassifier().matchName(label)
+	return r != nil && isDedicatedApplianceCategory(r.Category)
+}
+
+// matchName preserves taxonomy order when a name matches several device roles.
+func (c *Classifier) matchName(name string) *hostnameRule {
+	if name == "" {
+		return nil
+	}
+	for i := range c.hostRules {
+		if c.hostRules[i].re.MatchString(name) {
+			return &c.hostRules[i]
+		}
+	}
+	return nil
+}
+
 // ClassifyClient determines the Category, Role, Vendor, Confidence, and
 // supporting Signals for a single UniFi client using an ordered, deterministic
 // signal stack:
@@ -355,21 +375,17 @@ func (c *Classifier) ClassifyClient(cl unifi.Client, hp *probe.HostProfile, isWA
 
 	// 4. DHCP hostname and UniFi display-name taxonomy rules.
 	nameText := strings.TrimSpace(cl.Hostname + " " + cl.Name)
-	if nameText != "" {
-		for _, r := range c.hostRules {
-			if r.re.MatchString(nameText) {
-				sig := fmt.Sprintf("hostname/name matched %s", r.Role)
-				if cl.Hostname != "" {
-					sig = fmt.Sprintf("hostname %q", cl.Hostname)
-				}
-				return Result{
-					Category:   r.Category,
-					Role:       r.Role,
-					Vendor:     vendor,
-					Confidence: ConfidenceMedium,
-					Signals:    []string{sig},
-				}
-			}
+	if r := c.matchName(nameText); r != nil {
+		sig := fmt.Sprintf("hostname/name matched %s", r.Role)
+		if cl.Hostname != "" {
+			sig = fmt.Sprintf("hostname %q", cl.Hostname)
+		}
+		return Result{
+			Category:   r.Category,
+			Role:       r.Role,
+			Vendor:     vendor,
+			Confidence: ConfidenceMedium,
+			Signals:    []string{sig},
 		}
 	}
 

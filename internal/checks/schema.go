@@ -218,6 +218,8 @@ type GrantSpec struct {
 	WhenField string `yaml:"when_field,omitempty"`
 	// Requires names a prerequisite the probe left unverified.
 	Requires string `yaml:"requires,omitempty"`
+	// SameNetwork limits a grant to peers on the listener's own network.
+	SameNetwork bool `yaml:"same_network,omitempty"`
 	// Note describes the scope of the capability.
 	Note string `yaml:"note,omitempty"`
 }

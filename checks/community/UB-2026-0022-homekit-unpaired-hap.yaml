@@ -31,9 +31,11 @@ grants:
   - effect: control
     basis: conditional
     requires: an attacker on the same Wi-Fi pairs with the accessory before you do
+    same_network: true
   - effect: configure
     basis: conditional
     requires: an attacker on the same Wi-Fi pairs with the accessory and claims admin control
+    same_network: true
 
 remediation:
   summary: >

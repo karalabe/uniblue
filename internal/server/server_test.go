@@ -875,13 +875,37 @@ func TestAPIV1EndpointsAndSSEReplay(t *testing.T) {
 // TestDashboardSimulationControls checks the controls shared by the live and offline dashboards.
 func TestDashboardSimulationControls(t *testing.T) {
 	html := string(dashboardHTML)
-	for _, s := range []string{`data-action="checkup-page"`, `data-action="checkup-lane"`, "const checkupPageSize = 5", `let blastMode = "strict"`, `<select id="blast-device"`, "For this device", "All simulatable", "WAN Gateway"} {
+	for _, s := range []string{
+		`data-action="checkup-page"`, `data-action="checkup-lane"`, "const checkupPageSize = 5",
+		`let blastMode = "realistic"`, `<select id="blast-device"`, `blastControl("mode", "strict", "Proven"`,
+		`blastControl("mode", "realistic", "Realistic"`, `blastControl("mode", "worst", "Worst-Case"`,
+		"For this device", "All simulatable", "WAN Gateway",
+	} {
 		if !strings.Contains(html, s) {
 			t.Errorf("missing %s", s)
 		}
 	}
+	if strings.Contains(html, "nb-br") {
+		t.Error("obsolete simulator badge is still referenced")
+	}
 	legend, canvas := strings.Index(html, `<div class="br-legend"`), strings.Index(html, `<div class="br-map"`)
 	if legend < 0 || canvas < legend {
 		t.Fatal("map legend must precede the canvas")
+	}
+}
+
+// TestDashboardHeaderAndServiceChips protects the space reserved for signed-in
+// controls and the readable label shared by service tags and the device drawer.
+func TestDashboardHeaderAndServiceChips(t *testing.T) {
+	html := string(dashboardHTML)
+	for _, rule := range []string{
+		"@media (max-width: 1240px)", ".nav-pills { order: 3; width: 100%;",
+		".hdr-r .status-pill { min-width: 0; max-width: 100%; }",
+		"#status-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+		"flex: 0 1 420px;", `if (lbl.includes("ssh-key-accepted")) return "SSH key invited" + suffix;`,
+	} {
+		if !strings.Contains(html, rule) {
+			t.Errorf("dashboard missing %q", rule)
+		}
 	}
 }

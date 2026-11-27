@@ -818,7 +818,7 @@ func findingEndpoints(chk *Check, hp probe.HostProfile, port int) []findingEndpo
 		if svc.Port == port && slices.ContainsFunc(chk.Preconditions.ServiceProtoAny, func(want string) bool {
 			return strings.EqualFold(want, svc.Protocol)
 		}) {
-			add(svc.Transport, svc.AddressFamily, nil)
+			add(svc.Transport, svc.AddressFamily, []string{hp.ServiceIP(svc)})
 		}
 	}
 	if chk.compiled.upnpDevice != nil || chk.compiled.upnpService != nil {

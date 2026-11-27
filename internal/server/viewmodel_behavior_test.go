@@ -1353,6 +1353,151 @@ func TestDualStackIPv4PortForwardDoesNotMarkIPv6ServiceWAN(t *testing.T) {
 	})
 }
 
+// TestIPv6ServiceForwardMatchesObservedIP keeps identical listeners on different
+// addresses separate when only one address receives traffic from the internet.
+func TestIPv6ServiceForwardMatchesObservedIP(t *testing.T) {
+	cl := unifi.Client{IPv6: []string{"2001:db8::1", "2001:db8::2"}}
+	hp := probe.HostProfile{Client: cl, ProbeIP: cl.IPv6[0], Services: []probe.Service{
+		{Port: 443, Protocol: "https", AddressFamily: "ipv6"},
+		{Port: 443, Protocol: "https", AddressFamily: "ipv6", IP: cl.IPv6[1]},
+	}}
+	forward := unifi.PortForward{Enabled: true, Proto: "tcp", FwdPort: "443"}
+	for i, ip := range cl.IPv6 {
+		forward.FwdIP = ip
+		rows := buildHostServices(ClientView{Client: cl}, hp, []risk.ExposureAssessment{{Forward: forward}}, false, false)
+		if len(rows) != 2 || rows[i].Reachable != "wan" || rows[1-i].Reachable != "lan" {
+			t.Fatalf("forward to %s: got %+v", ip, rows)
+		}
+		f := checks.Finding{Client: cl, Port: 443, ObservedIPs: []string{cl.IPv6[1-i]}}
+		if idx := findMatchingServiceIndex(rows, f); idx != 1-i {
+			t.Errorf("finding on %s matched row %d, want %d", cl.IPv6[1-i], idx, 1-i)
+		}
+	}
+}
+
+// TestForwardedIPv6OpenPort keeps the scanned listener alongside a protocol
+// observed on the same port at another address.
+func TestForwardedIPv6OpenPort(t *testing.T) {
+	cl := unifi.Client{IPv6: []string{"2001:db8::1", "2001:db8::2"}}
+	hp := probe.HostProfile{Client: cl, ProbeIP: cl.IPv6[1], OpenPorts: []int{443}, Services: []probe.Service{
+		{IP: cl.IPv6[0], Port: 443, Protocol: "https"},
+	}}
+	for _, target := range cl.IPv6 {
+		wan := []risk.ExposureAssessment{{Forward: unifi.PortForward{Enabled: true, Proto: "tcp", FwdIP: target, FwdPort: "443"}}}
+		rows := buildHostServices(ClientView{Client: cl, OpenPorts: hp.OpenPorts}, hp, wan, false, false)
+		if len(rows) != 2 {
+			t.Fatalf("forward to %s: want both IPv6 listeners, got %+v", target, rows)
+		}
+		for _, tc := range []struct{ ip, state string }{
+			{hp.ProbeIP, probe.ServiceStateCandidatePort},
+			{cl.IPv6[0], probe.ServiceStateObservedProtocol},
+		} {
+			reach := "lan"
+			if tc.ip == target {
+				reach = "wan"
+			}
+			i := findMatchingServiceIndex(rows, checks.Finding{Port: 443, ObservedIPs: []string{tc.ip}})
+			if i < 0 || rows[i].Reachable != reach || rows[i].State != tc.state || rows[i].AddressFamily != "ipv6" {
+				t.Errorf("listener %s: want %s (%s), got %+v", tc.ip, reach, tc.state, rows)
+			}
+		}
+	}
+}
+
+// TestAddresslessServiceCoversScannedPort checks that a scan reuses an
+// addressless observation unless the scanned address has its own WAN forward.
+func TestAddresslessServiceCoversScannedPort(t *testing.T) {
+	cl := unifi.Client{IP: "192.0.2.1", IPv6: []string{"2001:db8::1"}}
+	hp := probe.HostProfile{Client: cl, OpenPorts: []int{3000}, Services: []probe.Service{{Port: 3000, Protocol: "http"}}}
+	cv := ClientView{Client: cl, OpenPorts: hp.OpenPorts}
+	finding := checks.Finding{Port: 3000, ObservedIPs: []string{cl.IP}}
+
+	t.Run("without_forward", func(t *testing.T) {
+		rows := buildHostServices(cv, hp, nil, false, false)
+		if len(rows) != 1 || rows[0].Name != "http" || rows[0].Reachable != "lan" {
+			t.Fatalf("want one LAN HTTP row, got %+v", rows)
+		}
+		if i := findMatchingServiceIndex(rows, finding); i != 0 {
+			t.Errorf("IPv4 finding matched row %d, want 0", i)
+		}
+	})
+
+	t.Run("ipv6_http_with_ipv4_scan", func(t *testing.T) {
+		client := unifi.Client{IP: cl.IP, IPv6: []string{"2001:db8::1", "2001:db8::2"}}
+		profile := probe.HostProfile{
+			Client:    client,
+			OpenPorts: []int{3000},
+			Services:  []probe.Service{{Port: 3000, Protocol: "http", AddressFamily: "ipv6"}},
+		}
+		rows := buildHostServices(ClientView{Client: client, OpenPorts: profile.OpenPorts}, profile, nil, false, false)
+		if len(rows) != 2 {
+			t.Fatalf("want separate IPv4 scan and IPv6 HTTP rows, got %+v", rows)
+		}
+		i := findMatchingServiceIndex(rows, finding)
+		if i < 0 || rows[i].AddressFamily != "ipv4" || rows[i].State != probe.ServiceStateCandidatePort {
+			t.Fatalf("IPv4 finding should match the scanned IPv4 port, got row %d in %+v", i, rows)
+		}
+		if s := rows[1-i]; s.AddressFamily != "ipv6" || s.Name != "http" {
+			t.Errorf("want an IPv6 HTTP row, got %+v", s)
+		}
+	})
+
+	t.Run("with_ipv4_forward", func(t *testing.T) {
+		wan := []risk.ExposureAssessment{{Forward: unifi.PortForward{Enabled: true, Proto: "tcp", FwdIP: cl.IP, FwdPort: "3000"}}}
+		rows := buildHostServices(cv, hp, wan, false, false)
+		if len(rows) != 2 {
+			t.Fatalf("want separate LAN and WAN rows, got %+v", rows)
+		}
+		i := findMatchingServiceIndex(rows, finding)
+		if i < 0 || rows[i].Reachable != "wan" || rows[i].State != probe.ServiceStateCandidatePort {
+			t.Fatalf("IPv4 finding should match the WAN candidate, got row %d in %+v", i, rows)
+		}
+		if s := rows[1-i]; s.Name != "http" || s.Reachable != "lan" {
+			t.Errorf("want the addressless HTTP row to remain on the LAN, got %+v", s)
+		}
+	})
+}
+
+// TestAddresslessServiceReachability covers legacy observations that could
+// belong to either IPv6 listener on a host.
+func TestAddresslessServiceReachability(t *testing.T) {
+	cl := unifi.Client{IPv6: []string{"2001:db8::1", "2001:db8::2"}}
+	hp := probe.HostProfile{Client: cl, Services: []probe.Service{{AddressFamily: "ipv6", Port: 443, Protocol: "https"}}}
+	wan := []risk.ExposureAssessment{{Forward: unifi.PortForward{Enabled: true, Proto: "tcp", FwdIP: cl.IPv6[0], FwdPort: "443"}}}
+	rows := buildHostServices(ClientView{Client: cl}, hp, wan, false, false)
+	if len(rows) != 1 || rows[0].Reachable != "lan" {
+		t.Fatalf("want a LAN service for the unresolved address, got %+v", rows)
+	}
+	hp.Services = append(hp.Services, probe.Service{IP: cl.IPv6[0], Port: 443, Protocol: "https"})
+	rows = buildHostServices(ClientView{Client: cl}, hp, wan, false, false)
+	for i, reach := range []string{"wan", "lan"} {
+		f := checks.Finding{Port: 443, ObservedIPs: []string{cl.IPv6[i]}}
+		if idx := findMatchingServiceIndex(rows, f); idx < 0 || rows[idx].Reachable != reach {
+			t.Errorf("finding on %s: want %s, matched row %d in %+v", cl.IPv6[i], reach, idx, rows)
+		}
+	}
+}
+
+// TestMergedServiceMatchesEveryAddress keeps findings on the merged row
+// regardless of how many observations came from the same family.
+func TestMergedServiceMatchesEveryAddress(t *testing.T) {
+	cl := unifi.Client{IP: "192.0.2.1", IPv6: []string{"2001:db8::1", "2001:db8::2"}}
+	hp := probe.HostProfile{Client: cl, Services: []probe.Service{
+		{IP: cl.IP, AddressFamily: "ipv4", Port: 443, Protocol: "https"},
+		{IP: cl.IPv6[0], AddressFamily: "ipv6", Port: 443, Protocol: "https"},
+		{IP: cl.IPv6[1], AddressFamily: "ipv6", Port: 443, Protocol: "https"},
+	}}
+	rows := buildHostServices(ClientView{Client: cl}, hp, nil, false, false)
+	if len(rows) != 1 || rows[0].AddressFamily != "" {
+		t.Fatalf("want one dual-stack row, got %+v", rows)
+	}
+	for _, ip := range cl.AllIPs() {
+		if i := findMatchingServiceIndex(rows, checks.Finding{Port: 443, ObservedIPs: []string{ip}}); i != 0 {
+			t.Errorf("finding on %s matched row %d, want 0", ip, i)
+		}
+	}
+}
+
 func TestDualStackHomeKitFindingDashboardRowFollowsObservedEndpoint(t *testing.T) {
 	all, err := checks.LoadFromFS(embedded.BuiltinFS)
 	if err != nil {

@@ -654,12 +654,19 @@ func (b *builder) routes() {
 				}
 			}
 			for _, s := range byHost[a.host] {
-				if _, observed := b.ids[s.fact()]; !observed || !owns(a.client, s.ip) {
+				to := s.fact()
+				if _, observed := b.ids[to]; !observed || !owns(a.client, s.ip) {
 					continue
 				}
 				dst := pin(a.client, s.ip)
 				c := b.Oracle.Service(pos, dst, s.proto, s.port, family(s.ip))
-				b.lateral(pos, from, s.fact(), a.client.NetworkID, c, &deferredEgress)
+				b.lateral(pos, from, to, a.client.NetworkID, c, &deferredEgress)
+				if sameNet {
+					to.kind = localEndpoint
+					if _, ok := b.ids[to]; ok {
+						b.lateral(pos, from, to, a.client.NetworkID, c, &deferredEgress)
+					}
+				}
 			}
 		}
 	}

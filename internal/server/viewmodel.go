@@ -72,6 +72,8 @@ type ServiceView struct {
 	Exposed          bool   `json:"exposed,omitempty"`
 	Severity         string `json:"severity,omitempty"`
 	Label            string `json:"label,omitempty"`
+	// observedIPs keeps later findings on the service row that supplied their address.
+	observedIPs []netip.Addr
 }
 
 // Entity is a stably-identified node shared across both lenses, the Inventory
@@ -818,13 +820,13 @@ func BuildPresentationModel(
 	}
 
 	// Index WAN forwards by target IP (supporting both IPv4 and IPv6).
-	wanByIP := make(map[string][]risk.ExposureAssessment)
+	wanByIP := make(map[netip.Addr][]risk.ExposureAssessment)
 	for _, a := range report.WANSurface {
 		ip := a.Forward.FwdIP
 		if ip == "" {
 			ip = a.Client.PrimaryIP()
 		}
-		if k := strings.ToLower(strings.TrimSpace(ip)); k != "" {
+		if k := serviceAddr(ip); k.IsValid() {
 			wanByIP[k] = append(wanByIP[k], a)
 		}
 	}
@@ -847,7 +849,7 @@ func BuildPresentationModel(
 	lookupWANForIPs := func(ips []string) []risk.ExposureAssessment {
 		var out []risk.ExposureAssessment
 		for _, ip := range ips {
-			out = append(out, wanByIP[strings.ToLower(strings.TrimSpace(ip))]...)
+			out = append(out, wanByIP[serviceAddr(ip)]...)
 		}
 		return out
 	}
@@ -2555,6 +2557,23 @@ func portForwardAddressFamily(pf unifi.PortForward) string {
 	}
 }
 
+// serviceAddr gives service observations and forward targets a common address key.
+func serviceAddr(ip string) netip.Addr {
+	addr, _ := netip.ParseAddr(strings.TrimSpace(ip))
+	return addr.Unmap()
+}
+
+// serviceAddrs retains the exact listeners available for matching later findings.
+func serviceAddrs(ips ...string) []netip.Addr {
+	var addrs []netip.Addr
+	for _, ip := range ips {
+		if addr := serviceAddr(ip); addr.IsValid() {
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs
+}
+
 func forwardMatchesAddressFamily(pf unifi.PortForward, svcFam string) bool {
 	sf := strings.ToLower(strings.TrimSpace(svcFam))
 	if sf == "" {
@@ -2669,10 +2688,15 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			}
 		}
 	}
-	// Decide WAN reachability for any observed (port, transport, addressFamily)
-	// directly via Forward.ExposesEndpoint and address-family matching so an
-	// IPv4-only port forward never marks an IPv6 service row as WAN-reachable.
-	wanReachForEndpoint := func(port int, transport, addrFamily string) (string, bool, bool) {
+	defaultReach := "lan"
+	if vlanIsolated {
+		defaultReach = "vlan-only"
+	}
+	// A forward targets one listener address even when several share a port and family.
+	wanReachForEndpoint := func(port int, transport, addrFamily string, ip netip.Addr) (string, bool) {
+		if !ip.IsValid() {
+			return defaultReach, false
+		}
 		matched := false
 		scope := wanRestricted
 		for _, a := range wan {
@@ -2682,20 +2706,20 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			if !forwardMatchesAddressFamily(a.Forward, addrFamily) {
 				continue
 			}
+			if target := serviceAddr(firstStr(a.Forward.FwdIP, a.Client.PrimaryIP())); target != ip {
+				continue
+			}
 			matched = true
 			scope = max(scope, forwardSourceScope(a.Forward))
 		}
 		if !matched {
-			return "", false, false
+			return defaultReach, false
 		}
-		return scope.reachLabel(behindCGNAT), scope == wanRestricted, true
+		return scope.reachLabel(behindCGNAT), scope == wanRestricted
 	}
 
-	// Group observed services by (transport, port), preserving distinct protocols
-	// or distinct WAN reachability across IPv4/IPv6 (e.g., IPv4 HTTPS forwarded
-	// to WAN vs. IPv6 MQTT or IPv6 HTTPS on LAN only) while collapsing duplicate
-	// rows when both families share the same protocol and reachability.
-	servicesByEndpoint := make(map[string][]probe.Service)
+	// Merge observations only after each listener has its own reachability label.
+	servicesByEndpoint := make(map[string][]ServiceView)
 	for _, svc := range hp.Services {
 		if svc.Port <= 0 {
 			continue
@@ -2705,42 +2729,37 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 			t = "tcp"
 		}
 		epKey := fmt.Sprintf("%s:%d", t, svc.Port)
-		normProto := strings.ToLower(strings.TrimSpace(svc.Protocol))
-		normFam := strings.ToLower(strings.TrimSpace(svc.AddressFamily))
+		listenerIP := hp.ServiceIP(svc)
+		normFam := cmp.Or(probe.IPFamily([]string{listenerIP}), strings.ToLower(strings.TrimSpace(svc.AddressFamily)))
+		ip := serviceAddr(listenerIP)
+		reach, restricted := wanReachForEndpoint(svc.Port, t, normFam, ip)
+		name := strings.TrimSpace(svc.Protocol)
 		existing := servicesByEndpoint[epKey]
 		merged := false
 		for i := range existing {
-			exProto := strings.ToLower(strings.TrimSpace(existing[i].Protocol))
-			exFam := strings.ToLower(strings.TrimSpace(existing[i].AddressFamily))
-			if exProto == normProto {
-				if exFam != "" && normFam != "" && exFam != normFam {
-					exReach, exRestr, exWAN := wanReachForEndpoint(svc.Port, t, exFam)
-					normReach, normRestr, normWAN := wanReachForEndpoint(svc.Port, t, normFam)
-					if exWAN != normWAN || exReach != normReach || exRestr != normRestr {
-						continue
-					}
-					existing[i].AddressFamily = ""
-				} else if exFam == "" && normFam != "" {
-					existing[i].AddressFamily = normFam
-				}
-				if existing[i].State == "" && svc.State != "" {
-					existing[i].State = svc.State
-				}
-				merged = true
-				break
+			row := &existing[i]
+			if !strings.EqualFold(row.Name, name) || row.Reachable != reach || row.SourceRestricted != restricted {
+				continue
 			}
+			// A mixed row stays family-neutral when more observations arrive.
+			if row.AddressFamily != normFam {
+				row.AddressFamily = ""
+			}
+			row.State = firstStr(row.State, svc.State)
+			if ip.IsValid() && !slices.Contains(row.observedIPs, ip) {
+				row.observedIPs = append(row.observedIPs, ip)
+			}
+			merged = true
+			break
 		}
 		if !merged {
-			cp := svc
-			cp.Transport = t
-			cp.AddressFamily = normFam
-			servicesByEndpoint[epKey] = append(existing, cp)
+			row := ServiceView{Port: svc.Port, Proto: t, AddressFamily: normFam, Name: name, State: svc.State,
+				Reachable: reach, SourceRestricted: restricted}
+			if ip.IsValid() {
+				row.observedIPs = []netip.Addr{ip}
+			}
+			servicesByEndpoint[epKey] = append(existing, row)
 		}
-	}
-
-	defaultReach := "lan"
-	if vlanIsolated {
-		defaultReach = "vlan-only"
 	}
 
 	formatServiceLabel := func(name, transport string, port int, fam string, multiOnPort bool) string {
@@ -2758,105 +2777,51 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		return base
 	}
 
-	hostDefaultFamily := ""
-	if strings.TrimSpace(cv.Client.IP) == "" && len(cv.Client.IPv6) > 0 {
-		hostDefaultFamily = "ipv6"
-	} else if strings.TrimSpace(cv.Client.IP) != "" && len(cv.Client.IPv6) == 0 {
-		hostDefaultFamily = "ipv4"
+	// Older scans used the client's IPv4 address. Without a recorded probe
+	// target, an IPv6-only scan can be attributed to a single inventory address.
+	openIP := firstStr(hp.ProbeIP, cv.Client.IP)
+	if openIP == "" && len(cv.Client.IPv6) == 1 {
+		openIP = cv.Client.IPv6[0]
 	}
+	openAddr := serviceAddr(openIP)
+	openFamily := probe.IPFamily([]string{openIP})
 
 	var out []ServiceView
 	seen := make(map[string]bool)
-	emitObservedEndpoint := func(epKey string, port int, transport string) {
+	emitObservedEndpoint := func(epKey string, port int, transport string, open bool) {
 		if seen[epKey] {
 			return
 		}
 		seen[epKey] = true
 		svcs := servicesByEndpoint[epKey]
-		if len(svcs) == 0 {
-			reach := defaultReach
-			srcRestricted := false
-			if lbl, restr, ok := wanReachForEndpoint(port, transport, hostDefaultFamily); ok {
-				reach = lbl
-				srcRestricted = restr
-			}
-			name := commonPortLabel(port)
-			state := probe.ServiceStateCandidatePort
-			if transport == "tcp" && hasOpenPort(hp.ConnectOnlyPorts, port) {
-				state = "connect-only"
-			}
-			out = append(out, ServiceView{
-				Port:             port,
-				Proto:            transport,
-				Name:             name,
-				Reachable:        reach,
-				State:            state,
-				SourceRestricted: srcRestricted,
-				Label:            formatServiceLabel(name, transport, port, "", false),
+		if open {
+			reach, restricted := wanReachForEndpoint(port, transport, openFamily, openAddr)
+			// A protocol observed at another address leaves the scanned listener unidentified.
+			// An addressless observation may be this listener, but cannot carry its forward.
+			observed := slices.ContainsFunc(svcs, func(s ServiceView) bool {
+				return slices.Contains(s.observedIPs, openAddr) || (len(s.observedIPs) == 0 && (s.AddressFamily == "" || s.AddressFamily == openFamily) && reach == defaultReach)
 			})
-			return
-		}
-		// If this open TCP port was only observed via IPv6 (for example from a
-		// passive flow record) on a dual-stack host that also has an IPv4 WAN
-		// port forward on the same port, synthesize the IPv4 WAN row so the
-		// internet-exposed IPv4 endpoint is never hidden as LAN-only.
-		addIPv4WAN := false
-		var ipv4WANReach string
-		var ipv4WANRestr bool
-		if transport == "tcp" && strings.TrimSpace(cv.Client.IP) != "" && hasOpenPort(cv.OpenPorts, port) {
-			hasIPv4OrGeneric := false
-			for _, svc := range svcs {
-				if svc.AddressFamily == "" || svc.AddressFamily == "ipv4" {
-					hasIPv4OrGeneric = true
-					break
+			if len(svcs) == 0 || (openAddr.IsValid() && !observed) {
+				state := probe.ServiceStateCandidatePort
+				if hasOpenPort(hp.ConnectOnlyPorts, port) {
+					state = "connect-only"
 				}
-			}
-			if !hasIPv4OrGeneric {
-				if lbl, restr, ok := wanReachForEndpoint(port, transport, "ipv4"); ok {
-					addIPv4WAN = true
-					ipv4WANReach = lbl
-					ipv4WANRestr = restr
-				}
+				svcs = append(svcs, ServiceView{
+					Port: port, Proto: transport, AddressFamily: openFamily, State: state,
+					Reachable: reach, SourceRestricted: restricted, observedIPs: serviceAddrs(openIP),
+				})
 			}
 		}
-
-		multi := len(svcs) > 1 || addIPv4WAN
 		for _, svc := range svcs {
-			reach := defaultReach
-			srcRestricted := false
-			if lbl, restr, ok := wanReachForEndpoint(port, transport, svc.AddressFamily); ok {
-				reach = lbl
-				srcRestricted = restr
-			}
-			name := firstStr(svc.Protocol, commonPortLabel(port))
-			out = append(out, ServiceView{
-				Port:             port,
-				Proto:            transport,
-				AddressFamily:    svc.AddressFamily,
-				Name:             name,
-				Reachable:        reach,
-				State:            firstStr(svc.State, probe.ServiceStateObservedProtocol),
-				SourceRestricted: srcRestricted,
-				Label:            formatServiceLabel(name, transport, port, svc.AddressFamily, multi),
-			})
-		}
-		if addIPv4WAN {
-			name := commonPortLabel(port)
-			out = append(out, ServiceView{
-				Port:             port,
-				Proto:            transport,
-				AddressFamily:    "ipv4",
-				Name:             name,
-				Reachable:        ipv4WANReach,
-				State:            probe.ServiceStateCandidatePort,
-				SourceRestricted: ipv4WANRestr,
-				Label:            formatServiceLabel(name, transport, port, "ipv4", multi),
-			})
+			svc.Name = firstStr(svc.Name, commonPortLabel(port))
+			svc.State = firstStr(svc.State, probe.ServiceStateObservedProtocol)
+			svc.Label = formatServiceLabel(svc.Name, transport, port, svc.AddressFamily, len(svcs) > 1)
+			out = append(out, svc)
 		}
 	}
 
 	for _, p := range cv.OpenPorts {
-		emitObservedEndpoint(fmt.Sprintf("tcp:%d", p), p, "tcp")
+		emitObservedEndpoint(fmt.Sprintf("tcp:%d", p), p, "tcp", true)
 	}
 	// Include observed UDP or passive services from hp.Services that were not in TCP OpenPorts.
 	for _, svc := range hp.Services {
@@ -2867,7 +2832,7 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		if t == "" {
 			t = "tcp"
 		}
-		emitObservedEndpoint(fmt.Sprintf("%s:%d", t, svc.Port), svc.Port, t)
+		emitObservedEndpoint(fmt.Sprintf("%s:%d", t, svc.Port), svc.Port, t, false)
 	}
 	// Also record UDP-only WAN forwards as distinct UDP endpoints in deterministic
 	// sorted port order so a UDP forward never conflates with a TCP service.
@@ -2951,17 +2916,29 @@ func isSnapshotWANBehindCGNAT(snap *unifi.Snapshot) bool {
 	return cgnat.Contains(addr)
 }
 
+// findMatchingServiceIndex prefers listener addresses and falls back to legacy
+// rows when the finding and service lack a shared address.
 func findMatchingServiceIndex(services []ServiceView, f checks.Finding) int {
 	proto := f.EffectiveTransport()
-	family := probe.IPFamily(f.EndpointIPs())
-	var matches []int
-	for i := range services {
-		if (family == "ipv4" || family == "ipv6") && services[i].AddressFamily != "" && services[i].AddressFamily != family {
+	ips := f.EndpointIPs()
+	family := probe.IPFamily(ips)
+	addrs := serviceAddrs(ips...)
+	var matches, exact []int
+	for i, svc := range services {
+		if (family == "ipv4" || family == "ipv6") && svc.AddressFamily != "" && svc.AddressFamily != family {
 			continue
 		}
-		if services[i].Port == f.Port && strings.EqualFold(services[i].Proto, proto) {
-			matches = append(matches, i)
+		if svc.Port != f.Port || !strings.EqualFold(svc.Proto, proto) {
+			continue
 		}
+		if len(addrs) == 0 || len(svc.observedIPs) == 0 {
+			matches = append(matches, i)
+		} else if slices.ContainsFunc(addrs, func(ip netip.Addr) bool { return slices.Contains(svc.observedIPs, ip) }) {
+			exact = append(exact, i)
+		}
+	}
+	if len(exact) > 0 {
+		matches = exact
 	}
 	if len(matches) == 0 {
 		return -1
@@ -3030,6 +3007,7 @@ func recordObservedService(ent *Entity, f checks.Finding) {
 		Name:          commonPortLabel(f.Port),
 		Reachable:     reach,
 		State:         obsState,
+		observedIPs:   serviceAddrs(f.EndpointIPs()...),
 		Exposed:       false,
 		Label:         compactCheckChip(f),
 	})
@@ -3077,6 +3055,7 @@ func markServiceExposed(ent *Entity, f checks.Finding, endpointWAN []risk.Exposu
 		SourceRestricted: srcRestricted,
 		Exposed:          true,
 		Severity:         newSev,
+		observedIPs:      serviceAddrs(f.EndpointIPs()...),
 		Label:            compactCheckChip(f),
 	})
 }

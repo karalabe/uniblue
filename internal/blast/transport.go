@@ -107,17 +107,19 @@ func inboundSurfaces(hp probe.HostProfile) []TransportSurvival {
 		services[endpoint{ip, "tcp", port}] = probe.Service{}
 	}
 	for _, svc := range hp.Services {
-		for _, addr := range serviceIPs(hp, svc.AddressFamily) {
-			k := endpoint{addr, cmp.Or(svc.Transport, "tcp"), svc.Port}
-			// A candidate port alone cannot establish encryption or authentication.
-			if svc.State != "" && svc.State != probe.ServiceStateObservedProtocol && svc.State != probe.ServiceStateTLSUnknownApp && svc.State != probe.ServiceStateOwnerDeclared && svc.State != probe.ServiceStateAdvertisedService {
-				if _, ok := services[k]; !ok {
-					services[k] = probe.Service{}
-				}
-				continue
-			}
-			services[k] = svc
+		addr := hp.ServiceIP(svc)
+		if addr == "" {
+			continue
 		}
+		k := endpoint{addr, cmp.Or(svc.Transport, "tcp"), svc.Port}
+		// A candidate port alone cannot establish encryption or authentication.
+		if svc.State != "" && svc.State != probe.ServiceStateObservedProtocol && svc.State != probe.ServiceStateTLSUnknownApp && svc.State != probe.ServiceStateOwnerDeclared && svc.State != probe.ServiceStateAdvertisedService {
+			if _, ok := services[k]; !ok {
+				services[k] = probe.Service{}
+			}
+			continue
+		}
+		services[k] = svc
 	}
 	for port, banner := range hp.HTTP {
 		if banner.Scheme == "http" || banner.Scheme == "https" {

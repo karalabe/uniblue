@@ -163,14 +163,15 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
+    gap: 12px;
   }
-  .brand { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .brand { display: flex; align-items: center; flex-shrink: 0; gap: 10px; cursor: pointer; }
   .brand img { height: 28px; display: block; }
 
   .nav-pills {
     display: inline-flex;
+    flex-shrink: 0;
+    min-width: 0;
     align-items: center;
     gap: 4px;
     padding: 4px;
@@ -185,12 +186,13 @@
     color: var(--muted);
     padding: 7px 10px;
     border-radius: 9px;
-    font-size: 13.5px;
+    font-size: 13px;
+    white-space: nowrap;
     font-weight: 600;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
-    gap: 7px;
+    gap: 6px;
     transition: background .15s, color .15s, box-shadow .15s;
   }
   .nav-btn:hover { color: var(--text); }
@@ -211,7 +213,13 @@
   .nav-cnt.warn { background: var(--warn-bg); color: var(--warn); }
   .nav-cnt.blue { background: var(--blue-bg); color: var(--blue); }
 
-  .hdr-r { display: flex; align-items: center; gap: 10px; }
+  .hdr-r { display: flex; align-items: center; flex-shrink: 1; min-width: 0; gap: 8px; white-space: nowrap; }
+  .hdr-r .btn, .hdr-r .sdot { flex-shrink: 0; }
+  .hdr-r .status-pill { min-width: 0; max-width: 100%; }
+  #status-lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hdr-r:has(#logout-error:not(:empty)) { display: grid; grid-template-columns: minmax(0, auto) auto auto; row-gap: 2px; }
+  #logout-error:empty { display: none; }
+  #logout-error:not(:empty) { grid-column: 1 / -1; justify-self: end; font-size: 12px; color: var(--crit); }
   .status-pill {
     display: inline-flex;
     align-items: center;
@@ -452,11 +460,10 @@
   .story-why { font-size: 13px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
 
   .story-item {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
-    justify-content: space-between;
-    gap: 16px;
+    gap: 12px 16px;
     padding: 14px 22px;
     border-bottom: 1px solid var(--border);
     cursor: pointer;
@@ -464,10 +471,12 @@
   }
   .story-item:last-child { border-bottom: 0; }
   .story-item:hover { background: var(--surface-2); }
-  .story-item-l { min-width: 220px; flex: 1 1 260px; }
+  .story-item-l { min-width: 0; overflow-wrap: anywhere; }
   .story-item-name { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .story-item-sub { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
-  .story-item-r { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .story-item-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+  .story-item-tags .tag { max-width: 100%; white-space: normal; }
+  .story-item-r { justify-self: end; }
   .go-arrow { color: var(--muted); font-weight: 600; font-size: 13px; white-space: nowrap; }
   .story-item:hover .go-arrow { color: var(--blue); }
 
@@ -507,20 +516,43 @@
   .whatif-blind ul { margin: 6px 0 0 18px; padding: 0; }
   .whatif-blind li { margin: 3px 0; }
 
-  .priority-row { padding: 11px 20px; display: flex; align-items: baseline; gap: 10px; border-top: 1px solid var(--border); }
+  .priority-row { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 12px; align-items: start; padding: 13px 20px; border-top: 1px solid var(--border); }
+  .priority-row > .tag { width: 100%; justify-content: center; text-align: center; margin-top: 1px; }
   .priority-row .aq-meta:not(:empty) { margin-top: 4px; }
   .priority-copy { min-width: 0; }
-  .priority-reason { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .priority-reason { color: var(--muted); font-size: 12px; line-height: 1.45; margin-top: 2px; overflow-wrap: anywhere; }
   .br-panel, .br-kpi { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); min-width: 0; }
   #view-blast h1, #view-blast h2, #view-blast h3, #view-blast p { margin: 0; }
   #view-blast h1 { font-size: clamp(19px, 2vw, 23px); letter-spacing: -.035em; line-height: 1.25; }
   #view-blast h2 { font-size: 16px; letter-spacing: -.02em; line-height: 1.4; }
   .br-controls, .br-heading, .br-path-title, .br-tabs { display: flex; align-items: center; gap: 10px; }
   .br-controls { flex-wrap: wrap; padding: 10px 14px; font-size: 13px; font-weight: 650; }
-  .br-controls select { max-width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; }
+  .br-controls select {
+    appearance: none;
+    -webkit-appearance: none;
+    flex: 0 1 420px;
+    min-width: 0;
+    max-width: 100%;
+    min-height: 34px;
+    padding: 7px 34px 7px 11px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background-color: var(--surface);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='m3 6 5 5 5-5' fill='none' stroke='%2364748b' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-position: right 10px center;
+    background-size: 14px 14px;
+    background-repeat: no-repeat;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  .br-controls select:hover, .br-controls select:focus-visible { border-color: var(--blue); }
+  @media (prefers-color-scheme: dark) {
+    .br-controls select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='m3 6 5 5 5-5' fill='none' stroke='%2394a3b8' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
+  }
   .priority-head { flex-wrap: wrap; gap: 6px; }
   .priority-head .br-filters { margin: 0; }
-  .priority-pages { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 6px 16px; font-size: 12px; color: var(--muted); }
+  .priority-pages { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
   #view-blast .br-sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
   .br-segment { display: inline-flex; flex-wrap: wrap; padding: 3px; border: 1px solid var(--border); background: var(--surface-2); border-radius: 11px; }
   .br-control { appearance: none; color: var(--muted); border: 0; background: transparent; font: inherit; font-size: 12px; font-weight: 650; padding: 6px 9px; border-radius: 8px; cursor: pointer; }
@@ -619,12 +651,14 @@
   .br-radius meter::-webkit-meter-bar { background: var(--surface-3); border: 0; height: 6px; }
   .br-radius meter::-webkit-meter-optimum-value { background: var(--br-line); border-radius: 4px; }
   .br-radius meter::-moz-meter-bar { background: var(--br-line); }
+  @media (max-width: 1240px) {
+    .hdr-inner { flex-wrap: wrap; row-gap: 6px; padding-block: 6px; }
+    .nav-pills { order: 3; width: 100%; justify-content: safe center; overflow-x: auto; }
+    .br-inspector { top: 100px; }
+  }
   @media (max-width: 980px) {
     .br-workspace { grid-template-columns: 1fr; }
     .br-inspect-body { max-height: 480px; }
-    .hdr-inner { gap: 6px; padding-block: 6px; }
-    .nav-pills { order: 3; max-width: 100%; overflow-x: auto; }
-    .nav-btn { white-space: nowrap; }
   }
   @media (max-width: 700px) {
     .br-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -634,6 +668,10 @@
     .br-table table { min-width: 760px; }
   }
   @media (max-width: 500px) {
+    .hdr-inner { padding-inline: 10px; column-gap: 6px; }
+    .brand img { height: 22px; }
+    .hdr-r { max-width: calc(100% - 88px); gap: 4px; }
+    .hdr-r .btn, .hdr-r .status-pill { padding-inline: 6px; }
     .br-map { grid-template-columns: minmax(0, 1fr); }
   }
 
@@ -1082,8 +1120,8 @@
     user-select: none;
   }
   details.tech summary::-webkit-details-marker { display: none; }
-  details.tech summary::after { content: "▸"; color: var(--muted); transition: transform .15s; }
-  details.tech[open] summary::after { transform: rotate(90deg); }
+  details.tech summary::after { content: ""; width: 7px; height: 7px; flex-shrink: 0; margin-right: 3px; border: solid var(--muted); border-width: 0 2px 2px 0; transform: rotate(-45deg); transition: transform .15s; }
+  details.tech[open] summary::after { transform: rotate(45deg); }
   details.tech[open] summary { border-bottom: 1px solid var(--border); }
   .tech-body { padding: 14px 16px; }
   .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
@@ -1342,7 +1380,7 @@
       </button>
       <button class="nav-btn" data-tab="blast">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></svg>
-        Blast Radius <span id="nb-br" class="nav-cnt">Sim</span>
+        Blast Radius
       </button>
       <button class="nav-btn" data-tab="devices">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
@@ -1355,13 +1393,13 @@
     </nav>
 
     <div class="hdr-r">
-      <span id="status-pill" class="status-pill"><span class="sdot"></span><span id="status-lbl">Loading…</span></span>
+      <span id="status-pill" class="status-pill" title="Loading…"><span class="sdot"></span><span id="status-lbl">Loading…</span></span>
       <button id="rescan-btn" class="btn sm" data-action="rescan" title="Check all devices again">
         <svg class="icon" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
         Scan
       </button>
-      <span id="logout-error" role="status"></span>
       <button id="logout-btn" class="btn sm ghost" type="button" style="display:none" title="Sign out of dashboard session">Sign out</button>
+      <span id="logout-error" role="status"></span>
     </div>
   </div>
 </header>
@@ -1424,7 +1462,7 @@ let blastFixScope = "device";
 let blastInspector = "paths";
 let blastAllFixes = false;
 let blastAllDevices = false;
-let blastMode = "strict";
+let blastMode = "realistic";
 let blastPatient = "";
 let selectedInfraKey = "";
 const blastAppliedFixes = new Set();
@@ -1615,6 +1653,15 @@ function humanStateLabel(ent) {
 
 function humanServiceChip(svc) {
   const lbl = (svc.label || "").toLowerCase();
+  const port = svc.port || lbl.match(/:(\d+)$/)?.[1];
+  const suffix = port ? " :" + port : "";
+  if (lbl.includes("ssh-weak-kex") || lbl.startsWith("weak-kex")) return "Weak SSH key exchange" + suffix;
+  if (lbl.includes("ssh-weak-mac") || lbl.startsWith("weak-mac")) return "Legacy SSH MAC" + suffix;
+  if (lbl.includes("ssh-weak-cipher") || lbl.startsWith("weak-cipher")) return "Weak SSH cipher" + suffix;
+  if (lbl.includes("ssh-none-auth")) return "Unauthenticated SSH" + suffix;
+  if (lbl.includes("ssh-key-accepted")) return "SSH key invited" + suffix;
+  if (lbl.includes("ssh-shared-host-key") || lbl.includes("ssh-shared-key")) return "Shared SSH host key";
+  if (lbl.includes("ssh-host-key-change") || lbl.includes("ssh-key-change")) return "Changed SSH host key";
   if (lbl.includes("ipmi")) return "Hardware control (IPMI)";
   if (lbl.includes("redfish")) return "Server admin API";
   if (lbl.includes("bmc web")) return "Hardware web panel";
@@ -1768,6 +1815,11 @@ function humanReason(r, ent) {
       title: "Single-device socket carries extra hidden networks",
       why: "This socket only plugs into one regular device, so it doesn't need to carry your other networks.",
       fix: "In UniFi → Ports, change Tagged VLAN Management to 'Block All' on this port."
+    },
+    "UB-UNIFI-WIFI-NO-L2-ISOLATION": {
+      title: "Client Device Isolation is turned off" + (r.title?.match(/ \(.*\)$/)?.[0] || ""),
+      why: "Wireless devices on this Wi-Fi network can talk directly to each other.",
+      fix: "Turn on Client Device Isolation in the UniFi settings for this Wi-Fi network."
     },
     "UB-UNIFI-SSH-PASSWORD": {
       title: "Router allows password login over SSH",
@@ -2363,6 +2415,16 @@ function renderInitialSplash() {
     </div>`;
 }
 
+function setStatus(text, mode = "") {
+  const pill = document.getElementById("status-pill");
+  if (pill) {
+    pill.className = mode ? "status-pill " + mode : "status-pill";
+    pill.title = text;
+  }
+  const lbl = document.getElementById("status-lbl");
+  if (lbl) lbl.textContent = text;
+}
+
 function renderHeader() {
   const vm = state.view || { census: {}, queue: [], entities: {} };
   const c = vm.census || {};
@@ -2374,29 +2436,22 @@ function renderHeader() {
   const checking = Boolean(state.scanning || (state.scan_progress && state.scan_progress.initial));
   const sp = state.scan_progress;
 
-  const pill = document.getElementById("status-pill");
-  const lbl = document.getElementById("status-lbl");
   if (isStaticMode) {
-    pill.className = "status-pill";
-    lbl.textContent = "Saved Snapshot · " + fmtTime(state.updated_at);
+    setStatus("Saved Snapshot · " + fmtTime(state.updated_at));
     document.getElementById("rescan-btn").style.display = "none";
   } else if (sseDisconnected) {
-    pill.className = "status-pill";
-    lbl.textContent = sseSource ? "Reconnecting..." : "Offline (reconnecting...)";
+    setStatus(sseSource ? "Reconnecting..." : "Offline (reconnecting...)");
   } else if (checking) {
-    pill.className = "status-pill scanning";
     if (sp && sp.percent > 0) {
-      lbl.textContent = `Scanning ${sp.percent}%…`;
+      setStatus(`Scanning ${sp.percent}%…`, "scanning");
     } else {
       const done = Math.max(0, scannableCount - unassessed);
-      lbl.textContent = unassessed > 0 ? `Checking ${done}/${scannableCount}…` : "Checking network…";
+      setStatus(unassessed > 0 ? `Checking ${done}/${scannableCount}…` : "Checking network…", "scanning");
     }
   } else if (state.last_scan_error) {
-    pill.className = "status-pill";
-    lbl.textContent = "Scan error";
+    setStatus("Scan error");
   } else {
-    pill.className = "status-pill live";
-    lbl.textContent = "Live · " + fmtTime(state.updated_at);
+    setStatus("Live · " + fmtTime(state.updated_at), "live");
   }
 
   const q = vm.queue || [];
@@ -2421,10 +2476,6 @@ function renderHeader() {
     ckB.textContent = checking && !checkupTotal ? "…" : checkupTotal;
     ckB.className = "nav-cnt" + (checkupHasCrit ? " crit" : checkupTotal ? " warn" : checking ? " blue" : "");
   }
-
-  const blastBadge = document.getElementById("nb-br");
-  blastBadge.classList.toggle("blue", Boolean(vm.blast?.simulation?.nodes?.length));
-  blastBadge.title = (vm.blast?.simulation?.nodes?.length || 0) + " simulator devices";
 
   const openGates = c.open_wall_gates || 0;
   const hsB = document.getElementById("nb-hs");
@@ -2628,7 +2679,7 @@ function renderCheckup() {
     </div>
   </div>`;
 
-  html += `<div class="checkup-grid"><div>`;
+  html += `<div class="checkup-grid"><div><div class="section-kicker">Action Queue</div>`;
 
   const priorities = (vm.blast?.actions || []).filter(a => a.highest_tier_reduced && a.lane !== "verify" && (checkupLane === "all" || checkupLane === a.lane));
   checkupPage = Math.max(0, Math.min(checkupPage, Math.ceil(priorities.length / checkupPageSize) - 1));
@@ -2673,8 +2724,9 @@ function renderCheckup() {
         <div class="story-item-l">
           <div class="story-item-name">${esc(bmc.label)} <span class="tag ${humanStateTone(bmc)}">${esc(humanStateLabel(bmc))}</span></div>
           <div class="story-item-sub">On <strong>${esc(bmc.network_name || "main")}</strong> network${portEnt ? ` · Plugged into <strong>${esc(portEnt.label)}</strong>` : ""} · <span class="mono">${esc(bmc.ip)}</span></div>
+          ${chips ? `<div class="story-item-tags">${chips}</div>` : ""}
         </div>
-        <div class="story-item-r">${chips}<span class="go-arrow">Fix →</span></div>
+        <div class="story-item-r"><span class="go-arrow">Fix →</span></div>
       </div>`;
     }
     html += `</div>`;
@@ -2825,8 +2877,9 @@ function renderCheckup() {
         <div class="story-item-l">
           <div class="story-item-name">${esc(h.label)}</div>
           <div class="story-item-sub">${esc(humanRole(h.role, false))} · On <strong>${esc(h.network_name || "main")}</strong>${portEnt ? ` · ${esc(portEnt.label)}` : (h.essid ? ` · Wi-Fi: ${esc(h.essid)}` : "")}</div>
+          ${tags.length ? `<div class="story-item-tags">${tags.join("")}</div>` : ""}
         </div>
-        <div class="story-item-r">${tags.join("")}<span class="go-arrow">Details →</span></div>
+        <div class="story-item-r"><span class="go-arrow">Details →</span></div>
       </div>`;
     }
     html += `</div>`;
@@ -3038,9 +3091,17 @@ const blastEgress = new Map([
 ]);
 const blastTiers = {
   takeover: {rank: 0, tone: "crit", label: "Direct Takeover"},
-  pivot: {rank: 1, tone: "warn", label: "Admin Pivot"},
-  l2: {rank: 2, tone: "l2", label: "L2 Peer"},
+  likely: {rank: 1, tone: "warn", label: "Likely Risk"},
+  pivot: {rank: 2, tone: "warn", label: "Admin Pivot"},
+  l2: {rank: 3, tone: "l2", label: "L2 Exposure"},
   wan: {tone: "blue", label: "WAN entry"}
+};
+
+// Unverified routes follow the same evidence threshold as their reachable counterparts.
+const blastModeTiers = {
+  strict: new Set(["takeover", "unknown-takeover"]),
+  realistic: new Set(["takeover", "likely", "unknown-takeover", "unknown-likely"]),
+  worst: new Set(["takeover", "likely", "pivot", "l2", "unknown-takeover", "unknown-likely", "unknown"])
 };
 
 function blastTag(tone, label) {
@@ -3093,13 +3154,11 @@ function blastGraph(sim, applied = blastAppliedFixes) {
       continue;
     }
     const from = indices.get(edge.from);
-    if (from === undefined) continue;
-    // Unverified management and peer paths only participate in the worst-case simulation.
-    if (edge.tier === "unknown-takeover" || (edge.tier === "unknown" && blastMode === "worst")) {
+    if (from === undefined || !blastModeTiers[blastMode].has(edge.tier)) continue;
+    if (edge.tier.startsWith("unknown")) {
       unknown[from].add(to);
       continue;
     }
-    if (!blastTiers[edge.tier] || (blastMode === "strict" && edge.tier !== "takeover")) continue;
     const prev = outgoing[from].get(to);
     if (!prev || blastTiers[edge.tier].rank < blastTiers[prev.tier].rank) outgoing[from].set(to, edge);
   }
@@ -3113,22 +3172,33 @@ function blastReach(graph, root) {
   const hops = new Uint8Array(nodes.length);
   const via = new Array(nodes.length);
   const queue = [root];
-  const critical = [];
   let direct = 0;
   for (let head = 0; head < queue.length && queue.length < nodes.length; head++) {
     const from = queue[head];
     for (const {to, edge} of adjacency[from]) {
-      if (to === root || hops[to]) continue;
+      if (edge.tier === "l2" || to === root || hops[to]) continue;
       hops[to] = hops[from] + 1;
       via[to] = edge;
       queue.push(to);
       if (from === root) direct++;
-      if (nodes[to].tier === "crown" || nodes[to].tier === "high") critical.push(nodes[to]);
     }
   }
+  // Cascading routes take precedence even when a shorter L2 path exists. Only
+  // compromised nodes can expose peers, and the BFS order gives the nearest one first.
+  const order = queue.slice(1);
+  for (const from of queue) {
+    for (const {to, edge} of adjacency[from]) {
+      if (edge.tier !== "l2" || to === root || hops[to]) continue;
+      hops[to] = hops[from] + 1;
+      via[to] = edge;
+      order.push(to);
+    }
+  }
+  const l2Count = order.length - (queue.length - 1);
+  const critical = order.map(i => nodes[i]).filter(n => n.tier === "crown" || n.tier === "high");
   const unknown = new Set();
   for (const i of queue) for (const to of graph.unknown[i]) if (to !== root && !hops[to]) unknown.add(to);
-  return {root, hops, via, unknown, order: queue.slice(1), total: queue.length - 1, direct, critical};
+  return {root, hops, via, unknown, order, total: order.length, direct, l2Count, critical};
 }
 
 function blastRanking(graph) {
@@ -3193,8 +3263,8 @@ function blastMap(graph, row, inventoryCount) {
   return `<section class="br-panel"><div class="br-heading"><h2>Infection Map · ${esc(row.node.name)}</h2>
     <p class="br-sub">Pick a node to simulate a compromise. Use ↗ for device details.${esc(coverage)}</p></div>
     <div class="br-legend" aria-label="Map legend"><span class="br-crit"><b class="br-source">Source</b> Patient Zero</span>
-      <span class="br-crit"><b>H1/H2</b> Direct takeover</span><span class="br-warn"><b>H1/H2</b> Admin pivot</span>
-      <span class="br-l2"><b>L2</b> Same-VLAN peer</span><span class="br-unreached">Unreached</span>
+      <span class="br-crit"><b>H1/H2</b> Direct takeover</span><span class="br-warn"><b>H1/H2</b> Likely / Pivot</span>
+      <span class="br-l2"><b>L2</b> Same-VLAN exposure</span><span class="br-unreached">Unreached</span>
       <span class="br-neutral"><b>Unknown</b></span><span class="br-wan-line">WAN entry</span></div>
     <div class="br-map" id="blast-map">
       <svg class="br-svg" id="blast-connectors" aria-hidden="true"></svg>
@@ -3229,7 +3299,8 @@ function drawBlastSVG() {
     for (const [name, value] of Object.entries(attrs)) el.setAttribute(name, value);
     return el;
   };
-  const colors = {wan: "var(--blue)", takeover: "var(--crit-solid)", pivot: "var(--warn-solid)", l2: "var(--l2)"};
+  const colors = {wan: "var(--blue)", takeover: "var(--crit-solid)", likely: "var(--warn-solid)", pivot: "var(--warn-solid)", l2: "var(--l2)"};
+  const dashes = {pivot: "6 3", l2: "4 4", wan: "1 4"};
   const defs = element("defs", {});
   for (const [tier, fill] of Object.entries(colors)) {
     const marker = element("marker", {id: "br-tip-" + tier, viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 5, markerHeight: 5, orient: "auto"});
@@ -3251,7 +3322,7 @@ function drawBlastSVG() {
     const bend = Math.min(84, Math.max(12, Math.hypot(x2-x1, y2-y1) / 3));
     svg.append(element("path", {d: `M ${x1} ${y1} C ${x1+sx*bend} ${y1+sy*bend}, ${x2-sx*bend} ${y2-sy*bend}, ${x2} ${y2}`,
       "data-edge-to": edge.to, fill: "none", stroke: colors[edge.tier], "stroke-width": 1.7, "stroke-linecap": "round",
-      "stroke-dasharray": edge.tier === "wan" ? "1 4" : edge.tier === "l2" ? "5 4" : "none", "marker-end": "url(#br-tip-" + edge.tier + ")"}));
+      "stroke-dasharray": dashes[edge.tier] || "none", "marker-end": "url(#br-tip-" + edge.tier + ")"}));
   }
 }
 // Following the displayed predecessor edges keeps highlights on the same path
@@ -3278,8 +3349,13 @@ const blastMapObserver = new ResizeObserver(scheduleBlastSVG);
 
 function blastPaths(graph, reach) {
   const names = new Map(graph.nodes.map(n => [n.id, n.name]));
-  return ["Hop 1 (Direct Reach)", "Hop 2+ (Cascaded Pivot)"].map((heading, group) => {
-    const indices = reach.order.filter(i => (reach.hops[i] > 1) === Boolean(group));
+  const cascading = reach.total - reach.l2Count;
+  const groups = [
+    ["Hop 1 (Direct Reach)", reach.order.slice(0, reach.direct)],
+    ["Hop 2+ (Cascaded)", reach.order.slice(reach.direct, cascading)]
+  ];
+  if (reach.l2Count) groups.push(["Same-VLAN Exposure (L2, non-cascading)", reach.order.slice(cascading)]);
+  return groups.map(([heading, indices]) => {
     return `<div class="br-overline">${esc(heading)} · ${esc(indices.length)}</div>` + (indices.length ? indices.map(i => {
       const n = graph.nodes[i], edge = reach.via[i], tier = blastTiers[edge.tier];
       return `<button class="br-path" data-path-target="${esc(n.id)}" data-entity-id="${esc(n.entity_id)}"><span class="br-path-title"><strong>${esc(n.name)}</strong>
@@ -3316,10 +3392,10 @@ function blastDeviceCuts(sim, row) {
   if (!row) return cuts;
   const base = blastGraph(sim, new Set());
   const reach = blastReach(base, row.reach.root);
-  const sources = new Set([row.node.id, ...reach.order.map(i => base.nodes[i].id)]);
+  const sources = new Set([row.node.id, ...reach.order.filter(i => reach.via[i].tier !== "l2").map(i => base.nodes[i].id)]);
   for (const edge of sim.edges || []) {
     const relevant = edge.tier === "wan" ? edge.to === row.node.id :
-      sources.has(edge.from) && (blastMode === "worst" || ["takeover", "unknown-takeover"].includes(edge.tier));
+      sources.has(edge.from) && blastModeTiers[blastMode].has(edge.tier);
     if (relevant) for (const id of edge.cut_ids || []) cuts.add(id);
   }
   return cuts;
@@ -3402,8 +3478,9 @@ function renderBlast() {
   let html = `<section class="br-panel br-controls" aria-label="Blast Radius Simulator">
     <label for="blast-device">Simulate:</label><select id="blast-device" ${rows.length ? "" : "disabled"}>
       ${rows.map(r => `<option value="${esc(r.node.id)}" ${r === row ? "selected" : ""}>${esc(r.node.name)} (${esc(r.node.vlan)})</option>`).join("")}</select>
-    <div class="br-segment" role="group" aria-label="Simulation mode">${blastControl("mode", "strict", "Strict (Confirmed Vulns)", blastMode === "strict")}
-    ${blastControl("mode", "worst", "Worst-Case (Admin + L2 Pivot)", blastMode === "worst")}</div>
+    <div class="br-segment" role="group" aria-label="Simulation mode">${blastControl("mode", "strict", "Proven", blastMode === "strict")}
+    ${blastControl("mode", "realistic", "Realistic", blastMode === "realistic")}
+    ${blastControl("mode", "worst", "Worst-Case", blastMode === "worst")}</div>
     <div class="br-status">${blastTag(applied ? "ok" : "neutral", applied ? applied + " What-If " + (applied === 1 ? "fix" : "fixes") + " active" : "Live baseline")}
       ${applied ? '<button class="btn sm" data-action="blast-reset">Reset</button>' : ""}</div></section>`;
   let map = '<div class="br-panel br-empty">No inventory devices available to simulate.</div>';
@@ -3415,8 +3492,10 @@ function renderBlast() {
     const baseline = blastEgress.get(node.internet_state) || blastEgress.get("unknown");
     const blocked = node.egress_cut_ids?.length && node.egress_cut_ids.every(id => blastAppliedFixes.has(id));
     const egress = blocked ? blastEgress.get("local-only (policy)") : baseline;
+    const counts = [reach.direct + " direct", (reach.total - reach.direct - reach.l2Count) + " cascaded"];
+    if (reach.l2Count) counts.push(reach.l2Count + " L2 exposed");
     html += `<div class="br-kpis">` +
-      blastKPI("Blast Radius", reach.total, `/ ${peers} peers (${pct}%)`, `${reach.direct} direct (Hop 1) · ${reach.total - reach.direct} cascaded (Hop 2+)`, reach.total ? (pct >= 50 ? "crit" : "warn") : "ok") +
+      blastKPI("Blast Radius", reach.total, `/ ${peers} peers (${pct}%)`, counts.join(" · "), reach.total ? (pct >= 50 ? "crit" : "warn") : "ok") +
       blastKPI("Critical Devices Threatened", reach.critical.length, "", reach.critical.slice(0, 2).map(n => n.name).join(" · ") || "No high-value peers reached", reach.critical.length ? "crit" : "ok", reach.critical.slice(2).map(n => n.name)) +
       (node.role === "gateway" ? blastKPI("Internet Egress", "WAN Gateway", "", "Primary internet router", "neutral") : blastKPI("Internet Egress", egress.short, "", blocked ? "Simulated outbound block · Baseline: " + baseline.short : egress.detail, egress.tone)) +
       blastKPI("Initial Entry Exposure", exposure, "", [node.vlan, node.ip].filter(Boolean).join(" · "), weight > 2 ? "crit" : weight === 2 ? "warn" : "neutral") + "</div>";
@@ -4254,7 +4333,7 @@ function renderDrawer() {
     b += `<div class="dsec-t" style="margin-top:8px">Network Services &amp; Ports (${ent.services.length})</div>
       <div class="pills" style="margin-bottom:12px">
         ${ent.services.map(svc => `<span class="tag ${svc.exposed ? humanStateTone(svc.severity) : (svc.reachable === "wan" || svc.reachable === "wan-restricted" ? "blue" : "neutral")}">
-          <span class="mono">${esc(svc.label || (svc.proto + ":" + svc.port))}</span> · ${esc(reachMap[svc.reachable] || svc.reachable)}${svc.state && svc.state !== "observed-protocol" ? ` (${esc(svc.state)})` : ""}
+          <span class="mono">${esc(svc.exposed ? humanServiceChip(svc) : (svc.label || (svc.proto + ":" + svc.port)))}</span> · ${esc(reachMap[svc.reachable] || svc.reachable)}${svc.state && svc.state !== "observed-protocol" ? ` (${esc(svc.state)})` : ""}
         </span>`).join("")}
       </div>`;
   }
@@ -4490,10 +4569,7 @@ function showAuthOverlay(errMsg) {
     const inp = document.getElementById("auth-token-input");
     if (inp) inp.focus();
   }
-  const pill = document.getElementById("status-pill");
-  const lbl = document.getElementById("status-lbl");
-  if (pill) pill.className = "status-pill";
-  if (lbl) lbl.textContent = "Sign in required";
+  setStatus("Sign in required");
 }
 
 function hideAuthOverlay() {
@@ -4765,10 +4841,7 @@ function connectSSE() {
   });
   es.onerror = () => {
     sseDisconnected = true;
-    const pill = document.getElementById("status-pill");
-    const lbl = document.getElementById("status-lbl");
-    if (pill) pill.className = "status-pill";
-    if (lbl) lbl.textContent = es.readyState === EventSource.CLOSED ? "Offline (reconnecting...)" : "Reconnecting...";
+    setStatus(es.readyState === EventSource.CLOSED ? "Offline (reconnecting...)" : "Reconnecting...");
     if (es.readyState === EventSource.CLOSED) {
       try { es.close(); } catch (_) {}
       if (sseSource === es) sseSource = null;

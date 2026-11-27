@@ -25,14 +25,16 @@ const (
 	origin factKind = iota
 	position
 	endpoint
+	localEndpoint
 	consequence
 	permission
 	blocked
 	notice
 )
 
-// A fact has one identity across routes. Only endpoint facts carry an address;
-// consequences deliberately lose it so a surviving second family retains credit.
+// A fact has one identity across routes. Endpoint and same-network endpoint
+// facts carry the listener address. Consequences omit it so another address
+// can keep the same consequence reachable.
 type fact struct {
 	kind          factKind
 	asset, detail string
@@ -40,6 +42,11 @@ type fact struct {
 type edge struct {
 	to, cut, bundle, tagCut int
 	level                   uint8
+	// sameNetwork limits a listener grant to peers on its own network.
+	sameNetwork bool
+	// finding identifies the source of a conditional grant, which has no remedy ID.
+	// A one-based index leaves zero available for edges without a finding.
+	finding uint32
 }
 
 const (

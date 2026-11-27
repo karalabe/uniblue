@@ -85,11 +85,7 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 				transport = "tcp"
 			}
 
-			var targets []string
-			if hp.ProbeIP != "" {
-				targets = []string{hp.ProbeIP}
-			}
-			ips := observationIPs(hp.Client, svc.AddressFamily, targets)
+			ips := observationIPs(hp.Client, svc.AddressFamily, []string{hp.ServiceIP(svc)})
 			endpoint := hp.Client.PrimaryIP() + "|" + svc.AddressFamily + "|unknown"
 			if len(ips) == 1 {
 				endpoint = ips[0]

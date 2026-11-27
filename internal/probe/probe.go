@@ -127,6 +127,9 @@ type Service struct {
 	// AddressFamily records "ipv4" or "ipv6".
 	AddressFamily string `json:"address_family,omitempty"`
 
+	// IP identifies the listener when an observation was collected independently of ProbeIP.
+	IP string `json:"ip,omitempty"`
+
 	// Observer records the observer network or vantage point, when known.
 	Observer string `json:"observer,omitempty"`
 
@@ -250,6 +253,29 @@ func (h HostProfile) EffectiveProbeIP() string {
 		return ip
 	}
 	return SelectProbeIP(h.Client, nil)
+}
+
+// ServiceIP returns the observed listener address. Older observations with only
+// a family can be attributed to inventory when exactly one address matches.
+func (h HostProfile) ServiceIP(s Service) string {
+	if s.IP != "" {
+		return canonicalIPKey(s.IP)
+	}
+	if h.ProbeIP != "" && (s.AddressFamily == "" || ipFamilyOf(h.ProbeIP) == s.AddressFamily) {
+		return canonicalIPKey(h.ProbeIP)
+	}
+	var ip string
+	for _, raw := range h.Client.AllIPs() {
+		candidate := canonicalIPKey(raw)
+		if s.AddressFamily != "" && ipFamilyOf(candidate) != s.AddressFamily {
+			continue
+		}
+		if ip != "" && ip != candidate {
+			return ""
+		}
+		ip = candidate
+	}
+	return ip
 }
 
 // IsRawPrintPort reports whether port on this host is protected by the raw

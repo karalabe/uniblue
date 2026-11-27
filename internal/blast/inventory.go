@@ -267,12 +267,14 @@ func grantLevel(g checks.GrantSpec) uint8 {
 
 // grant attaches a service consequence to its specific listener and remedy so
 // independent findings supporting the same consequence survive a single cut.
-func (b *builder) grant(s socket, g checks.GrantSpec, id int) {
+func (b *builder) grant(s socket, from fact, g checks.GrantSpec, id int) *edge {
 	cf := fact{consequence, s.host, string(g.Effect)}
-	b.link(s.fact(), cf, grantLevel(g), id, 0)
+	e := b.link(from, cf, grantLevel(g), id, 0)
+	e.sameNetwork = g.SameNetwork
 	if b.isHighProfileSocket(s) {
-		b.markHighProfile(s.fact(), s.fact())
+		b.markHighProfile(from, from)
 	}
+	return e
 }
 
 type serviceBundleKey struct{ host, label string }
@@ -282,10 +284,10 @@ type serviceMember struct{ node, edge, port int }
 type serviceBundles map[serviceBundleKey][]serviceMember
 
 // record remembers the edge just linked to this listener, even if its adjacency list grows.
-func (groups serviceBundles) record(b *builder, s socket, label string) {
-	n := b.node(s.fact())
-	k := serviceBundleKey{s.host, label}
-	groups[k] = append(groups[k], serviceMember{n, len(b.edges[n]) - 1, s.port})
+func (groups serviceBundles) record(b *builder, from fact, port int, label string) {
+	n := b.ids[from]
+	k := serviceBundleKey{from.asset, label}
+	groups[k] = append(groups[k], serviceMember{n, len(b.edges[n]) - 1, port})
 }
 
 // bundleServices assigns a single remedy to all confirmed CVEs on a product or
@@ -335,7 +337,15 @@ func (b *builder) services() {
 	for _, c := range b.Checks {
 		byID[c.ID] = c
 	}
-	for _, f := range b.Findings {
+	onLink := map[socket]bool{}
+	for _, hp := range b.Profiles {
+		for _, md := range hp.MDNSServices {
+			if !md.Reflected && !md.Withdrawn {
+				onLink[socket{hostKey(hp.Client), address(md.ResponderIP), strings.ToLower(cmp.Or(md.Transport, "tcp")), md.Port}] = true
+			}
+		}
+	}
+	for i, f := range b.Findings {
 		c := byID[f.CheckID]
 		if f.Port == 0 {
 			continue
@@ -380,6 +390,15 @@ func (b *builder) services() {
 				}
 			}
 			for _, g := range grants {
+				from := s.fact()
+				if g.SameNetwork {
+					from.kind = localEndpoint
+					// Only a direct mDNS answer places this listener on the observer's link.
+					if onLink[s] {
+						b.link(root(TrustedLAN), from, trivial, 0, 0)
+						delete(onLink, s)
+					}
+				}
 				name := b.assets[host].name
 				id := "act:check:" + f.CheckID + ":" + host + ":" + strconv.Itoa(f.Port)
 				if s.proto != "tcp" {
@@ -391,8 +410,8 @@ func (b *builder) services() {
 					if req := strings.TrimRight(strings.TrimSpace(g.Requires), "."); req != "" {
 						reason = "Check whether this applies: " + req + "."
 					}
-					b.verify(s.fact(), f.CheckID, host+":"+serviceName(s.proto, s.port), title, reason)
-					b.grant(s, g, 0)
+					b.verify(from, f.CheckID, host+":"+serviceName(s.proto, s.port), title, reason)
+					b.grant(s, from, g, 0).finding = uint32(i + 1)
 				} else {
 					title := fmt.Sprintf("Require sign-in or disable %s on port %d", name, f.Port)
 					reason := cmp.Or(strings.TrimSpace(g.Note), strings.TrimSpace(f.Title), "Anyone who can reach this service can use it without signing in.")
@@ -402,9 +421,9 @@ func (b *builder) services() {
 						title = "Restrict SNMP read access on " + name
 					}
 					a := b.action(id, title, reason, lane, 1)
-					b.grant(s, g, a)
+					b.grant(s, from, g, a)
 					if lane == LaneFixNow && c != nil {
-						checkBundles.record(b, s, f.CheckID)
+						checkBundles.record(b, from, s.port, f.CheckID)
 					}
 				}
 			}
@@ -416,28 +435,26 @@ func (b *builder) services() {
 			b.socket(host, hp.EffectiveProbeIP(), "tcp", p)
 		}
 		for _, svc := range hp.Services {
-			ips := serviceIPs(hp, svc.AddressFamily)
-			for _, ip := range ips {
-				s, ok := b.socket(host, ip, svc.Transport, svc.Port)
-				if !ok {
-					continue
+			ip := hp.ServiceIP(svc)
+			s, ok := b.socket(host, ip, svc.Transport, svc.Port)
+			if !ok {
+				continue
+			}
+			trait, ok := classify.LookupProtocol(svc.Protocol)
+			if !ok || (svc.State != "" && svc.State != probe.ServiceStateObservedProtocol) {
+				continue
+			}
+			b.link(root(TrustedLAN), s.fact(), trivial, 0, 0)
+			if svc.Protocol == "dns" && s.port == 53 && b.Oracle.PrivateLANListener(hp.Client, ip, s.proto, s.port) {
+				continue
+			}
+			for _, effect := range trait.AnonGrants {
+				basis := checks.BasisConditional
+				if trait.AuthModel == classify.AuthNone || svc.AnonymousAccess {
+					basis = checks.BasisImplied
 				}
-				trait, ok := classify.LookupProtocol(svc.Protocol)
-				if !ok || (svc.State != "" && svc.State != probe.ServiceStateObservedProtocol) {
-					continue
-				}
-				b.link(root(TrustedLAN), s.fact(), trivial, 0, 0)
-				if svc.Protocol == "dns" && s.port == 53 && b.Oracle.PrivateLANListener(hp.Client, ip, s.proto, s.port) {
-					continue
-				}
-				for _, effect := range trait.AnonGrants {
-					basis := checks.BasisConditional
-					if trait.AuthModel == classify.AuthNone || svc.AnonymousAccess {
-						basis = checks.BasisImplied
-					}
-					a := b.action("act:service:"+host+":"+serviceName(s.proto, s.port), fmt.Sprintf("Limit who can use %s on %s", svc.Protocol, b.assets[host].name), "Restricting this service to devices that need it limits who can use its built-in access.", LaneReduceExposure, 1)
-					b.grant(s, checks.GrantSpec{Effect: effect, Basis: basis}, a)
-				}
+				a := b.action("act:service:"+host+":"+serviceName(s.proto, s.port), fmt.Sprintf("Limit who can use %s on %s", svc.Protocol, b.assets[host].name), "Restricting this service to devices that need it limits who can use its built-in access.", LaneReduceExposure, 1)
+				b.grant(s, s.fact(), checks.GrantSpec{Effect: effect, Basis: basis}, a)
 			}
 		}
 		for _, child := range hp.Children {
@@ -481,25 +498,6 @@ func (b *builder) services() {
 		}
 	}
 	b.publications()
-}
-
-// serviceIPs prefers the probed IP. Passive family observations without a single
-// concrete IP cannot pin a service to a specific listener.
-func serviceIPs(hp probe.HostProfile, fam string) []string {
-	ip := hp.EffectiveProbeIP()
-	if ip != "" && (fam == "" || family(ip) == fam) {
-		return []string{ip}
-	}
-	var ips []string
-	for _, raw := range hp.Client.AllIPs() {
-		if fam == "" || family(raw) == fam {
-			ips = append(ips, raw)
-		}
-	}
-	if len(ips) == 1 {
-		return ips
-	}
-	return nil
 }
 
 func family(ip string) string {
@@ -560,7 +558,10 @@ func (b *builder) cve(m cve.Match, bundles serviceBundles) {
 		if r.KEV {
 			d = trivial
 		}
-		if (r.PrivilegesRequired != "" && r.PrivilegesRequired != "N") || (r.UserInteraction != "" && r.UserInteraction != "N") {
+		// CVSS v2 records authentication in the vector itself.
+		metrics := strings.Split(strings.Trim(r.CVSSVector, "()"), "/")
+		if (r.PrivilegesRequired != "" && r.PrivilegesRequired != "N") || (r.UserInteraction != "" && r.UserInteraction != "N") ||
+			slices.Contains(metrics, "Au:S") || slices.Contains(metrics, "Au:M") {
 			d = moderate
 		}
 		a := b.action("act:patch:"+r.ID+":"+host, "Update "+b.assets[host].name+" to fix "+r.ID, "The running service version matches a known remote vulnerability.", LaneFixNow, 2)
@@ -577,7 +578,7 @@ func (b *builder) cve(m cve.Match, bundles serviceBundles) {
 		}
 		b.patchProducts[edge.to] = label
 		if m.Product.Label != "" {
-			bundles.record(b, s, m.Product.Label)
+			bundles.record(b, s.fact(), s.port, m.Product.Label)
 		}
 	}
 }
