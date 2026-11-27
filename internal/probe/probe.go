@@ -203,8 +203,9 @@ type HostProfile struct {
 	// SSH holds the host key, algorithms, and observed authentication posture.
 	SSH *SSHInfo `json:"ssh,omitempty"`
 
-	// SSHBanner stores the passive greeting line advertised on port 22 (e.g.,
-	// "SSH-2.0-OpenSSH_9.6p1"), read without attempting authentication.
+	// SSHBanner stores the passive SSH greeting line (e.g.,
+	// "SSH-2.0-OpenSSH_9.6p1") observed on port 22, 2222, an advertised
+	// _ssh._tcp listener, or an alternate-port backfill, without authenticating.
 	SSHBanner string `json:"ssh_banner,omitempty"`
 
 	// Services holds structured application-layer services identified on open
@@ -302,6 +303,8 @@ func (h HostProfile) IsRawPrintPort(port int) bool {
 	return false
 }
 
+// recordOpenPort records an open TCP port on h and marks it connect-only when
+// protected by the raw print or serial sink guard, returning true for sink ports.
 func (h *HostProfile) recordOpenPort(port int) bool {
 	h.OpenPorts = append(h.OpenPorts, port)
 	if !h.IsRawPrintPort(port) {
@@ -315,6 +318,7 @@ func (h *HostProfile) recordOpenPort(port int) bool {
 	return true
 }
 
+// hostOwnsIP reports whether candidate matches any IPv4 or IPv6 address belonging to cl.
 func hostOwnsIP(cl unifi.Client, candidate string) bool {
 	want := canonicalIPKey(candidate)
 	if want == "" {
@@ -421,7 +425,10 @@ func (h HostProfile) HasPort(port int) bool {
 // Fingerprinter gently inspects a slice of LAN clients using a fixed-size
 // channel worker pool.
 type Fingerprinter struct {
+	// infrastructure indexes canonical MACs and IPs of adopted UniFi devices
+	// whose SSH settings are audited via the controller instead of host probes.
 	infrastructure map[string]bool
+
 	// ports is the curated list of TCP ports checked on each host.
 	ports []int
 
@@ -464,8 +471,8 @@ type Fingerprinter struct {
 
 	// sshKeyAudit holds optional opt-in SSH PK_OK audit settings, loaded keys,
 	// prior host-key fingerprints (to refuse auditing on changed keys), and a
-	// per-fingerprint result cache so repeated watch/serve scans replay findings
-	// without re-probing unchanged hosts.
+	// per-listener cache keyed by host identity and listener address so repeated
+	// watch/serve scans replay findings without re-probing unchanged hosts.
 	sshKeyAudit     *config.SSHKeyAuditConfig
 	sshAuditKeys    []SSHPublicKey
 	prevSSHHostKeys map[string]string
@@ -507,6 +514,8 @@ func (f *Fingerprinter) SetSSHKeyAudit(cfg *config.SSHKeyAuditConfig) error {
 	return nil
 }
 
+// matchesSSHKeyAuditTarget reports whether h is selected for opt-in SSH
+// public-key auditing based on active settings and optional TargetHosts filters.
 func (f *Fingerprinter) matchesSSHKeyAuditTarget(h HostProfile) bool {
 	if !f.sshKeyAudit.Active() || len(f.sshAuditKeys) == 0 {
 		return false
@@ -540,7 +549,8 @@ func (f *Fingerprinter) SetInfrastructure(devices []unifi.Device) {
 	}
 }
 
-// isInfrastructure also matches the probe address when the client record has no MAC.
+// isInfrastructure reports whether h is an adopted UniFi infrastructure device,
+// matching either its canonical MAC or its probe IP (even when a MAC is populated).
 func (f *Fingerprinter) isInfrastructure(h HostProfile) bool {
 	return f.infrastructure[config.CanonicalMAC(h.Client.MAC)] || f.infrastructure[h.ProbeIP]
 }
@@ -655,8 +665,9 @@ func (f *Fingerprinter) selectAllowedProbeIP(cl unifi.Client) string {
 	return SelectProbeIP(cl, f.allowedSubnets)
 }
 
-// SetProgressFunc registers an optional callback invoked on the collector
-// goroutine as discovery, per-host port probing, and protocol fingerprinting advance.
+// SetProgressFunc registers an optional callback invoked as discovery, per-host
+// port probing, Nerva fingerprinting, and fallback probes advance. Because
+// Nerva and fallback workers invoke fn concurrently, fn must be concurrency-safe.
 func (f *Fingerprinter) SetProgressFunc(fn func(phase string, done, total int, host string)) {
 	f.onProgress = fn
 }
@@ -747,6 +758,8 @@ func (f *Fingerprinter) FingerprintAll(ctx context.Context, clients []unifi.Clie
 	return f.collectProfiles(ctx, targets, workers)
 }
 
+// hasNonLoopbackTarget reports whether any target resolves to a non-loopback IP
+// so isolated localhost runs and tests skip LAN-wide multicast discovery.
 func (f *Fingerprinter) hasNonLoopbackTarget(targets []unifi.Client) bool {
 	for _, cl := range targets {
 		ip := net.ParseIP(f.selectAllowedProbeIP(cl))
@@ -947,8 +960,9 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 				}
 			case port == 445:
 				profile.SMB = negotiateSMB(conn, f.timeout)
-				// Send one read-only SMBv1 NEGOTIATE on a fresh connection to retain
-				// SMBv1 detection without ever sending SESSION_SETUP.
+				// Open a fresh TCP connection for a single read-only SMBv1 NEGOTIATE
+				// because conn already completed SMB2 negotiation, without ever
+				// sending SESSION_SETUP.
 				v1, v1SignEn, v1SignReq := false, false, false
 				if c1, err := dialer.DialContext(ctx, "tcp", addr); err == nil {
 					v1, v1SignEn, v1SignReq = negotiateSMBv1(c1, f.timeout)
@@ -974,8 +988,8 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		}
 		_ = conn.Close()
 
-		// Hard raw-printer zero-byte safety guard: never send HTTP or other
-		// application bytes to a raw print sink even if it overlaps a web port.
+		// Skip HTTP banner probing on raw print/serial sinks (strict zero-byte
+		// guard) and on SSH or SMB ports already handled by dedicated probes above.
 		if rawPrint || sshPort || port == 445 {
 			continue
 		}
@@ -1004,6 +1018,8 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 	return profile
 }
 
+// isRawPrintSinkPortAny reports whether port is a protected raw print or serial
+// sink unconditionally (9100/515) or on any of the host's IP addresses in disc.
 func isRawPrintSinkPortAny(port int, disc *LANDiscovery, ips []string) bool {
 	if isRawPrintSinkPort(port, disc, "") {
 		return true
@@ -1104,8 +1120,9 @@ func (f *Fingerprinter) walkVNCDisplays(ctx context.Context, dialer net.Dialer, 
 }
 
 // fetchHTTPBanner performs one bounded GET / request against a local host and
-// extracts its status code, Server/X-Powered-By headers, HTML title, and peer
-// TLS certificate subject metadata.
+// extracts its status code, Server/X-Powered-By headers, HTML title, negotiated
+// TLS protocol version, and peer certificate metadata (subject, expiry,
+// self-signed status, and chain verification).
 func (f *Fingerprinter) fetchHTTPBanner(ctx context.Context, scheme, ip string, port int) (HTTPBanner, bool) {
 	targetURL := fmt.Sprintf("%s://%s/", scheme, net.JoinHostPort(ip, strconv.Itoa(port)))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)

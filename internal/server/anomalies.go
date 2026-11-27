@@ -21,8 +21,8 @@ const (
 	// being absent for at least 30 days.
 	dormantWakeupThreshold = 30 * 24 * time.Hour
 
-	// iotUploadSpikeWindow and iotUploadSpikeBytes detect an idle embedded/IoT
-	// appliance suddenly uploading >= 50 MB within a 5-minute window (possible
+	// iotUploadSpikeWindow and iotUploadSpikeBytes detect an embedded/IoT
+	// appliance uploading >= 50 MiB within a 5-minute window (possible
 	// exfiltration or botnet participation) with a 30m per-host alert cooldown.
 	iotUploadSpikeWindow   = 5 * time.Minute
 	iotUploadSpikeBytes    = 50 << 20 // 50 MiB
@@ -114,6 +114,9 @@ func (a *anomalyTracker) Seed(snap *unifi.Snapshot, ports map[string]portLiveSta
 		a.lastWANIP = snap.Health.WANIP
 		a.lastWANStatus = snap.Health.WANStatus
 		a.lastVPNCount = snap.Health.ActiveVPNUsers
+		// Avoid seeding an empty VPN baseline after a known VPN feed failure
+		// (populated data or absent visibility metadata is still seeded) so a
+		// startup fetch outage does not trigger spurious connect alerts on recovery.
 		if snap.Visibility == nil || snap.Visibility.VPNAvailable || len(snap.Health.VPNConnections) > 0 {
 			a.lastVPNKeys = indexVPNConnections(snap.Health.VPNConnections)
 		}
@@ -121,6 +124,9 @@ func (a *anomalyTracker) Seed(snap *unifi.Snapshot, ports map[string]portLiveSta
 	if snap.SecuritySettings != nil {
 		a.lastSettingsSig = settingsOnlySignature(snap.SecuritySettings)
 	}
+	// Likewise, avoid seeding an empty WLAN config signature after a known WLAN
+	// feed failure (populated data or absent visibility metadata is still seeded)
+	// so a startup fetch outage cannot cause a false config_drift alert later.
 	if snap.Visibility == nil || snap.Visibility.WLANsAvailable || len(snap.WLANs) > 0 {
 		a.lastWLANSig = wlansOnlySignature(snap.WLANs)
 	}
@@ -352,7 +358,8 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			Summary:  ev.Message,
 		})
 	}
-	// Cap seenLogIDs map size gently.
+	// Once seenLogIDs grows past 2000 entries, reset it to the current poll's
+	// freshLogs IDs to bound memory while keeping the active poll window deduplicated.
 	if len(a.seenLogIDs) > 2000 {
 		a.seenLogIDs = make(map[string]struct{}, len(freshLogs))
 		for _, ev := range freshLogs {
@@ -545,6 +552,8 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 	return events
 }
 
+// indexVPNConnections keys active VPN sessions by controller session ID (or a
+// composite user/remote/local tuple when ID is absent) for connect/disconnect diffing.
 func indexVPNConnections(list []unifi.VPNConnection) map[string]unifi.VPNConnection {
 	out := make(map[string]unifi.VPNConnection, len(list))
 	for _, vc := range list {
@@ -556,6 +565,8 @@ func indexVPNConnections(list []unifi.VPNConnection) map[string]unifi.VPNConnect
 	return out
 }
 
+// settingsOnlySignature computes a deterministic digest string over the site's
+// security-relevant controller settings for config_drift detection.
 func settingsOnlySignature(s *unifi.SiteSecuritySettings) string {
 	if s == nil {
 		return ""
@@ -566,6 +577,8 @@ func settingsOnlySignature(s *unifi.SiteSecuritySettings) string {
 		s.HoneypotEnabled, s.DoHState, s.TeleportEnabled)
 }
 
+// wlansOnlySignature computes a sorted, deterministic digest string over the
+// site's Wi-Fi SSID security parameters for config_drift detection.
 func wlansOnlySignature(wlans []unifi.WLANConfig) string {
 	parts := make([]string, 0, len(wlans))
 	for _, w := range wlans {
@@ -576,6 +589,8 @@ func wlansOnlySignature(wlans []unifi.WLANConfig) string {
 	return strings.Join(parts, ";")
 }
 
+// isApplianceCategory reports whether a lowercase classifier category belongs
+// to an embedded or IoT appliance class eligible for upload-spike alerting.
 func isApplianceCategory(cat string) bool {
 	switch cat {
 	case "iot", "camera", "printer", "hvac", "smart-home", "media", "appliance", "sensor", "audio", "tv":
@@ -585,6 +600,11 @@ func isApplianceCategory(cat string) bool {
 	}
 }
 
+// isOwnedRadioBSSID reports whether a neighbor AP sighting matches one of our
+// own adopted UniFi radios. To prevent OUI or near-MAC spoofing from bypassing
+// evil-twin detection, it requires that the controller did not flag the AP as
+// rogue, any reported OUI belongs to Ubiquiti, and the exact BSSID appears in
+// ownedMACs (adopted device MACs and VAP BSSIDs).
 func isOwnedRadioBSSID(rap unifi.RogueAP, ownedMACs map[string]struct{}) bool {
 	if rap.IsRogue {
 		return false

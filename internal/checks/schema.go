@@ -256,8 +256,9 @@ type ProbeCapability struct {
 	MaxBasis GrantBasis
 }
 
-// probeCapabilities is also the allowlist of supported probe types. HTTP adds
-// only the paths explicitly checked in the successful response to a step.
+// probeCapabilities defines the allowlist of supported probe types along with
+// each probe's evidence ceiling and emitted protocol fields. HTTP probes also
+// emit any JSONPath selectors explicitly verified as present in a matching step.
 var probeCapabilities = map[string]ProbeCapability{
 	"adb":           {ObsAuthVerified, []string{"command"}, BasisImplied},
 	"avr":           {ObsPrivilegeVerified, []string{"power_reply"}, BasisProven},
@@ -380,11 +381,15 @@ type Metadata struct {
 // All non-empty fields must match (logical AND); values within each slice
 // match if any entry matches (logical OR).
 type Preconditions struct {
-	// PortsAny requires at least one of these TCP ports to be open on the host.
+	// PortsAny requires at least one of these ports to be observed on the host
+	// (open TCP ports, or, with non-TCP observations enabled, any observed
+	// service or non-withdrawn mDNS record on that port).
 	PortsAny []int `yaml:"ports_any"`
 
-	// PortsAll requires every listed TCP port to be open on the host (useful for
-	// multi-service fingerprints such as iOS lockdownd + SSH on a jailbroken device).
+	// PortsAll requires every listed port to be observed on the host (open TCP
+	// ports, or, with non-TCP observations enabled, any observed service or
+	// non-withdrawn mDNS record on that port; useful for multi-service
+	// fingerprints such as iOS lockdownd + SSH).
 	PortsAll []int `yaml:"ports_all"`
 
 	// MACPrefix requires the client's normalized MAC address to begin with any
@@ -490,7 +495,7 @@ type HTTPStepSpec struct {
 
 // JSONPredicate tests a bounded JSONPath field (e.g., "$.auth_en") in a JSON body.
 type JSONPredicate struct {
-	// Path is a bounded dot/index JSONPath expression starting with "$.".
+	// Path is a bounded dot/index JSONPath expression rooted at "$" (e.g., "$", "$[0]", or "$.auth_en").
 	Path string `yaml:"path"`
 
 	// Exists asserts whether Path is present (true) or absent (false).
@@ -683,6 +688,10 @@ func Merge(groups ...[]*Check) ([]*Check, error) {
 			if prior == nil {
 				continue
 			}
+			// Every grant effect declared by a superseded check must remain covered
+			// unconditionally by the superseding check, and a non-proven grant cannot
+			// be replaced solely by BasisProven (which EffectiveGrants drops unless
+			// privilege verification succeeds at runtime).
 			for _, grant := range prior.Grants {
 				covered := slices.ContainsFunc(chk.Grants, func(g GrantSpec) bool {
 					return g.Effect == grant.Effect && g.WhenField == "" && (g.Basis != BasisProven || grant.Basis == BasisProven)
@@ -850,11 +859,12 @@ func (c *Check) IsInventoryOnly() bool {
 	return c.Severity == SeverityInfo && (c.Claim == ClaimAssetIdentity || c.Claim == ClaimServiceAdvertised || c.Claim == ClaimServiceObserved)
 }
 
-// grantPredicate accepts field presence or equality with one literal token.
-// The length limit bounds both parsing work and the size of a literal in YAML.
+// grantPredicate matches either a bare field name/JSONPath (testing presence)
+// or a field == literal comparison.
 var grantPredicate = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*|\$(?:\[[0-9]+\])?(?:\.[A-Za-z0-9_-]+(?:\[[0-9]+\])?)*)(?:[ \t]*==[ \t]*([A-Za-z0-9_.*:/+-]+))?$`)
 
-// parseGrantPredicate is shared by validation and evaluation so both interpret literals identically.
+// parseGrantPredicate is shared by validation and evaluation so both interpret
+// literals identically. The 256-byte length cap bounds parsing work and YAML literal size.
 func parseGrantPredicate(expr string) (field, value string, ok bool) {
 	if len(expr) > 256 {
 		return "", "", false
@@ -898,8 +908,10 @@ func (p *ProbeSpec) httpSteps() []HTTPStepSpec {
 	return []HTTPStepSpec{p.HTTPStepSpec}
 }
 
-// verifiesRead identifies GET payload checks that can demonstrate a successful
-// read. The runner uses the actual status when the YAML leaves it open.
+// verifiesRead reports whether an HTTP GET step asserts response payload
+// content (body text, regex, or a positive JSONPath predicate) and allows a
+// 2xx status. When Match.Status is omitted, the runner verifies an actual 2xx
+// response status at runtime before upgrading to ObsPrivilegeVerified.
 func (s HTTPStepSpec) verifiesRead() bool {
 	if s.Method != "GET" || (len(s.Match.Status) > 0 && !slices.ContainsFunc(s.Match.Status, func(code int) bool { return code >= 200 && code < 300 })) {
 		return false
@@ -955,11 +967,14 @@ func (c *Check) canProve(effect GrantEffect, field, value string) bool {
 	if effect == GrantRead {
 		return slices.ContainsFunc(steps, HTTPStepSpec.verifiesRead)
 	}
+	// Non-read grants other than GrantSecrets require an explicit field==value
+	// predicate (not mere field presence) to prove the capability.
 	if effect != GrantSecrets && value == "" {
 		return false
 	}
-	// The last step that supplies a field owns its value. In a sequence its
-	// successful status must be explicit, since another step can prove a read.
+	// The last step that observes field owns its runtime value. In multi-step
+	// probes, that step must explicitly restrict Match.Status to 2xx so an
+	// earlier 2xx step cannot mask a non-2xx reply on the step supplying field.
 	for i := len(steps) - 1; i >= 0; i-- {
 		step := &steps[i]
 		if step.Match.observesPath(field) {
@@ -1143,6 +1158,9 @@ func (c *Check) DefaultTransport() string {
 	}
 }
 
+// inferDefaultClaim assigns a conservative default ClaimKind when a YAML check
+// omits claim, keeping passive observations, inventory rules, and banner/TLS
+// checks distinct from confirmed permission checks.
 func inferDefaultClaim(c *Check) ClaimKind {
 	cat := strings.ToLower(strings.TrimSpace(c.Category))
 	pt := strings.ToLower(strings.TrimSpace(c.Probe.Type))

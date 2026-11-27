@@ -45,7 +45,8 @@ const (
 	// budget independent of the multicast listen deadline.
 	ssdpFetchBudget = 2500 * time.Millisecond
 
-	// mDNS anti-DoS memory caps.
+	// mDNS anti-DoS memory caps bounding packet parsing, per-host/responder
+	// cardinality, and global cache tables against spoofed multicast floods.
 	maxDNSNameWireBytes             = 255
 	maxDNSQuestionsPerPacket        = 64
 	maxDNSRecordsPerPacket          = 128
@@ -54,19 +55,20 @@ const (
 	maxMDNSServicesPerHost          = 64
 	maxMDNSServicesPerResponder     = 512
 	maxMDNSHostsPerResponder        = 512
-	maxMDNSReflectedPerSenderTarget = 16
+	maxMDNSReflectedPerSenderTarget = 16 // per untrusted responder -> target IP admission threshold (multi-address instances admit if any target is below it)
 	maxMDNSServicesTotal            = 4096
 	maxMDNSHostsTotal               = 4096
 	maxMDNSIPsPerHost               = 16
-	maxMDNSRespondersPerAddress     = 8
+	maxMDNSRespondersPerAddress     = 8 // distinct responders tracked per (hostname, ip) address claim
 
-	// SSDP anti-DoS caps and string length bounds.
+	// SSDP anti-DoS caps and string length bounds preventing noisy or spoofed
+	// responders from exhausting description fetches or starving gateway IGDs.
 	maxSSDPHeaderLen        = 256
 	maxSSDPLocationLen      = 512
 	maxSSDPLocHitsPerIP     = 8
-	maxSSDPIGDLocHitsPerIP  = 2
+	maxSSDPIGDLocHitsPerIP  = 2 // caps IGD-labelled LOCATION URLs per responder IP
 	maxSSDPLocHitsTotal     = 256
-	maxSSDPIGDReservedSlots = 16
+	maxSSDPIGDReservedSlots = 16 // gives InternetGatewayDevice hits eviction preference up to 16 entries (ordinary hits may fill the table when fewer IGDs exist)
 	maxSSDPNoLocHitsPerIP   = 8
 	maxSSDPNoLocHitsTotal   = 256
 	maxSSDPSTsPerLocation   = 16
@@ -261,14 +263,26 @@ type UPnPDevice struct {
 	// ServiceTypes lists normalized XML <serviceType> URNs advertised by the device.
 	ServiceTypes []string `json:"service_types,omitempty"`
 
-	// ObserverInterface, ObserverVLAN, AddressFamily, ObservedAt, and ExpiresAt
-	// capture where and when this SSDP advertisement was seen.
-	ObserverInterface string     `json:"observer_interface,omitempty"`
-	ObserverVLAN      string     `json:"observer_vlan,omitempty"`
-	AddressFamily     string     `json:"address_family,omitempty"`
-	ObservedAt        *time.Time `json:"observed_at,omitempty"`
-	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
-	Withdrawn         bool       `json:"withdrawn,omitempty"`
+	// ObserverInterface names the local interface where this SSDP advertisement was received.
+	ObserverInterface string `json:"observer_interface,omitempty"`
+
+	// ObserverVLAN names the VLAN or zone of the observing interface.
+	ObserverVLAN string `json:"observer_vlan,omitempty"`
+
+	// AddressFamily records "ipv4" or "ipv6" for the responding device address.
+	AddressFamily string `json:"address_family,omitempty"`
+
+	// ObservedAt is optional observation metadata recording when this SSDP
+	// advertisement was last received (not populated by the built-in SSDP collector).
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
+
+	// ExpiresAt is optional observation metadata recording when this cached SSDP
+	// advertisement expires (not tracked by the built-in SSDP collector).
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// Withdrawn is optional observation metadata indicating an SSDP ssdp:byebye
+	// revocation (not processed by the built-in SSDP collector).
+	Withdrawn bool `json:"withdrawn,omitempty"`
 }
 
 // WSDiscoveryRecord stores one WS-Discovery ProbeMatch (ONVIF cameras, WSD printers/hosts).
@@ -282,21 +296,41 @@ type WSDiscoveryRecord struct {
 	// Ports lists TCP ports parsed from same-host XAddr HTTP(S) URLs.
 	Ports []int `json:"ports,omitempty"`
 
-	// ObserverInterface, ObserverVLAN, AddressFamily, and ObservedAt capture provenance.
-	ObserverInterface string     `json:"observer_interface,omitempty"`
-	ObserverVLAN      string     `json:"observer_vlan,omitempty"`
-	AddressFamily     string     `json:"address_family,omitempty"`
-	ObservedAt        *time.Time `json:"observed_at,omitempty"`
+	// ObserverInterface names the local interface where this ProbeMatch was received.
+	ObserverInterface string `json:"observer_interface,omitempty"`
+
+	// ObserverVLAN names the VLAN or zone of the observing interface.
+	ObserverVLAN string `json:"observer_vlan,omitempty"`
+
+	// AddressFamily records "ipv4" or "ipv6" for the responding device address.
+	AddressFamily string `json:"address_family,omitempty"`
+
+	// ObservedAt is optional observation metadata recording when this ProbeMatch
+	// was last received (left unset by the built-in WS-Discovery collector).
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
 }
 
 // LANDiscovery holds all passive/multicast observations indexed by IPv4/IPv6 address.
 type LANDiscovery struct {
-	MDNS        map[string][]MDNSService
-	UPnP        map[string][]UPnPDevice
+	// MDNS maps each discovered IP address to its observed DNS-SD service records.
+	MDNS map[string][]MDNSService
+
+	// UPnP maps each discovered IP address to its SSDP/UPnP device summaries.
+	UPnP map[string][]UPnPDevice
+
+	// WSDiscovery maps each discovered IP address to its WS-Discovery ProbeMatch records.
 	WSDiscovery map[string][]WSDiscoveryRecord
-	PortsByIP   map[string][]int
+
+	// PortsByIP maps each discovered IP address to deduplicated, sorted TCP port hints.
+	PortsByIP map[string][]int
+
+	// RawPrintIPs maps each IP address to its set of zero-byte sink ports
+	// (both raw printer data-stream ports and raw serial/Zigbee UART bridge ports).
 	RawPrintIPs map[string]map[int]struct{}
-	Unavailable map[string]string // observer VLAN/interface -> reason when discovery was unavailable
+
+	// Unavailable maps an observer VLAN or discovery family label to the reason
+	// discovery could not run there.
+	Unavailable map[string]string
 }
 
 // senderBuckets tracks per-sender entry counts with O(1) amortized updates and
@@ -385,8 +419,14 @@ func (b *senderBuckets) heaviest() (string, int) {
 // across full-scan and live recomputations, supporting IPv4/IPv6 AAAA records,
 // RFC 6762 TTL=0 goodbye withdrawal, and reflection tracking.
 type DiscoveryCache struct {
-	mu                  sync.RWMutex
-	trustedReflectors   map[string]struct{}
+	mu                sync.RWMutex
+	trustedReflectors map[string]struct{}
+
+	// mDNS service instance table and secondary anti-DoS accounting indexes
+	// (per-responder/unresolved/per-target counts, O(1) heaviest-sender buckets,
+	// and reflected non-sink vs. zero-byte sink key sets kept in lockstep by
+	// ensureMDNSInstLocked, indexReflectedInstLocked, unindexReflectedInstLocked,
+	// and deleteMDNSInstLocked).
 	mdnsInst            map[string]*cachedMDNSInst
 	respInstCount       map[string]int
 	respUnresolvedCount map[string]int
@@ -398,37 +438,47 @@ type DiscoveryCache struct {
 	respReflSinkKeys    map[string]map[string]struct{}
 	targetReflKeys      map[string]map[string]struct{}
 	respTargetInstCount map[string]map[string]int
-	hostIPs             map[string]map[string]cachedHostIP // hostname -> ip -> responder expirations
-	hostOwner           map[string]string                  // hostname -> first responderIP that created it
-	hostReflected       map[string]bool                    // hostname -> currently indexed as reflected
-	respHostCount       map[string]int
-	ipHostCount         map[string]int
-	allHostBuckets      *senderBuckets
-	reflHostBuckets     *senderBuckets
-	respHostKeys        map[string]map[string]struct{}
-	respReflHostKeys    map[string]map[string]struct{}
-	ipReflHosts         map[string]map[string]struct{}
-	respIPHostCount     map[string]map[string]int
-	upnp                map[string][]UPnPDevice
-	wsd                 map[string][]WSDiscoveryRecord
-	unavail             map[string]string
+
+	// mDNS hostname A/AAAA table and matching anti-DoS accounting indexes
+	// maintained by recordHostIPLocked, removeHostIPSourceLocked, and deleteHostLocked.
+	hostIPs          map[string]map[string]cachedHostIP // hostname -> ip -> responder expirations
+	hostOwner        map[string]string                  // hostname -> first responderIP that created it
+	hostReflected    map[string]bool                    // hostname -> currently indexed as reflected
+	respHostCount    map[string]int
+	ipHostCount      map[string]int
+	allHostBuckets   *senderBuckets
+	reflHostBuckets  *senderBuckets
+	respHostKeys     map[string]map[string]struct{}
+	respReflHostKeys map[string]map[string]struct{}
+	ipReflHosts      map[string]map[string]struct{}
+	respIPHostCount  map[string]map[string]int
+
+	upnp    map[string][]UPnPDevice
+	wsd     map[string][]WSDiscoveryRecord
+	unavail map[string]string
 }
 
-// Each source of an address record has an independent TTL.
+// cachedHostIP maps each responder IP that advertised a given (hostname, ip)
+// A/AAAA record to that claim's expiration timestamp so sources expire independently.
 type cachedHostIP map[string]time.Time
 
+// supports reports whether an address record authorizes binding ip to a service
+// from responder: either responder itself holds an unexpired claim or ip
+// self-announced an unexpired claim, blocking cross-responder address spoofing.
 func (sources cachedHostIP) supports(ip, responder string, now time.Time) bool {
 	return now.Before(sources[responder]) || now.Before(sources[ip])
 }
 
+// cachedMDNSInst wraps a cached MDNSService with the exact accounting state
+// recorded at insertion so promotion or deletion reverses every index cleanly.
 type cachedMDNSInst struct {
 	svc               MDNSService
-	hasPTR            bool
-	createdBy         string
-	reflectedIndexed  bool
-	reflectedSink     bool
-	countedTargetIPs  []string
-	countedUnresolved bool
+	hasPTR            bool     // true once a PTR record observed this instance (distinguishes from standalone TXT)
+	createdBy         string   // responderIP charged in per-responder counts and buckets
+	reflectedIndexed  bool     // whether currently indexed in reflInstBuckets and reflected key sets
+	reflectedSink     bool     // whether indexed under respReflSinkKeys instead of respReflNonSinkKeys
+	countedTargetIPs  []string // target IPs charged in targetInstCount and targetReflKeys
+	countedUnresolved bool     // whether charged in respUnresolvedCount (no resolved target IP at insert)
 }
 
 // NewDiscoveryCache initializes an empty durable DiscoveryCache.
@@ -719,6 +769,9 @@ func pickAnyKey(set map[string]struct{}) string {
 	return ""
 }
 
+// indexReflectedInstLocked registers a non-authoritative service instance in
+// the reflected eviction buckets and per-target sets, separating zero-byte
+// sinks from regular services so sink guards survive churn.
 func (c *DiscoveryCache) indexReflectedInstLocked(k string, inst *cachedMDNSInst) {
 	if inst.reflectedIndexed {
 		return
@@ -739,6 +792,8 @@ func (c *DiscoveryCache) indexReflectedInstLocked(k string, inst *cachedMDNSInst
 	}
 }
 
+// unindexReflectedInstLocked removes an instance from the reflected eviction
+// indexes, called both on deletion and when a matching SRV confirms authority.
 func (c *DiscoveryCache) unindexReflectedInstLocked(k string, inst *cachedMDNSInst) {
 	if !inst.reflectedIndexed {
 		return
@@ -758,6 +813,8 @@ func (c *DiscoveryCache) unindexReflectedInstLocked(k string, inst *cachedMDNSIn
 	}
 }
 
+// deleteHostLocked removes host and every IP claim beneath it while decrementing
+// all per-IP, per-responder, and reflected host accounting structures.
 func (c *DiscoveryCache) deleteHostLocked(host string) {
 	ipMap, ok := c.hostIPs[host]
 	if !ok {
@@ -787,6 +844,8 @@ func (c *DiscoveryCache) deleteHostLocked(host string) {
 	}
 }
 
+// deleteMDNSInstLocked removes cached instance k and reverses all responder,
+// reflected, unresolved, and per-target counts recorded for it.
 func (c *DiscoveryCache) deleteMDNSInstLocked(k string) {
 	inst, ok := c.mdnsInst[k]
 	if !ok {
@@ -807,6 +866,9 @@ func (c *DiscoveryCache) deleteMDNSInstLocked(k string) {
 	}
 }
 
+// evictReflectedHostForIPLocked frees one per-IP host slot on ip by evicting a
+// reflected claim from the heaviest sender using max-min fairness, while
+// protecting trusted reflectors from displacement by non-authoritative senders.
 func (c *DiscoveryCache) evictReflectedHostForIPLocked(ip, incomingResp string, incomingIsAuth, incomingIsTrusted bool) bool {
 	candidates := c.ipReflHosts[ip]
 	if len(candidates) == 0 {
@@ -851,6 +913,9 @@ func (c *DiscoveryCache) evictReflectedHostForIPLocked(ip, incomingResp string, 
 	return true
 }
 
+// evictGlobalHostLocked frees one global hostname slot in O(1) by first
+// evicting from the heaviest reflected sender and then applying max-min
+// fairness across all senders.
 func (c *DiscoveryCache) evictGlobalHostLocked(incomingResp string, incomingIsAuth, incomingIsTrusted bool) bool {
 	// Pass 1 (O(1)): evict from the heaviest reflected/third-party sender.
 	if sender, cnt := c.reflHostBuckets.heaviest(); sender != "" && cnt > 0 {
@@ -874,6 +939,10 @@ func (c *DiscoveryCache) evictGlobalHostLocked(incomingResp string, incomingIsAu
 	return false
 }
 
+// evictReflectedInstForTargetLocked frees one per-target service slot on
+// targetIP by evicting a reflected entry from the heaviest sender, preferring
+// non-sink entries so zero-byte sinks survive churn and protecting trusted
+// reflectors from non-authoritative senders.
 func (c *DiscoveryCache) evictReflectedInstForTargetLocked(targetIP, incomingResp string, incomingIsAuth, incomingIsTrusted, incomingIsSink bool) bool {
 	candidates := c.targetReflKeys[targetIP]
 	if len(candidates) == 0 {
@@ -921,6 +990,9 @@ func (c *DiscoveryCache) evictReflectedInstForTargetLocked(targetIP, incomingRes
 	return true
 }
 
+// evictGlobalMDNSInstLocked frees one global service slot in O(1), evicting
+// non-sink reflected entries from the heaviest third-party sender first so
+// zero-byte sink guards survive floods, then falling back to max-min fairness.
 func (c *DiscoveryCache) evictGlobalMDNSInstLocked(incomingResp string, incomingIsAuth, incomingIsTrusted bool) bool {
 	// Pass 1 (O(1)): evict from the heaviest reflected/third-party sender,
 	// preferring non-sink entries so zero-byte sink guards survive churn.
@@ -949,6 +1021,9 @@ func (c *DiscoveryCache) evictGlobalMDNSInstLocked(incomingResp string, incoming
 	return false
 }
 
+// recordHostIPLocked ingests one A or AAAA address record (or withdraws
+// responderIP's claim on TTL == 0), enforcing per-responder, per-IP, and global
+// caps while promoting authoritative self-announcements out of reflected indexes.
 func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl uint32, now time.Time) {
 	if host == "" || ip == "" {
 		return
@@ -1051,6 +1126,7 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 			delete(sources, evict)
 		}
 		if isAuth {
+			// A self-announcement upgrades this (host, ip) binding from reflected to authoritative.
 			delNestedSet(c.ipReflHosts, ip, host)
 			decNestedCount(c.respIPHostCount, c.hostOwner[host], ip)
 		}
@@ -1065,7 +1141,9 @@ func (c *DiscoveryCache) recordHostIPLocked(host, ip, responderIP string, ttl ui
 	}
 }
 
-// removeHostIPSourceLocked withdraws only the address claim from responderIP.
+// removeHostIPSourceLocked withdraws only responderIP's claim on (host, ip),
+// deleting the host when empty or demoting remaining third-party claims back
+// into the reflected indexes if the authoritative owner withdrew.
 func (c *DiscoveryCache) removeHostIPSourceLocked(host, ip, responderIP string) {
 	sources := c.hostIPs[host][ip]
 	if _, ok := sources[responderIP]; !ok {
@@ -1085,10 +1163,13 @@ func (c *DiscoveryCache) removeHostIPSourceLocked(host, ip, responderIP string) 
 			return
 		}
 	} else if responderIP == ip {
+		// Only relayed claims remain for (host, ip); re-index it as reflected.
 		addNestedSet(c.ipReflHosts, ip, host)
 		incNestedCount(c.respIPHostCount, owner, ip)
 	}
 	if responderIP == ip {
+		// If no other address under host still has an authoritative self-claim,
+		// mark the host reflected so it becomes eligible for reflected eviction.
 		for addr, remaining := range c.hostIPs[host] {
 			if _, auth := remaining[addr]; auth {
 				return
@@ -1100,6 +1181,9 @@ func (c *DiscoveryCache) removeHostIPSourceLocked(host, ip, responderIP string) 
 	}
 }
 
+// ensureMDNSInstLocked looks up or admits a cached service instance under key,
+// enforcing per-responder, unresolved, per-target, and global anti-DoS caps and
+// updating all secondary accounting indexes on insertion.
 func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderIP, observerIface, observerVLAN string, targetIPs []string, now time.Time) *cachedMDNSInst {
 	inst := c.mdnsInst[key]
 	if inst == nil {
@@ -1198,6 +1282,8 @@ func (c *DiscoveryCache) ensureMDNSInstLocked(key, svcType, instance, responderI
 	return inst
 }
 
+// applyMDNSTTL updates svc's freshness window or marks it Withdrawn on an
+// RFC 6762 TTL=0 goodbye packet.
 func applyMDNSTTL(svc *MDNSService, ttl uint32, now time.Time) {
 	if ttl == 0 {
 		svc.TTLSeconds = 0
@@ -1464,8 +1550,10 @@ func (c *DiscoveryCache) Snapshot(now time.Time) *LANDiscovery {
 	return res
 }
 
-// Prefer a resolved SRV, then the target itself, then a configured reflector.
-// A stable tie break keeps equivalent sources independent of map iteration.
+// preferMDNSService reports whether a should replace b when deduplicating the
+// same service instance: entries with a populated TargetHost beat PTR-only
+// entries, followed by authoritative over reflected, trusted over untrusted
+// reflectors, and a deterministic ResponderIP tie-break.
 func preferMDNSService(a, b MDNSService) bool {
 	if (a.TargetHost == "") != (b.TargetHost == "") {
 		return a.TargetHost != ""
@@ -1505,6 +1593,8 @@ func IPFamily(ips []string) string {
 	}
 }
 
+// isExcludedIP reports whether ip matches any entry in excluded either verbatim
+// or after canonical IP normalization (e.g., IPv4-mapped IPv6 or shorthand IPv6).
 func isExcludedIP(ip string, excluded map[string]struct{}) bool {
 	if len(excluded) == 0 || ip == "" {
 		return false
@@ -1542,6 +1632,9 @@ func DiscoverLANWithExclusions(ctx context.Context, httpClient *http.Client, exc
 	return discoverLANWithOptions(ctx, httpClient, excluded, nil, nil)
 }
 
+// discoverLANWithOptions runs bounded concurrent mDNS, SSDP, and WS-Discovery
+// sweeps, then fetches same-host UPnP XML descriptions only after mDNS
+// completes so zero-byte print and serial sink ports are already known and protected.
 func discoverLANWithOptions(ctx context.Context, httpClient *http.Client, excluded map[string]struct{}, allowedSubnets []netip.Prefix, trustedReflectors []string) *LANDiscovery {
 	res := &LANDiscovery{
 		MDNS:        make(map[string][]MDNSService),
@@ -1675,15 +1768,16 @@ func discoverMDNSSnapshotWithReflectors(ctx context.Context, trustedReflectors [
 	return cache.Snapshot(time.Now().UTC())
 }
 
+// collectMDNSIntoCache runs concurrent IPv4 and IPv6 multicast DNS-SD browse
+// passes into cache.
 func collectMDNSIntoCache(ctx context.Context, cache *DiscoveryCache) {
 	var wg sync.WaitGroup
-	// IPv4 mDNS sweep.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		collectMDNSFamily(ctx, cache, "udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0}, mdnsMulticastAddr, "mdns-ipv4")
 	}()
-	// IPv6 mDNS sweep (best-effort; records unavailability if host lacks IPv6 multicast).
+	// Best-effort IPv6 sweep; records unavailability when the host lacks IPv6 multicast.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1692,6 +1786,10 @@ func collectMDNSIntoCache(ctx context.Context, cache *DiscoveryCache) {
 	wg.Wait()
 }
 
+// collectMDNSFamily sends batched DNS-SD PTR queries over one address family,
+// reads responses until the earlier of discoveryWindow or ctx's deadline
+// (context cancellation alone need not interrupt an active UDP read), and
+// records label as unavailable if binding or multicast transmission fails.
 func collectMDNSFamily(ctx context.Context, cache *DiscoveryCache, network string, local *net.UDPAddr, remoteAddr, label string) {
 	conn, err := net.ListenUDP(network, local)
 	if err != nil {
@@ -1915,6 +2013,7 @@ func readDNSName(pkt []byte, off int) (string, int, bool) {
 	return "", 0, false
 }
 
+// stripLocalSuffix removes any trailing dot and case-insensitive ".local" domain suffix.
 func stripLocalSuffix(name string) string {
 	trimmed := strings.TrimSuffix(strings.TrimSpace(name), ".")
 	if len(trimmed) >= len(".local") && strings.EqualFold(trimmed[len(trimmed)-len(".local"):], ".local") {
@@ -1923,6 +2022,8 @@ func stripLocalSuffix(name string) string {
 	return trimmed
 }
 
+// normalizeMDNSType validates and normalizes a DNS-SD service type such as
+// "_http._tcp.local." into "_http._tcp", returning "" for non-service names.
 func normalizeMDNSType(name string) string {
 	n := stripLocalSuffix(name)
 	low := strings.ToLower(n)
@@ -1932,6 +2033,8 @@ func normalizeMDNSType(name string) string {
 	return ""
 }
 
+// extractMDNSTypeFromFull extracts the trailing "_service._proto" type from a
+// full DNS-SD instance name (e.g., "Printer._ipp._tcp.local." -> "_ipp._tcp").
 func extractMDNSTypeFromFull(full string) string {
 	trimmed := stripLocalSuffix(full)
 	parts := strings.Split(trimmed, ".")
@@ -1944,6 +2047,8 @@ func extractMDNSTypeFromFull(full string) string {
 	return ""
 }
 
+// extractMDNSInstance returns the bounded instance label preceding svcType in
+// a full DNS-SD name, truncated to 80 bytes.
 func extractMDNSInstance(full, svcType string) string {
 	trimmed := stripLocalSuffix(full)
 	if svcType != "" {
@@ -2007,6 +2112,8 @@ type ssdpHit struct {
 	location string
 }
 
+// ssdpCollector deduplicates raw SSDP responses by (ip, location) and enforces
+// per-IP, per-IGD, and global anti-DoS caps while preserving gateway IGD hits.
 type ssdpCollector struct {
 	hitsByLoc       map[string]ssdpHit
 	locCountByIP    map[string]int
@@ -2126,6 +2233,10 @@ func (c *ssdpCollector) evictForFairness(incomingIP string, incomingIsIGD bool) 
 	return true
 }
 
+// ingest parses one raw SSDP datagram from ip, deduplicating LOCATION hits by
+// (ip, location) and no-LOCATION hits by (ip, st, server). When an existing
+// non-IGD location receives an InternetGatewayDevice ST, it upgrades the entry
+// and charges igdLocCountByIP only while within maxSSDPIGDLocHitsPerIP.
 func (c *ssdpCollector) ingest(ip, raw string) {
 	if ip == "" || raw == "" {
 		return
@@ -2223,12 +2334,16 @@ func (c *ssdpCollector) result() ([]ssdpHit, map[string][]ssdpHit) {
 	return hits, c.noLocHits
 }
 
-// listenSSDP issues a single bounded SSDP M-SEARCH (MX: 1, ST: ssdp:all) and
-// returns passive UDP responses without sending any HTTP requests yet.
+// listenSSDP sends a single bounded multicast SSDP M-SEARCH (MX: 1,
+// ST: ssdp:all) and collects the UDP responses without issuing HTTP fetches yet.
 func listenSSDP(ctx context.Context) ([]ssdpHit, map[string][]ssdpHit) {
 	return listenSSDPWithSubnets(ctx, nil)
 }
 
+// listenSSDPWithSubnets sends an SSDP M-SEARCH and collects UDP responses from
+// built-in local ranges or allowedSubnets until the earlier of discoveryWindow
+// or ctx's deadline (context cancellation alone need not interrupt an active
+// UDP read).
 func listenSSDPWithSubnets(ctx context.Context, allowedSubnets []netip.Prefix) ([]ssdpHit, map[string][]ssdpHit) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
@@ -2272,6 +2387,8 @@ func listenSSDPWithSubnets(ctx context.Context, allowedSubnets []netip.Prefix) (
 	return collector.result()
 }
 
+// mergedSSDPSTs deduplicates an ssdpHit's primary ST and accumulated STs into
+// a space-separated summary string plus any UPnP ":service:" URNs.
 func mergedSSDPSTs(h ssdpHit) (string, []string) {
 	var list []string
 	seen := make(map[string]struct{})
@@ -2309,6 +2426,9 @@ func fetchSSDPDescriptions(ctx context.Context, httpClient *http.Client, hits []
 	return fetchSSDPDescriptionsWithSubnets(ctx, httpClient, hits, noLocHits, rawPrintIPs, excluded, nil)
 }
 
+// fetchSSDPDescriptionsWithSubnets concurrently fetches validated same-host
+// UPnP XML descriptions (up to 8 in flight) for allowed, non-excluded hosts,
+// skipping any port protected as a raw print or serial sink.
 func fetchSSDPDescriptionsWithSubnets(ctx context.Context, httpClient *http.Client, hits []ssdpHit, noLocHits map[string][]ssdpHit, rawPrintIPs map[string]map[int]struct{}, excluded map[string]struct{}, allowedSubnets []netip.Prefix) map[string][]UPnPDevice {
 	out := make(map[string][]UPnPDevice)
 	for ip, list := range noLocHits {
@@ -2369,6 +2489,8 @@ func fetchSSDPDescriptionsWithSubnets(ctx context.Context, httpClient *http.Clie
 	return out
 }
 
+// parseSSDPHeaders parses raw SSDP header lines into a lowercase-keyed map,
+// keeping the first non-empty value for each key and capping value lengths.
 func parseSSDPHeaders(raw string) map[string]string {
 	out := make(map[string]string)
 	for _, line := range strings.Split(raw, "\n") {
@@ -2422,6 +2544,8 @@ func validateSameHostURL(rawURL, responderIP string) (int, string, bool) {
 	return port, u.String(), true
 }
 
+// fetchUPnPXML performs a single bounded GET (2s timeout, maxUPnPDescBytes cap)
+// against a validated same-host UPnP description URL and populates dev.
 func fetchUPnPXML(ctx context.Context, client *http.Client, targetURL string, dev *UPnPDevice) {
 	reqCtx, cancel := context.WithTimeout(ctx, 2000*time.Millisecond)
 	defer cancel()
@@ -2498,6 +2622,8 @@ func parseUPnPDescriptionXML(raw []byte, dev *UPnPDevice) {
 	sort.Strings(dev.ServiceTypes)
 }
 
+// newRandomUUID returns an RFC 4122 version-4 UUID for WS-Discovery MessageID
+// headers, falling back to a timestamp seed if crypto/rand fails.
 func newRandomUUID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

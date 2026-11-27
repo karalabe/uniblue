@@ -35,7 +35,9 @@ import (
 // carried forward in persisted state before aging out as resolved.
 const offlineFindingTTL = 7 * 24 * time.Hour
 
-// transientPatchActionGrace keeps a missed version banner from resolving a known patch.
+// transientPatchActionGrace keeps a single missed service version banner from
+// immediately resolving a known patch action while genuinely patched hosts age
+// out promptly once the grace window passes.
 const transientPatchActionGrace = 2 * time.Hour
 
 // CurrentScoringVersion identifies the baseline for finding scores and ranked action identities.
@@ -43,7 +45,10 @@ const CurrentScoringVersion = 3
 
 // Report holds the complete risk-scored output of a single UniBlue scan.
 type Report struct {
-	// SSHHostKeys carries the updated baseline to local state storage.
+	// SSHHostKeys holds the next pinned SSH host-key fingerprint baseline keyed
+	// by host-and-port so callers can persist it into State.SSHHostKeys,
+	// retaining prior fingerprints for missing observations and for hosts that
+	// presented a changed key (excluded from serialized JSON reports).
 	SSHHostKeys map[string]string `json:"-"`
 
 	// GeneratedAt records when the report was evaluated.
@@ -108,13 +113,17 @@ type State struct {
 	// CarriedActions marks actions retained for online hosts awaiting a new probe.
 	CarriedActions map[string]bool `json:"carried_actions,omitempty"`
 
-	// ActionAssets records when each protected host was last observed for an action.
+	// ActionAssets maps each asset-tracked action ID to its per-host
+	// last-observed UTC timestamps (keyed by normalized client MAC or IP) so
+	// absent clients age out independently.
 	ActionAssets map[string]map[string]time.Time `json:"action_assets,omitempty"`
 
 	// UpgradeCarriedHosts records clients awaiting their first probe after a scoring upgrade.
 	UpgradeCarriedHosts map[string]time.Time `json:"upgrade_carried_hosts,omitempty"`
 
-	// KnownClientIPs preserves the last known client MAC for WAN backend addresses.
+	// KnownClientIPs maps canonical WAN backend IP addresses to the last
+	// unambiguously observed client MAC so offline WAN backends retain stable
+	// MAC-anchored action IDs across disconnects.
 	KnownClientIPs map[string]string `json:"known_client_ips,omitempty"`
 
 	// SSHHostKeys holds the last observed public host-key fingerprint for each device and port.
@@ -123,8 +132,10 @@ type State struct {
 	// UpdatedAt records when the baseline was last saved.
 	UpdatedAt time.Time `json:"updated_at"`
 
-	// Findings maps finding keys ("checkID|mac|port") to their last known
-	// effective severity.
+	// Findings maps persisted finding keys (Finding.Key() formatted as
+	// "checkID|host|port[|property][|transport]", or
+	// "UB-UNIFI-PORTFWD|portfwd:<id>|<port>" for port forwards) to their last
+	// known effective severity.
 	Findings map[string]checks.Severity `json:"findings"`
 
 	// FindingLastSeen records when each finding key was last actively observed
@@ -229,28 +240,62 @@ func ActionPriorityLabel(p string) string {
 // firewall or config drift, honeypot hit, edge physical tamper, evil-twin AP,
 // or trusted-VLAN medium swap) forwarded via webhook alongside diff changes.
 type AlertEvent struct {
-	Type     string          `json:"type"`
+	// Type classifies the security event category (e.g., "admin_access", "honeypot_hit").
+	Type string `json:"type"`
+
+	// Severity ranks the operational urgency of the event.
 	Severity checks.Severity `json:"severity"`
-	Time     time.Time       `json:"time,omitempty"`
-	Host     string          `json:"host,omitempty"`
-	IP       string          `json:"ip,omitempty"`
-	Summary  string          `json:"summary"`
+
+	// Time records when the event occurred, if known.
+	Time time.Time `json:"time,omitempty"`
+
+	// Host is the display name of the affected client or infrastructure device, if applicable.
+	Host string `json:"host,omitempty"`
+
+	// IP is the relevant source or device IP address associated with the event, if any.
+	IP string `json:"ip,omitempty"`
+
+	// Summary is a concise human-readable description of the event.
+	Summary string `json:"summary"`
 }
 
 // CVEAlert represents a newly matched or newly KEV-promoted exact-version CVE
 // on a LAN host or UniFi infrastructure appliance.
 type CVEAlert struct {
-	CVEID           string          `json:"cve_id"`
-	HostName        string          `json:"host_name"`
-	HostIP          string          `json:"host_ip"`
-	VLAN            string          `json:"vlan,omitempty"`
-	Product         string          `json:"product"`
-	Version         string          `json:"version,omitempty"`
-	Severity        checks.Severity `json:"severity"`
-	CVSS            float64         `json:"cvss,omitempty"`
-	KEV             bool            `json:"kev,omitempty"`
-	WANExposed      bool            `json:"wan_exposed,omitempty"`
-	MinFixedVersion string          `json:"min_fixed_version,omitempty"`
+	// CVEID is the canonical CVE identifier (e.g., "CVE-2024-12345").
+	CVEID string `json:"cve_id"`
+
+	// HostName is the display name of the affected host or UniFi device.
+	HostName string `json:"host_name"`
+
+	// HostIP is the IP address of the affected host or device.
+	HostIP string `json:"host_ip"`
+
+	// VLAN is the resolved network/VLAN name where the affected host resides.
+	VLAN string `json:"vlan,omitempty"`
+
+	// Product is the normalized software or firmware product name matched by the CVE.
+	Product string `json:"product"`
+
+	// Version is the exact observed software or firmware version string, if known.
+	Version string `json:"version,omitempty"`
+
+	// Severity is the effective vulnerability severity for alerting.
+	Severity checks.Severity `json:"severity"`
+
+	// CVSS is the base score from the selected NVD CVSS metric for this CVE, when available.
+	CVSS float64 `json:"cvss,omitempty"`
+
+	// KEV reports whether the CVE appears in CISA's Known Exploited Vulnerabilities catalog.
+	KEV bool `json:"kev,omitempty"`
+
+	// WANExposed reports whether a matching enabled port forward exposes the affected host.
+	WANExposed bool `json:"wan_exposed,omitempty"`
+
+	// MinFixedVersion is the minimum fixed version from the product/version rollup
+	// across exact CVE matches, which can exceed the fix boundary for this
+	// individual CVE, if published.
+	MinFixedVersion string `json:"min_fixed_version,omitempty"`
 }
 
 // Diff summarizes security-relevant changes between the previous persisted
@@ -560,7 +605,12 @@ func scoreFinding(f checks.Finding, forwards []unifi.PortForward, oracle *Oracle
 		if local {
 			f.EffectiveSeverity, f.ClaimKind = checks.SeverityInfo, checks.ClaimServiceObserved
 		}
-		// A forward with an unresolved source still publishes the listener.
+		// Return immediately once WAN reachability is settled (either confirmed
+		// critical allow or confirmed non-WAN). When ListenerWAN returned
+		// "unknown" without already reaching Critical (for instance, due to a
+		// port forward with an unresolved source filter), fall through to the
+		// port-forward loop below so the standard severity bump and forward
+		// evidence are still applied.
 		if !unknown || f.EffectiveSeverity == checks.SeverityCritical {
 			return f
 		}
@@ -683,6 +733,9 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 		}
 	}
 
+	// Retain IP-to-MAC mappings only for configured WAN backends and addresses
+	// backing active or carried WAN service actions so stale DHCP leases do not
+	// accumulate in state.
 	onlineOwners := onlineIPOwners(snap)
 	st.KnownClientIPs = wanBackendOwners(snap, knownClientIPs(prev, onlineOwners), onlineOwners, st.Actions)
 
@@ -730,7 +783,9 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 				}
 				st.CarriedFindings[k] = true
 			}
-			// Only scores saved before version 2 could include a VLAN discount.
+			// Baselines saved under scoring version < 2 applied a one-tier
+			// severity discount to isolated-VLAN findings; bump carried-forward
+			// severities by one tier so they match un-discounted scoring.
 			if prev.ScoringVersion < 2 {
 				sev = sev.Bump(1)
 			}
@@ -1093,8 +1148,40 @@ func ComputeDiffWithProbed(prev *State, snap *unifi.Snapshot, report Report, net
 	return diff
 }
 
-// ComputeActionDiff compares stable remediation IDs and builds the next action baseline.
-// Existing state without comparable action priorities is seeded silently.
+// ComputeActionDiff compares the current scan's ranked remediation actions
+// against prev and produces both the alert diff and the updated action maps to
+// persist in State.
+//
+// Inputs:
+//   - prev: previous persisted State. A nil prev treats current actions as new
+//     and emits them in newActions; an existing State needing a scoring
+//     rebaseline or with a nil Actions map seeds the action maps silently
+//     without emitting new or escalated alerts.
+//   - snap: current UniFi snapshot used to resolve online hosts, infrastructure
+//     devices, port forwards, and IP-to-MAC ownership.
+//   - current: action alerts built for the current scan.
+//   - probedHostKeys: hosts actively probed in this cycle (nil means probe
+//     coverage is unavailable, so the previous carry-forward flag decides
+//     retention for an online host).
+//   - cveMatched: whether exact-version CVE matching ran in this cycle (when
+//     false, patch actions are carried forward rather than resolved).
+//
+// Return values:
+//   - newActions, escalatedActions: sorted alerts for newly introduced actions
+//     and existing actions whose priority increased.
+//   - resolvedIDs: sorted action IDs no longer active or eligible for carry-forward.
+//   - nextActions, nextLastSeen, nextPeakAt: retained action priorities and UTC
+//     timestamps (priority peaks are preserved for offlineFindingTTL even when
+//     an absent protected host temporarily lowers measured benefit).
+//   - nextCarried: actions currently retained only via online-unprobed carry-forward.
+//   - nextAssets: per-action map of normalized protected client hosts to last-seen time.
+//   - nextOwners: canonical WAN backend IP-to-MAC ownership map retained for offline continuity.
+//
+// Key invariants: IP-keyed WAN service actions are normalized to MAC-anchored
+// IDs once a client MAC is known, duplicate fallback port-forward actions
+// (act:wan-pf:*) are suppressed while a carried WAN service bundle covers them
+// at equal or higher priority, and hosts awaiting their first probe after a
+// scoring upgrade are suppressed from new-action alerts until probed.
 func ComputeActionDiff(
 	prev *State,
 	snap *unifi.Snapshot,
@@ -1112,8 +1199,9 @@ func ComputeActionDiff(
 	nextAssets = make(map[string]map[string]time.Time)
 	nextCarried = make(map[string]bool)
 	for _, a := range current {
-		// Blast already used the current inventory for online hosts. Only supply
-		// a remembered MAC for an address that no online client claims.
+		// The blast-radius action builder already resolves online hosts from
+		// current inventory. Only substitute a remembered MAC when no online
+		// client currently claims the address.
 		a.ID = wanServiceMACID(a.ID, knownOwners, onlineOwners)
 		if a.ID == "" || ActionPriorityRank(a.Priority) <= ActionPriorityRank(nextActions[a.ID]) {
 			continue
@@ -1196,8 +1284,10 @@ func ComputeActionDiff(
 			nextCarried[id] = true
 		}
 	}
-	// A disconnect can leave just the IPv4 forward visible. Suppress the
-	// duplicate unless the forward now warrants a higher-priority alert.
+	// While a WAN backend client is offline, its bundled act:wan-service action
+	// is carried forward above, while the gateway still emits a raw
+	// act:wan-pf:<id> action for the port forward alone. Suppress that fallback
+	// duplicate unless the port-forward action now has strictly higher priority.
 	if len(carriedBundles) > 0 {
 		covered := make(map[string]int)
 		for _, pf := range snap.PortForwards {
@@ -1229,6 +1319,9 @@ func ComputeActionDiff(
 	slices.SortFunc(escalatedActions, order)
 	slices.Sort(resolvedIDs)
 	nextOwners = wanBackendOwners(snap, knownOwners, onlineOwners, nextActions)
+	// Preserve the IP-to-MAC bridge for any current IP-keyed WAN service action
+	// that was rewritten onto a remembered MAC and kept in nextActions so
+	// subsequent offline cycles continue matching the same MAC-anchored ID.
 	for _, a := range current {
 		if s, ok := parseWANService(a.ID); ok && knownOwners[s.host] != "" && nextActions[wanServiceMACID(a.ID, knownOwners, onlineOwners)] != "" {
 			nextOwners[s.host] = knownOwners[s.host]
@@ -1237,8 +1330,9 @@ func ComputeActionDiff(
 	return
 }
 
-// upgradeActionHosts links recent legacy observations to the identifiers Blast
-// can use for the same client after it reconnects.
+// upgradeActionHosts expands recent scoring-upgrade host markers to all
+// identifiers (MAC, client ID, IPs) of matching online clients so the
+// blast-radius action builder recognizes them after reconnects.
 func upgradeActionHosts(markers map[string]time.Time, snap *unifi.Snapshot, now time.Time) map[string]struct{} {
 	if len(markers) == 0 {
 		return nil
@@ -1265,8 +1359,10 @@ func upgradeActionHosts(markers map[string]time.Time, snap *unifi.Snapshot, now 
 	return hosts
 }
 
-// normalizeActionAssetHost maps Blast's child and managed assets to the host
-// whose presence can be verified in the client inventory.
+// normalizeActionAssetHost strips the "managed:<host>" wrapper or the
+// "child:" prefix and final colon-delimited component emitted by blast-radius
+// analysis. For a child ID whose suffix contains additional colons,
+// activeActionAssetHost completes parent resolution against inventory.
 func normalizeActionAssetHost(raw string) string {
 	s := strings.ToLower(strings.TrimSpace(raw))
 	if rest, ok := strings.CutPrefix(s, "child:"); ok {
@@ -1310,7 +1406,9 @@ func actionAssetObservations(prev *State, id string, current []string, lastSeen,
 	for raw, seen := range prev.ActionAssets[id] {
 		host := observationHostKey(raw)
 		if strings.HasPrefix(host, "child:") || strings.HasPrefix(host, "managed:") {
-			// Wrapped entries in older baselines were never verified as clients.
+			// Older baselines stored raw blast-radius asset IDs instead of
+			// canonical client keys; resolve them to active non-infrastructure
+			// clients before checking retention.
 			host = activeActionAssetHost(host, infraHosts, activeHosts)
 		}
 		seen = observationLastSeen(seen, lastSeen, now)
@@ -1333,15 +1431,20 @@ func actionAssetObservations(prev *State, id string, current []string, lastSeen,
 	return assets, onlineUnprobed
 }
 
-// carryMissingAction distinguishes unavailable evidence from a confirmed fix.
-// Network actions can still protect an absent client even if another returned.
+// carryMissingAction decides whether a previously active action missing from
+// the current scan should be carried forward (offline/unprobed client, skipped
+// CVE matching, or transient version-banner miss) versus marked resolved.
 func carryMissingAction(id string, prev *State, snap *unifi.Snapshot, lastSeen, now time.Time, cveMatched bool, infraHosts, activeHosts, probedHostKeys map[string]struct{}) (keep, onlineUnprobed bool, assets map[string]time.Time) {
+	// Keep patch actions when CVE matching did not run in this scan or while
+	// still inside transientPatchActionGrace after a missed version banner.
 	if (strings.HasPrefix(id, "act:patch:") || strings.HasPrefix(id, "act:patch-product:")) && (!cveMatched || now.Sub(lastSeen) <= transientPatchActionGrace) {
 		return true, prev.CarriedActions[id], nil
 	}
 	if snap == nil {
 		return false, false, nil
 	}
+	// Resolve gateway-routed policy actions immediately once gateway policies
+	// confirm the referenced ALLOW rule is disabled or deleted.
 	if rule, routed := strings.CutPrefix(id, "act:gateway-routed:"); routed && snap.Visibility != nil && snap.Visibility.GatewayPoliciesAvailable {
 		if !slices.ContainsFunc(snap.FirewallPolicies, func(p unifi.FirewallPolicy) bool {
 			return p.Enabled && cmp.Or(p.ID, p.Name) == rule && strings.EqualFold(strings.TrimSpace(p.Action), "ALLOW")
@@ -1352,8 +1455,9 @@ func carryMissingAction(id string, prev *State, snap *unifi.Snapshot, lastSeen, 
 	host := observationHostKey(actionClientHost(id))
 	if assetTrackedAction(id) {
 		assets, onlineUnprobed = actionAssetObservations(prev, id, nil, lastSeen, now, infraHosts, activeHosts, probedHostKeys)
-		// A WAN bundle identifies its backend even when Blast lists no assets.
-		// A tracked backend already has its own observation window above.
+		// A WAN bundle action ID still names its backend even when blast-radius
+		// analysis emitted no separate AffectedAssets; skip the fallback host
+		// check only when that backend already has its own tracked window above.
 		if _, tracked := prev.ActionAssets[id][host]; tracked {
 			host = ""
 		}
@@ -1395,7 +1499,9 @@ type wanService struct {
 	port        int
 }
 
-// parseWANService splits at the last colon to preserve IPv6 and MAC addresses.
+// parseWANService parses an "act:wan-service:<host>:<proto>/<port>" action ID,
+// splitting at the last colon so colons inside IPv6 and MAC addresses stay
+// intact, and returns the canonicalized backend host, transport, and port.
 func parseWANService(id string) (wanService, bool) {
 	tail, ok := strings.CutPrefix(id, "act:wan-service:")
 	i := strings.LastIndexByte(tail, ':')
@@ -1486,7 +1592,9 @@ func (s wanService) targetsIP(ip string, owners map[string]string) bool {
 	return s.host == ip || s.host == owners[ip]
 }
 
-// matchesForward compares translated ports, including untranslated port ranges.
+// matchesForward reports whether an enabled port forward exposes s's transport
+// and port on s's backend host, falling back to DstPort when FwdPort is omitted
+// for untranslated forwards.
 func (s wanService) matchesForward(pf unifi.PortForward, owners map[string]string) bool {
 	pf.FwdPort = firstNonEmptyStr(pf.FwdPort, pf.DstPort)
 	return pf.ExposesEndpoint(s.port, s.proto) && s.targetsIP(pf.FwdIP, owners)
@@ -1573,8 +1681,14 @@ func assetTrackedAction(id string) bool {
 		strings.HasPrefix(id, "act:gateway-routed:") || strings.HasPrefix(id, "act:switch-routed:") || strings.HasPrefix(id, "act:wan-service:")
 }
 
-// actionClientHost strips only the known ID components so MACs and IPv6 addresses
-// retain their embedded colons. Network controls have no client lifetime.
+// actionClientHost extracts the host identifier (MAC or IP) from client-scoped
+// action IDs:
+//   - "act:patch:<...>:<host>", "act:patch-product:<...>:<host>", "act:check-host:<...>:<host>"
+//   - "act:check:<checkID>:<host>:<port>[:tcp|:udp]"
+//   - "act:service:<host>:<proto>/<port>", "act:wan-service:<host>:<proto>/<port>"
+//
+// Splitting only on the known leading/trailing delimiters keeps colons inside
+// MACs and IPv6 addresses intact. Network-level control IDs return "".
 func actionClientHost(id string) string {
 	body, ok := strings.CutPrefix(id, "act:")
 	if !ok {
@@ -1758,6 +1872,8 @@ func IsolatedZones(snap *unifi.Snapshot) map[string]bool {
 	return isolatedZoneSet(snap)
 }
 
+// zoneLANNetworks returns all non-WAN, non-remote-VPN networks assigned to
+// zone, or a zone-only placeholder when the snapshot lists no networks in zone.
 func zoneLANNetworks(snap *unifi.Snapshot, zone string) []unifi.Network {
 	var nets []unifi.Network
 	for _, n := range snap.Networks {
@@ -1776,11 +1892,15 @@ func zoneLANNetworks(snap *unifi.Snapshot, zone string) []unifi.Network {
 	return nets
 }
 
+// endpointCoversNetwork reports whether ep unconditionally matches all ports
+// and all hosts on n without target or port negation.
 func endpointCoversNetwork(ep unifi.PolicyEndpoint, n unifi.Network) bool {
 	return !ep.NegatePort && ep.CoversAllPorts() && !ep.NegateTarget &&
 		endpointUnconditionallyMatchesNetwork(ep, n.ZoneName, n, false)
 }
 
+// blocksCoverNetworkPairs reports whether every (src, dst) network pair is
+// unconditionally covered by at least one block policy in blocks.
 func blocksCoverNetworkPairs(blocks []unifi.FirewallPolicy, srcNets, dstNets []unifi.Network) bool {
 	for _, src := range srcNets {
 		for _, dst := range dstNets {
@@ -1902,6 +2022,10 @@ func (o *Oracle) isolatedZones() map[string]bool {
 							fullyIsolated = false
 							break
 						}
+						// Re-probe UDP/53 against a non-pinhole Internal host on
+						// gateway-routed pairs to confirm an explicit BLOCK/REJECT
+						// rule (ruleID != "") blocks general UDP/53 transit rather
+						// than relying on implicit zone defaults or a broad DNS allow.
 						if srcNet.RouterDeviceMAC == "" && dstNet.RouterDeviceMAC == "" {
 							avoid := pinholeIPsV4
 							if fam == "ipv6" {

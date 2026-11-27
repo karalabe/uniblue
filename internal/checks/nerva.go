@@ -13,15 +13,14 @@ import (
 	"github.com/karalabe/uniblue/internal/probe"
 )
 
-// FindingsFromProfiles converts high-signal, noise-filtered Nerva protocol
-// findings discovered during host fingerprinting into first-class Finding
-// values so they flow through UniBlue's UniFi blast-radius scoring, state
-// diffing, and webhook alerting alongside declarative YAML checks.
+// FindingsFromProfiles converts Nerva service observations from hp.Services and
+// SSH posture observations from hp.SSH into Finding values used by scoring and
+// alerts.
 //
-// Any Nerva finding on a (host, port) whose security property is already
-// reported by an existing UniBlue check is skipped so operators never see
-// duplicate entries, while independent properties on the same port (such as an
-// expired TLS certificate alongside an HTTP product finding) are preserved.
+// Nerva findings whose (host, port, transport, property) is already covered by
+// an existing finding are skipped, while independent properties on the same
+// port (such as an expired TLS certificate alongside an HTTP product finding)
+// are preserved.
 func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Finding {
 	// Key deduplication strictly by (hostIP, port, transport, property) so
 	// independent security properties on the same endpoint (e.g., an HTTP
@@ -85,6 +84,9 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 				transport = "tcp"
 			}
 
+			// When a multi-IP host has no single resolved listener IP for this
+			// service, key deduplication by primary IP + family + "unknown" so
+			// unresolved findings do not collide with or suppress concrete endpoints.
 			ips := observationIPs(hp.Client, svc.AddressFamily, []string{hp.ServiceIP(svc)})
 			endpoint := hp.Client.PrimaryIP() + "|" + svc.AddressFamily + "|unknown"
 			if len(ips) == 1 {
@@ -139,6 +141,10 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 	return out
 }
 
+// existingFindingProperty resolves the canonical security property of an
+// existing Finding for deduplication against Nerva findings, mapping the 18
+// legacy UB-00xx unauthenticated-access checks that predate explicit YAML
+// property annotations to "auth-anon".
 func existingFindingProperty(f Finding) string {
 	if p := strings.ToLower(strings.TrimSpace(f.Property)); p != "" {
 		return p
@@ -169,6 +175,9 @@ func existingFindingProperty(f Finding) string {
 	}
 }
 
+// nervaFindingProperty maps a raw Nerva finding ID into the shared security
+// property namespace so independent TLS, SMB, and auth issues on the same port
+// stay distinct while matching equivalent YAML checks.
 func nervaFindingProperty(rawID string) string {
 	id := strings.ToLower(strings.TrimSpace(rawID))
 	switch {
@@ -211,6 +220,8 @@ func nervaTLSCipherProperty(id string) string {
 	}
 }
 
+// isTLSCipherFinding reports whether id is a Nerva weak-cipher finding rather
+// than a TLS protocol version or certificate finding.
 func isTLSCipherFinding(id string) bool {
 	if !strings.HasPrefix(id, "tls-") {
 		return false
@@ -224,6 +235,9 @@ func isTLSCipherFinding(id string) bool {
 		strings.Contains(id, "-des")
 }
 
+// isNervaUnauthFinding reports whether id indicates unauthenticated service
+// access, excluding tls-* and smb-* findings (such as tls-anon-cipher or SMB
+// signing posture) that describe transport weaknesses rather than open access.
 func isNervaUnauthFinding(id string) bool {
 	if strings.HasPrefix(id, "tls-") || strings.HasPrefix(id, "smb-") {
 		return false
@@ -234,6 +248,8 @@ func isNervaUnauthFinding(id string) bool {
 		strings.HasSuffix(id, "-none")
 }
 
+// nervaClaimKind classifies unauthenticated Nerva findings as confirmed
+// permissions and all other protocol/posture findings as observed services.
 func nervaClaimKind(rawID string) ClaimKind {
 	id := strings.ToLower(strings.TrimSpace(rawID))
 	switch {

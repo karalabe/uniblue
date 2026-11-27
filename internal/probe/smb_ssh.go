@@ -56,31 +56,31 @@ func negotiateSMB(conn net.Conn, timeout time.Duration) *SMBInfo {
 	binary.BigEndian.PutUint32(frame, uint32(len(frame)-4))
 	msg := frame[4:]
 	copy(msg, "\xfeSMB")
-	le.PutUint16(msg[4:], 64)
-	le.PutUint16(msg[14:], 1) // Request one credit.
+	le.PutUint16(msg[4:], 64) // StructureSize (64-byte SMB2 header)
+	le.PutUint16(msg[14:], 1) // CreditRequest = 1
 	body := msg[64:]
 	dialects := [...]uint16{0x0202, 0x0210, 0x0300, 0x0302, 0x0311}
-	le.PutUint16(body, 36)
-	le.PutUint16(body[2:], uint16(len(dialects)))
-	le.PutUint16(body[4:], 1) // Signing enabled.
-	le.PutUint32(body[8:], 0x40)
-	rand.Read(body[12:28])
-	le.PutUint32(body[28:], 112)
-	le.PutUint16(body[32:], 2)
+	le.PutUint16(body, 36)                        // NEGOTIATE request StructureSize
+	le.PutUint16(body[2:], uint16(len(dialects))) // DialectCount
+	le.PutUint16(body[4:], 1)                     // SecurityMode: signing enabled
+	le.PutUint32(body[8:], 0x40)                  // Capabilities: SMB2_GLOBAL_CAP_ENCRYPTION
+	rand.Read(body[12:28])                        // ClientGuid
+	le.PutUint32(body[28:], 112)                  // NegotiateContextOffset (64 hdr + 36 body + 10 dialects + 2 pad)
+	le.PutUint16(body[32:], 2)                    // NegotiateContextCount
 	for i, dialect := range dialects {
 		le.PutUint16(body[36+2*i:], dialect)
 	}
 	preauth := msg[112:160]
-	le.PutUint16(preauth, 1)
-	le.PutUint16(preauth[2:], 38)
-	le.PutUint16(preauth[8:], 1)
-	le.PutUint16(preauth[10:], 32)
-	le.PutUint16(preauth[12:], 1) // SHA-512 with a fresh 32-byte salt.
+	le.PutUint16(preauth, 1)       // SMB2_PREAUTH_INTEGRITY_CAPABILITIES
+	le.PutUint16(preauth[2:], 38)  // DataLength (2 hash count + 2 salt len + 2 hash ID + 32 salt)
+	le.PutUint16(preauth[8:], 1)   // HashAlgorithmCount
+	le.PutUint16(preauth[10:], 32) // SaltLength
+	le.PutUint16(preauth[12:], 1)  // SHA-512 with a fresh 32-byte salt.
 	rand.Read(preauth[14:46])
 	cipher := msg[160:]
-	le.PutUint16(cipher, 2) // SMB2_ENCRYPTION_CAPABILITIES
-	le.PutUint16(cipher[2:], 10)
-	le.PutUint16(cipher[8:], 4) // Offer AES-128-CCM, AES-128-GCM, AES-256-CCM, AES-256-GCM.
+	le.PutUint16(cipher, 2)      // SMB2_ENCRYPTION_CAPABILITIES
+	le.PutUint16(cipher[2:], 10) // DataLength (2 count + 4*2 cipher IDs)
+	le.PutUint16(cipher[8:], 4)  // Offer AES-128-CCM, AES-128-GCM, AES-256-CCM, AES-256-GCM.
 	le.PutUint16(cipher[10:], 1)
 	le.PutUint16(cipher[12:], 2)
 	le.PutUint16(cipher[14:], 3)
@@ -101,21 +101,27 @@ func negotiateSMB(conn net.Conn, timeout time.Duration) *SMBInfo {
 	if _, err := io.ReadFull(conn, reply); err != nil {
 		return nil
 	}
+	// Verify SMB2 magic, 64-byte header, STATUS_SUCCESS, NEGOTIATE command (0),
+	// server-to-redir flag (bit 0), NextCommand=0, MessageId=0, and NEGOTIATE
+	// response StructureSize=65.
 	if !bytes.Equal(reply[:4], msg[:4]) || le.Uint16(reply[4:]) != 64 ||
 		le.Uint32(reply[8:]) != 0 || le.Uint16(reply[12:]) != 0 ||
 		le.Uint32(reply[16:])&1 == 0 || le.Uint32(reply[20:]) != 0 ||
 		le.Uint64(reply[24:]) != 0 || le.Uint16(reply[64:]) != 65 {
 		return nil
 	}
+	// Offsets 66 and 68 hold SecurityMode (bit 0 enabled, bit 1 required) and DialectRevision.
 	mode, dialect := le.Uint16(reply[66:]), le.Uint16(reply[68:])
 	names := [...]string{"2.0.2", "2.1", "3.0", "3.0.2", "3.1.1"}
 	for i, d := range dialects {
 		if dialect != d {
 			continue
 		}
+		// SMB 3.0/3.0.2 advertise encryption via Capabilities bit 0x40 at offset 88.
 		encryption := d >= 0x0300 && le.Uint32(reply[88:])&0x40 != 0
 		if d == 0x0311 {
-			// SMB 3.1.1 servers select an encryption cipher in a negotiate context.
+			// SMB 3.1.1 servers select an encryption cipher in an 8-byte-aligned
+			// negotiate context (offset at 124, count at 70, context type 2).
 			offset := int(le.Uint32(reply[124:]))
 			for range le.Uint16(reply[70:]) {
 				if offset < 128 || offset%8 != 0 || offset > len(reply)-8 {
@@ -153,11 +159,11 @@ func negotiateSMBv1(conn net.Conn, timeout time.Duration) (ok, signingEnabled, s
 	binary.BigEndian.PutUint32(frame, uint32(len(frame)-4))
 	msg := frame[4:]
 	copy(msg[0:4], "\xffSMB")
-	msg[4] = 0x72 // SMB_COM_NEGOTIATE
-	msg[9] = 0x18 // Canonicalized + case-insensitive paths
-	binary.LittleEndian.PutUint16(msg[10:], 0x4801)
-	msg[32] = 0 // WordCount
-	binary.LittleEndian.PutUint16(msg[33:], uint16(len(dialect)))
+	msg[4] = 0x72                                                 // SMB_COM_NEGOTIATE
+	msg[9] = 0x18                                                 // Flags: canonicalized + case-insensitive paths
+	binary.LittleEndian.PutUint16(msg[10:], 0x4801)               // Flags2: long names (0x0001), extended security (0x0800), NT status (0x4000)
+	msg[32] = 0                                                   // WordCount
+	binary.LittleEndian.PutUint16(msg[33:], uint16(len(dialect))) // ByteCount
 	copy(msg[35:], dialect)
 
 	if _, err := conn.Write(frame); err != nil {
@@ -176,6 +182,8 @@ func negotiateSMBv1(conn net.Conn, timeout time.Duration) (ok, signingEnabled, s
 		return false, false, false
 	}
 	le := binary.LittleEndian
+	// Verify SMB1 magic, SMB_COM_NEGOTIATE, STATUS_SUCCESS, WordCount >= 1,
+	// and DialectIndex == 0 (accepted our sole offered NT LM 0.12 dialect).
 	accepted := bytes.Equal(reply[:4], []byte("\xffSMB")) &&
 		reply[4] == 0x72 &&
 		le.Uint32(reply[5:]) == 0 &&
@@ -193,8 +201,9 @@ func negotiateSMBv1(conn net.Conn, timeout time.Duration) (ok, signingEnabled, s
 	return true, signingEnabled, signingRequired
 }
 
-// sshPort reserves both SSH ports recognized by the general fingerprinter and any
-// SSH listener advertised for this address so only the pre-authentication probe runs.
+// sshPort reports whether port is a recognized SSH listener on this host (ports
+// 22, 2222, or a non-forged _ssh._tcp mDNS advertisement targeting ProbeIP) so
+// it is handled by the dedicated pre-auth SSH observer rather than generic probes.
 func (h HostProfile) sshPort(port int) bool {
 	if port == 22 || port == 2222 {
 		return true
@@ -212,19 +221,28 @@ func (h HostProfile) sshPort(port int) bool {
 // query. All fields are excluded from JSON serialization so key-to-host maps
 // never leak into webhooks, state files, or external logs.
 type SSHAcceptedKey struct {
-	Username    string `json:"-"`
+	// Username is the account name queried (PK_OK only invites a signed request and does not establish a successful login).
+	Username string `json:"-"`
+	// Fingerprint is the OpenSSH SHA-256 fingerprint of the invited public key (empty for "none" auth).
 	Fingerprint string `json:"-"`
-	Algorithm   string `json:"-"`
-	KeyLabel    string `json:"-"`
-	Method      string `json:"-"`
-	Note        string `json:"-"`
+	// Algorithm is the offered public-key algorithm echoed in SSH_MSG_USERAUTH_PK_OK (not separately negotiated).
+	Algorithm string `json:"-"`
+	// KeyLabel is the basename of the local .pub file that supplied this key.
+	KeyLabel string `json:"-"`
+	// Method records how the server responded ("publickey-ok" or "none").
+	Method string `json:"-"`
+	// Note explains caveats such as MFA, ForceCommand, or source-IP restrictions.
+	Note string `json:"-"`
 }
 
 // SSHPublicKey holds a parsed local OpenSSH public key and its SHA-256 fingerprint.
 type SSHPublicKey struct {
-	Key         ssh.PublicKey
+	// Key is the parsed OpenSSH public key.
+	Key ssh.PublicKey
+	// Fingerprint is the OpenSSH SHA-256 fingerprint of Key.
 	Fingerprint string
-	Label       string
+	// Label is the basename of the local .pub file used for operator display.
+	Label string
 }
 
 // SSHInfo identifies an SSH listener by its greeting, verified key exchange,
@@ -296,8 +314,12 @@ func (c *sshGreetingConn) Read(b []byte) (int, error) {
 }
 
 // parseServerKexInit inspects the server's first unencrypted SSH binary packet
-// (SSH_MSG_KEXINIT, type 20) and returns any deprecated KEX, cipher, or MAC names.
+// (RFC 4253 SSH_MSG_KEXINIT, type 20) and returns any deprecated KEX, cipher,
+// or MAC names.
 func parseServerKexInit(buf []byte) (weakKex, weakCiphers, weakMACs []string) {
+	// Binary packet framing: 4-byte packet_length and 1-byte padding_length,
+	// followed by the KEXINIT payload prefix: 1-byte message type
+	// (20 = SSH_MSG_KEXINIT) and 16-byte random cookie.
 	if len(buf) < 22 {
 		return nil, nil, nil
 	}
@@ -324,6 +346,8 @@ func parseServerKexInit(buf []byte) (weakKex, weakCiphers, weakMACs []string) {
 		}
 		return strings.Split(raw, ","), true
 	}
+	// RFC 4253 section 7.1 name-lists: [0] kex_algorithms, [1] server_host_key_algorithms,
+	// [2..3] encryption_algorithms (c2s, s2c), [4..5] mac_algorithms (c2s, s2c).
 	var lists [6][]string
 	for i := range lists {
 		var ok bool
@@ -474,7 +498,9 @@ type SSHKeyAuditCache struct {
 	entries sync.Map // Stable listener identity to *SSHKeyAuditCacheEntry.
 }
 
-// SSHKeyAuditCacheEntry serializes queries for one listener across concurrent scans.
+// SSHKeyAuditCacheEntry serializes queries for one listener across concurrent
+// scans and tracks whether cached results cover auth methods only or a full
+// key audit, along with positive TTL expiry and failure backoff deadlines.
 type SSHKeyAuditCacheEntry struct {
 	mu             sync.Mutex
 	result         SSHInfo
@@ -484,8 +510,10 @@ type SSHKeyAuditCacheEntry struct {
 	retryAfter     time.Time
 }
 
-// auditSSH reuses the initial none request of a configured key audit. Without
-// configured keys, the client stops as soon as the server advertises its methods.
+// auditSSH queries advertised SSH authentication methods and, when opt-in key
+// auditing is active and the host key has not changed, runs AuditSSHKeys on the
+// same connection budget. Results are cached per listener for one hour with a
+// five-minute backoff after failed probes.
 func (f *Fingerprinter) auditSSH(ctx context.Context, hp *HostProfile) {
 	info := hp.SSH
 	if info == nil || info.HostKeyFingerprint == "" || f.isInfrastructure(*hp) || ctx.Err() != nil {
@@ -513,10 +541,15 @@ func (f *Fingerprinter) auditSSH(ctx context.Context, hp *HostProfile) {
 		return
 	}
 	now := time.Now()
+	// Clear the cached result and query flags when the listener presents a new
+	// host key; any prior failure-backoff deadline remains active and can delay
+	// the next query.
 	if entry.result.HostKeyFingerprint != info.HostKeyFingerprint {
 		entry.result = SSHInfo{HostKeyFingerprint: info.HostKeyFingerprint}
 		entry.methodsQueried, entry.keysAudited = false, false
 	}
+	// Re-probe once any failure backoff has elapsed if the entry expired or a
+	// newly requested probe tier (key audit or auth-method query) has not yet run.
 	if !now.Before(entry.retryAfter) && (!now.Before(entry.expiresAt) || auditKeys && !entry.keysAudited || !f.DisableSSHAuthProbe && !entry.methodsQueried) {
 		answer := SSHInfo{HostKeyFingerprint: info.HostKeyFingerprint}
 		dropped := false
@@ -550,10 +583,15 @@ func (f *Fingerprinter) auditSSH(ctx context.Context, hp *HostProfile) {
 }
 
 const (
-	maxSSHKeyConnsHardCap   = 3
+	// maxSSHKeyConnsHardCap caps auth-attempting SSH connections per audit run.
+	maxSSHKeyConnsHardCap = 3
+	// maxSSHKeyQueriesHardCap caps total public-key queries per audit run
+	// (each attempted username uses one ephemeral canary sharing this 4-query cap).
 	maxSSHKeyQueriesHardCap = 4
 )
 
+// errPKOKConfirmed aborts ssh.NewClientConn as soon as PK_OK is observed so no
+// private-key signature is ever computed or transmitted.
 var errPKOKConfirmed = errors.New("ssh pk_ok confirmed without signing")
 
 // LoadSSHPublicKeys reads local OpenSSH .pub files and returns deduplicated
@@ -576,6 +614,9 @@ func LoadSSHPublicKeys(paths []string) ([]SSHPublicKey, error) {
 		for len(bytes.TrimSpace(rest)) > 0 {
 			pub, _, _, next, err := ssh.ParseAuthorizedKey(rest)
 			if err != nil {
+				// Skip blank lines and "#" comments between keys, and fail on malformed
+				// newline-terminated lines (an unterminated trailing line breaks out of
+				// the loop and is ignored if an earlier key was already parsed).
 				idx := bytes.IndexByte(rest, '\n')
 				if idx < 0 {
 					break
@@ -612,12 +653,16 @@ type pkQuerySigner struct {
 	algo     string
 }
 
+// PublicKey returns the queried public key without holding a private key.
 func (s *pkQuerySigner) PublicKey() ssh.PublicKey { return s.pub }
 
+// Sign delegates to SignWithAlgorithm to record PK_OK acceptance and abort.
 func (s *pkQuerySigner) Sign(_ io.Reader, _ []byte) (*ssh.Signature, error) {
 	return s.SignWithAlgorithm(nil, nil, s.pub.Type())
 }
 
+// SignWithAlgorithm records that the server invited this key via PK_OK and
+// immediately returns errPKOKConfirmed so no signature is ever sent.
 func (s *pkQuerySigner) SignWithAlgorithm(_ io.Reader, _ []byte, algorithm string) (*ssh.Signature, error) {
 	s.accepted = true
 	s.algo = algorithm
@@ -686,11 +731,14 @@ func probeSSHKeyBatch(ctx context.Context, addr, expectedHostKeyFP, user string,
 	return false, -1, false
 }
 
-// AuditSSHKeys runs a strictly opt-in, Fail2ban-safe SSH "none" and PK_OK audit
-// against one host. It caps BOTH total auth-attempting connections AND total
-// public-key queries (including the per-username ephemeral Ed25519 canary) at
-// maxProbes (default 3, hard max 3), refuses to run when the host key changed,
-// stops immediately on disconnects, and records only SHA-256 fingerprints.
+// AuditSSHKeys runs a strictly opt-in SSH "none" and PK_OK audit against one
+// host. Per audit run, it caps auth-attempting connections at maxProbes
+// (default 3, hard max 3) and total public-key queries at
+// min(maxSSHKeyQueriesHardCap, maxProbes+1) (up to 4), with each attempted
+// username generating its own ephemeral Ed25519 canary sharing that cap. It
+// refuses to run when the host key changed, stops immediately on disconnects,
+// and records each match's username, algorithm, key label, method, and caveat
+// alongside its SHA-256 fingerprint (never private key material).
 func AuditSSHKeys(ctx context.Context, addr string, keys []SSHPublicKey, usernames []string, maxProbes int, timeout time.Duration, info *SSHInfo) {
 	if info == nil || info.HostKeyFingerprint == "" || info.HostKeyChanged || len(keys) == 0 || len(usernames) == 0 {
 		return

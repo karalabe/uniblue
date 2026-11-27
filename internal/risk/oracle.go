@@ -104,8 +104,10 @@ func NewOracle(snap *unifi.Snapshot, netCfg config.NetworkConfig) *Oracle {
 	return o
 }
 
-// newPolicyOracle prepares the routing evidence shared with VLAN classification.
-// A zone-only evaluation borrows its snapshot and needs no attachment indexes.
+// newPolicyOracle constructs a lightweight Oracle containing only gateway
+// identity, ordered firewall policies, ordered switch ACLs, and feed
+// availability flags, skipping client, switch-port, and AP-uplink indexing for
+// zone-only checks.
 func newPolicyOracle(snap *unifi.Snapshot) *Oracle {
 	if snap == nil {
 		snap = &unifi.Snapshot{}
@@ -216,10 +218,11 @@ func (o *Oracle) InternetEgress(cl unifi.Client, fam string) IsolationCell {
 	if _, local := routableClient(cl, fam); local {
 		return o.nonRoutableCell(n, external, n.ZoneName, "External", cl, "", 0, fam)
 	}
-	// Keep L3 switch routing intact when switch ACLs are present or during
-	// infrastructure-compromise evaluation so switch egress blocks remain
-	// monotonic before and after gateway compromise. Preserve RouterUnresolved
-	// in all cases so unresolved routing owners never report allow then unknown.
+	// Clear RouterDeviceMAC only when no switch ACLs or compromised-enforcer
+	// scenarios apply so L3-switch-routed VLANs evaluate both switch egress ACLs
+	// and gateway rules whenever switch enforcement or compromise scenarios are
+	// in play. Keep RouterUnresolved intact so unresolved routing owners never
+	// appear permitted.
 	if len(o.snap.SwitchACLs) == 0 && len(o.compromised) == 0 {
 		n.RouterDeviceMAC = ""
 	}
@@ -369,8 +372,10 @@ func (o *Oracle) Internet(dst unifi.Client, proto string, port int, fam string) 
 	return cells
 }
 
-// ListenerWAN reports allow, deny or unknown for the exact observed socket.
-// A missing lease inventory cannot rule out an automatic port mapping.
+// ListenerWAN evaluates WAN reachability for the exact observed (ip, proto,
+// port) socket and returns "allow", "deny", or "unknown". Missing port-forward
+// visibility or enabled UPnP without a dynamic lease inventory prevents
+// certifying "deny" and degrades the result to "unknown".
 func (o *Oracle) ListenerWAN(cl unifi.Client, ip, proto string, port int) string {
 	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
 	if err != nil {
@@ -406,7 +411,9 @@ func (o *Oracle) PrivateLANListener(cl unifi.Client, ip, proto string, port int)
 	return err == nil && addr.Unmap().IsPrivate() && o.ListenerWAN(cl, ip, proto, port) == "deny"
 }
 
-// WithCompromised returns an independent scenario that bypasses only the named enforcers.
+// WithCompromised returns a shallow copy of the Oracle whose compromised
+// enforcer set includes enforcerMACs (canonicalized) so what-if blast-radius
+// queries bypass only the named switches, APs, or gateway.
 func (o *Oracle) WithCompromised(enforcerMACs ...string) *Oracle {
 	cp := *o
 	cp.compromised = make(map[string]bool, len(o.compromised)+len(enforcerMACs))
@@ -421,7 +428,9 @@ func (o *Oracle) WithCompromised(enforcerMACs ...string) *Oracle {
 
 const compromiseReason = "Enforcer compromised in what-if scenario"
 
-// bypass marks a decision at one compromised hop so the other hops can still enforce their rules.
+// bypass checks whether mac is marked compromised in the active scenario; when
+// true, it records an allow decision on cell for that hop while allowing other
+// enforcers along a multi-hop path to keep enforcing their own rules.
 func (o *Oracle) bypass(cell *IsolationCell, mac string) bool {
 	if len(o.compromised) == 0 || !o.compromised[config.CanonicalMAC(mac)] {
 		return false
@@ -448,8 +457,9 @@ func (o *Oracle) WithoutPolicies(excludeIDs map[string]bool) *Oracle {
 	return &cp
 }
 
-// InternetPolicy finds an inbound policy witness even when a host has no
-// observed services. Internet can then resolve all publications for that socket.
+// InternetPolicy evaluates External-to-LAN gateway firewall policies for dst
+// across all protocols and ports (proto="", port=0), surfacing a policy-level
+// ingress witness even when no concrete service ports were probed on dst.
 func (o *Oracle) InternetPolicy(dst unifi.Client, fam string) []IsolationCell {
 	dst = o.hydrateClient(dst, fam)
 	return o.firewallIngress(o.network(dst.NetworkID, dst.NetworkName), dst, "", 0, fam)
@@ -605,6 +615,8 @@ func (o *Oracle) hydrateClient(cl unifi.Client, fam string) unifi.Client {
 	if cl.NetworkID == "" && cl.NetworkName == "" {
 		cl.NetworkID, cl.NetworkName = observed.NetworkID, observed.NetworkName
 	}
+	// Infer wired attachment from switch fields only when neither the caller nor
+	// snapshot inventory reports a wireless AP or SSID for this client.
 	switch {
 	case cl.IsWired || ((cl.SwitchMAC != "" || cl.SwitchPort > 0) && cl.APMAC == "" && cl.ESSID == "" && (observed.IsWired || (observed.APMAC == "" && observed.ESSID == ""))):
 		cl.IsWired = true
@@ -1070,7 +1082,10 @@ func (o *Oracle) peerPorts(a, b checks.SwitchPortRef, path string, single bool) 
 	return c, ""
 }
 
-// peerPortSettingsKnown reports whether both ends can forward a permitted ACL flow.
+// peerPortSettingsKnown reports whether both switch ports are present in
+// o.ports with known port-isolation state (!IsolationUnknown), ensuring an ACL
+// allow is not treated as proven reachability when port isolation could still
+// block the crossing.
 func (o *Oracle) peerPortSettingsKnown(a, b checks.SwitchPortRef) bool {
 	pa, okA := o.ports[a]
 	pb, okB := o.ports[b]
@@ -1174,8 +1189,12 @@ func routingOwners(src, dst unifi.Network, srcZone, dstZone string) routingPath 
 	case strings.EqualFold(a, b):
 		return routingPath{a}
 	case a == "":
+		// Gateway-routed source to L3-switch-routed destination traverses both
+		// the destination switch ACL and the gateway firewall.
 		return routingPath{b, gatewayOwner}
 	default:
+		// Switch-routed source to gateway-routed destination (when b == "") or
+		// inter-switch transit across two distinct L3 switches (when b != "").
 		return routingPath{a, b}
 	}
 }

@@ -301,6 +301,7 @@ func (c *Classifier) matchName(name string) *hostnameRule {
 //  4. DHCP hostname / controller display name patterns
 //  5. Generic embedded Wi-Fi/MCU silicon OUIs (e.g., Espressif)
 //  6. IEEE locally-administered MAC bit (wired -> virtual NIC, Wi-Fi -> private mobile/laptop)
+//  7. Ambient AirPlay/RAOP mDNS media receiver fallback
 func (c *Classifier) ClassifyClient(cl unifi.Client, hp *probe.HostProfile, isWANWeb bool) Result {
 	ouiRes := c.ouiDB.Lookup(cl.MAC)
 	vendor := resolveVendor(ouiRes, cl.OUI)
@@ -589,7 +590,8 @@ func classifyByProtocol(hp *probe.HostProfile, vendor string) (Result, bool) {
 		}, true
 	}
 
-	// Building automation / IoT control protocols.
+	// Building automation / IoT control protocols (Modbus 502, MQTT 1883,
+	// Zehnder ComfoConnect 56747, or Tasmota/Shelly/ESPHome web UIs).
 	if hp.HasPort(502) || hp.HasPort(1883) || hp.HasPort(56747) ||
 		containsAny(titlesLower, "tasmota", "shelly", "esphome") {
 		return Result{
@@ -763,6 +765,8 @@ func classifyByDiscovery(hp *probe.HostProfile, vendor string) (Result, bool) {
 				Signals:    []string{"mDNS " + md.Type},
 			}, true
 		case "_axis-video._tcp":
+			// DoorBird intercoms advertise Axis's _axis-video._tcp service type but
+			// carry DoorBird's OUI (1c:ca:e3) in their mDNS TXT MAC field.
 			for _, kv := range md.TXT {
 				lowKV := strings.ToLower(kv)
 				if strings.HasPrefix(lowKV, "macaddress=1ccae3") || strings.HasPrefix(lowKV, "macaddress=1c:ca:e3") ||
@@ -815,6 +819,9 @@ func resolveVendor(ouiRes oui.Result, unifiOUI string) string {
 		return ouiRes.Vendor
 	}
 	trimmed := strings.TrimSpace(unifiOUI)
+	// IEEE assigns 24-bit prefixes of shared MA-M/MA-S blocks to "IEEE
+	// Registration Authority", so filter out that placeholder instead of
+	// treating it as a hardware manufacturer.
 	if trimmed == "" || strings.Contains(strings.ToLower(trimmed), "ieee registration authority") {
 		return ""
 	}

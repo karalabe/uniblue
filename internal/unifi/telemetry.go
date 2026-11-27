@@ -180,6 +180,9 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	t.missing = appendFeedError(t.missing, "health", h.err)
 	t.missing = appendFeedError(t.missing, "vpn-connections", vpnErr)
 	t.missing = appendFeedError(t.missing, "system-logs", l.err)
+	// Require at least one setting section alongside a nil error: an empty
+	// rest/setting array indicates insufficient permissions or an incomplete
+	// response rather than all security features being disabled.
 	if len(s.items) > 0 && s.err == nil {
 		t.settingsOK = true
 		t.settings = parseSecuritySettings(s.items)
@@ -206,9 +209,11 @@ func (c *Controller) fetchSiteTelemetry(ctx context.Context) siteTelemetry {
 	return t
 }
 
-// FetchRecentLogs queries UniFi's v2 System Log (security threats, critical
-// alerts, network anomalies, and admin activity) since the given timestamp.
-// Returns newest-first normalized events and fails gracefully on older consoles.
+// FetchRecentLogs queries UniFi's v2 System Log endpoints (system-log/all and
+// system-log/admin-activity) concurrently since the given timestamp and returns
+// newest-first normalized security and admin events. If one endpoint fails, it
+// still returns any events decoded from the other endpoint alongside the joined
+// fetch error so callers can preserve partial logs while recording feed gaps.
 func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]ControllerLogEvent, error) {
 	if c.currentControllerType() == "" {
 		if err := c.Login(ctx); err != nil {
@@ -265,6 +270,10 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		if entry.Admin != nil && strings.TrimSpace(entry.Admin.Name) != "" {
 			adminName = strings.TrimSpace(entry.Admin.Name)
 		}
+		// Admin-activity records often place actor, source IP, platform,
+		// change count, target object, and section on top-level fields rather
+		// than inside parameters; backfill any missing template keys before
+		// interpolating message templates.
 		params := extractLogParams(entry.Parameters)
 		if params == nil {
 			params = make(map[string]string, 8)
@@ -396,6 +405,9 @@ func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any,
 	return lastErr
 }
 
+// postJSONOnce performs a single read-only POST request to fullPath with API
+// key and CSRF headers, enforces maxControllerBodyBytes, checks HTTP status
+// and UniFi meta.rc envelope errors, and decodes the JSON response into dst.
 func (c *Controller) postJSONOnce(ctx context.Context, fullPath string, raw []byte, dst any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+fullPath, bytes.NewReader(raw))
 	if err != nil {
@@ -528,6 +540,9 @@ func convertRogueAPs(raw []rawRogueAP) []RogueAP {
 	return out
 }
 
+// convertHistoricalClients normalizes /rest/user records into HistoricalClient
+// entries, keeping the most recent of last_seen and disconnect_timestamp and
+// resolving missing network names via netByID.
 func convertHistoricalClients(raw []rawHistoricalUser, netByID map[string]Network) []HistoricalClient {
 	if len(raw) == 0 {
 		return nil
@@ -587,6 +602,8 @@ func isSecurityRelevantLog(e rawSystemLogEntry) bool {
 
 var unresolvedLogPlaceholderPattern = regexp.MustCompile(`\{[A-Z][A-Z0-9_]*\}`)
 
+// extractLogParams decodes raw JSON log parameter values into trimmed strings
+// and stores uppercase aliases alongside original keys for template lookup.
 func extractLogParams(raw map[string]json.RawMessage) map[string]string {
 	if len(raw) == 0 {
 		return nil
@@ -609,10 +626,14 @@ const maxLogParamDecodeDepth = 8
 
 var logPlaceholderPattern = regexp.MustCompile(`\{([A-Za-z0-9_]+)\}`)
 
+// decodeLogParamValue extracts a human-readable string from a raw JSON log
+// parameter (string, bool, number, or structured object) with bounded recursion.
 func decodeLogParamValue(v json.RawMessage) string {
 	return decodeLogParamValueDepth(v, 0)
 }
 
+// decodeLogParamValueDepth recursively decodes a JSON log parameter up to
+// maxLogParamDecodeDepth, dispatching on the leading token byte for linear work.
 func decodeLogParamValueDepth(v json.RawMessage, depth int) string {
 	if depth > maxLogParamDecodeDepth {
 		return ""
@@ -665,6 +686,9 @@ func decodeLogParamValueDepth(v json.RawMessage, depth int) string {
 	return ""
 }
 
+// interpolateLogTemplate substitutes {KEY} placeholders in tmpl in a single
+// pass using exact or uppercase lookups in params, stripping any unresolved
+// uppercase template placeholders and normalizing residual whitespace.
 func interpolateLogTemplate(tmpl string, params map[string]string) string {
 	if tmpl == "" {
 		return ""
@@ -703,6 +727,9 @@ func interpolateLogTemplate(tmpl string, params map[string]string) string {
 	return strings.TrimSpace(out)
 }
 
+// normalizeLogSeverity maps controller severity labels, categories, and
+// high-signal event keywords (such as honeypot or rogue AP detections) onto
+// normalized "critical", "high", "medium", "low", or "info" levels.
 func normalizeLogSeverity(rawSev, category, event string) string {
 	ev := strings.ToUpper(event)
 	if strings.Contains(ev, "HONEYPOT") || strings.Contains(ev, "ROGUE") {

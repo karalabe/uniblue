@@ -178,26 +178,43 @@ type AssetOverride struct {
 
 // BridgeInventoryConfig points to one owner-supplied bridge/recorder inventory file.
 type BridgeInventoryConfig struct {
-	Format       string `yaml:"format"`
-	Path         string `yaml:"path"`
-	ParentIP     string `yaml:"parent_ip,omitempty"`
-	ParentMAC    string `yaml:"parent_mac,omitempty"`
-	ParentRole   string `yaml:"parent_role,omitempty"`
+	// Format identifies the bridge inventory schema or parser to use.
+	Format string `yaml:"format"`
+	// Path is the filesystem path to the read-only inventory file.
+	Path string `yaml:"path"`
+	// ParentIP optionally identifies the parent bridge, hub, or recorder IP.
+	ParentIP string `yaml:"parent_ip,omitempty"`
+	// ParentMAC optionally identifies the parent bridge, hub, or recorder MAC.
+	ParentMAC string `yaml:"parent_mac,omitempty"`
+	// ParentRole optionally describes the parent device's operational role.
+	ParentRole string `yaml:"parent_role,omitempty"`
+	// ObservedFrom optionally records where or how the inventory export was collected.
 	ObservedFrom string `yaml:"observed_from,omitempty"`
 }
 
 // ApprovedPath declares one explicitly intended cross-zone service workflow
 // (such as Guest -> Printer IPPS on TCP 631 or NVR -> Camera RTSP on TCP 554).
 type ApprovedPath struct {
-	Name        string `yaml:"name" json:"name"`
-	SourceZone  string `yaml:"source_zone" json:"source_zone"`
-	DestRole    string `yaml:"dest_role,omitempty" json:"dest_role,omitempty"`
-	DestIP      string `yaml:"dest_ip,omitempty" json:"dest_ip,omitempty"`
-	DestZone    string `yaml:"dest_zone,omitempty" json:"dest_zone,omitempty"`
-	Function    string `yaml:"function" json:"function"` // e.g., "ipps-printing", "bmc-admin", "camera-recording"
-	Transport   string `yaml:"transport" json:"transport"`
-	Port        int    `yaml:"port" json:"port"`
-	IPVersion   string `yaml:"ip_version,omitempty" json:"ip_version,omitempty"` // "ipv4" | "ipv6" | "both"
+	// Name is the display label shown in reports and BreaksApproved annotations.
+	Name string `yaml:"name" json:"name"`
+	// SourceZone names the originating firewall zone or network.
+	SourceZone string `yaml:"source_zone" json:"source_zone"`
+	// DestRole optionally matches destinations by classified role or category.
+	DestRole string `yaml:"dest_role,omitempty" json:"dest_role,omitempty"`
+	// DestIP optionally restricts the destination to a specific IP address.
+	DestIP string `yaml:"dest_ip,omitempty" json:"dest_ip,omitempty"`
+	// DestZone optionally names the destination firewall zone or network (e.g., "External").
+	DestZone string `yaml:"dest_zone,omitempty" json:"dest_zone,omitempty"`
+	// Function labels the approved service workflow (e.g., "ipps-printing", "bmc-admin", "camera-recording").
+	Function string `yaml:"function" json:"function"`
+	// Transport specifies the layer 4 protocol ("tcp" or "udp").
+	Transport string `yaml:"transport" json:"transport"`
+	// Port specifies the destination port number (0 acts as a wildcard in some
+	// approval lookups, while transit exceptions require a positive port).
+	Port int `yaml:"port" json:"port"`
+	// IPVersion optionally limits matching to "ipv4", "ipv6", or "both".
+	IPVersion string `yaml:"ip_version,omitempty" json:"ip_version,omitempty"`
+	// Description optionally documents why this cross-zone path is approved.
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 }
 
@@ -368,8 +385,9 @@ func Load(path string) (*Config, error) {
 		}
 	} else {
 		loadedFromFile = true
-		// Clear default ports before unmarshaling so we can tell whether the
-		// user explicitly overrode scan.ports vs. left it omitted.
+		// Clear default ports and state path before unmarshaling so we can tell
+		// whether the YAML file explicitly set scan.ports or state.path
+		// (setting State.ExplicitPath) vs. leaving them omitted.
 		cfg.Scan.Ports = nil
 		cfg.State.Path = ""
 		dec := yaml.NewDecoder(bytes.NewReader(raw))
@@ -439,6 +457,9 @@ func Load(path string) (*Config, error) {
 	if cfg.State.Path == "" {
 		cfg.State.Path = "uniblue-state.json"
 	}
+	// Anchor relative state paths to the config file's directory when loaded
+	// from disk. In zero-file env mode started from "/", redirect to a writable
+	// user state/cache directory instead of attempting to write at root.
 	if !filepath.IsAbs(cfg.State.Path) {
 		if loadedFromFile {
 			if cfgDir := filepath.Dir(path); cfgDir != "" && cfgDir != "." {
@@ -526,6 +547,8 @@ func CanonicalMAC(raw string) string {
 	return strings.ToLower(strings.TrimSpace(raw))
 }
 
+// defaultFallbackStatePath places baseName under XDG_STATE_HOME (or the user
+// cache directory) when running in zero-file environment mode with cwd == "/".
 func defaultFallbackStatePath(baseName string) string {
 	if stateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME")); stateHome != "" {
 		return filepath.Join(stateHome, "uniblue", baseName)
@@ -537,7 +560,8 @@ func defaultFallbackStatePath(baseName string) string {
 }
 
 // Validate checks that required fields are present and well-formed before any
-// network calls are attempted.
+// network calls are attempted, and normalizes/canonicalizes c.Network.Assets
+// entries in place.
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.UniFi.URL) == "" {
 		return errors.New("config: unifi.url is required")

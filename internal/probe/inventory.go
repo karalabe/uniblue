@@ -91,11 +91,27 @@ type ChildDevice struct {
 // BridgeInventorySpec describes an owner-provided read-only inventory file for
 // a bridge, NVR, coordinator, or BLE proxy.
 type BridgeInventorySpec struct {
-	Format       string `json:"format" yaml:"format"` // "generic" | "nvr" | "zigbee2mqtt" | "zwave-js" | "matter" | "ble" | "energy"
-	Path         string `json:"path" yaml:"path"`
-	ParentIP     string `json:"parent_ip,omitempty" yaml:"parent_ip,omitempty"`
-	ParentMAC    string `json:"parent_mac,omitempty" yaml:"parent_mac,omitempty"`
-	ParentRole   string `json:"parent_role,omitempty" yaml:"parent_role,omitempty"`
+	// Format selects the export schema ("" or "generic", "bridge", "nvr",
+	// "zigbee2mqtt", "zwave-js"/"zwave_js", "matter", "ble", or "energy").
+	Format string `json:"format" yaml:"format"`
+
+	// Path is the local filesystem path to the read-only inventory file.
+	Path string `json:"path" yaml:"path"`
+
+	// ParentIP optionally sets the LAN IP of the owning bridge, NVR, or
+	// coordinator. For generic inventories, precedence is child ParentIP, then
+	// this configured ParentIP (overriding any wrapper-level parent_ip), then
+	// the wrapper-level value.
+	ParentIP string `json:"parent_ip,omitempty" yaml:"parent_ip,omitempty"`
+
+	// ParentMAC optionally pins the MAC address of the owning bridge, NVR, or
+	// coordinator; takes strict precedence over ParentIP when set.
+	ParentMAC string `json:"parent_mac,omitempty" yaml:"parent_mac,omitempty"`
+
+	// ParentRole optionally overrides the default parent role inferred from Format.
+	ParentRole string `json:"parent_role,omitempty" yaml:"parent_role,omitempty"`
+
+	// ObservedFrom optionally records the observer network or radio reception zone.
 	ObservedFrom string `json:"observed_from,omitempty" yaml:"observed_from,omitempty"`
 }
 
@@ -125,6 +141,9 @@ func ParseBridgeInventory(raw []byte, spec BridgeInventorySpec) ([]ChildDevice, 
 	}
 }
 
+// parseGenericBridgeInventory decodes generic, NVR, Matter, BLE, or energy
+// inventory JSON/YAML (either a top-level list or a wrapper object with
+// devices/children) and fills in format-specific defaults and stable IDs.
 func parseGenericBridgeInventory(raw []byte, spec BridgeInventorySpec, format string) ([]ChildDevice, error) {
 	var wrapper struct {
 		ParentIP     string        `json:"parent_ip" yaml:"parent_ip"`
@@ -211,6 +230,8 @@ func parseGenericBridgeInventory(raw []byte, spec BridgeInventorySpec, format st
 	return out, nil
 }
 
+// uniqueChildID reserves base in seen or appends a deterministic numeric suffix
+// derived from itemNum so duplicate names within one export still get unique IDs.
 func uniqueChildID(base string, itemNum int, seen map[string]struct{}) string {
 	if _, dup := seen[base]; !dup {
 		seen[base] = struct{}{}
@@ -249,6 +270,7 @@ func parseZigbee2MQTTInventory(raw []byte, spec BridgeInventorySpec) ([]ChildDev
 	var out []ChildDevice
 	seenIDs := make(map[string]struct{}, len(rawNodes))
 	for i, n := range rawNodes {
+		// Skip the coordinator entry itself; it represents the parent bridge rather than a child device.
 		if strings.EqualFold(n.Type, "Coordinator") {
 			continue
 		}
@@ -376,7 +398,7 @@ func AttachBridgeChildren(profiles []HostProfile, children []ChildDevice) {
 		if idx < 0 {
 			continue
 		}
-		// Deduplicate by child ID.
+		// Skip duplicate child IDs so overlapping inventory imports stay idempotent.
 		dup := false
 		for _, existing := range profiles[idx].Children {
 			if existing.ID == ch.ID {
@@ -419,6 +441,8 @@ func MatchDeviceBridgeChildren(devices []unifi.Device, children []ChildDevice) m
 	for _, ch := range children {
 		devMAC := ""
 		if m := strings.ToLower(strings.TrimSpace(ch.ParentMAC)); m != "" {
+			// Require a strict MAC match when ParentMAC is set rather than falling
+			// back to ParentIP so DHCP lease reuse cannot attach children to the wrong device.
 			devMAC = byMAC[m]
 		} else if ch.ParentIP != "" {
 			devMAC = byIP[canonicalIPKey(ch.ParentIP)]
@@ -457,6 +481,8 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// sanitizeChildIDSlug normalizes an arbitrary label into a compact lowercase
+// slug safe for synthetic child IDs, returning "unknown" when nothing remains.
 func sanitizeChildIDSlug(s string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(strings.TrimSpace(s)) {

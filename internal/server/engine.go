@@ -130,8 +130,9 @@ type LiveEvent struct {
 	// Time is the UTC timestamp when the event occurred.
 	Time time.Time `json:"time"`
 
-	// Type categorizes the event ("startup", "client_joined", "client_moved",
-	// "client_left", "host_scanned", "finding_new", "policy_changed", "scan_complete").
+	// Type categorizes the event (e.g., "startup", "client_joined",
+	// "client_moved", "client_left", "host_scanned", "finding_new",
+	// "policy_changed", "port_poe_tamper", "wifi_evil_twin", "scan_complete").
 	Type string `json:"type"`
 
 	// Severity ranks visual emphasis ("info", "low", "medium", "high", "critical").
@@ -193,11 +194,13 @@ type StateSnapshot struct {
 	// LastFullScanAt records when the latest full LAN reconciliation finished.
 	LastFullScanAt time.Time `json:"last_full_scan_at"`
 
-	// LastScanError records the most recent full-scan error (cleared once a
-	// scan succeeds) so the UI can surface errors instead of hanging at 4%.
+	// LastScanError records the most recent full-scan error (cleared only when
+	// a full scan succeeds) so the UI can surface errors instead of stalling on
+	// the initial progress splash.
 	LastScanError string `json:"last_scan_error,omitempty"`
 
-	// EventMode describes the active UniFi ingestion mode ("websocket" or "poll-5s").
+	// EventMode describes the active UniFi ingestion or export mode
+	// ("websocket", "poll-<interval>", "demo", or "static-export").
 	EventMode string `json:"event_mode"`
 
 	// Scanning reports whether a full or targeted probe is currently running.
@@ -314,6 +317,11 @@ const (
 	hostRescanQueueFull
 )
 
+// pendingWebhook is one queued outbound webhook delivery tracked in memory.
+// seq is a monotonic in-memory handle used by drainWebhooks to locate and
+// remove a batch safely even if lower-priority entries are evicted ahead of it,
+// whereas id is the stable UUID sent as the webhook idempotency header and
+// preserved across retries and restarts.
 type pendingWebhook struct {
 	seq         uint64
 	id          string
@@ -324,6 +332,8 @@ type pendingWebhook struct {
 	queuedAt    time.Time
 }
 
+// persistedWebhook is the on-disk JSON representation of pendingWebhook stored
+// in the sibling .pending-webhooks.json outbox across daemon restarts.
 type persistedWebhook struct {
 	ID          string    `json:"id"`
 	Site        string    `json:"site"`
@@ -333,6 +343,7 @@ type persistedWebhook struct {
 	QueuedAt    time.Time `json:"queued_at,omitempty"`
 }
 
+// Outbox bounds and coalescing defaults for asynchronous webhook delivery.
 const (
 	maxPendingWebhooks           = 64
 	maxWebhookRetries            = 288
@@ -505,8 +516,8 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 // Start authenticates with UniFi, fetches an immediate UniFi topology snapshot
 // so the web UI can render clients, VLANs, and firewall findings right away,
 // and spawns background goroutines for the initial LAN probe baseline, event
-// ingestion (WebSocket + 5s delta polling), targeted per-host scanning, and
-// periodic full reconciliation.
+// ingestion (WebSocket + configurable delta polling on e.opts.PollInterval),
+// targeted per-host scanning, and periodic full reconciliation.
 func (e *Engine) Start(ctx context.Context) error {
 	if err := e.ctrl.Login(ctx); err != nil {
 		return err
@@ -558,7 +569,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	// uninterrupted even while a multi-minute full LAN scan is running.
 	go e.fullScanLoop(ctx)
 
-	// Start event ingestion (WebSocket push when supported, plus 5s delta polling).
+	// Start event ingestion (WebSocket push when supported, plus delta polling on e.opts.PollInterval).
 	if e.ctrl.SupportsWebSocket() {
 		go e.websocketLoop(ctx)
 	}
@@ -681,6 +692,8 @@ func (e *Engine) cveSyncLoop(ctx context.Context) {
 	}
 }
 
+// cveStatsChanged reports whether a completed CVE cache sync modified any feed
+// counts, KEV or yearly feed digests, or sync timestamp relative to prev.
 func cveStatsChanged(prev, cur *cve.CacheStats) bool {
 	if prev == nil || cur == nil {
 		return prev != cur
@@ -841,6 +854,10 @@ func clientMatchesIdentifier(cl unifi.Client, query string) bool {
 	return false
 }
 
+// triggerHostRescanStatus resolves query against active clients (by entity ID,
+// MAC, or IP) and enqueues a targeted host probe; in demo mode it emits a
+// simulated event and returns the matched client with hostRescanQueued, or
+// returns hostRescanNotFound / hostRescanQueueFull when unavailable.
 func (e *Engine) triggerHostRescanStatus(query string) (unifi.Client, hostRescanStatus) {
 	q := strings.TrimSpace(query)
 	e.mu.RLock()
@@ -906,7 +923,8 @@ func (e *Engine) SubscribeWithReplay(lastEventID int64) ([]LiveEvent, chan LiveE
 	e.mu.RLock()
 	var replay []LiveEvent
 	if lastEventID > 0 && len(e.events) > 0 {
-		// e.events is stored newest-first; collect matching items then reverse.
+		// e.events is stored newest-first; walk backwards to append matching items
+		// directly in chronological order.
 		for i := len(e.events) - 1; i >= 0; i-- {
 			if e.events[i].ID > lastEventID {
 				replay = append(replay, e.events[i])
@@ -928,7 +946,7 @@ func (e *Engine) SubscribeWithReplay(lastEventID int64) ([]LiveEvent, chan LiveE
 // fullScanLoop executes queued full scans sequentially in a dedicated goroutine
 // so delta polling stays responsive during multi-minute scans, and retries a
 // failed initial baseline scan with bounded exponential backoff so the UI never
-// hangs indefinitely at 4%.
+// stalls indefinitely on the initial progress splash.
 func (e *Engine) fullScanLoop(ctx context.Context) {
 	backoff := 5 * time.Second
 	for {
@@ -973,8 +991,9 @@ func (e *Engine) fullScanLoop(ctx context.Context) {
 	}
 }
 
-// pollAndReconcileLoop runs the 5-second lightweight UniFi delta check and
-// triggers periodic full reconciliation without blocking delta polls on scans.
+// pollAndReconcileLoop runs the lightweight UniFi delta check on
+// e.opts.PollInterval and triggers periodic full reconciliation on
+// e.opts.ReconcileInterval without blocking delta polls on scans.
 func (e *Engine) pollAndReconcileLoop(ctx context.Context) {
 	pollTicker := time.NewTicker(e.opts.PollInterval)
 	defer pollTicker.Stop()
@@ -1081,6 +1100,8 @@ func (e *Engine) pollDelta(ctx context.Context) {
 // (even while UniFi still caches them), publishing the refreshed StateSnapshot
 // before broadcasting SSE events, and returning any hosts queued for rescanning.
 func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, now time.Time) []hostScanTask {
+	// Carry forward unavailable telemetry before computing port states so
+	// snapshotPortStates and offline-wired filtering see last-known port profiles.
 	e.mu.RLock()
 	prevSnapHint := e.snap
 	e.mu.RUnlock()
@@ -1108,6 +1129,8 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 
 	e.mu.Lock()
 	prevSnap := e.snap
+	// Re-apply telemetry preservation under the write lock in case e.snap was
+	// updated by a full scan between the hint read above and acquiring e.mu.
 	preserveUnavailableTelemetry(prevSnap, snap)
 	prevClients := make(map[string]unifi.Client)
 	if prevSnap != nil {
@@ -1328,6 +1351,11 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 					Summary:   fmt.Sprintf("Physical link DOWN on %s Port %d (%s, zone=%s)", curr.DeviceName, curr.PortIdx, curr.PortName, curr.Zone),
 				})
 			}
+			// Compare Enabled unconditionally, compare PortSecurity only when both
+			// sides are known (!PortSecurityUnknown), guard non-empty NativeVLAN
+			// changes directly, and gate profile-derived changes (known TaggedPolicy
+			// and cleared NativeVLAN) on PortProfilesAvailable so transient
+			// port-profile fetch outages never fire false config alerts.
 			portProfilesOK := snap.Visibility == nil || snap.Visibility.PortProfilesAvailable
 			directChanged := prev.Enabled != curr.Enabled ||
 				(!prev.PortSecurityUnknown && !curr.PortSecurityUnknown && prev.PortSecurity != curr.PortSecurity) ||
@@ -1485,6 +1513,8 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 		return
 	}
 	k := clientKey(cl)
+	// Verify the client is still active on the same IP and VLAN before caching
+	// probe results so a concurrent disconnect or VLAN move cannot leave stale data.
 	e.mu.Lock()
 	stillMatches := false
 	if e.snap != nil {
@@ -1896,11 +1926,12 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	return nil
 }
 
-// recomputeAndPublish runs checks, blast-radius risk evaluation, CVE rollup,
-// topology construction, and webhook diffing against the current in-memory
-// snapshot and host profiles. Any extraEvents (and newly detected findings) are
-// broadcast over SSE only after e.current is atomically updated so UI clients
-// immediately fetch the fresh snapshot.
+// recomputeAndPublish merges cached check findings with profile-derived
+// findings without issuing any host network I/O, then runs blast-radius risk
+// evaluation, CVE rollup, topology construction, and webhook diffing against
+// the current in-memory snapshot and host profiles. Any extraEvents (and newly
+// detected findings) are broadcast over SSE only after e.current is atomically
+// updated so UI clients immediately fetch the fresh snapshot.
 func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extraEvents []LiveEvent) {
 	// Serialize the entire read -> diff -> notify -> save -> publish sequence so
 	// concurrent host scans, delta polls, and full scans never double-alert,
@@ -2219,6 +2250,9 @@ func (e *Engine) pendingWebhooksPath() string {
 	return p + ".pending-webhooks.json"
 }
 
+// persistPendingWebhooksLocked atomically writes e.pendingWebhooks to the
+// sibling .pending-webhooks.json file (removing the file when the queue empties)
+// so unsent alert batches survive daemon restarts. Caller must hold e.webhookMu.
 func (e *Engine) persistPendingWebhooksLocked() error {
 	path := e.pendingWebhooksPath()
 	if path == "" {
@@ -2292,6 +2326,9 @@ func (e *Engine) persistPendingWebhooksLocked() error {
 	return nil
 }
 
+// resumePendingWebhooks reloads any undelivered webhook batches saved on disk
+// from a prior run, deduplicates them by idempotency ID, enforces the queue
+// cap, and starts drainWebhooks if any batches are waiting.
 func (e *Engine) resumePendingWebhooks(ctx context.Context) {
 	path := e.pendingWebhooksPath()
 	var loaded []persistedWebhook
@@ -2351,6 +2388,10 @@ func (e *Engine) resumePendingWebhooks(ctx context.Context) {
 	}
 }
 
+// splitWebhookByCVEs partitions diff into one or more pendingWebhook batches
+// when maxCVEs is positive, bounding each batch by CVE alert count (payload
+// byte size is not measured) and keeping all non-CVE diff fields in the first
+// batch. A non-positive maxCVEs disables splitting.
 func splitWebhookByCVEs(site string, diff risk.Diff, maxCVEs int) []pendingWebhook {
 	if maxCVEs <= 0 || len(diff.NewCVEs) <= maxCVEs {
 		return []pendingWebhook{{id: notify.NewWebhookID(), site: site, diff: diff}}
@@ -2615,6 +2656,8 @@ func (e *Engine) flushCoalescedEvents(ctx context.Context, gen uint64, startDrai
 	}
 }
 
+// splitEventCount strips an existing " (xN)" repetition suffix from a coalesced
+// alert summary, returning the base text and its parsed repeat count (default 1).
 func splitEventCount(summary string) (string, int) {
 	s := strings.TrimSpace(summary)
 	if idx := strings.LastIndex(s, " (x"); idx > 0 && strings.HasSuffix(s, ")") {
@@ -2626,6 +2669,9 @@ func splitEventCount(summary string) (string, int) {
 	return s, 1
 }
 
+// appendUniqueAlertEvents merges dst and src while collapsing identical
+// (type, host, ip, base summary) events into a single entry with an accumulated
+// " (xN)" suffix, keeping the highest severity and latest timestamp.
 func appendUniqueAlertEvents(dst, src []risk.AlertEvent) []risk.AlertEvent {
 	idxByKey := make(map[string]int, len(dst)+len(src))
 	counts := make([]int, 0, len(dst)+len(src))
@@ -2780,8 +2826,9 @@ func diffExactCVEs(
 	}
 
 	// Carry forward exact CVE keys for offline/unprobed hosts (up to 7 days)
-	// and across brief transient banner misses (up to 15 minutes) so sleeping
-	// laptops or single flaky probes do not drop and re-alert existing CVEs.
+	// and across brief transient banner misses (up to 2 hours, matching
+	// exactCVETransientGrace) so sleeping laptops or flaky probes do not drop
+	// and re-alert existing CVEs.
 	if seeded {
 		for k, v := range prev.ExactCVEs {
 			if _, exists := next[k]; exists {
@@ -2895,6 +2942,10 @@ func selectPushWorthyEvents(events []LiveEvent, snap *unifi.Snapshot, netCfg con
 	return out
 }
 
+// drainWebhooks delivers queued webhook batches in FIFO order with exponential
+// retry backoff, dropping batches on permanent 4xx errors or after retry/age
+// limits and allowing in-flight sends a brief shutdown grace window so
+// completed deliveries are removed from disk before exit.
 func (e *Engine) drainWebhooks(ctx context.Context) {
 	baseDelay := e.webhookRetryBase
 	if baseDelay <= 0 {
@@ -3095,6 +3146,8 @@ func preserveUnavailableTelemetry(prevSnap, nextSnap *unifi.Snapshot) {
 	}
 }
 
+// lookupClientClass resolves a client's classification result from classes,
+// trying its primary IPv4, preferred primary IP, all secondary IPs, and MAC.
 func lookupClientClass(classes map[string]classify.Result, cl unifi.Client) classify.Result {
 	if len(classes) == 0 {
 		return classify.Result{}
@@ -3242,6 +3295,9 @@ func snapshotSubnets(snap *unifi.Snapshot) []netip.Prefix {
 	return out
 }
 
+// snapshotReflectorIPs collects UniFi gateway LAN interface IPs so passive
+// mDNS discovery distinguishes gateway-reflected cross-VLAN announcements from
+// third-party LAN spoofing.
 func snapshotReflectorIPs(snap *unifi.Snapshot) []string {
 	if snap == nil {
 		return nil
@@ -3355,6 +3411,8 @@ func clientSkipReason(cl unifi.Client, excluded map[string]struct{}, allowedSubn
 	return "Public or out-of-subnet IP address (active probing skipped)"
 }
 
+// firewallPolicySignature builds a deterministic digest string over all
+// non-system-defined firewall policies so delta polls detect user policy edits.
 func firewallPolicySignature(pols []unifi.FirewallPolicy) string {
 	parts := make([]string, 0, len(pols))
 	for _, p := range pols {
@@ -3407,6 +3465,8 @@ func filterOfflineWiredClients(clients []unifi.Client, ports map[string]portLive
 	return out
 }
 
+// snapshotPortStates evaluates physical switch ports from snap into a map
+// keyed by "deviceMAC|portIdx" for live link, config, and tamper diffing.
 func snapshotPortStates(snap *unifi.Snapshot, netCfg config.NetworkConfig) map[string]portLiveState {
 	views, _, _ := risk.AnalyzeSwitchPorts(snap, netCfg, nil, nil)
 	out := make(map[string]portLiveState)

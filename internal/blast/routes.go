@@ -111,7 +111,10 @@ func (b *builder) tcpOnlyPolicy(c risk.IsolationCell, ports ...int) bool {
 	return found
 }
 
-// sshAccess keeps adopted-device key settings separate from console authentication.
+// sshAccess returns the observed SSH authentication mode ("none", "password",
+// "publickey", or "") for listener s. Gateways consult the controller's
+// SecuritySettings.SSHPasswordAuth flag, while LAN and adopted hosts use
+// observed SSH probe results from b.Profiles.
 func (b *builder) sshAccess(s socket, cl unifi.Client) string {
 	if cl.NetworkID == risk.GatewayNetworkID {
 		if settings := b.Snapshot.SecuritySettings; settings != nil && settings.SSHPasswordAuth {
@@ -130,12 +133,18 @@ type egressLink struct {
 	dstName  string
 }
 
+// ruleScopeIndex tracks every MAC and IP/CIDR selector referenced by enabled
+// firewall policies or switch ACLs so routes can safely cache cross-VLAN
+// Transit decisions for unreferenced endpoints.
 type ruleScopeIndex struct {
 	allScoped bool
 	macs      map[string]bool
 	prefixes  []netip.Prefix
 }
 
+// matchesClient reports whether cl could match a MAC- or IP-scoped rule.
+// Missing MACs conservatively return true when any MAC-scoped rule exists so
+// cross-VLAN Transit caching is skipped rather than risking a false cache hit.
 func (r ruleScopeIndex) matchesClient(cl unifi.Client) bool {
 	if r.allScoped {
 		return true
@@ -159,6 +168,10 @@ func (r ruleScopeIndex) matchesClient(cl unifi.Client) bool {
 	return false
 }
 
+// matchesPosition reports whether pos could match a MAC- or IP-scoped rule.
+// Empty MACs (when MAC-scoped rules exist or allScoped is set), empty IPs
+// (when IP-scoped rules exist), and unparseable IPs conservatively return
+// true to opt out of cross-VLAN Transit caching.
 func (r ruleScopeIndex) matchesPosition(pos risk.Position) bool {
 	if r.allScoped {
 		return true
@@ -323,6 +336,9 @@ func (b *builder) addPolicySockets(a attachment) {
 			continue
 		}
 		ports := slices.Clone(p.Destination.Ports)
+		// Register only the range start as a representative socket so wide port
+		// ranges trigger policy evaluation without enumerating thousands of ports;
+		// observed services inside the range keep their exact sockets.
 		for _, r := range p.Destination.PortRanges {
 			ports = append(ports, r.Start)
 		}
@@ -387,6 +403,8 @@ func (b *builder) addPolicySockets(a attachment) {
 	}
 }
 
+// isRoutableAddr reports whether raw is a valid address in fam that can carry
+// routed traffic, excluding loopback, link-local, and unspecified addresses.
 func isRoutableAddr(raw, fam string) bool {
 	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
 	if err != nil {
@@ -489,6 +507,9 @@ func (b *builder) routes() {
 			}
 		}
 		for _, fam := range b.Oracle.Families(cl) {
+			// Skip UniFi's auto-generated "Allow Port Forward" policy only when
+			// port-forward telemetry is available and an enabled forward targets
+			// DestIP, so the concrete forward owns the exposure without double credit.
 			skipAuto := func(c risk.IsolationCell) bool {
 				return b.isAutoPortForwardCell(c) && (visibility == nil || visibility.PortForwardsAvailable) && b.hasEnabledPortForwardFor(c.DestIP)
 			}
@@ -503,6 +524,9 @@ func (b *builder) routes() {
 					if b.isExpectedGatewayRule(c) {
 						continue
 					}
+					// b.socket returns false for broad/all-ports allows (c.Port == 0),
+					// which are emitted here as host-level "network access" permissions.
+					// Port-specific allows register a socket evaluated later in b.internet().
 					if _, ok := b.socket(a.host, c.DestIP, c.Transport, c.Port); !ok {
 						entry, _ := b.scope(socket{}, c)
 						lane := LaneFixNow
@@ -535,6 +559,10 @@ func (b *builder) routes() {
 	}
 	b.linkPublications(groups)
 
+	// Cache Oracle.Transit decisions when endpoint-specific selectors cannot
+	// distinguish two pairs: crossCache shares inter-VLAN results for unscoped
+	// routable pairs with matching network/zone/presence keys, and wifiCache
+	// shares same-VLAN, same-AP, same-SSID wireless peer results.
 	scopeIdx := b.buildRuleScopeIndex()
 	type crossKey struct {
 		srcNet, srcZone     string
@@ -610,6 +638,9 @@ func (b *builder) routes() {
 					}
 				} else {
 					var cell risk.IsolationCell
+					// Reuse cached Transit cells only when neither endpoint matches any
+					// IP/MAC-scoped rule (crossCache) or when both peers share the same
+					// wireless AP and SSID on the same VLAN (wifiCache).
 					switch {
 					case !sameNet && pm.netKey != "" && dstNetKey != "" && !pm.scoped && !dstScoped && pm.routable[fam] && dstRoutable[fam]:
 						k := crossKey{pm.netKey, pos.Zone, pos.IP != "", pm.mac != "", dstNetKey, true, dstMAC != "", fam}
@@ -632,6 +663,8 @@ func (b *builder) routes() {
 						b.boundaryFact(pos, from, a.host, a.client.NetworkID, "network access", cell, &deferredEgress)
 					}
 				}
+				// Annotate BreaksApproved on both the lateral boundary cut and any
+				// physical outdoor-port cuts that feed `from`.
 				if hasApproved {
 					for _, ap := range b.Oracle.ApprovedServices(pos, a.client, b.Findings, fam) {
 						var cell risk.IsolationCell
@@ -665,6 +698,8 @@ func (b *builder) routes() {
 				dst := pin(a.client, s.ip)
 				c := b.Oracle.Service(pos, dst, s.proto, s.port, family(s.ip))
 				b.lateral(pos, from, to, a.client.NetworkID, c, &deferredEgress)
+				// SameNetwork grants attach to localEndpoint so only peers on the
+				// same VLAN can link to them.
 				if sameNet {
 					to.kind = localEndpoint
 					if _, ok := b.ids[to]; ok {
@@ -824,6 +859,10 @@ func (b *builder) missing(from fact, c risk.IsolationCell, host string) {
 	b.verify(from, code, key, title, reason, host)
 }
 
+// lateral records a lateral reachability edge from `from` to `to`. Routed
+// inter-VLAN allows (non-empty dstKey) are deferred to linkEgressBundles so
+// destinations reachable from two or more source VLANs receive a shared
+// destination-ingress bundle cut across all feeding edges.
 func (b *builder) lateral(pos risk.Position, from, to fact, dstID string, c risk.IsolationCell, deferred *[]egressLink) {
 	switch c.Effective {
 	case "deny":
@@ -873,6 +912,9 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 		}
 		dst := pin(a.client, s.ip)
 		fam := family(s.ip)
+		// Keep non-gateway publications (port forwards, proxies, tunnels, UPnP)
+		// separate from gateway firewall policies because only firewall policies
+		// can be iteratively peeled via WithoutPolicies.
 		rawCells := b.Oracle.Internet(dst, s.proto, s.port, fam)
 		hasPortForward := slices.ContainsFunc(rawCells, func(c risk.IsolationCell) bool {
 			return c.PathKind == "port-forward" && c.Effective == "allow" && (c.DestIP == "" || address(c.DestIP) == s.ip)
@@ -896,6 +938,8 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 				continue
 			}
 			expected := b.isExpectedGatewayRule(c)
+			// Suppress built-in gateway control traffic (ICMPv6, DHCPv6, return
+			// traffic) when no qualifying listener remedy attaches to this socket.
 			if c.Effective == "allow" && expected && gatewayControlTraffic(c.DecisiveRuleName) && len(b.listenerRemedies(s)) == 0 {
 				continue
 			}
@@ -954,6 +998,9 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 			if entry == InternetSource || level >= moderate {
 				lane = LaneReduceExposure
 			}
+			// A listener is "clean" when it has no qualifying listener remedy (patch
+			// or direct check action); intentional public entrypoints (VPN/P2P/gateway
+			// VPN) that are clean are omitted rather than flagged as unwanted exposure.
 			clean := len(b.listenerRemedies(s)) == 0
 			outcomeLevel := trivial
 			if clean && webOnly {
@@ -993,6 +1040,8 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 			groups[k] = append(groups[k], publication{label: entryLabel, s: s, entry: entry, level: level, action: act, expected: expected, outcomeLevel: outcomeLevel})
 		}
 	}
+	// Emit a positive "contained" boundary only when all WAN telemetry (gateway
+	// policies, port forwards, and UPnP lease state) is complete and no ingress exists.
 	if !anyIngress && !upnpUnknown && len(sockets) > 0 && b.Snapshot.Visibility != nil && b.Snapshot.Visibility.GatewayPoliciesAvailable && b.Snapshot.Visibility.PortForwardsAvailable {
 		b.link(root(Internet), fact{blocked, a.host, "network access"}, trivial, 0, 0)
 	}
@@ -1032,7 +1081,7 @@ func (b *builder) linkPublications(groups map[fact][]publication) {
 				wan.CutIDs = append(wan.CutIDs, b.actions[bundle].ID)
 			}
 			if r.expected {
-				// An intentional listener becomes a risky entry only while a finding on it survives.
+				// An intentional listener becomes a risky entry only while a qualifying listener remedy on it survives.
 				for _, e := range b.listenerRemedies(r.s) {
 					route := wan
 					route.CutIDs = append(slices.Clone(wan.CutIDs), b.actions[e.cut].ID)
@@ -1044,6 +1093,10 @@ func (b *builder) linkPublications(groups map[fact][]publication) {
 			} else {
 				b.wanEdges = append(b.wanEdges, wan)
 			}
+			// Always link the WAN root to the listener socket for publications that
+			// reach this stage (including expected publications with a qualifying
+			// listener remedy) so attached CVEs or findings remain reachable from WAN;
+			// skip the generic "public access to ..." consequence when expected.
 			b.link(root(r.entry), r.s.fact(), r.level, r.action, bundle)
 			if !r.expected {
 				b.link(root(r.entry), outcome, r.outcomeLevel, r.action, bundle)

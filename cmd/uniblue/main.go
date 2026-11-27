@@ -6,8 +6,10 @@
 
 // Command uniblue is a blue-team security engine for UniFi networks.
 // It pulls live topology from a local UniFi controller, gently fingerprints
-// LAN hosts, runs declarative community-submitted checks, and scores risk by
-// VLAN and WAN blast radius.
+// LAN hosts, runs declarative community-submitted checks, scores risk and
+// counterfactual blast-radius actions (`blast`), serves a live event-driven
+// web UI and offline demo (`serve`/`demo`), and maintains offline NVD+KEV
+// (`cve`) and IEEE OUI (`oui`) caches.
 package main
 
 import (
@@ -389,8 +391,9 @@ func printLocalSSHKeyAudit(w io.Writer, profiles []probe.HostProfile) {
 	}
 }
 
-// printInfraBlast prints the direction and three properties of each leg. All
-// resilient rows share the same six limitations, printed together below them.
+// printInfraBlast formats an infrastructure compromise report, printing the
+// compromise effects and per-leg transport survival verdicts, with shared
+// caveats printed once below the legs.
 func printInfraBlast(w io.Writer, r blast.InfraReport) {
 	fmt.Fprintf(w, "%s compromise: %s\n", r.Scope, r.Target)
 	for _, effect := range r.Effects {
@@ -453,7 +456,8 @@ func printInfraBlast(w io.Writer, r blast.InfraReport) {
 	}
 }
 
-// humanPriority translates the ranked action into the label used by dashboard readers.
+// humanPriority maps a blast action's lane or priority tier (P1-P5 or verify)
+// to the plain-English urgency label shared by CLI output and the web dashboard.
 func humanPriority(a blast.Action) string {
 	if a.Lane == blast.LaneVerify {
 		return "Verify"
@@ -472,7 +476,9 @@ func humanPriority(a blast.Action) string {
 	}
 }
 
-// printBlast summarizes the ranked changes in each lane.
+// printBlast formats the counterfactual exposure report: a top-3 summary of
+// highest-impact changes, each action lane capped at 5 rows (pointing to -json
+// for the full list), and the Device internet access (r.Cloud) egress section.
 func printBlast(w io.Writer, r blast.Report) {
 	fmt.Fprintln(w, "Network exposure review")
 	var top []blast.Action
@@ -540,9 +546,9 @@ func printBlast(w io.Writer, r blast.Report) {
 	}
 }
 
-// runWatch runs executeCycle immediately and then on cfg.Scan.Interval,
-// persisting state.json and sending webhook alerts only when meaningful changes
-// occur.
+// runWatch runs watchSession.runCycle immediately and then on cfg.Scan.Interval,
+// persisting baseline state to cfg.State.Path (default uniblue-state.json) and
+// sending webhook alerts only when meaningful changes occur.
 func runWatch(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -642,6 +648,8 @@ type watchSession struct {
 	pendingWebhookKey string
 	pendingDiff       risk.Diff
 
+	// Injectable scan, notification, and state-persistence hooks wired to live
+	// implementations in runWatch and stubbed in unit tests.
 	scanBlastFn  func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, *blast.Report, bool, error)
 	scanFn       func(ctx context.Context) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error)
 	sendFn       func(ctx context.Context, site string, diff risk.Diff) error
@@ -696,6 +704,12 @@ func watchDiffFingerprint(site string, diff risk.Diff) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// runCycle executes one watch pass: loads the persisted baseline once, runs a
+// scan, carries forward unavailable controller telemetry, diffs findings and
+// blast actions against the in-memory baseline, sends any alerts using a
+// stable fingerprinted webhook ID across retries, and advances the in-memory
+// baseline only after notifications succeed (retaining it even if disk save
+// fails so I/O errors cannot cause repeated alert storms).
 func (w *watchSession) runCycle(ctx context.Context) {
 	if !w.stateLoaded {
 		prev, err := w.loadFn(w.cfg.State.Path)
@@ -885,6 +899,12 @@ func preserveUnavailableWatchTelemetry(prevSnap, nextSnap *unifi.Snapshot) bool 
 	return changed
 }
 
+// cloneWatchTelemetrySnapshot copies only the controller telemetry fields
+// (SecuritySettings, WLANs, and Devices with Ports) needed by
+// preserveUnavailableWatchTelemetry so subsequent cycles can fall back cleanly
+// without retaining client slices. It clones the Devices slice and each
+// device's Ports slice, while nested slices inside each copied SwitchPort
+// (such as VLAN membership and MAC lists) remain shared.
 func cloneWatchTelemetrySnapshot(snap *unifi.Snapshot) *unifi.Snapshot {
 	if snap == nil {
 		return nil
@@ -913,6 +933,8 @@ func cloneWatchTelemetrySnapshot(snap *unifi.Snapshot) *unifi.Snapshot {
 	return cp
 }
 
+// watchFindingKey returns a stable deduplication key (check|host|port|property)
+// used when merging preserved controller posture findings back into a watch report.
 func watchFindingKey(f checks.Finding) string {
 	host := strings.ToLower(strings.TrimSpace(f.Client.MAC))
 	if host == "" {
@@ -921,6 +943,10 @@ func watchFindingKey(f checks.Finding) string {
 	return fmt.Sprintf("%s|%s|%d|%s", f.CheckID, host, f.Port, f.Property)
 }
 
+// mergePreservedWatchPosture re-evaluates controller posture against a snapshot
+// patched by preserveUnavailableWatchTelemetry, appending any restored findings
+// missing from report and refreshing UniFiPosture, SwitchPorts, and PostureNotes
+// so transient telemetry outages do not drop posture findings.
 func mergePreservedWatchPosture(snap *unifi.Snapshot, report risk.Report, netCfg config.NetworkConfig) risk.Report {
 	eval := risk.Evaluate(snap, nil, netCfg)
 	seen := make(map[string]struct{}, len(report.Findings))
@@ -1252,11 +1278,19 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 // sending repeat PK_OK queries.
 var watchAuditedSSHHostKeys = new(probe.SSHKeyAuditCache)
 
+// executeCycleWithPrev runs executeCycleDetailed using caller-provided previous
+// snapshot and baseline state, returning only the snapshot, host profiles, and
+// scored risk report.
 func executeCycleWithPrev(ctx context.Context, cfg *config.Config, checkList []*checks.Check, prevSnap *unifi.Snapshot, prev *risk.State) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
 	snap, profiles, _, _, report, err := executeCycleDetailed(ctx, cfg, checkList, prevSnap, prev)
 	return snap, profiles, report, err
 }
 
+// executeCycleDetailed executes one complete UniFi fetch, telemetry fallback,
+// host fingerprinting sweep, site/bridge/flow enrichment, declarative check
+// run, SSH host-key comparison, profile-finding merge, and risk evaluation. It
+// also returns the raw observed findings and UniFi-device children needed for
+// counterfactual blast-radius analysis.
 func executeCycleDetailed(ctx context.Context, cfg *config.Config, checkList []*checks.Check, prevSnap *unifi.Snapshot, prev *risk.State) (*unifi.Snapshot, []probe.HostProfile, []checks.Finding, map[string][]probe.ChildDevice, risk.Report, error) {
 	if prev == nil {
 		prev, _ = risk.LoadState(cfg.State.Path)
@@ -1305,9 +1339,9 @@ func executeCycleDetailed(ctx context.Context, cfg *config.Config, checkList []*
 		return nil, nil, nil, nil, risk.Report{}, err
 	}
 
-	// Merge noise-filtered Nerva protocol findings (e.g., legacy protocols,
-	// anonymous service access, expired TLS certs) so they receive UniFi
-	// blast-radius scoring, state diffing, and watch alerting alongside YAML checks.
+	// Attach SSH host-key change and reuse signals onto profiles first so
+	// FindingsFromProfiles collects both noise-filtered Nerva protocol findings
+	// and SSH profile findings alongside the YAML check results.
 	keys := prev.CompareSSHHostKeys(profiles)
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 
@@ -1467,6 +1501,9 @@ func verifyStatePathWritable(path string) error {
 	return nil
 }
 
+// probedHostKeys builds the set of host identity keys for all actively probed
+// profiles so state diffing can tell genuinely resolved findings apart from
+// hosts that were skipped or offline during this cycle.
 func probedHostKeys(profiles []probe.HostProfile) map[string]struct{} {
 	out := make(map[string]struct{}, len(profiles)*2)
 	for _, hp := range profiles {
@@ -1780,6 +1817,8 @@ func countCleanProbedHosts(profiles []probe.HostProfile, findings []checks.Findi
 		for _, ip := range f.Client.AllIPs() {
 			affectedIPs[strings.ToLower(strings.TrimSpace(ip))] = struct{}{}
 		}
+		// Skip synthetic fw:/gw: identifiers used by firewall and gateway findings
+		// so they never collide with real probed client MAC addresses.
 		if m := strings.ToLower(strings.TrimSpace(f.Client.MAC)); m != "" && !strings.HasPrefix(m, "fw:") && !strings.HasPrefix(m, "gw:") {
 			affectedMACs[m] = struct{}{}
 		}
@@ -2141,7 +2180,9 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 	return nil
 }
 
-// runCVEHistory reports product-wide history using only the local cache.
+// runCVEHistory prints historical CVE, CISA KEV, 1/3/5-year network High/Critical
+// velocity, and NVD CPE coverage statistics for a single vendor:product pair
+// using only the local offline CVE cache.
 func runCVEHistory(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("cve history", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -2482,6 +2523,9 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		}
 		rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 	} else {
+		// In -no-probe mode, skip active LAN port probing: build stub profiles
+		// from UniFi inventory, apply configured site/bridge/flow enrichments,
+		// and run only passive observation checks.
 		profiles = make([]probe.HostProfile, len(snap.Clients))
 		for i, cl := range snap.Clients {
 			profiles[i] = probe.HostProfile{Client: cl}
@@ -2514,6 +2558,9 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return writeJSON(stdout, model)
 	}
 	if *outPath != "" {
+		// Assemble a full StateSnapshot (risk report, optional local CVE rollup,
+		// enriched client views, device children, and blast-radius assessment) so
+		// the static offline HTML export matches the live web dashboard.
 		report := risk.Evaluate(snap, rawFindings, cfg.Network, profiles...)
 		var exactCVEs, potentialCVEs []cve.ProductSummary
 		var exportCVEs []cve.Match

@@ -29,7 +29,7 @@ type Event struct {
 	// Message identifies the UniFi event stream topic (e.g., "sta:sync", "events", "device:sync").
 	Message string `json:"message"`
 
-	// Raw holds the decoded event payload objects for downstream inspection.
+	// Data holds the decoded event payload objects for downstream inspection.
 	Data []map[string]any `json:"data,omitempty"`
 }
 
@@ -223,6 +223,9 @@ func (c *Controller) SubscribeEvents(ctx context.Context, out chan<- Event) erro
 	}
 }
 
+// emitWSEvent decodes a UniFi WebSocket text payload's {meta.message, data}
+// envelope, ignoring malformed or empty-topic frames, and delivers the Event
+// to out until sent or ctx is cancelled.
 func emitWSEvent(ctx context.Context, out chan<- Event, payload []byte) error {
 	var frame struct {
 		Meta struct {
@@ -241,8 +244,8 @@ func emitWSEvent(ctx context.Context, out chan<- Event, payload []byte) error {
 	}
 }
 
-// readWSFrame reads a single RFC 6455 WebSocket frame from r (server-to-client
-// frames are unmasked per RFC 6455 section 5.1).
+// readWSFrame reads a single RFC 6455 WebSocket frame from r, unmasking
+// masked payloads when present and rejecting frames larger than 8 MiB.
 func readWSFrame(r *bufio.Reader) (bool, byte, []byte, error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {

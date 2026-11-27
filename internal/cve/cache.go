@@ -130,7 +130,9 @@ func (c *Cache) Stats() (*CacheStats, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The metadata can survive the loss of the shards used for matching.
+	// stats.json can outlive deleted or emptied vendors/ shards, so verify that
+	// the shard directory exists and, when VendorCount > 0, at least one shard
+	// file exists on disk.
 	vendors := filepath.Join(c.dir, "vendors")
 	info, err := os.Stat(vendors)
 	if err != nil {
@@ -217,8 +219,9 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 		prevMeta = prevStats.YearMeta
 	}
 
-	// A schema upgrade recompiles the local snapshot. The next regular sync
-	// resumes upstream freshness checks, including KEV-only changes.
+	// Step 1: Load or fetch the CISA KEV catalog. A schema upgrade recompiles
+	// from the local snapshot first; the next regular sync resumes upstream
+	// freshness checks, including KEV-only changes.
 	migrating := prevStats != nil && prevStats.SchemaVersion != CurrentIndexSchemaVersion && !opts.Force
 	kevPath := filepath.Join(c.dir, "kev.json")
 	var kevSet map[string]kevEntry
@@ -310,6 +313,8 @@ func (c *Cache) Sync(ctx context.Context, opts SyncOptions) (*CacheStats, error)
 	if downloaded == 0 && !opts.Force && !migrating && prevStats != nil &&
 		prevStats.KEVSHA != "" && prevStats.KEVSHA == kevSHA &&
 		equalFeedSHAs(prevStats.YearSHAs, newSHAs) && (prevStats.VendorCount == 0 || hasVendorShards(vendorsDir)) {
+		// Backfill YearMeta into stats.json for caches created before archive
+		// size/mtime tracking was recorded so future syncs skip re-hashing.
 		if len(prevStats.YearMeta) == 0 && len(newMeta) > 0 {
 			updated := *prevStats
 			updated.YearMeta = newMeta
@@ -414,6 +419,9 @@ func (r *feedResult) reuseArchive(sha, prevSHA string, prev FeedFileMeta) bool {
 		return false
 	}
 	meta := FeedFileMeta{Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()}
+	// Fast path: when expected SHA, previous SHA, and file size/mtime all match,
+	// reuse the archive without decompressing. Slow path: stream through feedDigest
+	// to verify integrity and compute a missing SHA.
 	if sha == "" || !strings.EqualFold(sha, prevSHA) || prev != meta {
 		digest, err := feedDigest(r.filePath, sha)
 		if err != nil {
@@ -556,7 +564,9 @@ func verifyFeedGzipFile(path, expectedSHA string) error {
 	return err
 }
 
-// feedDigest also supplies the checksum for legacy snapshots without a stored SHA.
+// feedDigest streams a gzipped NVD feed archive, verifies that it begins with
+// a JSON object, computes the uncompressed SHA256 digest, and validates it
+// against expectedSHA when expectedSHA is a 64-character hex SHA256 string.
 func feedDigest(path, expectedSHA string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -855,6 +865,8 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 		}
 
 		writeCtx, cancelWrite := context.WithCancel(ctx)
+		// Cap concurrent gzip shard writers at 2 to overlap compression with disk
+		// I/O without spiking working memory across large vendor shards.
 		writeWorkers := 2
 		if len(byShard) < writeWorkers {
 			writeWorkers = len(byShard)
@@ -926,6 +938,8 @@ func (c *Cache) buildVendorIndex(ctx context.Context, feedFiles []string, vendor
 		}
 		cancelWrite()
 		byShard = nil
+		// Trigger a GC after large buckets so old heap allocations become eligible
+		// for reuse before subsequent buckets allocate.
 		if bucketRecs > 500 {
 			runtime.GC()
 		}
@@ -1678,6 +1692,8 @@ func sanitizeVendor(vendor string) string {
 	return out
 }
 
+// writeBytesAtomic writes raw to a unique temp file in path's directory with
+// the given permissions and atomically renames it into place.
 func writeBytesAtomic(path string, raw []byte, mode os.FileMode) error {
 	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".uniblue-cve-sync-"+filepath.Base(path)+".*.tmp")
 	if err != nil {
@@ -1850,7 +1866,9 @@ func extractVendorMatches(configs []nvdConfigNode) map[string][]CPEMatch {
 	return out
 }
 
-// record uses the same selected metric and catalog entry for shard and feed lookups.
+// record converts an NVD JSON 2.0 CVE item into a compact Record, selecting
+// the newest available CVSS metric (v4.0, v3.1, v3.0, then v2.0) and enriching
+// it with CISA KEV metadata from kev.
 func (c nvdCVE) record(kev map[string]kevEntry) Record {
 	entry, listed := kev[strings.ToUpper(c.ID)]
 	rec := Record{ID: c.ID, Published: c.Published[:min(10, len(c.Published))],

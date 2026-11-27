@@ -78,7 +78,9 @@ type Finding struct {
 	Transport string `json:"transport,omitempty"`
 
 	// ObservedIPs identifies the target addresses supporting this finding.
-	// An empty list means unresolved. Older records omit the field entirely.
+	// A non-nil empty slice explicitly marks the target address as unresolved,
+	// whereas nil means target addresses were omitted (for example in legacy
+	// records or controller findings).
 	ObservedIPs []string `json:"observed_ips,omitzero"`
 
 	// BaseSeverity is the check's intrinsic severity before UniFi topology scoring.
@@ -93,7 +95,8 @@ type Finding struct {
 	// Client identifies the affected host from the UniFi snapshot.
 	Client unifi.Client `json:"client"`
 
-	// Port is the TCP port where the issue was observed (0 for pure posture findings).
+	// Port is the TCP/UDP transport port or physical switch-port index where the
+	// issue was observed (0 for pure posture findings).
 	Port int `json:"port,omitempty"`
 
 	// Observation carries probe fields for evaluation during this scan.
@@ -110,7 +113,9 @@ type Finding struct {
 }
 
 // EndpointIPs returns the addresses eligible for correlation with a WAN forward.
-// Legacy records can be attributed only when the client has one possible address.
+// When ObservedIPs is non-nil (including an explicitly empty slice for an
+// unresolved endpoint), it is returned verbatim; legacy records with nil
+// ObservedIPs fall back to the client's sole inventory IP when unambiguous.
 func (f Finding) EndpointIPs() []string {
 	if f.ObservedIPs != nil {
 		return f.ObservedIPs
@@ -138,7 +143,8 @@ func (f Finding) Key() string {
 }
 
 // EffectiveTransport returns the normalized transport protocol ("tcp" or "udp")
-// for this finding, defaulting to "tcp" for legacy records without Transport set.
+// for this finding. For legacy records without Transport set, well-known UDP
+// probe ports (623, 161, 5351, 5683) infer "udp" and all others default to "tcp".
 func (f Finding) EffectiveTransport() string {
 	if t := strings.ToLower(strings.TrimSpace(f.Transport)); t != "" {
 		return t
@@ -153,6 +159,8 @@ func (f Finding) EffectiveTransport() string {
 // or service visibility at informational severity without asserting a policy
 // violation or unauthorized permission.
 func (f Finding) IsInventoryOnly() bool {
+	// Risk scoring downgrades private LAN-only recursive DNS resolvers (UB-0010)
+	// to SeverityInfo + ClaimServiceObserved while keeping their original BaseSeverity.
 	if f.BaseSeverity != SeverityInfo && !(f.CheckID == "UB-0010" && f.EffectiveSeverity == SeverityInfo && f.ClaimKind == ClaimServiceObserved) {
 		return false
 	}
@@ -201,8 +209,10 @@ func NewRunner(list []*Check, concurrency int) *Runner {
 				IdleConnTimeout:   5 * time.Second,
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true, //nolint:gosec // local LAN appliances routinely use self-signed certificates
-					MinVersion:         tls.VersionTLS10,
-					CipherSuites:       allLegacyTLSCipherSuites(),
+					// Allow TLS 1.0+ and legacy cipher suites so HTTP checks can still
+					// inspect older embedded web UIs (iLO, iDRAC, printers, NAS).
+					MinVersion:   tls.VersionTLS10,
+					CipherSuites: allLegacyTLSCipherSuites(),
 				},
 			},
 			// Never follow redirects: prevents a hostile or misconfigured device
@@ -324,7 +334,7 @@ func (r *Runner) RunHost(ctx context.Context, hp probe.HostProfile) []Finding {
 					obs.Level = ObsIdentity
 				}
 			} else {
-				// Hard raw-printer safety guard: never send active bytes to raw print sinks.
+				// Hard zero-byte sink guard: never send active bytes to raw print or raw serial/Zigbee sinks.
 				if hp.IsRawPrintPort(port) {
 					continue
 				}
@@ -779,6 +789,11 @@ func observationIPs(cl unifi.Client, family string, targets []string) []string {
 	return ips
 }
 
+// findingEndpoints resolves the (transport, ObservedIPs) tuples that a matched
+// check emits on hp: active probes yield a single endpoint using EffectiveProbeIP,
+// while passive "observe" checks group matching mDNS, service, UPnP, and
+// WS-Discovery observations by transport (preserving non-nil empty IP slices
+// when an address cannot be resolved unambiguously).
 func findingEndpoints(chk *Check, hp probe.HostProfile, port int) []findingEndpoint {
 	if chk.Probe.Type != "observe" {
 		ips := []string{}
@@ -946,7 +961,8 @@ func (r *Runner) probeHTTPStep(ctx context.Context, endpoint string, step *HTTPS
 				continue
 			}
 		}
-		// Keep fallback candidates separate until all predicates on one response match.
+		// Stage extracted JSONPath fields in a temporary map so a non-matching
+		// fallback path candidate never leaks partial fields into obs.Fields.
 		fields := make(map[string]string)
 		matched := m.matchesHTTP(resp, bodyBytes, fields)
 		if isMultiStep && ctx.Err() != nil {
@@ -1063,6 +1079,9 @@ func (m *MatchSpec) matchesHTTP(resp *http.Response, bodyBytes []byte, fields ma
 	return matchJSONPredicates(bodyBytes, m.JSONMatch, fields)
 }
 
+// hostHasObservedPort reports whether port was observed on hp via TCP open
+// ports or, when allowUDP is true for non-TCP probes, via passive/Nerva
+// services or non-withdrawn mDNS advertisements.
 func hostHasObservedPort(hp probe.HostProfile, port int, allowUDP bool) bool {
 	if hp.HasPort(port) {
 		return true
@@ -1232,6 +1251,9 @@ func probeRTSP(ctx context.Context, ip string, port int, obs *Observation) (stri
 	return "RTSP DESCRIBE returned 200 OK with SDP without authentication", true
 }
 
+// sendRTSPDescribe sends an RTSP DESCRIBE request on conn and retries once on a
+// fresh connection if the first write or response parse fails (for example when
+// the server closes TCP after answering OPTIONS).
 func sendRTSPDescribe(ctx context.Context, conn net.Conn, reader *bufio.Reader, ip string, port int, req string) (rtspResponse, bool) {
 	if _, err := io.WriteString(conn, req); err == nil {
 		if resp, ok := readRTSPResponse(ctx, conn, reader, true); ok {
@@ -1251,6 +1273,10 @@ func sendRTSPDescribe(ctx context.Context, conn net.Conn, reader *bufio.Reader, 
 	return readRTSPResponse(ctx, conn2, bufio.NewReader(conn2), true)
 }
 
+// readRTSPResponse parses an RTSP/1.x status line, up to 64 headers (stopping
+// header processing once accumulated bytes exceed 8 KiB after ReadString returns
+// a line, not capping a single line read), and an optional bounded body (up to
+// 4 KiB) from reader.
 func readRTSPResponse(ctx context.Context, conn net.Conn, reader *bufio.Reader, wantBody bool) (rtspResponse, bool) {
 	statusLine, err := reader.ReadString('\n')
 	if err != nil {
@@ -1311,6 +1337,8 @@ func readRTSPResponse(ctx context.Context, conn net.Conn, reader *bufio.Reader, 
 			resp.body = string(body[:n])
 		}
 	} else if wantBody && resp.statusCode == 200 && !strings.Contains(strings.ToLower(resp.contentType), "application/sdp") {
+		// Some embedded cameras omit Content-Length and Content-Type on DESCRIBE
+		// replies; attempt one brief read to capture any trailing SDP lines.
 		shortDeadline := time.Now().Add(150 * time.Millisecond)
 		if dl, ok := ctx.Deadline(); ok && dl.Before(shortDeadline) {
 			shortDeadline = dl
@@ -1735,10 +1763,14 @@ func probeRDPNoNLA(ctx context.Context, ip string, port int, obs *Observation) (
 		ev, matched, _ = probeRDPWithProtocol(ctx, ip, port, rdpProtoRDP, obs)
 		return ev, matched
 	}
+	// SSL_REQUIRED_BY_SERVER (0x01) needs no retry because rdpProtoSSL already offered TLS.
 	_ = rdpFailSSLRequired
 	return "", false
 }
 
+// probeRDPWithProtocol sends one TPKT + X.224 Connection Request carrying an
+// RDP_NEG_REQ for requestedProto and returns either a confirmed NLA-disabled
+// match or any TYPE_RDP_NEG_FAILURE code returned by the server.
 func probeRDPWithProtocol(ctx context.Context, ip string, port int, requestedProto uint32, obs *Observation) (string, bool, uint32) {
 	conn, err := dialWithContextDeadline(ctx, ip, port)
 	if err != nil {

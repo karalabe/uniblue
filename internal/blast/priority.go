@@ -41,6 +41,8 @@ const (
 )
 
 // Priority is the urgency of a modeled consequence, ordered from P1 to P5.
+// String ordering matches urgency (P1 < P2 < P3 < P4 < P5), so comparisons like
+// p < q mean "p is more urgent than q" and max(p, P3) caps urgency at P3.
 type Priority string
 
 const (
@@ -87,7 +89,9 @@ func PromotePriority(p Priority) Priority {
 	}
 }
 
-// PriorityFor looks up urgency from audience, evidence and asset value.
+// PriorityFor looks up urgency from audience, evidence, and asset value.
+// Unrecognized audiences return P5, unrecognized asset tiers fall back to
+// TierMedium, and unrecognized difficulties fall back to DifficultyUnknown.
 func PriorityFor(audience EntryAudience, difficulty ChainDifficulty, assetValue classify.AssetTier) Priority {
 	row, ok := priorities[audience]
 	if !ok {

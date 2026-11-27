@@ -19,10 +19,17 @@ import (
 // NervaPluginEntry describes one registered service recognizer in the pinned
 // Nerva dependency along with whether UniBlue's active TCP adapter exercises it.
 type NervaPluginEntry struct {
-	Name          string   `json:"name"`
-	Transports    []string `json:"transports"`
-	ActiveTCPPath bool     `json:"active_tcp_path"`
-	PassiveNeeded bool     `json:"passive_needed"`
+	// Name is the lowercase canonical recognizer name reported by Nerva.
+	Name string `json:"name"`
+
+	// Transports lists the registries ("tcp", "tls", "udp", "sctp") where this plugin is registered.
+	Transports []string `json:"transports"`
+
+	// ActiveTCPPath reports whether UniBlue's active TCP/TLS Nerva scan path can exercise this plugin.
+	ActiveTCPPath bool `json:"active_tcp_path"`
+
+	// PassiveNeeded reports that this plugin only supports non-TCP transports (UDP or SCTP) and relies on passive telemetry or dedicated probes.
+	PassiveNeeded bool `json:"passive_needed"`
 }
 
 // ServiceCoverageReport makes service identification measurable per site/run,
@@ -30,16 +37,35 @@ type NervaPluginEntry struct {
 // unknown applications, candidate open ports, and unidentified endpoints across
 // transport and address family.
 type ServiceCoverageReport struct {
-	TotalObservedEndpoints int            `json:"total_observed_endpoints"`
-	ByState                map[string]int `json:"by_state"`
-	ByTransport            map[string]int `json:"by_transport"`
-	ByAddressFamily        map[string]int `json:"by_address_family"`
-	ConnectOnlyPorts       int            `json:"connect_only_ports,omitempty"`
-	OutboundDependencies   int            `json:"outbound_dependencies"`
-	PinnedNervaTotal       int            `json:"pinned_nerva_total"`
-	PinnedNervaTCPCapable  int            `json:"pinned_nerva_tcp_capable"`
-	PinnedNervaUDPOnly     int            `json:"pinned_nerva_udp_only"`
-	PinnedNervaSCTPOnly    int            `json:"pinned_nerva_sctp_only"`
+	// TotalObservedEndpoints is the count of locally hosted (transport, port, address family) endpoints deduplicated per host profile.
+	TotalObservedEndpoints int `json:"total_observed_endpoints"`
+
+	// ByState breaks down TotalObservedEndpoints by highest-ranked ServiceState.
+	ByState map[string]int `json:"by_state"`
+
+	// ByTransport breaks down TotalObservedEndpoints by transport ("tcp", "udp", "sctp").
+	ByTransport map[string]int `json:"by_transport"`
+
+	// ByAddressFamily breaks down TotalObservedEndpoints by address family ("ipv4", "ipv6", "dual").
+	ByAddressFamily map[string]int `json:"by_address_family"`
+
+	// ConnectOnlyPorts is the total count of open sink ports kept strictly connect-only (zero bytes written).
+	ConnectOnlyPorts int `json:"connect_only_ports,omitempty"`
+
+	// OutboundDependencies is the total count of external internet dependencies tracked separately from hosted services.
+	OutboundDependencies int `json:"outbound_dependencies"`
+
+	// PinnedNervaTotal is the total number of distinct service plugins compiled into the pinned Nerva dependency.
+	PinnedNervaTotal int `json:"pinned_nerva_total"`
+
+	// PinnedNervaTCPCapable is the number of compiled Nerva plugins reachable via TCP or TCP+TLS.
+	PinnedNervaTCPCapable int `json:"pinned_nerva_tcp_capable"`
+
+	// PinnedNervaUDPOnly is the number of compiled Nerva plugins supporting UDP (including UDP+SCTP) without TCP/TLS support.
+	PinnedNervaUDPOnly int `json:"pinned_nerva_udp_only"`
+
+	// PinnedNervaSCTPOnly is the number of compiled Nerva plugins registered only for SCTP.
+	PinnedNervaSCTPOnly int `json:"pinned_nerva_sctp_only"`
 }
 
 // AuditPinnedNervaPlugins introspects the live Nerva plugin registry compiled
@@ -126,6 +152,8 @@ func ComputeServiceCoverage(profiles []HostProfile) ServiceCoverageReport {
 		}
 	}
 
+	// Rank states by evidence strength so protocol confirmation outranks owner
+	// declarations, passive advertisements, TLS-only handshakes, and bare open ports.
 	stateRank := func(s string) int {
 		switch s {
 		case ServiceStateObservedProtocol:
@@ -146,6 +174,8 @@ func ComputeServiceCoverage(profiles []HostProfile) ServiceCoverageReport {
 	for _, hp := range profiles {
 		rep.ConnectOnlyPorts += len(hp.ConnectOnlyPorts)
 		rep.OutboundDependencies += len(hp.OutboundDependencies)
+		// Default to "ipv4" when a host profile has no parseable primary IP so
+		// coverage buckets remain populated rather than keyed by an empty string.
 		hostFamily := ipFamilyOf(hp.Client.PrimaryIP())
 		if hostFamily == "" {
 			hostFamily = "ipv4"

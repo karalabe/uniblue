@@ -29,6 +29,8 @@ func (b *builder) position(p risk.Position) fact {
 	return f
 }
 
+// appliance groups consumer and embedded device categories that are seeded as
+// assumed-breach origins and evaluated for outbound cloud egress.
 func appliance(c classify.Category) bool {
 	switch c {
 	case classify.CategoryIoT, classify.CategoryCamera, classify.CategoryPrinter, classify.CategoryMedia:
@@ -92,6 +94,9 @@ func (b *builder) entries() {
 			occupied[k] = true
 			compromised[a.host] = true
 		}
+		// b.clients also includes infrastructure devices and offline backend
+		// placeholders; only site clients, appliances, or hosts with observed
+		// vendor cloud traffic receive a cloud-egress assessment.
 		if siteClients[a.host] || isAppliance || observedVendor(byHost[a.host]) {
 			cloud[a.host] = append(cloud[a.host], b.egress(a, byHost[a.host], isAppliance, role))
 		}
@@ -100,6 +105,8 @@ func (b *builder) entries() {
 	for _, a := range b.clients {
 		if compromised[a.host] {
 			b.link(root(AssumeBreach), b.position(risk.PositionForClient(a.client)), trivial, 0, 0)
+			// Only emit a control consequence when controlling this host cascades to
+			// downstream assets (such as managed servers, VMs, or child devices).
 			owner := fact{consequence, a.host, "control"}
 			if i, ok := b.ids[owner]; ok && len(b.edges[i]) > 0 {
 				b.link(root(AssumeBreach), owner, trivial, 0, 0)
@@ -152,6 +159,8 @@ const (
 	cloudConnected = "cloud-connected (observed)"
 )
 
+// cloudOrder ranks client egress states so a higher value wins when merging
+// multiple attachments of a multi-homed client into its most exposed state.
 func cloudOrder(s string) int {
 	switch s {
 	case cloudConnected:
@@ -195,6 +204,10 @@ func (b *builder) egress(a attachment, deps []probe.OutboundDependency, isApplia
 	e, allowed, missing := b.assessEgress(a, deps, isAppliance)
 	n := b.network(a.client.NetworkID, a.client.NetworkName)
 	netName := cmp.Or(n.Name, "this network")
+	// Appliances on a shared or trusted VLAN need to be moved to an isolated
+	// VLAN (AssumeBreach), whereas devices already on a dedicated IoT, camera,
+	// or isolated VLAN with allowed egress get an outbound-blocking action
+	// (CloudEgress).
 	dedicated := (role == "iot" || role == "camera" || role == "isolated") && !namesNetwork(b.NetCfg.TrustedVLANs, n)
 	if isAppliance && !dedicated {
 		id := b.action("act:move-iot:"+networkKey(n), "Move IoT devices off "+netName+" to an isolated IoT network", "A dedicated IoT network separates these appliances from other devices on "+netName+".", LaneReduceExposure, 2)
@@ -214,7 +227,10 @@ func (b *builder) egress(a attachment, deps []probe.OutboundDependency, isApplia
 	return e
 }
 
-// assessEgress keeps the observed and policy-only states consistent for clients and infrastructure.
+// assessEgress evaluates outbound internet reachability for one attachment,
+// returning the client egress summary, whether policy permits egress on any
+// address family, and whether any family lacked sufficient policy data.
+// Observed vendor cloud traffic takes precedence over policy in egress.State.
 func (b *builder) assessEgress(a attachment, deps []probe.OutboundDependency, isAppliance bool) (ClientEgress, bool, bool) {
 	e := ClientEgress{Asset: a.host, Name: b.assets[a.host].name, State: localOnly, Reason: "Firewall policy blocks outbound internet access on every address family checked."}
 	allowed, missing := false, false
@@ -279,6 +295,9 @@ func (b *builder) outdoor() {
 				b.unknownPhysical = true
 				b.verify(root(Physical), "port-profile", key, "Check the switch port profile for "+name, "The controller did not report which networks are assigned to this socket.", canonicalMAC(sw.MAC))
 			}
+			// Treat custom tagged policies with missing or unresolved tagged VLAN IDs
+			// as unknown rather than assuming the port blocks non-native VLANs (the
+			// native VLAN is evaluated separately).
 			unresolved := func(id string) bool { return b.network(id, "").Name == "" }
 			missingMembers := slices.ContainsFunc(sp.TaggedNetworkIDs, unresolved) || slices.ContainsFunc(sp.ExcludedNetworkIDs, unresolved)
 			customUnknown := sp.TaggedVLANUnknown || p.TaggedPolicy == "unknown" || missingMembers || (p.TaggedPolicy == "custom" && sp.TaggedNetworkIDs == nil && sp.ExcludedNetworkIDs == nil)
@@ -293,6 +312,7 @@ func (b *builder) outdoor() {
 				isNative := native.Name != "" && networkKey(n) == networkKey(native)
 				tag := 0
 				level := trivial
+				// Unknown port isolation leaves even native-VLAN reachability unverified.
 				if sp.IsolationUnknown {
 					level = unknown
 				}
@@ -306,6 +326,8 @@ func (b *builder) outdoor() {
 					if customUnknown {
 						level = unknown
 					}
+					// Attach tag removal only to non-native tagged VLANs so stripping trunk
+					// tags earns credit for extra VLANs without claiming the native VLAN is closed.
 					tag = b.action("act:port-tags:"+key, "Remove unused tagged VLANs from "+name, "Extra tagged VLANs on this outdoor port can be reached from outside. Keep only the VLAN this device needs.", LaneReduceExposure, 1)
 					b.actions[tag].addTarget(canonicalMAC(sw.MAC))
 				}

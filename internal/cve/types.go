@@ -108,12 +108,14 @@ type CPEMatch struct {
 	// Version is an exact vulnerable version when not "*" or "-".
 	Version string `json:"version,omitempty"`
 
-	// StartIncl / StartExcl bound the lower end of a vulnerable version range.
+	// StartIncl is the inclusive lower bound (versionStartIncluding) of a vulnerable range.
 	StartIncl string `json:"start_incl,omitempty"`
+	// StartExcl is the exclusive lower bound (versionStartExcluding) of a vulnerable range.
 	StartExcl string `json:"start_excl,omitempty"`
 
-	// EndIncl / EndExcl bound the upper end of a vulnerable version range.
+	// EndIncl is the inclusive upper bound (versionEndIncluding) of a vulnerable range.
 	EndIncl string `json:"end_incl,omitempty"`
+	// EndExcl is the exclusive upper bound (versionEndExcluding) of a vulnerable range.
 	EndExcl string `json:"end_excl,omitempty"`
 }
 
@@ -129,10 +131,12 @@ type YearCoverageStats struct {
 }
 
 // FeedFileMeta records the size and modification timestamp of a verified local
-// yearly NVD feed archive so unchanged hourly refreshes can skip re-hashing
+// yearly NVD feed archive so unchanged incremental syncs can skip re-hashing
 // the full uncompressed payload.
 type FeedFileMeta struct {
-	Size            int64 `json:"size"`
+	// Size is the compressed archive size on disk in bytes.
+	Size int64 `json:"size"`
+	// ModTimeUnixNano is the archive file's modification timestamp in Unix nanoseconds.
 	ModTimeUnixNano int64 `json:"mtime_ns"`
 }
 
@@ -174,13 +178,13 @@ type CacheStats struct {
 	// ElapsedMS records how long the sync took in milliseconds.
 	ElapsedMS int64 `json:"elapsed_ms"`
 
-	// YearSHAs maps each NVD feed key (e.g., "2025", "modified") to its last
+	// YearSHAs maps each synced NVD yearly feed key (e.g., "2025") to its last
 	// synced .meta SHA256 checksum.
 	YearSHAs map[string]string `json:"year_shas"`
 
-	// YearMeta maps each NVD feed key to the verified local file's size and
-	// modification time so unchanged hourly refreshes avoid re-gunzipping all
-	// yearly archives on disk.
+	// YearMeta maps each synced NVD yearly feed key to the verified local file's
+	// size and modification time so unchanged incremental syncs avoid
+	// re-gunzipping all yearly archives on disk.
 	YearMeta map[string]FeedFileMeta `json:"year_meta,omitempty"`
 }
 
@@ -229,7 +233,8 @@ type Product struct {
 	HostIP string `json:"host_ip"`
 	// VLAN identifies the host's network.
 	VLAN string `json:"vlan,omitempty"`
-	// WANExposed indicates that a forward reaches a bound endpoint or an unbound host.
+	// WANExposed reports whether an enabled port forward reaches any bound
+	// endpoint of this product (or any address of the host when unbound).
 	WANExposed bool `json:"wan_exposed,omitempty"`
 }
 

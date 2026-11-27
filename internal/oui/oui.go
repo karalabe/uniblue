@@ -39,7 +39,8 @@ const (
 )
 
 // registrySource describes one official IEEE CSV registry endpoint and its
-// expected assignment prefix length in hex nibbles.
+// expected assignment prefix length in hex nibbles. MinEntries guards against
+// truncated responses or error pages replacing a valid cached table.
 type registrySource struct {
 	Name       string
 	URL        string
@@ -209,8 +210,8 @@ func (d *DB) Stats() (*Meta, error) {
 }
 
 // Sync downloads all official IEEE OUI CSV registries concurrently, compiles
-// them into a compact gzipped lookup table, persists it atomically, and loads
-// it into memory.
+// them into a compact gzipped lookup table, commits the compiled table
+// atomically via rename, writes meta.json, and loads the new table into memory.
 func (d *DB) Sync(ctx context.Context, progress func(string)) (*Meta, error) {
 	if err := os.MkdirAll(d.dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create oui cache dir: %w", err)
@@ -366,6 +367,8 @@ func (d *DB) fetchCSV(ctx context.Context, src registrySource) (map[string]strin
 			break
 		}
 		if err != nil {
+			// Tolerate occasional malformed rows in upstream IEEE CSV exports
+			// while still aborting on transport or context errors.
 			var parseErr *csv.ParseError
 			if errors.As(err, &parseErr) {
 				continue
@@ -380,7 +383,8 @@ func (d *DB) fetchCSV(ctx context.Context, src registrySource) (map[string]strin
 		if len(assignment) < src.Nibbles || org == "" {
 			continue
 		}
-		// Avoid letting generic IEEE shared-block placeholders overwrite specific sub-blocks.
+		// Avoid letting generic IEEE shared-block placeholders overwrite a
+		// specific vendor entry already recorded for the same prefix.
 		pfx := assignment[:src.Nibbles]
 		if _, exists := out[pfx]; !exists || !isIEEEPlaceholder(org) {
 			out[pfx] = org
@@ -398,6 +402,7 @@ func isValidIEEEHeader(header []string) bool {
 	if len(header) < 3 {
 		return false
 	}
+	// Strip any leading UTF-8 BOM that IEEE CSV exports occasionally prepend.
 	col0 := strings.TrimSpace(strings.TrimPrefix(header[0], "\ufeff"))
 	col1 := strings.TrimSpace(header[1])
 	col2 := strings.ToLower(strings.TrimSpace(header[2]))
@@ -419,8 +424,8 @@ func (d *DB) Lookup(mac string) Result {
 		IsLocallyAdministered: isLocallyAdministered(hexMAC),
 	}
 
-	// Check built-in virtualization prefixes first (e.g., QEMU 52:54:00, Proxmox bc:24:11),
-	// since some hypervisor prefixes have the locally-administered bit set.
+	// Check built-in virtualization prefixes first (e.g., QEMU 52:54:00, Docker 02:42:ac),
+	// since some hypervisor and container prefixes have the locally-administered bit set.
 	if v, ok := builtinVirtualOUIs[hexMAC[:6]]; ok {
 		res.Vendor = v
 		res.Prefix = strings.ToUpper(hexMAC[:6])

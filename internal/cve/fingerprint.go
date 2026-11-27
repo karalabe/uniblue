@@ -331,6 +331,9 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 	finalGroups := make(map[hostVersion][]Product, len(products))
 	var finalOrder []hostVersion
 	for _, p := range products {
+		// Distro backport ambiguity only applies to versioned matches; clear it on
+		// surviving versionless products now that supersession has already
+		// propagated the flag to any matching versioned entries.
 		if p.Version == "" {
 			p.VersionAmbiguous = false
 		}
@@ -460,7 +463,9 @@ func dropSupersededVersionlessProducts(products []Product, recomputeWAN func(*Pr
 	return out
 }
 
-// productsOverlapVendorProduct recognizes aliases shared by fingerprints on the same host.
+// productsOverlapVendorProduct reports whether two products share at least one
+// CPE vendor and have overlapping product patterns (exact or wildcard) in
+// either direction.
 func productsOverlapVendorProduct(ruleProd, versionedProd Product) bool {
 	for _, rv := range ruleProd.Vendors {
 		rv = strings.ToLower(strings.TrimSpace(rv))
@@ -578,6 +583,10 @@ func (r *FingerprintRule) matchAll(hp probe.HostProfile) []ruleHit {
 			}
 		}
 	}
+	// When no service banner yielded a version, consult host identity signals
+	// either to seed a first hit (len(hits) == 0) or to contribute a versionless
+	// model refinement (h.version == "") without injecting an unverified
+	// host-level version onto port-bound hits.
 	if !slices.ContainsFunc(hits, func(h ruleHit) bool { return h.version != "" }) {
 		if h, ok := r.matchHostIdentity(hp); ok && (len(hits) == 0 || h.version == "") {
 			hits = append(hits, h)
@@ -659,6 +668,9 @@ func hardwarePrinterService(md probe.MDNSService, banner probe.HTTPBanner) bool 
 	default:
 		return false
 	}
+	// Reject CUPS shared-queue markers (" @ " instance naming, cups/ HTTP server
+	// header, or printer-type/rp=printers/cups TXT keys) that advertise a remote
+	// printer proxied by a print server rather than the host's own hardware.
 	if strings.Contains(md.Instance, " @ ") || strings.HasPrefix(strings.ToLower(banner.Server), "cups/") {
 		return false
 	}
@@ -695,7 +707,9 @@ func upstreamVersion(version string, packaged bool) string {
 	return version
 }
 
-// serviceHit retains the endpoint and packaging evidence that the regex capture omits.
+// serviceHit builds a port-bound ruleHit from a regex match, stripping any
+// distribution package revision from the captured version and marking ambiguous
+// when raw contains Linux/BSD distro packaging markers.
 func (r *FingerprintRule) serviceHit(m []string, raw, source string, port int) ruleHit {
 	version := captureGroup(m, r.VersionGroup)
 	packaged := distroPackage.MatchString(raw)

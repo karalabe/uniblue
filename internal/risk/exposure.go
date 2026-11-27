@@ -151,6 +151,8 @@ func LoadExposureClassifier(fsys fs.FS) (*ExposureClassifier, error) {
 
 // Classify matches an enabled UniFi PortForward against the ordered rule list,
 // falling back to an unclassified MEDIUM assessment when no rule matches.
+// Optional probe profiles let SSH entrypoints escalate severity via
+// ObservedSSHAccess when password or credential-free login is observed.
 func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client, profiles ...probe.HostProfile) ExposureAssessment {
 	if c != nil {
 		for _, r := range c.rules {
@@ -164,6 +166,8 @@ func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client, pro
 					Summary:  strings.TrimSpace(r.Summary),
 					Actions:  r.Actions,
 				}
+				// ssh-entrypoint rules confine the backend strictly to port 22,
+				// so query observed SSH auth methods on that listener directly.
 				if assessment.Class == "ssh-entrypoint" {
 					switch ObservedSSHAccess(profiles, cl, pf.FwdIP, 22) {
 					case "none":
@@ -191,8 +195,15 @@ func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client, pro
 	}
 }
 
-// ObservedSSHAccess prefers the listener's own SSH auth posture. An observation
-// from the other address family can identify password or credential-free access.
+// ObservedSSHAccess inspects probed SSH host profiles for cl on (ip, port) and
+// returns the strongest observed authentication exposure: "none" (unauthenticated
+// login accepted), "password" (password or keyboard-interactive offered),
+// "publickey" (exact listener advertised only "publickey" for the probed
+// account), or "" (no conclusive profile).
+// Exact listener IP matches take precedence; an observation on the same host's
+// other address family can still surface "none" or "password" risks, whereas
+// "publickey" requires an exact listener IP match because key-only enforcement
+// on one address family does not guarantee the other listener is key-only.
 func ObservedSSHAccess(profiles []probe.HostProfile, cl unifi.Client, ip string, port int) string {
 	identity := func(c unifi.Client) string {
 		return cmp.Or(config.CanonicalMAC(c.MAC), c.ID, canonicalIsolationIP(c.PrimaryIP()))
@@ -235,6 +246,9 @@ func ObservedSSHAccess(profiles []probe.HostProfile, cl unifi.Client, ip string,
 // matches evaluates whether a PortForward satisfies an ExposureRule's protocol,
 // port list, or optional rule-name regex.
 func (r *ExposureRule) matches(pf unifi.PortForward) bool {
+	// Require exact protocol and single-purpose backend ports for SSH
+	// entrypoints so broader multi-port or mixed-transport forwards that merely
+	// overlap port 22 do not get narrowed to an SSH-only classification.
 	if r.Class == "ssh-entrypoint" {
 		return pf.Enabled && strings.EqualFold(pf.Proto, r.Proto) && pf.OnlyBackendPort(r.Ports...)
 	}
@@ -435,6 +449,11 @@ func auditFirewallPolicies(snap *unifi.Snapshot) []checks.Finding {
 	// rule already shadows a later ALLOW policy on the same zone pair.
 	sorted := orderedFirewallPolicies(snap.FirewallPolicies)
 
+	// Skip reporting a dead ALLOW rule only when a strictly earlier (lower Index)
+	// unconditional blanket deny covers the same zone pair, IP family, and
+	// protocol (including via protocol negation handled by protocolCovers).
+	// Equal-index, scheduled, stateful, target- or port-negated, or unsupported
+	// denies never shadow a later ALLOW.
 	isShadowedByEarlierDeny := func(pos int, pol unifi.FirewallPolicy) bool {
 		for k := 0; k < pos; k++ {
 			earlier := sorted[k]
@@ -668,6 +687,9 @@ func protocolCovers(earlierProto string, earlierNeg bool, targetProto string, ta
 		}
 		return !matchesProtocol(ep, tp)
 	}
+	// A specific positive protocol covers a wildcard target only if the target
+	// is negated (negating all protocols matches nothing); an unnegated wildcard
+	// is strictly broader than a single protocol.
 	if tp == "" || tp == "all" || tp == "any" {
 		return targetNeg
 	}

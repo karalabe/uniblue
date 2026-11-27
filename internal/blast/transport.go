@@ -40,7 +40,8 @@ func (v TransportVerdict) String() string {
 	}
 }
 
-// BlindSpots returns a fresh disclosure for every resilience assessment.
+// BlindSpots returns mandatory disclosure bullets for resilient verdicts, and
+// nil for all other verdicts.
 func (v TransportVerdict) BlindSpots() []string {
 	if v != resilient {
 		return nil
@@ -79,7 +80,8 @@ type TransportSurvival struct {
 	Transport string `json:"transport"`
 	// Protocol is the application protocol identified at this endpoint.
 	Protocol string `json:"protocol"`
-	// Class describes the protection seen on this leg.
+	// Class describes the protection seen on this leg ("e2e", "tls-ca",
+	// "tls-unverifiable", "cleartext-auth", "cleartext-noauth", or "unknown").
 	Class string `json:"class"`
 	// Reachability reports whether the modeled source can initiate a connection.
 	Reachability string `json:"reachability"`
@@ -146,6 +148,8 @@ func inboundSurfaces(hp probe.HostProfile) []TransportSurvival {
 		case "_hap._tcp":
 			proto = "hap"
 		case "_matter._tcp":
+			// Matter advertises operational discovery via _matter._tcp DNS-SD records,
+			// but its operational CASE/MRP transport runs over UDP.
 			proto, transport = "matter", "udp"
 		case "_esphomelib._tcp":
 			for _, txt := range md.TXT {
@@ -163,6 +167,8 @@ func inboundSurfaces(hp probe.HostProfile) []TransportSurvival {
 				continue
 			}
 			previous := services[k].Protocol
+			// Allow mDNS api_encryption=noise_ to upgrade a generic TCP-probed
+			// "esphome" service to the Noise-encrypted "esphome-noise" variant.
 			if previous == "" || previous == "unknown" || proto == "esphome-noise" && previous == "esphome" {
 				services[k] = probe.Service{Protocol: proto, State: probe.ServiceStateAdvertisedService}
 			}

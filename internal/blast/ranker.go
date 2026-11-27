@@ -47,6 +47,9 @@ func (g *graph) prioritiesByFact(baseline, states [][]uint8, cuts []bool, pairs 
 			s := starts[i]
 			p := g.factPriority(s, n, f, d, hpDist, base, hpCuts)
 			isHP := g.isHighProfileIn(n, f, hpDist, base, hpCuts)
+			// Exclude CloudEgress even though it shares AudienceAssumeBreach: outbound
+			// vendor telemetry is not lateral reach from an untrusted peer, so it
+			// should not trigger the untrusted-LAN high-profile tie-breaker.
 			isUntrusted := isHP && s.entry != CloudEgress && (s.audience == AudienceGuestOrUntrusted || s.audience == AudienceAssumeBreach || s.audience == AudiencePhysical)
 			key := pairs[n]
 			if out[key] == "" || p < out[key] {
@@ -118,6 +121,12 @@ func laneOrder(l Lane) int {
 	}
 }
 
+// precedes reports whether candidate a ranks ahead of b:
+//  1. More improved pairs in PairsByTier (P1 down to P5, lexicographically)
+//  2. Untrusted-LAN / physical / assume-breach high-profile tie-breaker (tieBreakHP)
+//  3. Lane precedence (LaneFixNow < LaneReduceExposure < LaneVerify)
+//  4. Lower effort
+//  5. Lexicographically smaller action ID
 func precedes(a, b candidate) bool {
 	for i, n := range a.PairsByTier {
 		if n != b.PairsByTier[i] {
@@ -235,6 +244,8 @@ func (g *graph) rank(states [][]uint8) []Action {
 				continue
 			}
 			cuts[id] = true
+			// Cutting an action that touches no reachable edge from root i cannot
+			// change root i's fixpoint, so reuse currentStates[i] without re-solving.
 			for i, r := range g.roots {
 				if byRoot[i][id] {
 					g.solveRoot(r, cuts, rootScratch[i], queue[:0])
@@ -271,6 +282,8 @@ func (g *graph) rank(states [][]uint8) []Action {
 				a, b := g.actions[i], g.actions[j]
 				return cmp.Or(cmp.Compare(laneOrder(a.Lane), laneOrder(b.Lane)), cmp.Compare(a.effort, b.effort), cmp.Compare(a.ID, b.ID))
 			})
+			// Clear any transient scoring fields from earlier candidate trials before
+			// appending the zero-credit residual actions.
 			for _, id := range remaining {
 				g.actions[id].HighestTierReduced = ""
 				g.actions[id].PairsByTier = [5]int{}
@@ -320,6 +333,7 @@ func (g *graph) rank(states [][]uint8) []Action {
 
 		cuts[winner] = true
 		nextStates := make([][]uint8, len(starts))
+		// Only re-solve roots whose reachable edges included the winning cut.
 		for i, r := range g.roots {
 			if byRoot[i][winner] {
 				dist := make([]uint8, len(g.facts))

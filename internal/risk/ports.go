@@ -47,56 +47,145 @@ type PortPeer struct {
 // SwitchPortView merges live link state, VLAN/MAC configuration, physical
 // perimeter zoning, connected peers, and security status for one switch port.
 type SwitchPortView struct {
-	PortIdx       int     `json:"port_idx"`
-	Name          string  `json:"name"`
-	Label         string  `json:"label,omitempty"`
-	Zone          string  `json:"zone"`        // "external", "external_uplink", "internal", "uplink", "wan", "unused"
-	ZoneSource    string  `json:"zone_source"` // "config", "auto", "parent_link", "default"
-	State         string  `json:"state"`       // "active", "inactive_enabled", "disabled"
-	Enabled       bool    `json:"enabled"`
-	Up            bool    `json:"up"`
-	Speed         int     `json:"speed"`
-	Media         string  `json:"media,omitempty"`
-	PoEEnabled    bool    `json:"poe_enabled,omitempty"`
-	PoEMode       string  `json:"poe_mode,omitempty"`
-	PoEPower      string  `json:"poe_power,omitempty"`
+	// PortIdx is the 1-based physical port number on the switch.
+	PortIdx int `json:"port_idx"`
+
+	// Name is the controller-configured or default port label.
+	Name string `json:"name"`
+
+	// Label is an operator-defined or inferred perimeter description for the port.
+	Label string `json:"label,omitempty"`
+
+	// Zone classifies the port's physical perimeter role ("external",
+	// "external_uplink", "internal", "uplink", "wan", or "unused").
+	Zone string `json:"zone"`
+
+	// ZoneSource records how Zone was determined ("config", "auto", "parent_link", or "default").
+	ZoneSource string `json:"zone_source"`
+
+	// State summarizes link and admin status ("active", "inactive_enabled", or "disabled").
+	State string `json:"state"`
+
+	// Enabled reports whether the port is administratively enabled.
+	Enabled bool `json:"enabled"`
+
+	// Up reports whether a physical Ethernet or SFP link is currently active.
+	Up bool `json:"up"`
+
+	// Speed is the negotiated link rate in Mbps (0 when down).
+	Speed int `json:"speed"`
+
+	// Media is the physical port media type (e.g., "GE", "2.5GE", "SFP", "SFP+").
+	Media string `json:"media,omitempty"`
+
+	// PoEEnabled reports whether PoE power is actively delivered on this port.
+	PoEEnabled bool `json:"poe_enabled,omitempty"`
+
+	// PoEMode is the configured PoE operating mode ("auto", "off", "passthrough", etc.).
+	PoEMode string `json:"poe_mode,omitempty"`
+
+	// PoEPower is the raw live PoE draw string reported by the controller.
+	PoEPower string `json:"poe_power,omitempty"`
+
+	// PoEPowerWatts is the parsed numeric PoE power draw in watts.
 	PoEPowerWatts float64 `json:"poe_power_watts,omitempty"`
-	NativeVLAN    string  `json:"native_vlan,omitempty"`
-	TaggedPolicy  string  `json:"tagged_policy"` // "all", "block_all", "custom", "disabled"
-	PortSecurity  bool    `json:"port_security"`
+
+	// NativeVLAN is the resolved native/untagged VLAN display name.
+	NativeVLAN string `json:"native_vlan,omitempty"`
+
+	// TaggedPolicy is the effective tagged-VLAN forwarding policy
+	// ("all", "block_all", "custom", "disabled", or "unknown").
+	TaggedPolicy string `json:"tagged_policy"`
+
+	// PortSecurity reports whether MAC address allowlisting is enabled on this port.
+	PortSecurity bool `json:"port_security"`
+
 	// PortSecurityUnknown reports when the controller omitted the effective setting.
-	PortSecurityUnknown bool       `json:"port_security_unknown,omitempty"`
-	PortSecurityMACs    []string   `json:"port_security_macs,omitempty"`
-	Isolation           bool       `json:"isolation,omitempty"`
-	IsolationUnknown    bool       `json:"isolation_unknown,omitempty"`
-	MACTableCount       int        `json:"mac_table_count,omitempty"`
-	STPState            string     `json:"stp_state,omitempty"`
-	RXErrors            int64      `json:"rx_errors,omitempty"`
-	TXErrors            int64      `json:"tx_errors,omitempty"`
-	Peers               []PortPeer `json:"peers,omitempty"`
-	Status              string     `json:"status"` // "ok", "warn", "critical"
-	Issues              []string   `json:"issues,omitempty"`
+	PortSecurityUnknown bool `json:"port_security_unknown,omitempty"`
+
+	// PortSecurityMACs lists explicitly permitted MAC addresses when PortSecurity is enabled.
+	PortSecurityMACs []string `json:"port_security_macs,omitempty"`
+
+	// Isolation reports whether L2 Switch Port Isolation is enabled on this port.
+	Isolation bool `json:"isolation,omitempty"`
+
+	// IsolationUnknown reports when the effective port isolation setting could not be resolved.
+	IsolationUnknown bool `json:"isolation_unknown,omitempty"`
+
+	// MACTableCount is the number of active MAC addresses learned on this port.
+	MACTableCount int `json:"mac_table_count,omitempty"`
+
+	// STPState is the Spanning Tree port state ("forwarding", "discarding", "blocking", "disabled").
+	STPState string `json:"stp_state,omitempty"`
+
+	// RXErrors counts receive frame errors on this port.
+	RXErrors int64 `json:"rx_errors,omitempty"`
+
+	// TXErrors counts transmit frame errors on this port.
+	TXErrors int64 `json:"tx_errors,omitempty"`
+
+	// Peers lists wired clients and downstream UniFi devices connected to this port.
+	Peers []PortPeer `json:"peers,omitempty"`
+
+	// Status summarizes the port's evaluated security health ("ok", "warn", or "critical").
+	Status string `json:"status"`
+
+	// Issues lists human-readable security or link warnings identified on this port.
+	Issues []string `json:"issues,omitempty"`
 }
 
 // SwitchDeviceView summarizes physical port allocation and perimeter security
 // for one UniFi switch, gateway, or In-Wall AP.
 type SwitchDeviceView struct {
-	Name                 string           `json:"name"`
-	MAC                  string           `json:"mac"`
-	IP                   string           `json:"ip"`
-	Model                string           `json:"model"`
-	Type                 string           `json:"type"`
-	ExternalDevice       bool             `json:"external_device"`
-	ZoneSource           string           `json:"zone_source,omitempty"`
-	UplinkName           string           `json:"uplink_name,omitempty"`
-	UplinkPort           int              `json:"uplink_port,omitempty"`
-	TotalPorts           int              `json:"total_ports"`
-	ActivePorts          int              `json:"active_ports"`
-	InactiveEnabledPorts int              `json:"inactive_enabled_ports"`
-	DisabledPorts        int              `json:"disabled_ports"`
-	ExternalPorts        int              `json:"external_ports"`
-	AtRiskPorts          int              `json:"at_risk_ports"`
-	Ports                []SwitchPortView `json:"ports"`
+	// Name is the friendly UniFi device name.
+	Name string `json:"name"`
+
+	// MAC is the normalized lowercase hardware address of the device.
+	MAC string `json:"mac"`
+
+	// IP is the management IP address of the device.
+	IP string `json:"ip"`
+
+	// Model is the UniFi hardware model code.
+	Model string `json:"model"`
+
+	// Type is the normalized controller device type (e.g., "usw", "udm", "uap").
+	Type string `json:"type"`
+
+	// ExternalDevice reports whether the entire device sits outside the secured building perimeter.
+	ExternalDevice bool `json:"external_device"`
+
+	// ZoneSource records how ExternalDevice was classified ("config" or "auto"), if external.
+	ZoneSource string `json:"zone_source,omitempty"`
+
+	// UplinkName is the parent UniFi device display name reported via LLDP, if any.
+	UplinkName string `json:"uplink_name,omitempty"`
+
+	// UplinkPort is the remote port number on the parent switch or gateway.
+	UplinkPort int `json:"uplink_port,omitempty"`
+
+	// TotalPorts is the total number of physical ports reported on this device.
+	TotalPorts int `json:"total_ports"`
+
+	// ActivePorts counts enabled ports with an active physical link up.
+	ActivePorts int `json:"active_ports"`
+
+	// InactiveEnabledPorts counts administratively enabled ports with no link up.
+	InactiveEnabledPorts int `json:"inactive_enabled_ports"`
+
+	// DisabledPorts counts administratively disabled ports.
+	DisabledPorts int `json:"disabled_ports"`
+
+	// ExternalPorts counts ports classified as "external" or "external_uplink".
+	ExternalPorts int `json:"external_ports"`
+
+	// AtRiskPorts counts selected risk detections across the device's ports (one
+	// port can increment it multiple times, and an error-counter warning alone
+	// does not increment it).
+	AtRiskPorts int `json:"at_risk_ports"`
+
+	// Ports holds the per-port security and link views sorted by port index.
+	Ports []SwitchPortView `json:"ports"`
 }
 
 // AnalyzeSwitchPorts inspects every UniFi device's physical Ethernet/SFP ports,

@@ -75,6 +75,11 @@ type NetworkContainment struct {
 	SharedZoneWith []string `json:"shared_zone_with,omitempty"`
 }
 
+// Heuristic patterns used to infer an isolated network's workload archetype
+// when explicit config lists and captive-portal signals do not decide it.
+// The first tier classifies individual hosts during the client census from
+// display names, hostnames, and vendor OUIs; the second tier falls back to
+// network-level metadata (DHCP domain names and network/zone labels).
 var (
 	personalDevicePattern = regexp.MustCompile(`(?i)(^|[-_.\s(])(iphone|ipad|pixel|galaxy|macbook|imac|mac[-_\s]?mini|mac[-_\s]?studio|mac[-_\s]?pro|^mac\b|apple\s*watch|^watch\b|desktop-|laptop-|surface|thinkpad|oneplus|android|phone|tablet|laptop)($|[-_.\s)\d])`)
 	cameraDevicePattern   = regexp.MustCompile(`(?i)(^|[-_.\s(])(camera|cam|doorbell|chime|nvr|cctv|hikvision|reolink|dahua|amcrest|axis|ring|arlo|wyze|eufy[-_\s]?cam)($|[-_.\s)\d])`)
@@ -393,8 +398,10 @@ func (o *Oracle) evaluateNetworkContainment(
 	return containments, cells, findings, notes
 }
 
-// peerGap accumulates report facts for one path kind. Counts are per attachment
-// path, while the matrix retains each evaluated address family's decision.
+// peerGap aggregates same-VLAN peer-isolation evidence for one attachment path
+// kind (same-AP Wi-Fi, wired-to-wired, wired-to-AP, or cross-AP). Evaluated and
+// permitted counters track attachment paths, while the matrix keeps individual
+// per-family decision cells.
 type peerGap struct {
 	kind, property, title, unit, function string
 
@@ -406,14 +413,16 @@ type peerGap struct {
 	requiresACL, limited bool
 }
 
-// peerPermit keeps the actual permitting families together with one directional
-// witness for a named ACL exception. Default forwarding needs no example.
+// peerPermit tracks how many evaluated IPv4 (v4) and IPv6 (v6) paths a given
+// switch ACL or default forwarding disposition permitted, plus one directional
+// example flow for named ACL exceptions (default forwarding needs no example).
 type peerPermit struct {
 	name, example string
 	v4, v6        int
 }
 
-// peerFamilies names just the IP families for which an allow was witnessed.
+// peerFamilies formats the witnessed IPv4/IPv6 flags for display, defaulting
+// to "IPv4" when neither flag is set.
 func peerFamilies(v4, v6 bool) string {
 	if v4 && v6 {
 		return "IPv4 and IPv6"
@@ -424,7 +433,8 @@ func peerFamilies(v4, v6 bool) string {
 	return "IPv4"
 }
 
-// comparePeerPorts orders sockets numerically within a physical switch.
+// comparePeerPorts orders switch ports deterministically by switch MAC and
+// numeric port index.
 func comparePeerPorts(a, b checks.SwitchPortRef) int {
 	if n := cmp.Compare(a.SwitchMAC, b.SwitchMAC); n != 0 {
 		return n
@@ -455,8 +465,9 @@ func peerList(items []string, limit int, noun string) string {
 	return strings.Join(items, ", ")
 }
 
-// peerPortList groups sockets by switch and caps physical ports across switches.
-// The caller sorts by switch MAC and numeric port so trimming is deterministic.
+// peerPortList groups switch ports by switch and caps the total ports shown
+// across switches. The caller sorts by switch MAC and numeric port index so
+// trimming is deterministic.
 func peerPortList(snap *unifi.Snapshot, refs []checks.SwitchPortRef, labels map[checks.SwitchPortRef]string, limit int) string {
 	var groups []string
 	shown := refs[:min(limit, len(refs))]
@@ -488,8 +499,10 @@ func peerPortList(snap *unifi.Snapshot, refs []checks.SwitchPortRef, labels map[
 	return strings.Join(groups, ", ")
 }
 
-// peerRemediation offers a port change only when it closes every reported
-// crossing. A permissive rule may need narrowing before a VLAN deny can work.
+// peerRemediation builds switch-isolation remediation guidance. It recommends
+// enabling Switch Port Isolation only when ports is non-empty (meaning access-port
+// isolation alone closes every reported crossing), and adds ACL-narrowing steps
+// whenever named permit exceptions exist.
 func peerRemediation(network, families, ports, exceptions string, defaultAllow bool) checks.Remediation {
 	var steps, actions []string
 	if defaultAllow {
@@ -509,8 +522,10 @@ func peerRemediation(network, families, ports, exceptions string, defaultAllow b
 	return checks.Remediation{Summary: strings.Join(steps, " "), UniFiActions: actions}
 }
 
-// recordPermit keeps a representative flow for an explicit rule. The caller
-// submits a rule once per pair and family even if both directions match it.
+// recordPermit increments the permitting rule's per-family path counter, saves
+// a representative directional witness for named ACL exceptions, and populates
+// cell.DecisiveReason and cell.RecommendedFix. The caller invokes it once per
+// distinct rule on a pair and family even when both directions match.
 func (g *peerGap) recordPermit(cell *IsolationCell, sw, from, to, fixPorts string) {
 	key := [3]string{sw, cell.DecisiveRuleID, cell.DecisiveRuleName}
 	rule := g.rules[key]
@@ -692,7 +707,8 @@ func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, 
 	coverage := make(map[string]bool)
 	allowed, blocked, unknown := false, false, false
 	zone := firstNonEmptyStr(n.ZoneName, n.Name)
-	// Matrix verdicts drive the axis state independently of summary counts.
+	// Stamp network/zone metadata onto each cell and roll its verdict into the
+	// axis posture flags independently of the per-gap finding summaries.
 	record := func(c IsolationCell) {
 		c.SourceZone, c.DestZone = zone, zone
 		c.SourceNetwork, c.DestNetwork = n.Name, n.Name
@@ -735,8 +751,10 @@ func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, 
 		})
 	}
 
-	// A downstream segment can switch locally. Record its uncertainty once,
-	// independently of crossings that the upstream switch can conclusively block.
+	// Detect downstream unmanaged switches or hubs behind a non-infrastructure
+	// access port: peers sharing that segment can switch locally without
+	// reaching the upstream UniFi switch. Record that uncertainty once so it
+	// stays separate from cross-port flows the upstream switch can block.
 	shared := make(map[checks.SwitchPortRef]bool)
 	var downstream []checks.SwitchPortRef
 	for _, ref := range slices.SortedFunc(maps.Keys(wiredCount), comparePeerPorts) {
@@ -745,6 +763,10 @@ func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, 
 		if ref.SwitchMAC == "" || ref.PortIdx <= 0 || o.infrastructure[ref] {
 			continue
 		}
+		// Only use MACTableCount > 1 on single-client ports when upstream port
+		// isolation is known and enabled: an unisolated or unknown port already
+		// surfaces through normal peer evaluation, whereas an isolated port
+		// would otherwise mask unverified local switching behind a downstream hub.
 		if count <= 1 && (p.IsolationUnknown || !p.Isolation || p.MACTableCount <= 1) {
 			continue
 		}
@@ -771,8 +793,10 @@ func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, 
 	if siteHasIPv6Context(snap, n, n, unifi.Client{}) {
 		families = append(families, "ipv6")
 	}
-	// Evaluate ACLs only for traffic that can actually cross the switch fabric.
-	// The lone-client check models a client-to-VLAN path with an unconstrained peer.
+	// Evaluate switch port isolation and directional ACLs for a pair of
+	// attachments crossing the switch fabric. When single is true (only one
+	// wired client exists on the VLAN), model a client-to-arbitrary-VLAN-peer
+	// path by leaving the destination endpoint unconstrained.
 	evaluatePair := func(a, b peerAttachment, g *peerGap, single bool) {
 		g.evaluated++
 		if a.ref == b.ref && shared[a.ref] {
@@ -831,6 +855,9 @@ func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, 
 			if single {
 				to = "a VLAN peer"
 			} else if cell.Verdict != IsolationViolation || len(snap.SwitchACLs) > 0 {
+				// Skip the reverse probe on default-allow when no switch ACLs
+				// exist, since default switch forwarding behaves identically in
+				// both directions and cannot reveal a second named rule.
 				reverse := checkDir(b, a)
 				// Keep one matrix cell per family. A different permitting ACL in
 				// the other direction is also relevant to the operator's fix.
@@ -1170,6 +1197,10 @@ func (e containmentEvaluator) evaluateRoutedAxis(
 			}
 			policies = append(policies, p)
 		}
+		// If internet egress has only the synthetic trailing "External default"
+		// rule and its UnsupportedReason is populated (no explicit External
+		// policies matched and the controller omitted InternetAccessEnabled),
+		// emit IsolationUnknown directly rather than running the solver.
 		if isInternet && len(policies) == 1 && policies[0].UnsupportedReason != "" {
 			states["unknown"] = true
 			cells = append(cells, IsolationCell{
@@ -1200,8 +1231,10 @@ func (e containmentEvaluator) evaluateRoutedAxis(
 			return c
 		}
 
-		// Search for any permitted path first; if one exists, also search for a
-		// blocked path to distinguish "restricted" from "open".
+		// Two-pass counterexample search: first ask whether any flow is
+		// permitted (expected="deny"). If a permit exists, invert the query
+		// (expected="allow") to see whether any flow is blocked, distinguishing
+		// "restricted" (some flows blocked) from "open" (every flow allowed).
 		permit := check("deny", config.IsolationIntent{})
 		state := "unknown"
 		switch permit.Verdict {
@@ -1215,6 +1248,9 @@ func (e containmentEvaluator) evaluateRoutedAxis(
 			case IsolationApproved:
 				state = "open"
 			}
+			// Under strict mode, re-evaluate with configured ApprovedPaths so
+			// only traffic outside approved pinholes remains an unapproved leak
+			// (and any evaluation uncertainty stays visible as IsolationUnknown).
 			unapproved := strict
 			if strict && len(e.intent.ApprovedPaths) > 0 {
 				exception := check("deny", e.intent)
@@ -1258,6 +1294,10 @@ func (e containmentEvaluator) evaluateRoutedAxis(
 		id, fix := "", ""
 		var actions []string
 		sev := checks.SeverityLow
+		// Even without explicit strict mode, blocking one IP family while
+		// leaving the other open on the same source network indicates operator
+		// intent to block this boundary, so escalate the open family as a High
+		// dual-stack leak.
 		parity := false
 		if !strict {
 			for _, other := range cells {
@@ -1302,6 +1342,9 @@ func (e containmentEvaluator) evaluateRoutedAxis(
 		if c.Port != 0 {
 			evidence += fmt.Sprintf(" (port %d)", c.Port)
 		}
+		// Flip matching allow cells to IsolationViolation when dual-stack
+		// parity escalation applies so the matrix and axis Violation flag
+		// stay consistent with the emitted High leak finding.
 		if parity {
 			for i := range cells {
 				if cells[i].Effective == "allow" && cells[i].SourceNetwork == c.SourceNetwork && cells[i].IPFamily == c.IPFamily {

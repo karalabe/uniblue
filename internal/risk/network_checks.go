@@ -58,8 +58,10 @@ func AnalyzeExtendedNetworkChecks(
 			continue
 		}
 		sev := checks.SeverityMedium
+		// Escalate to High when the requesting host differs from the forwarded
+		// target (OwnerIP != InternalIP), indicating a third-party NAT mapping.
 		if dm.OwnerIP != "" && dm.InternalIP != "" && dm.OwnerIP != dm.InternalIP {
-			sev = checks.SeverityHigh // third-party mapping!
+			sev = checks.SeverityHigh
 		}
 		findings = append(findings, checks.Finding{
 			CheckID:           "UB-UNIFI-DYNAMIC-NAT-MAPPING",
@@ -197,7 +199,9 @@ func AnalyzeExtendedNetworkChecks(
 		}
 	}
 
-	// 6. Native VLAN Mismatch Across Known LLDP Switch Links (requires explicit VLAN IDs).
+	// 6. Native VLAN Mismatch Across Known LLDP Switch Links (prefers explicit
+	// NativeNetworkID values and falls back to NativeNetworkName when both ports
+	// omit IDs and report explicit non-empty names).
 	devByMAC := make(map[string]unifi.Device, len(snap.Devices))
 	for _, d := range snap.Devices {
 		devByMAC[strings.ToLower(d.MAC)] = d
@@ -366,6 +370,9 @@ func AnalyzeExtendedNetworkChecks(
 	return findings, notes
 }
 
+// isPrivateOrCGNAT reports whether addr falls in RFC 1918 private, IPv6
+// unique-local (fc00::/7, via Addr.IsPrivate), loopback, link-local, or
+// RFC 6598 CGNAT address space rather than public internet space.
 func isPrivateOrCGNAT(addr netip.Addr) bool {
 	if addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
 		return true
@@ -375,6 +382,8 @@ func isPrivateOrCGNAT(addr netip.Addr) bool {
 	return cgnat.Contains(addr)
 }
 
+// dhcpPoolSize returns the inclusive number of IPv4 addresses between startStr
+// and endStr, or 0 if either address is invalid, non-IPv4, or out of order.
 func dhcpPoolSize(startStr, endStr string) int {
 	a, err1 := netip.ParseAddr(strings.TrimSpace(startStr))
 	b, err2 := netip.ParseAddr(strings.TrimSpace(endStr))

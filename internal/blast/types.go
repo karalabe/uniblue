@@ -106,7 +106,8 @@ type Exposure struct {
 	Name string `json:"name"`
 	// Consequence identifies the permission, publication or boundary affected.
 	Consequence string `json:"consequence"`
-	// State distinguishes exposure, containment, missing evidence and an incomplete chain.
+	// State is one of "exposed", "contained", "unknown", "needs-verification",
+	// or "no-known-path".
 	State string `json:"state"`
 	// Difficulty describes the strongest prerequisite on the path.
 	Difficulty ChainDifficulty `json:"difficulty,omitempty"`
@@ -155,7 +156,8 @@ func (a Action) TargetsAsset(key string) bool {
 	return a.targetAssets[key]
 }
 
-// addTarget keeps host filtering independent of the ranked benefit chips.
+// addTarget records direct and helped host keys in targetAssets independently
+// of the capped Benefits and AffectedAssets summary slices.
 func (a *Action) addTarget(key string) {
 	if key == "" {
 		return

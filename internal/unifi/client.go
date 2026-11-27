@@ -101,17 +101,22 @@ type Controller struct {
 	httpClient *http.Client
 
 	// authMu guards apiPrefix, controllerType, site, displaySite, siteID, csrfToken,
-	// authEpoch, wsReloginSuppressed, and unauthPaths.
+	// authEpoch, wsReloginSuppressedUntil, and unauthPaths.
 	authMu sync.RWMutex
 
 	// loginMu serializes Login/relogin calls so concurrent 401s re-authenticate once
 	// and failed re-logins share a cooldown window.
-	loginMu                  sync.Mutex
+	loginMu sync.Mutex
+	// authFailCooldown, transientReloginCooldown, and reloginSuppressTTL are
+	// optional duration overrides (used in tests) that default to the package
+	// default constants when zero.
 	authFailCooldown         time.Duration
 	transientReloginCooldown time.Duration
 	reloginSuppressTTL       time.Duration
-	authFailCooldownUntil    time.Time
-	lastLoginErr             error
+	// authFailCooldownUntil and lastLoginErr cache the active relogin backoff
+	// deadline and error under loginMu.
+	authFailCooldownUntil time.Time
+	lastLoginErr          error
 
 	// authEpoch increments on every completed Login so single-flight relogin callers
 	// know whether another goroutine already refreshed the session.
@@ -324,6 +329,9 @@ func shouldActivateAuthCooldown(ctx context.Context, err error) bool {
 	return hasAuthRejectionError(err)
 }
 
+// hasAuthRejectionError recursively inspects err (including joined/wrapped
+// errors) for HTTP 401/403/429 responses, credential-rejection HTTP 400
+// messages, or UniFi API envelope authentication/permission errors.
 func hasAuthRejectionError(err error) bool {
 	if err == nil {
 		return false
@@ -361,6 +369,11 @@ func hasAuthRejectionError(err error) bool {
 	return false
 }
 
+// relogin performs single-flight session re-authentication under loginMu.
+// Callers whose seenEpoch is already stale return nil immediately because
+// another goroutine refreshed the session; failures enter either the full
+// credential-rejection cooldown or a short burst cooldown for transient 5xx
+// and transport errors while leaving caller-cancelled contexts unpenalized.
 func (c *Controller) relogin(ctx context.Context, seenEpoch uint64) error {
 	c.loginMu.Lock()
 	defer c.loginMu.Unlock()
@@ -409,6 +422,9 @@ func (c *Controller) Login(ctx context.Context) error {
 	return nil
 }
 
+// loginLocked executes authentication while the caller holds loginMu,
+// dispatching to API-key resolution or local cookie login with UniFi OS
+// (/api/auth/login) and classic (/api/login) auto-detection.
 func (c *Controller) loginLocked(ctx context.Context) error {
 	if c.apiKey != "" {
 		return c.loginWithAPIKey(ctx)
@@ -596,9 +612,15 @@ func (c *Controller) postLogin(ctx context.Context, path string) (int, error) {
 	return resp.StatusCode, nil
 }
 
-// FetchSnapshot retrieves active clients, UniFi devices, networks, and WAN port
-// forwards concurrently, then cross-links client records with resolved VLAN
-// names so downstream risk scoring has complete topology context.
+// FetchSnapshot collects a point-in-time inventory and security posture
+// snapshot from the controller, logging in automatically if no session is
+// active yet. Depending on the detected API flavor, it dispatches to either
+// Integration API v1 or legacy/v2 endpoints (cookie-authenticated, or using
+// API-key fallback after an Integration API 404), concurrently
+// fetching clients, infrastructure devices, networks, port forwards, firewall
+// zones and policies, switch ACLs, and best-effort site telemetry (WLANs,
+// rogue APs, security settings, WAN/VPN health, historical clients, and recent
+// logs) while recording any unavailable feeds in Snapshot.Visibility.
 func (c *Controller) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
 	if c.currentControllerType() == "" {
 		if err := c.Login(ctx); err != nil {
@@ -754,6 +776,9 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	ldr := <-legacyDevicesCh
 
 	ln, gr := <-legacyNetworks, <-groupCh
+	// Older Network versions with Integration v1 do not serve /networks (404);
+	// fall back to legacy rest/networkconf rows when available, or record the
+	// missing networks feed without aborting the rest of the snapshot.
 	var netHTTP *httpStatusError
 	legacyFallback := errors.As(nr.err, &netHTTP) && netHTTP.status == http.StatusNotFound
 	var networksMissingErr error
@@ -1378,6 +1403,10 @@ func fetchAllPages[T any](ctx context.Context, c *Controller, path string) ([]T,
 	return nil, lastErr
 }
 
+// fetchAllPagesOnce performs one full paginated pass over path, validating
+// offset/count/totalCount invariants and duplicate item IDs. It returns
+// drifted=true when totalCount shifts or a duplicate row appears mid-walk so
+// fetchAllPages can retry the snapshot cleanly.
 func fetchAllPagesOnce[T any](ctx context.Context, c *Controller, path string) ([]T, bool, error) {
 	var all []T
 	seen := make(map[string]bool)
@@ -1734,6 +1763,9 @@ func convertSwitchPorts(rd rawDevice, netByID map[string]Network, portConfByID m
 			}
 		}
 
+		// Treat tagged VLAN membership as unknown whenever a profile-managed
+		// port's profile is missing, the forwarding mode could not be decoded,
+		// or custom mode omits both inclusion and exclusion lists.
 		missingProfile := profileManaged && !profileFound
 		taggedUnknown := missingProfile || tagged == "unknown" || (tagged == "custom" && rp.TaggedNetworkIDs == nil && rp.ExcludedNetworkIDs == nil)
 		nativeID := rp.NativeNetworkConfID
@@ -1805,6 +1837,10 @@ func convertPortForwards(raw []rawPortForward, groups groupIndex) []PortForward 
 		}
 		src := strings.TrimSpace(rf.Src)
 		unknown := false
+		// When modern controllers emit src_limiting_enabled, treat it as
+		// authoritative over legacy src: false resets to "any", FIREWALL_GROUP
+		// resolves against legacy address groups, and invalid or unrecognized
+		// limiters set SourceUnknown so source restriction is never assumed.
 		if rf.SrcLimitingEnabled != nil {
 			switch {
 			case !*rf.SrcLimitingEnabled:
@@ -2134,6 +2170,9 @@ func convertIntegrationACLs(raw []integrationACLRule, devMACByID map[string]stri
 				source.UnsupportedSelector = "acl.networkIds"
 			}
 		}
+		// Record schema and required-field errors on the rule even when
+		// disabled so aclCoverage marks switch ACL coverage partial instead of
+		// treating malformed rules as complete.
 		switch {
 		case rr.wireError != "":
 			source.UnsupportedSelector = rr.wireError
@@ -2549,6 +2588,10 @@ func convertPolicyEndpoint(ep integrationPolicyEndpoint, zoneNames map[string]st
 	return out
 }
 
+// trafficFilterTypeDecoded reports whether a declared Integration v1
+// trafficFilter.type corresponds to one of the decoded IP, Network, MAC, or
+// Port sub-filter blocks rather than an unmodeled filter type (such as REGION
+// or APPLICATION).
 func trafficFilterTypeDecoded(tfType string, hasIP, hasNet, hasMAC, hasPort bool) bool {
 	switch tfType {
 	case "", "ANY", "ALL":
@@ -2771,6 +2814,7 @@ type apiEnvelopeError struct {
 	msg  string
 }
 
+// Error formats the controller API path and envelope error message.
 func (e *apiEnvelopeError) Error() string {
 	if e.msg != "" {
 		return fmt.Sprintf("API %s returned error: %s", e.path, e.msg)
@@ -2895,6 +2939,9 @@ func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) erro
 	return lastErr
 }
 
+// getJSONOnce performs a single read-only GET request to fullPath with API key
+// and CSRF headers, enforces maxControllerBodyBytes, checks HTTP status and
+// UniFi meta.rc envelope errors, and decodes the JSON body into dst.
 func (c *Controller) getJSONOnce(ctx context.Context, fullPath string, dst any) error {
 	fullURL := c.baseURL + fullPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)

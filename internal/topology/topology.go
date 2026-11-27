@@ -4,9 +4,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package topology builds a structural, vendor-agnostic network topology model
-// from a UniFi Snapshot and deterministic device classifications, and renders
-// it as a clean, self-contained SVG diagram without mixing in per-device CVEs.
+// Package topology builds a structural, vendor-agnostic network topology Model
+// from a UniFi Snapshot and deterministic device classifications for JSON
+// export and UI rendering without mixing in per-device CVEs.
 package topology
 
 import (
@@ -37,8 +37,8 @@ const (
 	PlacementIsolate Placement = "isolate"
 )
 
-// Model is the complete, deterministic network topology representation rendered
-// by RenderSVG or exported as JSON by `uniblue topology`.
+// Model is the complete, deterministic network topology representation exported
+// as JSON by `uniblue topology` and consumed by the dashboard UI.
 type Model struct {
 	// Site is the UniFi site identifier.
 	Site string `json:"site"`
@@ -428,6 +428,8 @@ func evaluatePlacement(cl unifi.Client, cls classify.Result, inIsolated, inManag
 	return PlacementOK, ""
 }
 
+// isManagementVLAN reports whether a VLAN is an out-of-band management network
+// based on explicit configuration or standard management naming keywords.
 func isManagementVLAN(name, zone string, configured []string) bool {
 	for _, c := range configured {
 		if strings.EqualFold(strings.TrimSpace(c), strings.TrimSpace(name)) {
@@ -606,6 +608,9 @@ func zoneSortOrder(name string) int {
 	}
 }
 
+// compareNumericString orders strings by length then lexically, which produces
+// numeric order for unpadded decimal tags (leading zeros affect ordering)
+// without parsing errors on empty or non-numeric labels.
 func compareNumericString(a, b string) int {
 	if len(a) != len(b) {
 		if len(a) < len(b) {

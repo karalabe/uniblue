@@ -194,6 +194,9 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 			if hp.sshPort(port) || port == 445 || covered[port] || hp.IsRawPrintPort(port) || isRawPrintSinkPortAny(port, f.discovery, allIPs) {
 				continue
 			}
+			// Promote already-fetched HTTP/TLS banners into hp.Services before
+			// queuing fallback probes to avoid redundant dials and keep TLS-only
+			// ports without an HTTP status marked as ServiceStateTLSUnknownApp.
 			if b, ok := hp.HTTP[port]; ok {
 				now := time.Now().UTC()
 				proto := "http"
@@ -257,7 +260,9 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 						}
 						label := fmt.Sprintf("%s:%d", job.name, port)
 						if svc, ok := probeAlternatePortFallback(ctx, job.ip, port, nervaTimeout); ok {
-							// A greeting on an alternate port identifies a listener for the same pre-authentication exchange.
+							// probeAlternatePortFallback closes its connection after reading the
+							// greeting line, so open a second TCP connection to run the full
+							// pre-auth KEX/host-key observation and opt-in SSH audit on non-infrastructure hosts.
 							if svc.Protocol == "ssh" && !f.isInfrastructure(*hp) {
 								dialer := net.Dialer{Timeout: nervaTimeout}
 								conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(job.ip, strconv.Itoa(port)))
@@ -402,6 +407,9 @@ func isNervaAnonAccessFinding(rawID string) bool {
 	}
 }
 
+// isSyntheticHTTPAnonFinding identifies Nerva's synthetic HTTP product-detection
+// finding ("<tech>-anon-access" with boilerplate evidence) so convertNervaService
+// can clear AnonymousAccess when that placeholder was the only auth signal.
 func isSyntheticHTTPAnonFinding(sf plugins.SecurityFinding) bool {
 	id := strings.ToLower(strings.TrimSpace(sf.ID))
 	return strings.HasSuffix(id, "-anon-access") &&
@@ -434,9 +442,9 @@ func sanitizeBanner(raw string) string {
 
 // probeAlternatePortFallback performs a gentle read-only check on an open TCP
 // port that Nerva FastMode left unclassified: first listens briefly for a
-// server-initiated greeting (SSH, RFB/VNC, SMTP/FTP/Redis), and if the server
-// waits for a client, attempts a read-only TLS handshake to identify TLS-wrapped
-// services without guessing the inner application protocol.
+// server-initiated greeting (SSH or RFB/VNC), and if the server waits for a
+// client, attempts a read-only TLS handshake to identify TLS-wrapped services
+// without guessing the inner application protocol.
 func probeAlternatePortFallback(ctx context.Context, ip string, port int, timeout time.Duration) (Service, bool) {
 	if timeout <= 0 || timeout > 800*time.Millisecond {
 		timeout = 500 * time.Millisecond
@@ -532,8 +540,9 @@ func shouldKeepNervaFinding(sf plugins.SecurityFinding) bool {
 	return true
 }
 
-// isRawPrintSinkPort returns true for raw printer data-stream ports that must
-// remain strictly connect-only (zero application bytes written).
+// isRawPrintSinkPort returns true for raw printer data-stream and raw
+// serial/Zigbee UART sink ports that must remain strictly connect-only
+// (zero application bytes written).
 func isRawPrintSinkPort(port int, disc *LANDiscovery, ip string) bool {
 	if port == 9100 || port == 515 {
 		return true

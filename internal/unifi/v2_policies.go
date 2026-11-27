@@ -321,6 +321,10 @@ func checkWireFields(raw json.RawMessage, typ reflect.Type, path string) error {
 		}
 		typ = typ.Elem()
 	} else if isNull && strings.Contains(path, ".") && !strings.HasSuffix(path, "]") {
+		// UniFi v2 payloads frequently emit explicit JSON null for unset nested
+		// fields; allow those through so required-field validation decides
+		// whether absence is an error, while still rejecting null root values
+		// and null array elements.
 		return nil
 	}
 	switch typ.Kind() {
@@ -513,6 +517,9 @@ func (e v2Endpoint) policyEndpoint(zones map[string]FirewallZone, nets aliases, 
 	default:
 		out.UnsupportedSelector = "matching_target"
 	}
+	// Non-IP, non-ANY targets (NETWORK, CLIENT, MAC) only support inline
+	// values ("" or "SPECIFIC"); reject any other matching_target_type such as
+	// an unmodeled object reference.
 	if e.Target != "IP" && e.Target != "ANY" && e.Subtype != "" && e.Subtype != "SPECIFIC" {
 		out.UnsupportedSelector = "matching_target_type"
 	}
@@ -679,6 +686,9 @@ func (w *v2ACLEndpoint) aclEndpoint(class, path string, nets aliases) PolicyEndp
 	default:
 		p.UnsupportedSelector = path + ".type"
 	}
+	// Cross-validate populated selector slices against both w.Type and the
+	// parent ACL class (MAC vs IPV4/IPV6) so stale or mismatched fields fail
+	// closed as conflicting selectors instead of being silently ignored.
 	if (len(w.MACs) > 0 && (w.Type != "CLIENT_MAC" || class != "MAC")) || (len(w.IPs) > 0 && (w.Type != "IP_OR_SUBNET" || class == "MAC")) || (len(w.Networks) > 0 && w.Type != "NETWORK") {
 		p.UnsupportedSelector = path + ": conflicting selectors"
 	}
@@ -789,7 +799,11 @@ func readGuestRestrictions(rows []map[string]any) guestRestrictions {
 	return g
 }
 
-// applyGuestRestrictions supplies the implicit IPv4 hotspot target omitted by both APIs.
+// applyGuestRestrictions narrows UniFi's built-in SYSTEM_DEFINED IPv4 BLOCK
+// rule "Post-Authorization Restrictions" (Hotspot -> External) from AnyTarget
+// to the site's guest_access restricted_subnet_* CIDRs (defaulting to RFC 1918
+// ranges when omitted), or sets UnsupportedReason if any entry is invalid,
+// because both controller APIs omit this implicit destination target.
 func applyGuestRestrictions(policies []FirewallPolicy, g guestRestrictions) {
 	for i := range policies {
 		p := &policies[i]

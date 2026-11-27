@@ -84,13 +84,27 @@ type IsolationCell struct {
 // IsolationMatrix summarizes effective isolation policy evaluation across zones,
 // IPv4/IPv6 families, gateway vs switch routing, and Wi-Fi/wired L2 boundaries.
 type IsolationMatrix struct {
-	Cells          []IsolationCell      `json:"cells,omitempty"`
-	Containment    []NetworkContainment `json:"containment,omitempty"`
-	ApprovedCount  int                  `json:"approved_count"`
-	BlockedOKCount int                  `json:"blocked_ok_count"`
-	ViolationCount int                  `json:"violation_count"`
-	UnknownCount   int                  `json:"unknown_count"`
-	BrokenDepCount int                  `json:"broken_dep_count"`
+	// Cells holds every individual evaluated isolation path across routed and L2 boundaries.
+	Cells []IsolationCell `json:"cells,omitempty"`
+
+	// Containment holds the 4-axis containment summary (Peers, LAN Egress,
+	// Internet Egress, LAN Inbound) for each isolated or targeted VLAN.
+	Containment []NetworkContainment `json:"containment,omitempty"`
+
+	// ApprovedCount counts cells with verdict IsolationApproved.
+	ApprovedCount int `json:"approved_count"`
+
+	// BlockedOKCount counts cells with verdict IsolationBlockedOK.
+	BlockedOKCount int `json:"blocked_ok_count"`
+
+	// ViolationCount counts cells with verdict IsolationViolation.
+	ViolationCount int `json:"violation_count"`
+
+	// UnknownCount counts cells with verdict IsolationUnknown due to missing or ambiguous evidence.
+	UnknownCount int `json:"unknown_count"`
+
+	// BrokenDepCount counts cells with verdict IsolationBrokenDependency where an approved workflow is blocked.
+	BrokenDepCount int `json:"broken_dep_count"`
 }
 
 type pathQuery struct {
@@ -141,7 +155,9 @@ func EvaluateIsolation(
 	return NewOracle(snap, netCfg).evaluateIsolation(rawFindings, netCfg)
 }
 
-// evaluateIsolation shares the snapshot indexes with the per-listener exposure assessment.
+// evaluateIsolation computes the complete IsolationMatrix, policy-violation
+// findings, and posture notes using the Oracle's pre-indexed snapshot and site
+// isolation intent.
 func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.NetworkConfig) (*IsolationMatrix, []checks.Finding, []PostureNote) {
 	snap := o.snap
 	matrix := &IsolationMatrix{}
@@ -754,6 +770,9 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 	return matrix, findings, notes
 }
 
+// applyDecisionToCell copies dec's effective action, decisive rule metadata,
+// and missing-input note onto cell, then derives cell.Verdict by comparing
+// dec.action against cell.Expected.
 func applyDecisionToCell(cell *IsolationCell, dec policyDecision) {
 	cell.Effective = dec.action
 	cell.DecisiveRuleID = dec.ruleID
@@ -1000,6 +1019,13 @@ const (
 	matchUnknown
 )
 
+// matchesEndpoint evaluates ep's zone, port, network, MAC, and IP constraints
+// against a concrete or partially specified query, returning matchYes, matchNo,
+// or matchUnknown (with a reason). Among constraints the matcher reaches,
+// definitive mismatches take precedence over missing evidence in other
+// dimensions so an unrelated rule does not cause a spurious unknown verdict
+// (an unresolved zone ID or unsupported selector can still return matchUnknown
+// earlier).
 func matchesEndpoint(ep unifi.PolicyEndpoint, zone, netID, netName, ip, mac string, port int, ipFamily string) (triMatch, string) {
 	if ep.ZoneID != "" && ep.ZoneName == "" {
 		return matchUnknown, fmt.Sprintf("unresolved firewall zone ID %q", ep.ZoneID)
@@ -1109,6 +1135,10 @@ func matchesEndpoint(ep unifi.PolicyEndpoint, zone, netID, netName, ip, mac stri
 	return matchYes, ""
 }
 
+// ipMatchesSelectorTri tests whether targetIP matches selector (an exact IP,
+// CIDR prefix, or inclusive "start-end" range). Identical non-empty strings
+// match immediately (case-insensitively) before IP parsing; otherwise it
+// returns matchUnknown when either input is empty or unparseable.
 func ipMatchesSelectorTri(targetIP, selector string) triMatch {
 	targetIP = strings.TrimSpace(targetIP)
 	selector = strings.TrimSpace(selector)
@@ -1171,6 +1201,9 @@ func clientAddressForFamily(cl unifi.Client, fam string) string {
 	return cl.IP
 }
 
+// bmcServiceEndpoints collects deduplicated IPMI and Redfish/HTTPS service
+// endpoints observed for bmc in rawFindings, defaulting to TCP 443 when no
+// probe findings were recorded.
 func bmcServiceEndpoints(bmc unifi.Client, rawFindings []checks.Finding) []endpointSpec {
 	seen := make(map[string]bool)
 	var out []endpointSpec
@@ -1204,6 +1237,8 @@ func bmcServiceEndpoints(bmc unifi.Client, rawFindings []checks.Finding) []endpo
 	return out
 }
 
+// printerServicePort resolves the printing TCP port for prn from observed IPP
+// findings or matching ApprovedPaths, falling back to standard IPP/IPPS port 631.
 func printerServicePort(prn unifi.Client, rawFindings []checks.Finding, intent config.IsolationIntent) int {
 	for _, f := range rawFindings {
 		if sameClient(f.Client, prn) && f.Port > 0 && (f.Port == 631 || strings.Contains(strings.ToLower(f.Title), "ipp")) {
@@ -1288,6 +1323,9 @@ func matchesProtocol(ruleProto, queryProto string) bool {
 	return rp == qp
 }
 
+// siteHasIPv6Context reports whether IPv6 isolation should be evaluated for
+// networks a and b (and optional client cl) based on configured IPv6 subnets,
+// IPv6-specific firewall policies, or live IPv6 client addresses on either VLAN.
 func siteHasIPv6Context(snap *unifi.Snapshot, a, b unifi.Network, cl unifi.Client) bool {
 	if a.IPv6Subnet != "" || b.IPv6Subnet != "" || len(cl.IPv6) > 0 {
 		return true
@@ -1313,6 +1351,8 @@ func siteHasIPv6Context(snap *unifi.Snapshot, a, b unifi.Network, cl unifi.Clien
 	return false
 }
 
+// hasApprovedPath reports whether any operator-configured ApprovedPath permits
+// traffic from (srcZone, srcNet) to dst on (proto, port, fam) matching fnHint.
 func hasApprovedPath(paths []config.ApprovedPath, srcZone, srcNet string, dst unifi.Client, dstZone, fnHint, proto string, port int, fam string) bool {
 	for _, ap := range paths {
 		if ap.SourceZone != "" && !strings.EqualFold(ap.SourceZone, srcZone) && !strings.EqualFold(ap.SourceZone, srcNet) {
@@ -1426,6 +1466,10 @@ func hasAnyWordToken(tokSet map[string]struct{}, want ...string) bool {
 	return false
 }
 
+// clientMatchesApprovedRole reports whether cl fulfills an approved destination
+// role or function (such as printer, BMC, UPS, NVR, backup, PBX, or custom
+// role words) using observed probe findings, ports, vendor OUI, and tokenized
+// host identity.
 func clientMatchesApprovedRole(cl unifi.Client, rawFindings []checks.Finding, roleHint, fnHint string) bool {
 	hint := strings.ToLower(strings.TrimSpace(firstNonEmptyStr(roleHint, fnHint)))
 	if hint == "" {
@@ -1527,6 +1571,10 @@ func clientMatchesApprovedRole(cl unifi.Client, rawFindings []checks.Finding, ro
 	}
 }
 
+// isTransitProbeApproved reports whether a specific transit counterexample
+// (dstIP, proto, port, fam) is covered by an explicit port-scoped ApprovedPath,
+// verifying the resolved destination client's role whenever the approval sets
+// DestRole or sets Function without a fixed DestIP.
 func isTransitProbeApproved(
 	snap *unifi.Snapshot,
 	rawFindings []checks.Finding,
@@ -1580,10 +1628,10 @@ func isTransitProbeApproved(
 		if ap.IPVersion != "" && !matchesIPFamily(ap.IPVersion, fam) {
 			continue
 		}
-		// When an approval scopes by destination role or function without a fixed
-		// DestIP (e.g., dest_role: "ups" or function: "ipps-printing"), never
-		// suppress a zone-wide ALLOW rule or a host that does not actually hold
-		// the approved role or function.
+		// When an approval sets DestRole, or sets Function without a fixed DestIP
+		// (e.g., dest_role: "ups" or function: "ipps-printing"), never suppress a
+		// zone-wide ALLOW rule or a host that does not actually hold the approved
+		// role or function.
 		if strings.TrimSpace(ap.DestRole) != "" || (strings.TrimSpace(ap.DestIP) == "" && strings.TrimSpace(ap.Function) != "") {
 			if !hasDstClient || !clientMatchesApprovedRole(dstClient, rawFindings, ap.DestRole, ap.Function) {
 				continue
@@ -2258,6 +2306,9 @@ func partitionIPIntervals(
 	return out
 }
 
+// representativeIPInInterval picks a deterministic probe IP inside iv,
+// preferring preferred when contained and skipping the subnet network address
+// when a subsequent host address exists in iv.
 func representativeIPInInterval(iv ipInterval, netPfx netip.Prefix, hasNetPfx bool, preferred netip.Addr) string {
 	if iv.lo == iv.hi {
 		return iv.lo.String()
@@ -2318,6 +2369,8 @@ func partitionPortIntervals(ports []int, ranges []unifi.PortRange) []portInterva
 	return out
 }
 
+// representativePortInInterval chooses a deterministic probe port inside iv,
+// preferring common service ports (443, 80, 22, 53) when present.
 func representativePortInInterval(iv portInterval) int {
 	for _, pref := range []int{443, 80, 22, 53} {
 		if pref >= iv.lo && pref <= iv.hi {
@@ -2552,6 +2605,10 @@ func endpointUnconditionallyMatchesNetwork(ep unifi.PolicyEndpoint, zone string,
 		(net.Name != "" && containsFold(ep.NetworkIDs, net.Name))
 }
 
+// boundaryRule captures one candidate counterexample rule (or default
+// disposition) collected during boundary analysis together with the merged
+// destination port intervals unconditionally covered by strictly earlier rules
+// of the opposite action so shadowed port ranges can be skipped.
 type boundaryRule struct {
 	allow              bool
 	src                unifi.PolicyEndpoint
@@ -2564,8 +2621,9 @@ type boundaryRule struct {
 // Leaving a side empty keeps that side network-wide (for example, traffic
 // behind a wireless AP or a lone wired client on a VLAN).
 type peerEndpoints struct {
-	// concrete pins missing client attributes as unknown in individual queries.
-	// Whole-VLAN containment leaves unobserved attachment endpoints unconstrained.
+	// concrete pins missing client IP/MAC attributes as empty so selector
+	// checks report unknown instead of expanding to whole-VLAN sampling.
+	// Whole-VLAN containment leaves concrete false so omitted sides stay unconstrained.
 	concrete bool
 	src      unifi.Client
 	dst      unifi.Client
@@ -2598,7 +2656,10 @@ func (o *Oracle) evaluateBoundary(
 	return o.boundaryWithApproval(rawFindings, intent, srcNet, dstNet, srcZone, dstZone, fam, expected, peers, nil)
 }
 
-// builtinDNS recognizes the controller's DNS exception only on the actual winning policy.
+// builtinDNS reports whether cell was decided by UniFi's built-in
+// SYSTEM_DEFINED "Allow Public DNS" policy confined strictly to port 53.
+// Verifying the winning rule in o.sortedPolicies ensures a user-created or
+// broader rule with the same name is never exempted.
 func (o *Oracle) builtinDNS(cell IsolationCell) bool {
 	if !strings.EqualFold(cell.DecisiveRuleName, "Allow Public DNS") || cell.Port != 53 || cell.PathKind != "gateway-routed" || !strings.EqualFold(cell.DestZone, "Internal") {
 		return false
@@ -2616,8 +2677,23 @@ func (o *Oracle) builtinDNS(cell IsolationCell) bool {
 	return found
 }
 
-// boundaryWithApproval continues past permitted exceptions so another opening on
-// the same boundary can still determine the isolation verdict.
+// boundaryWithApproval searches the full (protocol, source IP/MAC/port,
+// destination IP/MAC/port) domain between srcNet and dstNet for a counterexample
+// to expected ("deny" or "allow") while continuing past flows accepted by
+// intent.ApprovedPaths or approve.
+//
+// Evaluation runs in four phases:
+//  1. Fast-path baseline probes (TCP 443 and UDP 53) to catch missing telemetry,
+//     unresolved zones, or blanket openings immediately.
+//  2. Per-protocol rule collection over switch ACLs and gateway policies,
+//     tracking unconditionally blocked port intervals so strictly later
+//     shadowed rules can be pruned.
+//  3. Equivalence-class partitioning of source/destination IP intervals, MACs,
+//     and source/destination port intervals from all collected selectors and
+//     approved endpoints.
+//  4. Bounded counterexample search across the partitioned classes, returning
+//     the first unapproved counterexample or IsolationUnknown if coverage hits
+//     maxExactBoundaryEvals.
 func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent config.IsolationIntent,
 	srcNet, dstNet unifi.Network, srcZone, dstZone, fam, expected string, peers *peerEndpoints, approve func(IsolationCell) bool) IsolationCell {
 	var approvedCell *IsolationCell
@@ -2825,8 +2901,11 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 	if fam == "ipv6" {
 		icmp = "icmpv6"
 	}
-	// Prefer a concrete witness for the remaining class. If all these names
-	// already occur, a permitted residual class can only establish uncertainty.
+	// Pick a concrete IP protocol name outside every named rule selector to
+	// represent the residual protocol class. If every candidate name already
+	// appears in a rule, fall back to the unnamedProtocol sentinel; a hit on
+	// that sentinel cannot name a concrete protocol and therefore degrades to
+	// IsolationUnknown instead of fabricating a protocol name.
 	const unnamedProtocol = "<unlisted IP protocol>"
 	representative := unnamedProtocol
 	for _, name := range []string{icmp, "gre", "esp", "ah", "sctp"} {
@@ -2848,6 +2927,10 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 		strings.EqualFold(strings.TrimSpace(srcZone), strings.TrimSpace(dstZone)) ||
 		strings.EqualFold(strings.TrimSpace(srcZone), "internal")
 
+	// The solver always treats allowRules/defaultAllows as counterexample
+	// candidates to expected. When verifying expected == "allow", invert the
+	// default polarity (and each rule's polarity in recordRuleEndpoints) so
+	// deny rules and default-deny become the counterexamples searched for.
 	if expected == "allow" {
 		defaultAllows = !defaultAllows
 	}
@@ -2881,6 +2964,10 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 			return len(merged) == 1 && merged[0].lo == 1 && merged[0].hi == 65535
 		}
 
+		// Buffer unconditional deny intervals across policies that share the
+		// same Index before merging them into uncondBlockedMerged. Equal-index
+		// rules have undefined relative precedence, so a deny must never shadow
+		// an allow at the same Index; both must stay visible to trigger unknown.
 		var groupBlocked []portInterval
 		deferBlocks := false
 		flushGroupBlocked := func() {
@@ -2901,6 +2988,9 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 		}
 
 		recordRuleEndpoints := func(allow bool, srcEP, dstEP unifi.PolicyEndpoint, indeterminate bool) {
+			// Mirror the expected == "allow" polarity inversion so deny rules
+			// are collected as counterexample candidates while unconditional
+			// allows prune strictly later shadowed denies.
 			if expected == "allow" {
 				allow = !allow
 			}
@@ -3018,6 +3108,8 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 			recordRuleEndpoints(strings.EqualFold(acl.Action, "ALLOW"), acl.Source, acl.Destination, indet)
 		}
 		if useGateway {
+			// Walk gateway policies in equal-Index groups with deferBlocks so
+			// unconditional denies only prune rules at strictly higher Indexes.
 			deferBlocks = true
 			for i := 0; i < len(o.sortedPolicies); {
 				idx := o.sortedPolicies[i].Index
@@ -3050,6 +3142,10 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 		}
 
 		mergePending()
+		// Append a catch-all boundaryRule whenever the default disposition is
+		// an unblocked counterexample, or when multiple enforcers share the path
+		// (len(path) > 1) because independent enforcers cannot shadow one
+		// another and their joint selector partitions must all be probed.
 		if len(path) > 1 || (defaultAllows && (sawIndeterminateRule || !isFullPortBlock(uncondBlockedMerged))) {
 			anyEP := unifi.PolicyEndpoint{AnyTarget: true, AnyPort: true}
 			var priorCopy []portInterval
@@ -3108,6 +3204,10 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 			dstReps = []string{dstIPSample}
 		}
 
+		// When a subnet-less, client-less network yields no concrete IP
+		// representatives, still probe with an empty IP if the rule's endpoint
+		// can match without an IP (AnyTarget, negated target, no IPs, or an
+		// unparseable IP selector) so the rule is evaluated instead of skipped.
 		endpointNeedsEmptyIPProbe := func(ep unifi.PolicyEndpoint) bool {
 			if ep.AnyTarget || ep.NegateTarget || len(ep.IPs) == 0 {
 				return true
@@ -3774,7 +3874,10 @@ func isCameraNetwork(n unifi.Network, intent config.IsolationIntent) bool {
 	return strings.Contains(low, "camera") || strings.Contains(low, "cam") || strings.Contains(low, "nvr")
 }
 
-// ManagementControllers resolves finding identities against the snapshot inventory.
+// ManagementControllers returns deduplicated, IP-sorted out-of-band server
+// management controllers (BMCs such as IPMI, iDRAC, iLO, and Redfish consoles)
+// identified from both rawFindings (oob-bmc, UB-0019, UB-0020) and snapshot
+// client name/hostname patterns, hydrated against the snapshot client inventory.
 func (o *Oracle) ManagementControllers(rawFindings []checks.Finding) []unifi.Client {
 	bmcByKey := make(map[string]unifi.Client)
 	for _, f := range rawFindings {

@@ -5,9 +5,10 @@
 // license that can be found in the LICENSE file.
 
 // Package unifi implements a minimal, read-only client for fetching topology,
-// active clients, UniFi infrastructure inventory, and port-forwarding rules
-// from both UniFi OS gateways (e.g., UDM Pro) and classic Network controllers
-// (e.g., older Cloud Key Gen2 deployments).
+// active clients, UniFi infrastructure inventory, port-forwarding rules,
+// Zone-Based Firewall policies, switch ACLs, and security telemetry across
+// UniFi's Integration API v1, UniFi OS gateways (e.g., UDM Pro), and classic
+// Network controllers (e.g., older Cloud Key Gen2 deployments).
 package unifi
 
 import (
@@ -26,7 +27,7 @@ type Snapshot struct {
 	// Site is the UniFi site name queried (typically "default").
 	Site string `json:"site"`
 
-	// ControllerType records which API flavor responded ("unifi-os" or "classic").
+	// ControllerType records which API flavor responded ("integration-v1", "unifi-os", or "classic").
 	ControllerType string `json:"controller_type"`
 
 	// Clients holds all currently active hosts reported by the controller.
@@ -94,87 +95,188 @@ type Snapshot struct {
 
 // SwitchACL describes one L2/L3 switch access control rule enforced on a UniFi switch.
 type SwitchACL struct {
-	// RuleType preserves the hardware ACL class for MAC-before-IP evaluation.
-	RuleType    string         `json:"rule_type,omitempty" yaml:"rule_type,omitempty"`
-	ID          string         `json:"id" yaml:"id"`
-	Name        string         `json:"name" yaml:"name"`
-	Enabled     bool           `json:"enabled" yaml:"enabled"`
-	Index       int            `json:"index" yaml:"index"`
-	Action      string         `json:"action" yaml:"action"` // "ALLOW" | "BLOCK"
-	IPVersion   string         `json:"ip_version,omitempty" yaml:"ip_version,omitempty"`
-	Protocol    string         `json:"protocol,omitempty" yaml:"protocol,omitempty"`
-	Source      PolicyEndpoint `json:"source" yaml:"source"`
+	// RuleType preserves the hardware ACL class ("MAC", "IPV4", or "IPV6") for MAC-before-IP evaluation.
+	RuleType string `json:"rule_type,omitempty" yaml:"rule_type,omitempty"`
+
+	// ID is the unique ACL rule identifier on the controller.
+	ID string `json:"id" yaml:"id"`
+
+	// Name is the human-readable ACL rule label.
+	Name string `json:"name" yaml:"name"`
+
+	// Enabled reports whether the ACL rule is actively enforced.
+	Enabled bool `json:"enabled" yaml:"enabled"`
+
+	// Index records the rule priority order within its hardware ACL class (lower evaluates first).
+	Index int `json:"index" yaml:"index"`
+
+	// Action is the rule verdict ("ALLOW" or "BLOCK").
+	Action string `json:"action" yaml:"action"`
+
+	// IPVersion records the matched address family ("ipv4", "ipv6", or "both").
+	IPVersion string `json:"ip_version,omitempty" yaml:"ip_version,omitempty"`
+
+	// Protocol is the matched transport protocol ("all", "tcp", "udp", or "tcp_udp").
+	Protocol string `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+
+	// Source constrains the initiating MAC, IP, network, or port selector.
+	Source PolicyEndpoint `json:"source" yaml:"source"`
+
+	// Destination constrains the target MAC, IP, network, or port selector.
 	Destination PolicyEndpoint `json:"destination" yaml:"destination"`
-	DeviceMACs  []string       `json:"device_macs,omitempty" yaml:"device_macs,omitempty"`
-	NetworkIDs  []string       `json:"network_ids,omitempty" yaml:"network_ids,omitempty"`
+
+	// DeviceMACs restricts enforcement to specific switch MAC addresses; empty applies to all switches.
+	DeviceMACs []string `json:"device_macs,omitempty" yaml:"device_macs,omitempty"`
+
+	// NetworkIDs scopes a MAC ACL to specific UniFi network IDs; empty applies across networks.
+	NetworkIDs []string `json:"network_ids,omitempty" yaml:"network_ids,omitempty"`
 }
 
 // SwitchACLCoverage records whether switch ACL evidence was collected for a site.
 type SwitchACLCoverage struct {
-	Status string `json:"status" yaml:"status"` // "complete" | "partial" | "unavailable" | "unsupported-model"
+	// Status reports collection completeness ("complete", "partial", "unavailable", or "unsupported-model").
+	Status string `json:"status" yaml:"status"`
+
+	// Reason explains why switch ACL coverage is not complete, when applicable.
 	Reason string `json:"reason,omitempty" yaml:"reason,omitempty"`
 }
 
 // SiteVisibility tracks per-site telemetry completeness across controller feeds.
 type SiteVisibility struct {
-	ControllerVersion        string   `json:"controller_version,omitempty" yaml:"controller_version,omitempty"`
-	APIMode                  string   `json:"api_mode,omitempty" yaml:"api_mode,omitempty"`
-	GatewayPoliciesAvailable bool     `json:"gateway_policies_available" yaml:"gateway_policies_available"`
-	SwitchACLsAvailable      bool     `json:"switch_acls_available" yaml:"switch_acls_available"`
-	WLANsAvailable           bool     `json:"wlans_available" yaml:"wlans_available"`
-	SettingsAvailable        bool     `json:"settings_available" yaml:"settings_available"`
-	VPNAvailable             bool     `json:"vpn_available" yaml:"vpn_available"`
-	PortForwardsAvailable    bool     `json:"port_forwards_available" yaml:"port_forwards_available"`
-	PortProfilesAvailable    bool     `json:"port_profiles_available" yaml:"port_profiles_available"`
-	DHCPAvailable            bool     `json:"dhcp_available" yaml:"dhcp_available"`
-	MDNSReflectorKnown       bool     `json:"mdns_reflector_known" yaml:"mdns_reflector_known"`
-	MissingFeeds             []string `json:"missing_feeds,omitempty" yaml:"missing_feeds,omitempty"`
+	// ControllerVersion records the reported UniFi Network controller version, if known.
+	ControllerVersion string `json:"controller_version,omitempty" yaml:"controller_version,omitempty"`
+
+	// APIMode records the active controller API flavor ("integration-v1", "unifi-os", or "classic").
+	APIMode string `json:"api_mode,omitempty" yaml:"api_mode,omitempty"`
+
+	// GatewayPoliciesAvailable reports whether both firewall zones and policies were retrieved cleanly.
+	GatewayPoliciesAvailable bool `json:"gateway_policies_available" yaml:"gateway_policies_available"`
+
+	// SwitchACLsAvailable reports whether switch ACL visibility was obtained from
+	// the controller endpoint without error or from a complete site supplement.
+	SwitchACLsAvailable bool `json:"switch_acls_available" yaml:"switch_acls_available"`
+
+	// WLANsAvailable reports whether Wi-Fi SSID configuration was retrieved cleanly.
+	WLANsAvailable bool `json:"wlans_available" yaml:"wlans_available"`
+
+	// SettingsAvailable reports whether site security settings (/rest/setting) were retrieved.
+	SettingsAvailable bool `json:"settings_available" yaml:"settings_available"`
+
+	// VPNAvailable reports whether live VPN connection telemetry was retrieved cleanly.
+	VPNAvailable bool `json:"vpn_available" yaml:"vpn_available"`
+
+	// PortForwardsAvailable reports whether static WAN port-forward rules were retrieved cleanly.
+	PortForwardsAvailable bool `json:"port_forwards_available" yaml:"port_forwards_available"`
+
+	// PortProfilesAvailable reports whether switch port profiles (/rest/portconf) were retrieved cleanly.
+	PortProfilesAvailable bool `json:"port_profiles_available" yaml:"port_profiles_available"`
+
+	// DHCPAvailable reports whether at least one network exposed DHCP pool bounds.
+	DHCPAvailable bool `json:"dhcp_available" yaml:"dhcp_available"`
+
+	// MDNSReflectorKnown reports whether at least one network exposed its mDNS reflection setting.
+	MDNSReflectorKnown bool `json:"mdns_reflector_known" yaml:"mdns_reflector_known"`
+
+	// MissingFeeds lists human-readable descriptions of every unavailable or partial telemetry feed.
+	MissingFeeds []string `json:"missing_feeds,omitempty" yaml:"missing_feeds,omitempty"`
 }
 
 // DynamicPortMapping captures one live UPnP / NAT-PMP / PCP dynamic NAT lease.
 type DynamicPortMapping struct {
-	Protocol   string     `json:"protocol" yaml:"protocol"` // "upnp" | "natpmp" | "pcp"
-	Transport  string     `json:"transport" yaml:"transport"`
-	ExtPort    int        `json:"ext_port" yaml:"ext_port"`
-	InternalIP string     `json:"internal_ip" yaml:"internal_ip"`
-	IntPort    int        `json:"int_port" yaml:"int_port"`
-	OwnerIP    string     `json:"owner_ip,omitempty" yaml:"owner_ip,omitempty"`
-	Source     string     `json:"source,omitempty" yaml:"source,omitempty"`
-	Approved   bool       `json:"approved,omitempty" yaml:"approved,omitempty"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
+	// Protocol identifies the dynamic mapping protocol ("upnp", "natpmp", or "pcp").
+	Protocol string `json:"protocol" yaml:"protocol"`
+
+	// Transport specifies the forwarded L4 transport ("tcp" or "udp").
+	Transport string `json:"transport" yaml:"transport"`
+
+	// ExtPort is the external WAN port opened by the dynamic lease.
+	ExtPort int `json:"ext_port" yaml:"ext_port"`
+
+	// InternalIP is the internal LAN destination IP address receiving mapped traffic.
+	InternalIP string `json:"internal_ip" yaml:"internal_ip"`
+
+	// IntPort is the internal LAN destination port receiving mapped traffic.
+	IntPort int `json:"int_port" yaml:"int_port"`
+
+	// OwnerIP is the LAN client IP that requested the mapping, if known.
+	OwnerIP string `json:"owner_ip,omitempty" yaml:"owner_ip,omitempty"`
+
+	// Source optionally restricts the allowed remote WAN source address for the lease.
+	Source string `json:"source,omitempty" yaml:"source,omitempty"`
+
+	// Approved marks an operator-approved dynamic lease (such as a game console) to skip alerting.
+	Approved bool `json:"approved,omitempty" yaml:"approved,omitempty"`
+
+	// ExpiresAt records when the dynamic lease expires (UTC), if bounded.
+	ExpiresAt *time.Time `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
 }
 
 // PublishedTunnel captures one owner-declared outbound publishing tunnel route.
 type PublishedTunnel struct {
-	Provider      string `json:"provider" yaml:"provider"` // "cloudflare-tunnel" | "tailscale-funnel" | "ngrok" | ...
-	Hostname      string `json:"hostname" yaml:"hostname"`
-	BackendIP     string `json:"backend_ip" yaml:"backend_ip"`
-	BackendPort   int    `json:"backend_port" yaml:"backend_port"`
-	BackendRole   string `json:"backend_role,omitempty" yaml:"backend_role,omitempty"`
-	AccessPolicy  string `json:"access_policy,omitempty" yaml:"access_policy,omitempty"` // "authenticated" | "public" | "none" | "" (unknown)
-	AdminEndpoint bool   `json:"admin_endpoint,omitempty" yaml:"admin_endpoint,omitempty"`
+	// Provider names the tunnel service (e.g., "cloudflare-tunnel", "tailscale-funnel", "ngrok").
+	Provider string `json:"provider" yaml:"provider"`
+
+	// Hostname is the public DNS hostname exposed by the tunnel.
+	Hostname string `json:"hostname" yaml:"hostname"`
+
+	// BackendIP is the internal LAN origin IP address reached through the tunnel.
+	BackendIP string `json:"backend_ip" yaml:"backend_ip"`
+
+	// BackendPort is the internal TCP port reached through the tunnel.
+	BackendPort int `json:"backend_port" yaml:"backend_port"`
+
+	// BackendRole optionally describes the origin service role (e.g., "admin", "web").
+	BackendRole string `json:"backend_role,omitempty" yaml:"backend_role,omitempty"`
+
+	// AccessPolicy records upstream tunnel access enforcement ("authenticated", "public", "none", or "" for unknown).
+	AccessPolicy string `json:"access_policy,omitempty" yaml:"access_policy,omitempty"`
+
+	// AdminEndpoint marks whether the published backend exposes an administrative interface.
+	AdminEndpoint bool `json:"admin_endpoint,omitempty" yaml:"admin_endpoint,omitempty"`
 }
 
 // ProxyRoute captures one owner-declared reverse proxy virtual host and origin backend.
 // FrontendAuth and BackendAuth are pointers so omitted fields remain unknown rather
 // than being treated as unauthenticated.
 type ProxyRoute struct {
-	ProxyIP       string `json:"proxy_ip" yaml:"proxy_ip"`
-	Hostname      string `json:"hostname" yaml:"hostname"`
-	PublicExposed bool   `json:"public_exposed" yaml:"public_exposed"`
-	FrontendAuth  *bool  `json:"frontend_auth,omitempty" yaml:"frontend_auth,omitempty"`
-	BackendIP     string `json:"backend_ip" yaml:"backend_ip"`
-	BackendPort   int    `json:"backend_port" yaml:"backend_port"`
-	BackendAuth   *bool  `json:"backend_auth,omitempty" yaml:"backend_auth,omitempty"`
-	AdminVHost    bool   `json:"admin_vhost,omitempty" yaml:"admin_vhost,omitempty"`
+	// ProxyIP is the LAN IP address of the reverse proxy server terminating the route.
+	ProxyIP string `json:"proxy_ip" yaml:"proxy_ip"`
+
+	// Hostname is the virtual host DNS name served by the reverse proxy.
+	Hostname string `json:"hostname" yaml:"hostname"`
+
+	// PublicExposed reports whether the reverse proxy route is reachable from the public internet.
+	PublicExposed bool `json:"public_exposed" yaml:"public_exposed"`
+
+	// FrontendAuth reports whether the reverse proxy enforces authentication before forwarding (nil means unknown).
+	FrontendAuth *bool `json:"frontend_auth,omitempty" yaml:"frontend_auth,omitempty"`
+
+	// BackendIP is the internal origin IP address receiving proxied traffic.
+	BackendIP string `json:"backend_ip" yaml:"backend_ip"`
+
+	// BackendPort is the internal TCP port of the origin service.
+	BackendPort int `json:"backend_port" yaml:"backend_port"`
+
+	// BackendAuth reports whether the origin backend enforces its own authentication (nil means unknown).
+	BackendAuth *bool `json:"backend_auth,omitempty" yaml:"backend_auth,omitempty"`
+
+	// AdminVHost marks whether this virtual host exposes an internal administrative console.
+	AdminVHost bool `json:"admin_vhost,omitempty" yaml:"admin_vhost,omitempty"`
 }
 
 // BackupStatus records owner-supplied controller backup and restore-test freshness.
 type BackupStatus struct {
-	LastBackupAt      *time.Time `json:"last_backup_at,omitempty" yaml:"last_backup_at,omitempty"`
+	// LastBackupAt records when the most recent controller configuration backup completed.
+	LastBackupAt *time.Time `json:"last_backup_at,omitempty" yaml:"last_backup_at,omitempty"`
+
+	// LastRestoreTestAt records when a backup restore was last verified.
 	LastRestoreTestAt *time.Time `json:"last_restore_test_at,omitempty" yaml:"last_restore_test_at,omitempty"`
-	Scope             string     `json:"scope,omitempty" yaml:"scope,omitempty"`
-	BackupHealthy     bool       `json:"backup_healthy" yaml:"backup_healthy"`
+
+	// Scope optionally labels what the backup covers (e.g., "console", "network").
+	Scope string `json:"scope,omitempty" yaml:"scope,omitempty"`
+
+	// BackupHealthy reports whether the automated backup job is currently succeeding.
+	BackupHealthy bool `json:"backup_healthy" yaml:"backup_healthy"`
 }
 
 // PortHintsByIP collects concrete destination TCP ports explicitly referenced
@@ -559,7 +661,11 @@ type SwitchPort struct {
 	TXDropped int64 `json:"tx_dropped,omitempty"`
 }
 
-// TaggedPolicy returns the effective forwarding mode for the port.
+// TaggedPolicy returns the port's normalized tagged-VLAN forwarding policy:
+// "disabled", "block_all", "custom", "all", or "unknown". An administratively
+// disabled port always returns "disabled" first; on an enabled port, it returns
+// "unknown" whenever TaggedVLANUnknown is set, the mode is unrecognized, or
+// custom mode carries neither an inclusion nor an exclusion list.
 func (sp SwitchPort) TaggedPolicy() string {
 	if !sp.Enabled {
 		return "disabled"
@@ -591,99 +697,221 @@ func (sp SwitchPort) TaggedPolicy() string {
 
 // WLANConfig represents one UniFi Wi-Fi SSID and its encryption/isolation settings.
 type WLANConfig struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Enabled     bool   `json:"enabled"`
-	Security    string `json:"security"`     // "wpapsk", "open", "wep", "wpaeap"
-	WPAMode     string `json:"wpa_mode"`     // "wpa2", "wpa3", "wpa1"
-	WPA3Support bool   `json:"wpa3_support"` // WPA3 transition or WPA3-only enabled
-	PMFMode     string `json:"pmf_mode"`     // "disabled", "optional", "required"
-	L2Isolation bool   `json:"l2_isolation"`
-	IsGuest     bool   `json:"is_guest"`
-	NetworkID   string `json:"network_id,omitempty"`
+	// ID is the controller's WLAN configuration identifier.
+	ID string `json:"id"`
+
+	// Name is the broadcast Wi-Fi SSID name.
+	Name string `json:"name"`
+
+	// Enabled reports whether this SSID is currently active.
+	Enabled bool `json:"enabled"`
+
+	// Security is the authentication/encryption mode ("wpapsk", "open", "wep", "wpaeap").
+	Security string `json:"security"`
+
+	// WPAMode is the configured WPA protocol generation ("wpa2", "wpa3", "wpa1").
+	WPAMode string `json:"wpa_mode"`
+
+	// WPA3Support reports whether WPA3 transition or WPA3-only mode is enabled.
+	WPA3Support bool `json:"wpa3_support"`
+
+	// PMFMode is the Protected Management Frames setting ("disabled", "optional", "required").
+	PMFMode string `json:"pmf_mode"`
+
+	// L2Isolation reports whether same-AP wireless client device isolation is enabled.
+	L2Isolation bool `json:"l2_isolation"`
+
+	// IsGuest reports whether guest policies or captive portal enforcement apply to this SSID.
+	IsGuest bool `json:"is_guest"`
+
+	// NetworkID links the SSID to its backing UniFi Network ID, if resolved.
+	NetworkID string `json:"network_id,omitempty"`
+
+	// NetworkName is the resolved human-readable VLAN/network name for this SSID.
 	NetworkName string `json:"network_name,omitempty"`
 }
 
 // RogueAP represents a neighboring or foreign wireless BSSID observed by UniFi APs.
 type RogueAP struct {
-	BSSID    string `json:"bssid"`
-	ESSID    string `json:"essid"`
-	APMAC    string `json:"ap_mac,omitempty"`
-	Channel  int    `json:"channel,omitempty"`
-	Band     string `json:"band,omitempty"`
+	// BSSID is the normalized lowercase radio MAC address of the observed AP.
+	BSSID string `json:"bssid"`
+
+	// ESSID is the advertised wireless network name, if broadcast.
+	ESSID string `json:"essid"`
+
+	// APMAC is the MAC address of the UniFi AP that observed this radio.
+	APMAC string `json:"ap_mac,omitempty"`
+
+	// Channel is the Wi-Fi radio channel on which the BSSID was seen.
+	Channel int `json:"channel,omitempty"`
+
+	// Band identifies the observed wireless band (e.g., "2g", "5g", "6g").
+	Band string `json:"band,omitempty"`
+
+	// Security describes the advertised wireless encryption scheme.
 	Security string `json:"security,omitempty"`
-	OUI      string `json:"oui,omitempty"`
-	RSSI     int    `json:"rssi,omitempty"`
-	IsRogue  bool   `json:"is_rogue,omitempty"`
-	IsUBNT   bool   `json:"is_ubnt,omitempty"`
-	IsAdhoc  bool   `json:"is_adhoc,omitempty"`
-	LastSeen int64  `json:"last_seen,omitempty"`
+
+	// OUI is the hardware vendor inferred from the BSSID prefix.
+	OUI string `json:"oui,omitempty"`
+
+	// RSSI is the signed receive signal strength in dBm (0 if unreported).
+	RSSI int `json:"rssi,omitempty"`
+
+	// IsRogue reports whether the controller flagged this BSSID as rogue.
+	IsRogue bool `json:"is_rogue,omitempty"`
+
+	// IsUBNT reports whether the controller detected a Ubiquiti radio signature.
+	IsUBNT bool `json:"is_ubnt,omitempty"`
+
+	// IsAdhoc reports whether the radio is operating in IBSS/ad-hoc mode.
+	IsAdhoc bool `json:"is_adhoc,omitempty"`
+
+	// LastSeen is the Unix timestamp (seconds) when the radio was last observed.
+	LastSeen int64 `json:"last_seen,omitempty"`
 }
 
 // SiteSecuritySettings summarizes non-secret controller/gateway security posture
 // parsed from /rest/setting (mgmt, usg, ips, doh, teleport).
 type SiteSecuritySettings struct {
-	SSHEnabled      bool `json:"ssh_enabled"`
+	// SSHEnabled reports whether UniFi Device SSH is enabled site-wide.
+	SSHEnabled bool `json:"ssh_enabled"`
+
+	// SSHPasswordAuth reports whether password authentication is enabled for Device SSH.
 	SSHPasswordAuth bool `json:"ssh_password_auth"`
+
 	// SSHPasswordAuthKnown distinguishes an explicit password setting from missing telemetry.
-	SSHPasswordAuthKnown bool     `json:"ssh_password_auth_known,omitempty"`
-	SSHKeyCount          int      `json:"ssh_key_count"`
-	UPnPEnabled          bool     `json:"upnp_enabled"`
-	UPnPNATPMPEnabled    bool     `json:"upnp_nat_pmp_enabled"`
-	UPnPSecureMode       bool     `json:"upnp_secure_mode"`
-	IPSMode              string   `json:"ips_mode,omitempty"` // "ips", "ids", "disabled"
-	HoneypotEnabled      bool     `json:"honeypot_enabled"`
-	HoneypotIPs          []string `json:"honeypot_ips,omitempty"`
-	DNSFiltering         bool     `json:"dns_filtering"`
-	DoHState             string   `json:"doh_state,omitempty"` // "off", "auto", "custom"
-	TeleportEnabled      bool     `json:"teleport_enabled"`
+	SSHPasswordAuthKnown bool `json:"ssh_password_auth_known,omitempty"`
+
+	// SSHKeyCount is the number of SSH public keys configured for Device Authentication.
+	SSHKeyCount int `json:"ssh_key_count"`
+
+	// UPnPEnabled reports whether gateway UPnP automatic port forwarding is enabled.
+	UPnPEnabled bool `json:"upnp_enabled"`
+
+	// UPnPNATPMPEnabled reports whether NAT-PMP support is enabled alongside UPnP.
+	UPnPNATPMPEnabled bool `json:"upnp_nat_pmp_enabled"`
+
+	// UPnPSecureMode reports whether UPnP restricts mappings to the requesting host IP.
+	UPnPSecureMode bool `json:"upnp_secure_mode"`
+
+	// IPSMode records the gateway intrusion detection/prevention mode ("ips", "ids", "disabled").
+	IPSMode string `json:"ips_mode,omitempty"`
+
+	// HoneypotEnabled reports whether UniFi's internal LAN honeypot is enabled.
+	HoneypotEnabled bool `json:"honeypot_enabled"`
+
+	// HoneypotIPs lists sorted internal IP addresses assigned to the UniFi honeypot.
+	HoneypotIPs []string `json:"honeypot_ips,omitempty"`
+
+	// DNSFiltering reports whether gateway content/DNS filtering is enabled.
+	DNSFiltering bool `json:"dns_filtering"`
+
+	// DoHState records the DNS Shield (DNS-over-HTTPS) mode ("off", "auto", "custom").
+	DoHState string `json:"doh_state,omitempty"`
+
+	// TeleportEnabled reports whether UniFi Teleport remote-access VPN is enabled.
+	TeleportEnabled bool `json:"teleport_enabled"`
 }
 
 // VPNConnection describes one currently active remote-access VPN session.
 type VPNConnection struct {
-	ID       string `json:"id,omitempty"`
-	Name     string `json:"name,omitempty"`
-	User     string `json:"user,omitempty"`
-	Type     string `json:"type,omitempty"`
+	// ID is the controller session or connection identifier.
+	ID string `json:"id,omitempty"`
+
+	// Name is the VPN server or tunnel display name.
+	Name string `json:"name,omitempty"`
+
+	// User is the authenticated VPN username, when reported.
+	User string `json:"user,omitempty"`
+
+	// Type identifies the VPN protocol or product (e.g., "wireguard", "teleport", "l2tp").
+	Type string `json:"type,omitempty"`
+
+	// RemoteIP is the remote client's public IP address.
 	RemoteIP string `json:"remote_ip,omitempty"`
-	LocalIP  string `json:"local_ip,omitempty"`
+
+	// LocalIP is the tunnel or LAN IP address assigned to the VPN client.
+	LocalIP string `json:"local_ip,omitempty"`
 }
 
 // SystemHealth summarizes gateway WAN health and active VPN sessions.
 type SystemHealth struct {
-	WANStatus      string          `json:"wan_status,omitempty"`
-	WANIP          string          `json:"wan_ip,omitempty"`
-	ActiveVPNUsers int             `json:"active_vpn_users"`
+	// WANStatus is the gateway WAN subsystem status string (e.g., "ok").
+	WANStatus string `json:"wan_status,omitempty"`
+
+	// WANIP is the primary public or upstream IP address reported on the WAN interface.
+	WANIP string `json:"wan_ip,omitempty"`
+
+	// ActiveVPNUsers is the count of currently connected remote-access VPN users.
+	ActiveVPNUsers int `json:"active_vpn_users"`
+
+	// VPNConnections holds individual active VPN session records when available.
 	VPNConnections []VPNConnection `json:"vpn_connections,omitempty"`
 }
 
 // HistoricalClient records a known client MAC from /rest/user for dormant
 // reappearance and wired/Wi-Fi medium-swap detection.
 type HistoricalClient struct {
-	MAC             string `json:"mac"`
-	Name            string `json:"name,omitempty"`
-	Hostname        string `json:"hostname,omitempty"`
-	IsWired         bool   `json:"is_wired"`
-	FirstSeen       int64  `json:"first_seen,omitempty"`
-	LastSeen        int64  `json:"last_seen,omitempty"`
+	// MAC is the normalized lowercase hardware address of the known client.
+	MAC string `json:"mac"`
+
+	// Name is the user-assigned UniFi alias, if any.
+	Name string `json:"name,omitempty"`
+
+	// Hostname is the last observed DHCP or DNS hostname.
+	Hostname string `json:"hostname,omitempty"`
+
+	// IsWired reports whether the client was last observed on Ethernet rather than Wi-Fi.
+	IsWired bool `json:"is_wired"`
+
+	// FirstSeen is the Unix timestamp (seconds) when the client first connected.
+	FirstSeen int64 `json:"first_seen,omitempty"`
+
+	// LastSeen is the Unix timestamp (seconds) of the client's most recent activity or disconnect.
+	LastSeen int64 `json:"last_seen,omitempty"`
+
+	// LastNetworkName is the resolved VLAN/network name from the client's last connection.
 	LastNetworkName string `json:"last_network_name,omitempty"`
 }
 
 // ControllerLogEvent represents a normalized security or admin activity event
-// from UniFi's v2 System Log (or legacy stat/event fallback).
+// collected from UniFi's v2 System Log (system-log/all and system-log/admin-activity).
 type ControllerLogEvent struct {
-	ID        string    `json:"id"`
+	// ID uniquely identifies the event (or carries a deterministic hash fallback when omitted).
+	ID string `json:"id"`
+
+	// Timestamp records when the controller logged the event (UTC).
 	Timestamp time.Time `json:"timestamp"`
-	Category  string    `json:"category"` // "SECURITY", "ADMIN", "NETWORK", "CLIENT_DEVICES", ...
-	Event     string    `json:"event"`    // "THREAT_BLOCKED", "ADMIN_ACCESS", ...
-	Key       string    `json:"key,omitempty"`
-	Severity  string    `json:"severity"` // "critical", "high", "medium", "low", "info"
-	Title     string    `json:"title,omitempty"`
-	Message   string    `json:"message"`
-	SrcIP     string    `json:"src_ip,omitempty"`
-	DstIP     string    `json:"dst_ip,omitempty"`
-	Admin     string    `json:"admin,omitempty"`
-	Device    string    `json:"device,omitempty"`
+
+	// Category is the uppercase log category ("SECURITY", "ADMIN", "NETWORK", "CLIENT_DEVICES", etc.).
+	Category string `json:"category"`
+
+	// Event is the uppercase event type or activity key (e.g., "THREAT_BLOCKED", "ADMIN_ACCESS").
+	Event string `json:"event"`
+
+	// Key is the raw controller event key string, if present.
+	Key string `json:"key,omitempty"`
+
+	// Severity is the normalized severity level ("critical", "high", "medium", "low", or "info").
+	Severity string `json:"severity"`
+
+	// Title is the interpolated short event headline, if present.
+	Title string `json:"title,omitempty"`
+
+	// Message is the interpolated human-readable event description.
+	Message string `json:"message"`
+
+	// SrcIP is the source IP address associated with the event, if reported.
+	SrcIP string `json:"src_ip,omitempty"`
+
+	// DstIP is the destination IP address associated with the event, if reported.
+	DstIP string `json:"dst_ip,omitempty"`
+
+	// Admin names the administrator account responsible for an admin-activity event.
+	Admin string `json:"admin,omitempty"`
+
+	// Device names the UniFi console or infrastructure device associated with the event.
+	Device string `json:"device,omitempty"`
 }
 
 // Network describes a UniFi LAN or VLAN segment along with its structural
@@ -744,10 +972,14 @@ type Network struct {
 	// DNSServers lists DHCP-assigned DNS resolvers for this VLAN.
 	DNSServers []string `json:"dns_servers,omitempty"`
 
-	// DHCPStart, DHCPEnd, and ActiveLeases support DHCP pool exhaustion and overlap checks.
-	DHCPStart    string `json:"dhcp_start,omitempty"`
-	DHCPEnd      string `json:"dhcp_end,omitempty"`
-	ActiveLeases int    `json:"active_leases,omitempty"`
+	// DHCPStart is the first IPv4 address in the network's configured DHCP pool.
+	DHCPStart string `json:"dhcp_start,omitempty"`
+
+	// DHCPEnd is the last IPv4 address in the network's configured DHCP pool.
+	DHCPEnd string `json:"dhcp_end,omitempty"`
+
+	// ActiveLeases is the count of active clients currently holding IPv4 addresses inside [DHCPStart, DHCPEnd].
+	ActiveLeases int `json:"active_leases,omitempty"`
 }
 
 // FirewallZone represents a UniFi Zone-Based Firewall zone grouping one or more
@@ -826,8 +1058,11 @@ type FirewallPolicy struct {
 
 // PortRange represents an inclusive TCP/UDP port range [Start, End] in 1..65535.
 type PortRange struct {
+	// Start is the inclusive lower port bound (1..65535).
 	Start int `json:"start" yaml:"start"`
-	End   int `json:"end" yaml:"end"`
+
+	// End is the inclusive upper port bound (Start..65535).
+	End int `json:"end" yaml:"end"`
 }
 
 // PolicyEndpoint captures the zone and optional IP/port constraints on one side
@@ -872,8 +1107,10 @@ type PolicyEndpoint struct {
 	UnsupportedSelector string `json:"unsupported_selector,omitempty" yaml:"unsupported_selector,omitempty"`
 }
 
-// HasCompoundTarget reports whether the endpoint restricts multiple independent
-// dimensions. The legacy NegateTarget field cannot identify which one is inverted.
+// HasCompoundTarget reports whether ep combines two or more independent target
+// dimensions (MACs, IPs, and NetworkIDs). When NegateTarget is also true, a
+// single boolean flag cannot specify which dimension is negated, so evaluators
+// treat negated compound targets as unknown.
 func (ep PolicyEndpoint) HasCompoundTarget() bool {
 	return len(ep.MACs) > 0 && (len(ep.IPs) > 0 || len(ep.NetworkIDs) > 0) || len(ep.IPs) > 0 && len(ep.NetworkIDs) > 0
 }
@@ -981,8 +1218,9 @@ func (p PortForward) ExposesPort(port int) bool {
 	return portMatchesSpec(p.FwdPort, port)
 }
 
-// OnlyBackendPort reports whether the backend is confined to the supplied ports.
-// A forward without port translation inherits its WAN port specification.
+// OnlyBackendPort reports whether every internal backend port targeted by the
+// forward is contained in ports, falling back to DstPort when FwdPort is blank
+// (untranslated port forwards).
 func (p PortForward) OnlyBackendPort(ports ...int) bool {
 	spec := strings.TrimSpace(p.FwdPort)
 	if spec == "" {
@@ -1203,6 +1441,9 @@ type rawDevice struct {
 // firmware may emit a plain integer.
 type flexSTPCount int
 
+// UnmarshalJSON decodes stp_state_change_count from either a plain integer or
+// a list of {change_count} entries, summing all entries and defaulting to 0 on
+// null or unrecognized shapes.
 func (f *flexSTPCount) UnmarshalJSON(data []byte) error {
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" || trimmed == "null" {
@@ -1536,6 +1777,8 @@ type flexMACFilter struct {
 	MACAddresses  []string `json:"macAddresses"`
 }
 
+// UnmarshalJSON decodes macAddressFilter from either a single MAC address
+// string or a structured {macAddresses, matchOpposite} JSON object.
 func (f *flexMACFilter) UnmarshalJSON(data []byte) error {
 	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" || trimmed == "null" {

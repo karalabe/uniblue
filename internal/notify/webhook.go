@@ -43,10 +43,13 @@ const (
 // HTTPStatusError is returned when a webhook endpoint responds with a non-2xx
 // HTTP status code.
 type HTTPStatusError struct {
+	// StatusCode is the non-2xx HTTP status code returned by the webhook endpoint.
 	StatusCode int
-	Redirect   bool
+	// Redirect reports that the response was a 3xx redirect, which delivery refuses to follow.
+	Redirect bool
 }
 
+// Error formats the HTTP status failure, noting when a redirect was rejected.
 func (e *HTTPStatusError) Error() string {
 	if e.Redirect {
 		return fmt.Sprintf("webhook returned redirect HTTP %d (redirects are disabled)", e.StatusCode)
@@ -232,6 +235,7 @@ func (n *Notifier) SendWithID(ctx context.Context, id, site string, diff risk.Di
 	case "discord":
 		body, err = json.Marshal(map[string]any{
 			"content": truncate(formatSummary(site, filtered, escapeDiscord), maxDiscordBodyBytes),
+			// Disable server-side mention parsing in addition to escaping untrusted text.
 			"allowed_mentions": map[string]any{
 				"parse": []string{},
 			},
@@ -283,6 +287,7 @@ func (n *Notifier) SendWithID(ctx context.Context, id, site string, diff risk.Di
 		return fmt.Errorf("send webhook: %w", sanitizeTransportError(n.webhookURL, err))
 	}
 	defer resp.Body.Close()
+	// Drain up to 4 KiB so the transport can reuse the connection without reading unbounded responses.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
@@ -331,6 +336,7 @@ func sanitizeTransportError(fallbackURL string, err error) error {
 func escapeDiscord(s string) string {
 	r := strings.NewReplacer(
 		"\\", "\\\\",
+		// Insert a zero-width space after "@" to break @everyone/@here/user mention triggers.
 		"@", "@\u200b",
 		"[", "\\[",
 		"]", "\\]",
@@ -356,6 +362,7 @@ func escapeSlack(s string) string {
 		"&", "&amp;",
 		"<", "&lt;",
 		">", "&gt;",
+		// Insert a zero-width space after "@" to break bare @ mention triggers.
 		"@", "@\u200b",
 		"\r", " ",
 		"\n", " ",
@@ -365,6 +372,8 @@ func escapeSlack(s string) string {
 
 // filterDiff returns a copy of diff containing only actionable alert items at
 // or above minSev (omitting resolved keys that are not push alert triggers).
+// NewTrustedClients, NewPortForwards, and CISA KEV CVEs are always included
+// regardless of minSev because they indicate high-signal topology or active-exploit changes.
 func filterDiff(d risk.Diff, minSev checks.Severity) risk.Diff {
 	out := risk.Diff{
 		NewTrustedClients: d.NewTrustedClients,

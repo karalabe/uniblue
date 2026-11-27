@@ -81,9 +81,8 @@ func probeObserve(chk *Check, hp probe.HostProfile, port int) (string, bool) {
 }
 
 // probeSNMPReadOnly sends a single bounded SNMPv2c GetRequest for sysDescr.0
-// (1.3.6.1.2.1.1.1.0) and sysObjectID.0 (1.3.6.1.2.1.1.2.0) using the single
-// explicitly configured community string. It never cycles communities, never
-// emits SET requests, and never walks MIB tables.
+// (1.3.6.1.2.1.1.1.0) using the single explicitly configured community string.
+// It never cycles communities, never emits SET requests, and never walks MIB tables.
 func probeSNMPReadOnly(ctx context.Context, ip string, port int, community string, obs *Observation) (string, bool) {
 	if community == "" {
 		community = "public"
@@ -116,6 +115,9 @@ func probeSNMPReadOnly(ctx context.Context, ip string, port int, community strin
 	if !ok {
 		return "", false
 	}
+	// A valid GetResponse proves the community matched an active SNMP agent
+	// (ObsService), while a non-empty sysDescr value upgrades the observation to
+	// ObsPrivilegeVerified so read grants gated on sys_descr can fire.
 	obs.Level = ObsService
 	if sysDescr != "" {
 		obs.Level = ObsPrivilegeVerified
@@ -195,14 +197,20 @@ func parseSNMPGetResponse(raw []byte, wantReqID uint32) (string, bool) {
 	if !ok || len(valRest) < 2 {
 		return "", false
 	}
+	// Extract OCTET STRING (0x04) when present; non-string varbinds (such as
+	// SNMPv2c noSuchObject/noSuchInstance exceptions) still confirm a live agent
+	// accepted the community string, so return true with an empty sysDescr.
 	if valBytes, _, ok := asn1Next(valRest, 0x04); ok {
 		return string(valBytes), true
 	}
 	return "", true
 }
 
+// asn1Seq wraps body in an ASN.1 BER SEQUENCE (tag 0x30).
 func asn1Seq(body []byte) []byte { return asn1Wrap(0x30, body) }
 
+// asn1Wrap encodes a tag-length-value BER element using definite short or
+// 1- to 2-byte long-form length encoding.
 func asn1Wrap(tag byte, body []byte) []byte {
 	var out bytes.Buffer
 	out.WriteByte(tag)
@@ -219,6 +227,9 @@ func asn1Wrap(tag byte, body []byte) []byte {
 	return out.Bytes()
 }
 
+// asn1Int encodes a non-negative 32-bit integer (cast to uint32) as a minimal
+// ASN.1 BER INTEGER, prepending a 0x00 sign byte whenever the high bit would
+// otherwise be set.
 func asn1Int(v int) []byte {
 	if v == 0 {
 		return []byte{0x02, 0x01, 0x00}
@@ -235,11 +246,14 @@ func asn1Int(v int) []byte {
 	return asn1Wrap(0x02, b[i:])
 }
 
+// asn1Unwrap returns the value bytes of a BER element matching wantTag.
 func asn1Unwrap(data []byte, wantTag byte) ([]byte, bool) {
 	v, _, ok := asn1Next(data, wantTag)
 	return v, ok
 }
 
+// asn1Next parses one BER element with tag wantTag from data and returns its
+// value slice along with the unparsed trailing bytes.
 func asn1Next(data []byte, wantTag byte) (val, rest []byte, ok bool) {
 	if len(data) < 2 || data[0] != wantTag {
 		return nil, nil, false
@@ -263,6 +277,7 @@ func asn1Next(data []byte, wantTag byte) (val, rest []byte, ok bool) {
 	return data[off : off+l], data[off+l:], true
 }
 
+// decodeASN1Int decodes big-endian unsigned BER INTEGER content bytes.
 func decodeASN1Int(b []byte) int {
 	v := 0
 	for _, x := range b {
@@ -458,6 +473,8 @@ func probeKasa(ctx context.Context, ip string, port int, obs *Observation) (stri
 	return fmt.Sprintf("TP-Link Kasa legacy XOR API responded to get_sysinfo (model=%q)", compactASCII(parsed.System.GetSysinfo.Model, 48)), true
 }
 
+// kasaXOREncode obfuscates a TP-Link Kasa JSON payload using the legacy
+// autokey XOR cipher seeded with 0xAB (each output byte becomes the next key).
 func kasaXOREncode(in []byte) []byte {
 	out := make([]byte, len(in))
 	key := byte(0xAB)
@@ -468,6 +485,7 @@ func kasaXOREncode(in []byte) []byte {
 	return out
 }
 
+// kasaXORDecode reverses TP-Link Kasa's 0xAB-seeded autokey XOR framing.
 func kasaXORDecode(in []byte) []byte {
 	out := make([]byte, len(in))
 	key := byte(0xAB)
@@ -600,6 +618,8 @@ func (r *Runner) probeIPP(ctx context.Context, ip string, port int, obs *Observa
 	return fmt.Sprintf("IPP Get-Printer-Attributes returned status 0x%04x on port %d", status, port), true
 }
 
+// writeIPPAttr appends a single RFC 8010 IPP attribute (value-tag, big-endian
+// name-length + name, big-endian value-length + value) to w.
 func writeIPPAttr(w *bytes.Buffer, tag byte, name, val string) {
 	w.WriteByte(tag)
 	_ = binary.Write(w, binary.BigEndian, uint16(len(name)))
@@ -699,6 +719,8 @@ func evalJSONPath(root any, path string) (any, bool) {
 	return cur, true
 }
 
+// stringifyJSONScalar formats a decoded JSON value as a string for equality
+// and regex matching in JSONPredicate.
 func stringifyJSONScalar(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -715,12 +737,14 @@ func stringifyJSONScalar(v any) string {
 	}
 }
 
+// randomUint32 returns a random 32-bit unsigned integer for UDP request/message IDs.
 func randomUint32() uint32 {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return binary.BigEndian.Uint32(b[:])
 }
 
+// randomShortHex returns 4 random lowercase hex characters for ephemeral client IDs.
 func randomShortHex() string {
 	var b [2]byte
 	_, _ = rand.Read(b[:])

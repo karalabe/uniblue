@@ -15,7 +15,8 @@ import (
 
 // PlanGlobalPorts computes the bounded baseline TCP port list to sweep across
 // all eligible hosts. It intentionally excludes ports belonging to checks that
-// are passive (`observe`), UDP-only (`snmp`, `coap`, `natpmp`), explicitly
+// are passive (`observe`), UDP-only (such as `snmp`, `coap`, `natpmp`, `ipmi`,
+// `nbns`, `pcp`, `dns-recursion`, `ntp`, `stun`, and `lifx`), explicitly
 // `discovery_only`, or gated by host identity / passive discovery
 // (`mdns_type_any`, `upnp_*`, `ws_type_regex`, `mac_prefix`, `hostname_regex`),
 // so adding hundreds of device-specific rules adds zero TCP dials on unrelated
@@ -110,6 +111,8 @@ func PlanHostPorts(clients []unifi.Client, list []*Check, baseHints map[string][
 	return out
 }
 
+// isGlobalBaselineCheck reports whether chk is an ungated active TCP check
+// eligible to contribute its precondition ports to the global baseline sweep.
 func isGlobalBaselineCheck(chk *Check) bool {
 	if chk == nil || chk.Preconditions.DiscoveryOnly {
 		return false
@@ -127,6 +130,8 @@ func isGlobalBaselineCheck(chk *Check) bool {
 	return true
 }
 
+// isNonTCPProbe reports whether probeType is passive ("observe") or UDP-only so
+// its ports are excluded from TCP sweeping and allowed to match UDP observations.
 func isNonTCPProbe(probeType string) bool {
 	switch strings.ToLower(probeType) {
 	case "observe", "snmp", "coap", "natpmp", "ipmi",
@@ -137,6 +142,8 @@ func isNonTCPProbe(probeType string) bool {
 	}
 }
 
+// matchesClientIdentity reports whether cl matches either chk's MACPrefix or
+// HostnameRegex preconditions so specialty TCP port hints target matching hosts.
 func matchesClientIdentity(chk *Check, cl unifi.Client) bool {
 	if len(chk.Preconditions.MACPrefix) > 0 && cl.MAC != "" {
 		macLower := strings.ToLower(cl.MAC)

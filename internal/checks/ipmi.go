@@ -107,6 +107,13 @@ func probeIPMI(ctx context.Context, ip string, port int, obs *Observation) (stri
 		return "", false
 	}
 
+	// IPMI v2.0 Table 22-15 response bytes:
+	//   resp[22] authTypes:  bit 7 (0x80) = IPMI v2.0 extended capabilities available
+	//                        (RMCP+ channel support is indicated separately),
+	//                        bit 4 = cleartext password, bit 2 = MD5,
+	//                        bit 1 = MD2, bit 0 = None
+	//   resp[23] authStatus: bit 2 = non-null users enabled, bit 1 = null users enabled,
+	//                        bit 0 = anonymous login enabled
 	authTypes := resp[22]
 	authStatus := resp[23]
 

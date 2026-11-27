@@ -23,7 +23,7 @@ type InfraReport struct {
 	TargetID string `json:"target_id,omitempty"`
 	// Target names the selected device or controller.
 	Target string `json:"target"`
-	// Scope identifies the role under review.
+	// Scope identifies the role under review ("Controller", "Gateway", "Switch", or "AP").
 	Scope string `json:"scope"`
 	// HostedOn identifies the known physical host of the Network application.
 	HostedOn string `json:"hosted_on,omitempty"`
@@ -43,9 +43,11 @@ type InfraReport struct {
 	UplinkUnknown bool `json:"uplink_unknown,omitempty"`
 	// RoutedVLANs names the VLANs whose routing policy the device controls.
 	RoutedVLANs []string `json:"routed_vlans,omitempty"`
-	// Effects describes exposed settings, secrets and local services without reading credentials.
+	// Effects lists modeled plain-language security impacts of compromising this
+	// target. UniBlue never reads or dumps device credentials.
 	Effects []string `json:"effects"`
-	// Legs assesses traffic in one direction at a time.
+	// Legs lists assessed inbound, outbound, and VPN transport legs traversing or
+	// terminating at the target device, one direction at a time.
 	Legs []TransportSurvival `json:"legs,omitempty"`
 }
 
@@ -66,7 +68,10 @@ func infraRole(d unifi.Device) string {
 
 func deviceLabel(d unifi.Device) string { return cmp.Or(d.Name, d.Model, d.MAC) }
 
-// controllerHost resolves the Network application separately from the devices it manages.
+// controllerHost identifies the physical host running the Network application.
+// It checks in.ControllerHost against adopted device IPs first, then client
+// IPs and hostnames, falling back to a Cloud Key or a non-classic integrated
+// gateway (UDM/UCG) console when no direct address match is found.
 func controllerHost(in Input) unifi.Device {
 	s := in.Snapshot
 	var console unifi.Device
@@ -93,7 +98,9 @@ func integratedGateway(d unifi.Device) bool {
 	return strings.EqualFold(d.Type, "udm") || strings.EqualFold(d.Type, "ucg")
 }
 
-// infraTarget accepts the logical controller because its host may be outside adopted inventory.
+// infraTarget resolves raw to the logical "controller" sentinel, a unique
+// adopted infrastructure device matched by name or MAC, or the resolved
+// controller host when it sits outside adopted inventory.
 func infraTarget(s *unifi.Snapshot, host unifi.Device, raw string) (unifi.Device, string, error) {
 	target := strings.TrimSpace(raw)
 	if strings.EqualFold(target, "controller") {
@@ -143,6 +150,9 @@ func uplinkNetworks(s *unifi.Snapshot, child unifi.Device) ([]unifi.Network, boo
 				knownIDs[n.ID] = true
 			}
 			missing := func(id string) bool { return !knownIDs[id] }
+			// In custom tagged mode, TaggedNetworkIDs == nil means all non-excluded
+			// VLANs are allowed; an unresolved exclusion ID prevents determining which
+			// custom VLANs are carried, so custom VLANs are withheld and unknown is set.
 			unknownExclusions := mode == "custom" && slices.ContainsFunc(p.ExcludedNetworkIDs, missing)
 			unknown := mode == "unknown" || unknownExclusions || mode == "custom" && slices.ContainsFunc(p.TaggedNetworkIDs, missing)
 			var nets []unifi.Network
@@ -268,6 +278,8 @@ func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
 	}
 	r := InfraReport{TargetID: targetID, Target: deviceLabel(d), Scope: role}
 	mac := canonicalMAC(d.MAC)
+	// An integrated gateway (UDM/UCG) hosting the Network application exposes
+	// full controller privileges alongside its gateway role.
 	control := role == "Controller" || integratedGateway(d) && mac != "" && mac == canonicalMAC(host.MAC)
 	owned := map[string]bool{}
 	if mac != "" {
@@ -389,7 +401,10 @@ func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
 		up, onUplink := carried[net]
 		directAP := !cl.IsWired && owned[parent]
 		attached := subtree[parent] || owned[parent]
-		// The gateway sees traffic routed to a client, not local traffic between two peers.
+		// Include any known VLAN when the gateway is compromised, even VLANs routed
+		// by L3 switches: the gateway still sits on upstream routed/WAN paths and
+		// can initiate connections from the Gateway zone, though local peer traffic
+		// does not cross it.
 		viaRouter := routed[net] || (gwOwned && net != "")
 		if attached || viaRouter {
 			r.Clients = append(r.Clients, cl.DisplayName())
@@ -435,6 +450,9 @@ func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
 					leg.Reachability = "allow"
 				}
 			case onUplink:
+				// Carrying a VLAN on an uplink only affects traffic that actually
+				// traverses that upstream trunk port, so exposure and availability
+				// downgrade to conditional.
 				leg.Path = "From the upstream port"
 				pos = up
 				leg.Availability = conditional
@@ -477,7 +495,9 @@ func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
 	return r, nil
 }
 
-// wirelessProtection describes the link separately because application encryption can survive AP compromise.
+// wirelessProtection summarizes L2 Wi-Fi peer confidentiality (WPA3-SAE vs
+// WPA2-PSK) separately from L4/L7 application encryption, which can survive AP
+// compromise.
 func wirelessProtection(wlans []unifi.WLANConfig, cl unifi.Client) string {
 	for _, w := range wlans {
 		if !w.Enabled || w.Name != cl.ESSID || (w.NetworkID != "" && cl.NetworkID != "" && w.NetworkID != cl.NetworkID) {

@@ -20,22 +20,33 @@ import (
 
 // ServiceState classifies how strongly a service endpoint has been identified.
 const (
-	ServiceStateObservedProtocol  = "observed-protocol"
+	// ServiceStateObservedProtocol means an active probe or passive flow identified the application protocol.
+	ServiceStateObservedProtocol = "observed-protocol"
+	// ServiceStateAdvertisedService means the host advertised the service via DNS-SD, SSDP, or WS-Discovery.
 	ServiceStateAdvertisedService = "advertised-service"
-	ServiceStateOwnerDeclared     = "owner-declared"
-	ServiceStateCandidatePort     = "candidate-port"
-	ServiceStateTLSUnknownApp     = "tls-unknown-app"
-	ServiceStateUnknown           = "unknown"
+	// ServiceStateOwnerDeclared means an owner-supplied configuration or manifest declared the service.
+	ServiceStateOwnerDeclared = "owner-declared"
+	// ServiceStateCandidatePort means a TCP connect succeeded, but no protocol or advertisement identified the service.
+	ServiceStateCandidatePort = "candidate-port"
+	// ServiceStateTLSUnknownApp means transport encryption (TLS, DTLS, or QUIC) was observed without identifying the inner application.
+	ServiceStateTLSUnknownApp = "tls-unknown-app"
+	// ServiceStateUnknown means an endpoint was observed without enough evidence to classify its protocol.
+	ServiceStateUnknown = "unknown"
 )
 
 // AttributionLevel records how specifically an outbound internet dependency is
 // supported by available evidence (never overstating a CDN IP as a specific app).
 const (
+	// AttributionConfiguredEgress means the external endpoint was explicitly declared in device or owner configuration.
 	AttributionConfiguredEgress = "configured-egress"
-	AttributionVendorFeed       = "vendor-feed"
-	AttributionGatewayOrDNS     = "gateway-or-dns-inferred"
+	// AttributionVendorFeed means the external endpoint matched a vendor-published endpoint feed.
+	AttributionVendorFeed = "vendor-feed"
+	// AttributionGatewayOrDNS means the external endpoint was inferred from gateway flow telemetry or DNS/SNI metadata.
+	AttributionGatewayOrDNS = "gateway-or-dns-inferred"
+	// AttributionHostingRangeOnly means only a shared CDN or hosting range is known, so the specific application remains ambiguous.
 	AttributionHostingRangeOnly = "hosting-range-only"
-	AttributionOpaqueEncrypted  = "opaque-encrypted"
+	// AttributionOpaqueEncrypted means encrypted transport (such as ECH, TLS, or QUIC without SNI) concealed the destination application.
+	AttributionOpaqueEncrypted = "opaque-encrypted"
 )
 
 // OutboundDependency represents an external internet service contacted by a
@@ -172,13 +183,8 @@ func ParsePassiveFlows(raw []byte) ([]PassiveFlowRecord, error) {
 	return list, nil
 }
 
-// ApplyPassiveFlows merges owner-supplied passive service and flow observations
-// onto matching HostProfiles:
-//   - Hosted local services enrich hp.Services (marking exact transport, family,
-//     and state, preserving "tls-unknown-app" / "unknown" when evidence shows
-//     only TLS, QUIC, or an opaque socket).
-//   - Outbound internet connections populate hp.OutboundDependencies and NEVER
-//     misclassify the local client as hosting that external server.
+// canonicalIPKey normalizes an IP address into its unmapped canonical string
+// form for consistent map lookups, falling back to lowercased text if unparseable.
 func canonicalIPKey(raw string) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -190,6 +196,12 @@ func canonicalIPKey(raw string) string {
 	return strings.ToLower(s)
 }
 
+// ApplyPassiveFlows merges owner-supplied passive service and flow observations
+// onto matching HostProfiles. Hosted local services are recorded on hp.Services
+// (preserving transport, address family, and state such as "tls-unknown-app" or
+// "unknown" for TLS, QUIC, or opaque sockets), while outbound external
+// connections are recorded on hp.OutboundDependencies rather than as hosted
+// services on the local client.
 func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 	if len(profiles) == 0 || len(records) == 0 {
 		return
@@ -240,7 +252,9 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 			continue
 		}
 
-		// Local hosted service record.
+		// Prefer an explicit application label over the transport protocol,
+		// falling back to "unknown" while preserving any non-unknown protocol
+		// already observed on the same endpoint.
 		proto := strings.ToLower(strings.TrimSpace(rec.Protocol))
 		app := strings.ToLower(strings.TrimSpace(rec.Application))
 		state := classifyPassiveServiceState(proto, app, rec.Source)
@@ -305,6 +319,9 @@ func ApplyPassiveFlows(profiles []HostProfile, records []PassiveFlowRecord) {
 	}
 }
 
+// classifyPassiveServiceState assigns a ServiceState with owner-declared
+// manifests taking precedence over observed applications, while keeping
+// transport-only encryption protocols (TLS, DTLS, QUIC) as ServiceStateTLSUnknownApp.
 func classifyPassiveServiceState(proto, app, source string) string {
 	if strings.EqualFold(source, "owner-config") || strings.EqualFold(source, "owner-manifest") {
 		if app != "" || proto != "" {
@@ -326,6 +343,9 @@ func classifyPassiveServiceState(proto, app, source string) string {
 	}
 }
 
+// buildOutboundDependency converts an outbound PassiveFlowRecord into an
+// OutboundDependency, capping attribution specificity for shared CDNs, ECH,
+// and opaque TLS/QUIC flows so hosting ranges are never overstated as specific apps.
 func buildOutboundDependency(rec PassiveFlowRecord, transport string) OutboundDependency {
 	proto := strings.ToLower(strings.TrimSpace(rec.Protocol))
 	src := firstNonEmpty(rec.Source, "passive-flow")
@@ -398,6 +418,8 @@ func buildOutboundDependency(rec PassiveFlowRecord, transport string) OutboundDe
 	}
 }
 
+// appendOutboundUnique appends dep unless existing already contains an entry
+// with the same destination IP, destination host, port, transport, and address family.
 func appendOutboundUnique(existing []OutboundDependency, dep OutboundDependency) []OutboundDependency {
 	for _, e := range existing {
 		if e.DestinationIP == dep.DestinationIP && e.DestinationHost == dep.DestinationHost && e.Port == dep.Port && e.Transport == dep.Transport && e.AddressFamily == dep.AddressFamily {

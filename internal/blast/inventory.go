@@ -43,15 +43,15 @@ type attachment struct {
 type builder struct {
 	Input
 	*graph
-	clients         []attachment
-	byIP            map[string][]string
-	roles           map[string]classify.Result
-	nets            map[string]unifi.Network
-	sockets         map[socket]bool
-	positions       map[risk.Position]fact
-	cloud           []ClientEgress
-	wanEdges        []SimEdge
-	unknownPhysical bool
+	clients         []attachment               // populated in inventory: all unique (host, position) attachments
+	byIP            map[string][]string        // populated in inventory: IP -> owning host keys
+	roles           map[string]classify.Result // populated in inventory: hostKey -> device role classification
+	nets            map[string]unifi.Network   // populated in inventory: network ID and lowercase name -> Network
+	sockets         map[socket]bool            // populated in services/publications/routes: all known service listeners
+	positions       map[risk.Position]fact     // populated in entries/services: interned Oracle query positions
+	cloud           []ClientEgress             // populated in entries: worst-case per-host cloud egress summaries
+	wanEdges        []SimEdge                  // populated in routes/internet: WAN simulation edges
+	unknownPhysical bool                       // populated in entries/outdoor: true if any outdoor port VLAN config or isolation is unknown
 }
 
 func canonicalMAC(s string) string { return config.CanonicalMAC(s) }
@@ -84,6 +84,8 @@ func (b *builder) inventory() {
 	b.positions = map[risk.Position]fact{}
 	b.sockets = map[socket]bool{}
 	b.roles = classify.ClientRoles(b.Snapshot, b.Profiles)
+	// Findings can reveal an out-of-band BMC (for example via an IPMI or iKVM
+	// check) even when passive classification did not tag it as CategoryBMC.
 	for _, cl := range b.Oracle.ManagementControllers(b.Findings) {
 		h := hostKey(cl)
 		role := b.roles[h]
@@ -131,6 +133,9 @@ func (b *builder) inventory() {
 			}
 		}
 	}
+	// Index Snapshot.Clients first so live client records with full VLAN, AP, and
+	// switch metadata take precedence over fallback entries from devices, profiles,
+	// or findings.
 	for _, cl := range b.Snapshot.Clients {
 		add(cl)
 	}
@@ -201,6 +206,9 @@ func (b *builder) indexTargetSignals() {
 		if sig.Port > 0 {
 			proto := strings.ToLower(cmp.Or(sig.Proto, "tcp"))
 			svc := serviceName(proto, sig.Port)
+			// Also record highProfileFamily so broad all-ports gateway policies
+			// (which have no socket port) still inherit high-profile velocity for
+			// the matching host and address family in routes.
 			if sigIP != "" {
 				b.highProfileSockets[key+"|"+sigIP+"|"+svc] = true
 				b.highProfileFamily[key+"|"+family(sigIP)] = true
@@ -253,6 +261,9 @@ func (b *builder) socket(host, ip, proto string, port int) (socket, bool) {
 	return s, true
 }
 
+// grantLevel maps a check grant to its graph edge difficulty: assumed,
+// conditional, or prerequisite-gated grants are moderate; direct control,
+// pivot, and configure effects are trivial; all other direct effects are low.
 func grantLevel(g checks.GrantSpec) uint8 {
 	if g.Basis == checks.BasisAssumed || g.Basis == checks.BasisConditional || g.Requires != "" {
 		return moderate
@@ -283,15 +294,19 @@ type serviceMember struct{ node, edge, port int }
 // serviceBundles indexes confirmed remedy edges by host and product or check.
 type serviceBundles map[serviceBundleKey][]serviceMember
 
-// record remembers the edge just linked to this listener, even if its adjacency list grows.
+// record stores the slice index of the edge just linked from `from` so bundle
+// assignment survives slice growth. Callers must invoke it immediately after
+// link or grant.
 func (groups serviceBundles) record(b *builder, from fact, port int, label string) {
 	n := b.ids[from]
 	k := serviceBundleKey{from.asset, label}
 	groups[k] = append(groups[k], serviceMember{n, len(b.edges[n]) - 1, port})
 }
 
-// bundleServices assigns a single remedy to all confirmed CVEs on a product or
-// all affected ports for a check, preserving each narrower remedy alongside it.
+// bundleServices assigns a single bundle remedy across multiple distinct
+// remedies on the same host, preserving each narrower remedy alongside it. When
+// checksByID is non-nil it bundles check findings spanning at least two ports;
+// when checksByID is nil it bundles version-matched CVEs by product label.
 func (b *builder) bundleServices(groups serviceBundles, checksByID map[string]*checks.Check) {
 	for key, members := range groups {
 		ports := map[int]bool{}
@@ -371,9 +386,13 @@ func (b *builder) services() {
 				continue
 			}
 			b.link(root(TrustedLAN), s.fact(), trivial, 0, 0)
+			// UB-0010 checks open DNS recursion; suppress it on private LAN-only port
+			// 53 resolvers that are expected to serve local clients and are not exposed to WAN.
 			if f.CheckID == "UB-0010" && s.port == 53 && b.Oracle.PrivateLANListener(f.Client, ip, s.proto, s.port) {
 				continue
 			}
+			// Non-inventory findings that declare no capability grants still represent
+			// hardening issues and are modeled as "service setting: <CheckID>" consequences.
 			if !inventoryOnly && len(grants) == 0 && (c == nil || len(c.Grants) == 0) {
 				title := fmt.Sprintf("Review %s on port %d", b.assets[host].name, s.port)
 				a := b.action("act:check:"+f.CheckID+":"+host+":"+serviceName(s.proto, s.port), title, cmp.Or(f.Title, "A service check found a setting that needs attention."), LaneReduceExposure, 1)
@@ -416,6 +435,8 @@ func (b *builder) services() {
 					title := fmt.Sprintf("Require sign-in or disable %s on port %d", name, f.Port)
 					reason := cmp.Or(strings.TrimSpace(g.Note), strings.TrimSpace(f.Title), "Anyone who can reach this service can use it without signing in.")
 					lane := LaneFixNow
+					// UB-0012 checks SNMP public community read access; when WAN access has
+					// not been confirmed, route it to LaneReduceExposure instead of FixNow.
 					if f.CheckID == "UB-0012" && b.Oracle.ListenerWAN(f.Client, s.ip, s.proto, s.port) != "allow" {
 						lane = LaneReduceExposure
 						title = "Restrict SNMP read access on " + name
@@ -445,6 +466,8 @@ func (b *builder) services() {
 				continue
 			}
 			b.link(root(TrustedLAN), s.fact(), trivial, 0, 0)
+			// Suppress built-in DNS recursion traits on private LAN-only resolvers
+			// just as UB-0010 findings are suppressed above.
 			if svc.Protocol == "dns" && s.port == 53 && b.Oracle.PrivateLANListener(hp.Client, ip, s.proto, s.port) {
 				continue
 			}
@@ -457,6 +480,8 @@ func (b *builder) services() {
 				b.grant(s, s.fact(), checks.GrantSpec{Effect: effect, Basis: basis}, a)
 			}
 		}
+		// Controlling a bridge, hub, or recorder implicitly grants control over its
+		// attached child devices.
 		for _, child := range hp.Children {
 			if child.ID == "" {
 				continue
@@ -479,6 +504,8 @@ func (b *builder) services() {
 	for _, host := range sortedKeys(b.assets) {
 		p := b.assets[host].profile
 		targets := append(slices.Clone(p.Manages), p.Hosts...)
+		// A BMC without explicit Manages targets still controls an underlying
+		// server, so synthesize a crown-tier placeholder to preserve that blast radius.
 		if b.roles[host].Category == classify.CategoryBMC && len(p.Manages) == 0 {
 			key := "managed:" + host
 			b.addAsset(key, "Unidentified server managed by "+b.assets[host].name, classify.AssetProfile{Tier: classify.TierCrown})
@@ -491,6 +518,8 @@ func (b *builder) services() {
 			b.link(fact{consequence, host, "control"}, fact{consequence, to, "control"}, trivial, 0, 0)
 		}
 	}
+	// A pivot consequence turns the compromised host into a network origin on
+	// every attachment it owns, enabling lateral traversal from its position.
 	for _, cl := range b.clients {
 		pivot := fact{consequence, cl.host, "pivot"}
 		if _, ok := b.ids[pivot]; ok {
@@ -513,6 +542,8 @@ func (b *builder) cve(m cve.Match, bundles serviceBundles) {
 	ip := address(m.Product.HostIP)
 	hosts := b.byIP[ip]
 	r := m.Record
+	// Ignore local, adjacent, and physical CVEs; keep KEV entries that have no
+	// published CVSS vector yet so known-exploited advisories are not dropped.
 	if r.AttackVector != "N" && !(r.AttackVector == "" && r.KEV) {
 		return
 	}
@@ -570,8 +601,9 @@ func (b *builder) cve(m cve.Match, bundles serviceBundles) {
 		if b.isHighProfileSocket(s) {
 			b.markHighProfile(s.fact(), s.fact())
 		}
-		// One CVE can affect several products on the same host. Its shared
-		// consequence survives while any of those products still supplies evidence.
+		// One CVE can affect several products on the same host. Clear the product
+		// label on disagreement so pairIndexes does not attribute the shared CVE
+		// consequence to one arbitrary product.
 		label := m.Product.Label
 		if previous, ok := b.patchProducts[edge.to]; ok && previous != label {
 			label = ""

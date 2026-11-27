@@ -19,6 +19,16 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// factKind classifies nodes in the reachability graph and determines what
+// (asset, detail) stores for each node:
+//   - origin:        ("", string(Entry)) starting root
+//   - position:      ("", position index) concrete network attachment
+//   - endpoint:      (hostKey, "<ip>/<proto>/<port>") routable listener
+//   - localEndpoint: (hostKey, "<ip>/<proto>/<port>") same-network-only listener
+//   - consequence:   (hostKey, outcome) host consequence, CVE, setting, or publication
+//   - permission:    (hostKey, "network access" | "network management") reachability without exploit
+//   - blocked:       (hostKey, "network access" | "network management") explicit deny boundary or complete WAN visibility with no ingress
+//   - notice:        (target, verify action ID) missing evidence or unverified prerequisite
 type factKind uint8
 
 const (
@@ -40,6 +50,11 @@ type fact struct {
 	asset, detail string
 }
 type edge struct {
+	// to is the destination node index. cut, bundle, and tagCut are one-based
+	// action indexes (0 means uncuttable); cutting any one of them severs this
+	// edge. tagCut is kept separate from cut and bundle so removing unused tagged
+	// VLANs on an outdoor trunk port can sever tagged access independently of
+	// physically securing the port or the whole switch.
 	to, cut, bundle, tagCut int
 	level                   uint8
 	// sameNetwork limits a listener grant to peers on its own network.
@@ -49,6 +64,9 @@ type edge struct {
 	finding uint32
 }
 
+// Monotone difficulty levels ordered 0..4. Values 0..3 map 1-to-1 to the
+// difficulties table (unreachable is the sentinel), guaranteeing that solve
+// terminates after at most four relaxations per node per root.
 const (
 	trivial uint8 = iota
 	low
@@ -77,13 +95,20 @@ type highProfileEdge struct {
 }
 
 type graph struct {
-	ids                map[fact]int
-	facts              []fact
-	edges              [][]edge
-	assets             map[string]asset
-	actionIDs          map[string]int
-	actions            []candidate
-	roots              [len(starts)]int
+	ids       map[fact]int
+	facts     []fact
+	edges     [][]edge
+	assets    map[string]asset
+	actionIDs map[string]int
+	// actions is one-indexed: slot 0 is a sentinel so edge cut index 0 means uncuttable.
+	actions []candidate
+	roots   [len(starts)]int
+	// High-profile velocity signal indexes:
+	//   highProfileHost:    hostKey
+	//   highProfileFamily:  "<hostKey>|<family>" (ipv4 or ipv6)
+	//   highProfilePorts:   "<hostKey>|<proto>/<port>"
+	//   highProfileSockets: "<hostKey>|<ip>|<proto>/<port>"
+	//   highProfileSources: target fact node index -> proving source edges
 	highProfileHost    map[string]bool
 	highProfileFamily  map[string]bool
 	highProfilePorts   map[string]bool
@@ -94,7 +119,10 @@ type graph struct {
 }
 type candidate struct {
 	Action
-	effort     int
+	// effort breaks ties after impact and lane (lower values rank earlier).
+	effort int
+	// tieBreakHP marks actions that improve a high-profile target reachable from
+	// an untrusted-LAN, physical, or assumed-breach entry point.
 	tieBreakHP bool
 }
 
@@ -114,7 +142,7 @@ func Evaluate(in Input) Report {
 		ids:                make(map[fact]int),
 		assets:             make(map[string]asset),
 		actionIDs:          make(map[string]int),
-		actions:            []candidate{{}},
+		actions:            []candidate{{}}, // Slot 0 is the uncuttable sentinel.
 		highProfileHost:    make(map[string]bool),
 		highProfileFamily:  make(map[string]bool),
 		highProfilePorts:   make(map[string]bool),
@@ -162,6 +190,10 @@ func (g *graph) link(from, to fact, level uint8, cut, bundle int) *edge {
 	return &g.edges[a][len(g.edges[a])-1]
 }
 
+// action registers or deduplicates a candidate action by ID, returning its
+// one-based index. When an ID is seen more than once, LaneFixNow promotes a
+// lower-urgency lane, title and reason break ties deterministically independent
+// of input order, and effort stays at the value from first registration.
 func (g *graph) action(id, title, reason string, lane Lane, effort int) int {
 	if i, ok := g.actionIDs[id]; ok {
 		// A shared rule can have several witnesses. Choose its wording independently of input order.
@@ -229,8 +261,10 @@ func (g *graph) solveRoot(r int, cuts []bool, dist []uint8, queue []int) {
 	}
 }
 
-// markHighProfile records the last edge linked from a node. Remember its index
-// so bundles assigned later cut the same evidence as the individual remedy.
+// markHighProfile associates the edge most recently linked from `from` with
+// `source`, the node whose reachability proves the high-profile signal. Callers
+// must invoke this immediately after link(from, ...) so the recorded edge index
+// stays aligned even when bundles are assigned later.
 func (g *graph) markHighProfile(from, source fact) {
 	node := g.ids[from]
 	index := len(g.edges[node]) - 1
@@ -242,6 +276,9 @@ func (g *graph) markHighProfile(from, source fact) {
 // signal reachable in state dist (falling back to base when a listener degraded
 // to unknown under a counterfactual cut) along an uncut edge.
 func (g *graph) isHighProfileIn(n int, f fact, dist, base []uint8, cuts []bool) bool {
+	// Skip host-wide signals for "public access to " facts; publications are
+	// attributed per socket via highProfileSources in linkPublications so an
+	// unrelated host signal does not tag clean or downgraded listeners.
 	if g.highProfileHost[f.asset] && !strings.HasPrefix(f.detail, "public access to ") {
 		return true
 	}
@@ -270,14 +307,17 @@ func (g *graph) isHighProfileIn(n int, f fact, dist, base []uint8, cuts []bool) 
 // outranks or inverts an exact KEV match on the same product.
 func (g *graph) factPriority(s start, n int, f fact, d uint8, dist, base []uint8, cuts []bool) Priority {
 	p := PriorityFor(s.audience, difficulties[d], g.assets[f.asset].profile.Tier)
-	// A clean published listener warrants an exposure review even on the gateway.
+	// Priority compares lexically ("P1" < "P3"), so max(p, P3) caps urgency at P3
+	// so clean published listeners stay exposure reviews rather than P1/P2 FixNow
+	// even on a crown-tier gateway.
 	if d == moderate && strings.HasPrefix(f.detail, "public access to ") {
 		return max(p, P3)
 	}
 	if s.audience == AudienceInternetAny && d < unknown && p > P1 && !strings.HasPrefix(f.detail, "CVE-") && g.isHighProfileIn(n, f, dist, base, cuts) {
 		p = PromotePriority(p)
 	}
-	// A hardening setting retains its severity limit even on a frequently targeted host.
+	// Cap low/info hardening settings at P3 (lexically max(p, P3)) so they do
+	// not escalate to P1/P2 even on a crown-tier or frequently targeted host.
 	if sev, ok := g.settingSeverity[n]; ok && sev <= checks.SeverityLow {
 		p = max(p, P3)
 	}
@@ -293,6 +333,8 @@ func (g *graph) exposure(s start, n int, f fact, level uint8, dist []uint8) Expo
 		e.Difficulty = ""
 		return e
 	}
+	// Reachability alone does not prove an exploit path, so permission facts
+	// report "no-known-path" and floor their difficulty at moderate.
 	if f.kind == permission && level != unknown {
 		e.State = "no-known-path"
 		level = max(level, moderate)
@@ -306,6 +348,8 @@ func (g *graph) exposure(s start, n int, f fact, level uint8, dist []uint8) Expo
 	case level == moderate && strings.HasPrefix(f.detail, "public access to "):
 		e.Lane = LaneReduceExposure
 	case level == moderate && f.kind != permission:
+		// Conditional consequences (other than clean publications) depend on an
+		// unconfirmed prerequisite, so they route to LaneVerify as needs-verification.
 		e.State = "needs-verification"
 		e.Lane = LaneVerify
 	case s.entry == Physical || s.entry == AssumeBreach || s.entry == CloudEgress:
@@ -318,8 +362,9 @@ func (g *graph) exposure(s start, n int, f fact, level uint8, dist []uint8) Expo
 	return e
 }
 
-// exposures publishes a negative assessment only when a stronger fact for the
-// same starting point and asset does not supersede it.
+// exposures collects owner-facing rows from all fixpoint states. "contained"
+// and "no-known-path" rows are suppressed whenever the same (Entry, Asset) pair
+// has a stronger state ("exposed", "unknown", or "needs-verification").
 func (g *graph) exposures(states [][]uint8) []Exposure {
 	out := make([]Exposure, 0)
 	for i, dist := range states {
@@ -347,6 +392,8 @@ func (g *graph) exposures(states [][]uint8) []Exposure {
 	return out
 }
 
+// stateOrder ranks exposure states by precedence for deduplication within an
+// (Entry, Asset) pair: exposed > unknown/needs-verification > no-known-path > contained.
 func stateOrder(s string) int {
 	switch s {
 	case "exposed":
@@ -360,7 +407,8 @@ func stateOrder(s string) int {
 	}
 }
 
-// addAsset keeps offline platform targets visible even without a network attachment.
+// addAsset registers an online or offline asset by key, defaulting unrecognized
+// tiers to TierMedium and falling back to key when no display name is available.
 func (g *graph) addAsset(key, name string, p classify.AssetProfile) {
 	if !p.Tier.Valid() {
 		p.Tier = classify.TierMedium

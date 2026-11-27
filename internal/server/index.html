@@ -1503,7 +1503,7 @@ const ICONS = {
 };
 
 /* ============================================================================
-   PLAIN-ENGLISH TRANSLATOR (Friendly for non-network-gurus!)
+   DOM & FORMATTING HELPERS + PLAIN-ENGLISH TRANSLATORS
    ============================================================================ */
 const vlanColorCache = Object.create(null);
 const vlanPalette = ["var(--vlan-0)", "var(--vlan-1)", "var(--vlan-2)", "var(--vlan-3)", "var(--vlan-4)"];
@@ -3082,6 +3082,9 @@ function renderCheckup() {
   patchContainerHTML(document.getElementById("view-checkup"), html);
 }
 
+/* ============================================================================
+   TAB 3: BLAST RADIUS (Interactive Compromise & What-If Simulator)
+   ========================================================================== */
 const blastEgress = new Map([
   ["cloud-connected (observed)", {label: "Cloud-connected (observed)", short: "Cloud-Connected", tone: "blue", detail: "Vendor traffic observed"}],
   ["cloud-capable (unverified)", {label: "Cloud-capable (unverified)", short: "Cloud-Capable", tone: "warn", detail: "Outbound policy permits cloud access"}],
@@ -3097,6 +3100,7 @@ const blastTiers = {
   wan: {tone: "blue", label: "WAN entry"}
 };
 
+// Edge tiers active in each simulation mode (proven, realistic, worst).
 // Unverified routes follow the same evidence threshold as their reachable counterparts.
 const blastModeTiers = {
   proven: new Set(["takeover", "unknown-takeover"]),
@@ -3137,8 +3141,10 @@ function blastPriority(a) {
   }
 }
 
-// Keep only the strongest surviving witness per ordered pair. Removing a cut
-// restores the original alternatives, including independently published WAN routes.
+// Build the active simulation adjacency graph after removing edges cut by
+// applied fixes. Keeps surviving WAN entry edges separate, tracks unverified
+// routes per node, and retains only the strongest (lowest-rank) surviving edge
+// per ordered (from, to) pair so unchecking a fix restores prior alternatives.
 function blastGraph(sim, applied = blastAppliedFixes) {
   const nodes = sim?.nodes || [];
   const indices = new Map(nodes.map((n, i) => [n.id, i]));
@@ -3167,8 +3173,11 @@ function blastGraph(sim, applied = blastAppliedFixes) {
   return {nodes, wan, unknown, adjacency};
 }
 
-// A visit records one shortest path. Dense numeric indices bound the traversal
-// by the size of the inventory even when several routes form a cycle.
+// Compute reachability from root in two phases: first BFS over cascading tiers
+// (takeover/likely/pivot) so cascading paths take precedence even over shorter
+// L2 paths, then append terminal same-VLAN L2 peers to order and collect
+// unverified neighbors separately in unknown without counting them toward total.
+// Dense numeric indices bound traversal to the inventory size even in cyclic graphs.
 function blastReach(graph, root) {
   const {nodes, adjacency} = graph;
   const hops = new Uint8Array(nodes.length);
@@ -3203,6 +3212,10 @@ function blastReach(graph, root) {
   return {root, hops, via, unknown, order, total: order.length, direct, l2Count, critical};
 }
 
+// Rank every node as a Patient Zero candidate by multiplying its entry
+// exposure weight (5 open WAN, 3 source-restricted, (authenticated), or
+// (login unverified) WAN, 2 outdoor/guest/IoT, 1 internal LAN) by
+// (1 + total reachable peers), breaking ties deterministically.
 function blastRanking(graph) {
   const rows = graph.nodes.map((node, i) => {
     const reach = blastReach(graph, i);
@@ -3313,6 +3326,8 @@ function drawBlastSVG() {
   for (const edge of blastDrawEdges) {
     const a = bounds.get(edge.from), b = bounds.get(edge.to);
     if (!a || !b) continue;
+    // Anchor each connector on the facing horizontal or vertical card midpoint
+    // (based on dominant center-to-center axis) and curve it with a clamped bend.
     const dx = (b.left + b.right - a.left - a.right) / 2;
     const dy = (b.top + b.bottom - a.top - a.bottom) / 2;
     const horizontal = Math.abs(dx) > Math.abs(dy);
@@ -3692,7 +3707,7 @@ function renderHWCard(vm, row) {
 }
 
 /* ============================================================================
-   TAB 3: DEVICES & WI-FI (Network Zones Explained Like Rooms)
+   TAB 4: DEVICES & WI-FI (Network Zones Explained Like Rooms)
    ========================================================================== */
 function wifiSecurityBadge(w) {
   const sec = (w.security || "").toLowerCase().trim();
@@ -3959,7 +3974,7 @@ function renderDeviceRow(vm, ent) {
 }
 
 /* ============================================================================
-   TAB 4: ACTIVITY (Friendly Chronological Timeline)
+   TAB 5: ACTIVITY (Friendly Chronological Timeline)
    ========================================================================== */
 function renderActivity() {
   const vm = state.view || { entities: {} };
@@ -4083,6 +4098,9 @@ function plainSummaryForEntity(vm, ent) {
   return `Review this security rule below to make sure it matches what you want allowed on your network.`;
 }
 
+// Classify an IP as internal if it falls in private, CGNAT, loopback, or
+// link-local IPv4/IPv6 ranges, or matches an individual entity IP in the live
+// site snapshot (covering public LAN entity IPs and IPv6 GUAs, not subnet matching).
 function isInternalIP(ip) {
   if (!ip) return false;
   const s = String(ip).trim().toLowerCase();
@@ -4665,6 +4683,10 @@ if (authForm) {
   });
 }
 
+// Single-flight state refresher for /api/v1/state. Coalesces overlapping SSE
+// and timer triggers while upgrading a queued progressOnly tick to a full
+// refresh if any non-progress event arrives, handles 401/429 auth overlays,
+// and reconnects SSE once authenticated.
 let fetchQueuedProgressOnly = true;
 async function fetchState(progressOnly = false) {
   if (isStaticMode) return;
@@ -4820,6 +4842,11 @@ function scheduleSSEReconnect() {
   }, delay);
 }
 
+// Subscribe to /api/v1/events/stream over SSE. Lightweight scan_progress
+// signals request progress-only UI refreshes; other events request a full
+// refresh (a coalesced refresh may still be pending) and show a toast for
+// eligible events (showToast skips startup and summary-less events). CLOSED
+// errors back off via scheduleSSEReconnect.
 function connectSSE() {
   if (isStaticMode || authRequired) return;
   if (sseSource) {

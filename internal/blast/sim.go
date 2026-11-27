@@ -38,7 +38,8 @@ type SimNode struct {
 	Role string `json:"role"`
 	// Tier is the asset's impact classification.
 	Tier string `json:"tier"`
-	// EntryExposure describes the strongest available entry.
+	// EntryExposure is the display label for the highest-exposure entry path
+	// (for example, "WAN TCP/443", "Outdoor cable", or "Local LAN").
 	EntryExposure string `json:"entry_exposure"`
 	// LocalExposure describes entry after all public routes are closed.
 	LocalExposure string `json:"local_exposure"`
@@ -56,8 +57,9 @@ type SimEdge struct {
 	From string `json:"from"`
 	// To identifies the destination asset.
 	To string `json:"to"`
-	// Tier distinguishes WAN entry, takeover, likely risk, admin pivot and terminal L2 exposure.
-	// Unknown reachability retains the evidence tier for mode-specific coverage.
+	// Tier classifies the edge evidence: "wan", "takeover", "likely", "pivot",
+	// "l2", "unknown", "unknown-takeover", or "unknown-likely". Unknown variants
+	// preserve the underlying evidence tier for mode-specific traversal.
 	Tier string `json:"tier"`
 	// Label describes the service or permission on this route.
 	Label string `json:"label"`
@@ -364,7 +366,9 @@ func (listeners simListenerIndex) add(s socket, tier, label string, sameNetwork 
 	})
 }
 
-// conditionalLabel names the observed interface without claiming its access prerequisites were met.
+// conditionalLabel names the observed interface without claiming its access
+// prerequisites were met. The five explicit check overrides replace verbose
+// finding titles with compact protocol or product names suited for graph edges.
 func conditionalLabel(f checks.Finding, effect string) string {
 	name := strings.TrimPrefix(strings.TrimPrefix(f.Title, "Unauthenticated "), "Unencrypted ")
 	switch f.CheckID {
@@ -397,12 +401,16 @@ func (b *builder) simGrant(e edge, disruptionOnly map[string]bool) (tier, label 
 		}
 		return "takeover", detail
 	case detail == "control" || detail == "configure" || detail == "pivot":
+		// Exclude "configure" from conditional "likely" edges because changing
+		// settings without host control or pivot does not establish a lateral takeover.
 		if e.finding != 0 && e.level == moderate && detail != "configure" {
 			return "likely", conditionalLabel(b.Findings[e.finding-1], detail)
 		}
 		if e.level < moderate && (strings.HasPrefix(id, "act:check:") || strings.HasPrefix(id, "act:service:")) {
 			return "takeover", "Unauthenticated " + detail
 		}
+	// These four SMB/SSH hardening findings expose lateral movement paths
+	// (relay, SMBv1 exploitation, or weak SSH crypto) and map to "likely" edges.
 	case detail == "service setting: NERVA-SMB-SIGNING-NOT-REQUIRED":
 		return "likely", "Unsigned SMB (relay risk)"
 	case detail == "service setting: NERVA-SMB-V1-ENABLED":
@@ -438,6 +446,8 @@ func (b *builder) simCVEs(listeners simListenerIndex, observed map[socket]bool) 
 	disruptionOnly := map[string]bool{}
 	for _, m := range b.CVEMatches {
 		r := m.Record
+		// Filter out availability/DoS-only CVEs using CVSS v3 (C:N and I:N) and
+		// CVSS v4 (VC:N, VI:N, SC:N, SI:N) vector metrics.
 		metrics := strings.Split(strings.Trim(r.CVSSVector, "()"), "/")
 		if (slices.Contains(metrics, "C:N") && slices.Contains(metrics, "I:N")) ||
 			(slices.Contains(metrics, "VC:N") && slices.Contains(metrics, "VI:N") && slices.Contains(metrics, "SC:N") && slices.Contains(metrics, "SI:N")) {
@@ -580,6 +590,8 @@ func (b *builder) simListeners() simListenerIndex {
 			}
 		}
 	}
+	// Common remote-management and file-sharing ports become "pivot" edges that
+	// are traversed only in ModeWorstCase (assuming credential reuse).
 	for s := range observed {
 		switch s.port {
 		case 22, 80, 443, 445, 623, 3389, 5900, 8006, 8443:
@@ -614,8 +626,9 @@ func compareWANLabels(a, b string) int {
 	return cmp.Compare(a, b)
 }
 
-// simNodes considers inventory devices only, so each selectable node has a
-// drawer. Additional attachments still participate in all reachability queries.
+// simNodes builds selectable simulation nodes restricted to real UniFi clients
+// and adopted devices. Additional attachments still participate in reachability
+// queries.
 func (b *builder) simNodes() []SimNode {
 	egress := map[string]string{}
 	for _, row := range b.cloud {
@@ -699,6 +712,7 @@ func (b *builder) simNodes() []SimNode {
 			VLAN: vlan, Zone: n.ZoneName, Role: role, Tier: string(b.assets[id].profile.Tier),
 			EntryExposure: cmp.Or(wan[id], local), LocalExposure: local, InternetState: st, IsDevice: device != nil,
 		}
+		// When a MAC appears as both a UniFi device and a client, prefer the device entry.
 		if prev, ok := nodes[id]; !ok || node.IsDevice || cmp.Or(cmp.Compare(node.VLAN, prev.VLAN), cmp.Compare(node.IP, prev.IP), cmp.Compare(node.Name, prev.Name)) < 0 {
 			nodes[id] = node
 		}
@@ -794,6 +808,8 @@ func (b *builder) simInfraEdges(kept map[string]bool) []SimEdge {
 // and L2 policy. Parallel witnesses stay separate until the browser applies cuts.
 func (b *builder) buildSimulation(report Report) *Simulation {
 	nodes := b.simNodes()
+	// Cap the interactive simulation graph at 60 nodes; simNodes sorts
+	// WAN-exposed hosts ahead of asset tier before truncating to the top 60.
 	sim := &Simulation{
 		InventoryCount: len(nodes), Nodes: nodes[:min(60, len(nodes))],
 		PolicyCount: len(b.Snapshot.FirewallPolicies) + len(b.Snapshot.SwitchACLs) + len(b.Snapshot.PortForwards),
@@ -822,6 +838,8 @@ func (b *builder) buildSimulation(report Report) *Simulation {
 	unknownEgress := map[string]bool{}
 	for _, a := range b.clients {
 		id := "act:vlan-egress:" + networkKey(b.network(a.client.NetworkID, a.client.NetworkName)) + "->internet"
+		// Hosts outside the 60-node map still run assessEgress when an egress
+		// action exists for their VLAN so targetAssets stays complete for host lookup.
 		if kept[a.host] {
 			attachments = append(attachments, a)
 		} else if actions[id] == nil {

@@ -212,7 +212,8 @@ var assetClassifier = sync.OnceValue(func() *Classifier {
 	return c
 })
 
-// ClientRoles resolves the operational role of each client, keyed like ResolveAssets.
+// ClientRoles resolves the operational role of each client, keyed by canonical
+// MAC, falling back to controller ID and then primary IP.
 func ClientRoles(snap *unifi.Snapshot, profiles []probe.HostProfile) map[string]Result {
 	roles := make(map[string]Result)
 	if snap == nil {
@@ -301,6 +302,8 @@ func (a *assetIndex) apply(o config.AssetOverride) []string {
 		warnings = append(warnings, fmt.Sprintf("Asset override for %s was skipped because ID %s belongs to a different device or client", mac, id))
 		key = ""
 	case mac != "" && byMAC == "" && byID != "" && a.macOf[byID] != "" && a.macOf[byID] != mac:
+		// The override's MAC was not seen in the scan, while its ID matched a
+		// scanned host that reports a different MAC; skip to avoid misattributing.
 		warnings = append(warnings, fmt.Sprintf("Asset override for %s was skipped because ID %s belongs to a different device or client (%s)", mac, id, a.macOf[byID]))
 		key = ""
 	case a.applied[key] != "":

@@ -117,6 +117,9 @@ func NewDemoEngine(opts Options) (*Engine, error) {
 
 	view := BuildPresentationModel(snap, report, topo, clientViews, exactCVEs, potentialCVEs, profiles)
 	demoChecks, _ := checks.LoadFromFS(builtinchecks.BuiltinFS)
+	// Demo mode runs completely offline without a local NVD/KEV cache, so seed
+	// synthetic VelocityHighProfile target signals for representative exposed
+	// services to exercise the same frequently-targeted badges and blast paths.
 	var demoSignals []blast.TargetSignal
 	for _, cl := range snap.Clients {
 		low := strings.ToLower(cl.Name + " " + cl.Hostname)

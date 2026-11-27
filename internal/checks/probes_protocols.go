@@ -42,7 +42,7 @@ func probeBitcoinP2P(ctx context.Context, ip string, port int, obs *Observation)
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 	}
 
-	// Build minimal 86-byte Bitcoin P2P version payload (version 70016, relay=false).
+	// Build minimal 99-byte Bitcoin P2P version payload (version 70016, relay=false).
 	var payload bytes.Buffer
 	_ = binary.Write(&payload, binary.LittleEndian, int32(70016))            // protocol version
 	_ = binary.Write(&payload, binary.LittleEndian, uint64(0))               // services
@@ -113,6 +113,8 @@ func probeBitcoinP2P(ctx context.Context, ip string, port int, obs *Observation)
 	return fmt.Sprintf("Bitcoin P2P (%s) version=%d", network, protoVer), true
 }
 
+// bitcoinNetworkFromMagic maps the 4-byte Bitcoin P2P message framing magic to
+// its network name (mainnet, testnet3, signet, or regtest).
 func bitcoinNetworkFromMagic(m []byte) string {
 	switch {
 	case bytes.Equal(m, []byte{0xf9, 0xbe, 0xb4, 0xd9}):
@@ -128,6 +130,8 @@ func bitcoinNetworkFromMagic(m []byte) string {
 	}
 }
 
+// parseBitcoinUserAgent extracts the length-prefixed user-agent string from a
+// Bitcoin P2P version payload after its fixed 80-byte prefix.
 func parseBitcoinUserAgent(payload []byte) string {
 	// Version(4) + Services(8) + Time(8) + AddrRecv(26) + AddrFrom(26) + Nonce(8) = 80
 	if len(payload) <= 80 {
@@ -399,6 +403,8 @@ func probeNBNS(ctx context.Context, ip string, port int, obs *Observation) (stri
 	if err != nil || n < 57 {
 		return "", false
 	}
+	// RFC 1002 NBSTAT reply: matching tx ID, QR response bit (0x80) in byte 2,
+	// NUMBER_OF_NAMES at byte 56, then 18-byte entries (15B name, 1B suffix, 2B flags).
 	if buf[0] != tx[0] || buf[1] != tx[1] || (buf[2]&0x80) == 0 {
 		return "", false
 	}
@@ -409,6 +415,7 @@ func probeNBNS(ctx context.Context, ip string, port int, obs *Observation) (stri
 	hasFileServer := false
 	for i := range numNames {
 		off := 57 + i*18
+		// Suffix 0x20 advertises the NetBIOS File Server Service.
 		suffix := buf[off+15]
 		if suffix == 0x20 {
 			hasFileServer = true
@@ -443,6 +450,8 @@ func probePCP(ctx context.Context, ip string, port int, obs *Observation) (strin
 	pkt := make([]byte, 24)
 	pkt[0] = 2 // PCP version 2
 	pkt[1] = 0 // ANNOUNCE request (R=0, Opcode=0)
+	// RFC 6887 section 7.1 encodes the client IP at bytes 8..24 as a 16-byte
+	// IPv6 or IPv4-mapped IPv6 address (falling back to ::ffff:127.0.0.1).
 	if laddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && laddr.IP != nil {
 		copy(pkt[8:24], laddr.IP.To16())
 	} else {
@@ -457,6 +466,7 @@ func probePCP(ctx context.Context, ip string, port int, obs *Observation) (strin
 	if err != nil || n < 24 {
 		return "", false
 	}
+	// Expect PCP v2, R=1 + ANNOUNCE opcode (0x80), and Result Code 0 (SUCCESS).
 	if buf[0] != 2 || buf[1] != 0x80 || buf[3] != 0 {
 		return "", false
 	}
@@ -583,6 +593,7 @@ func probeSTUN(ctx context.Context, ip string, port int, obs *Observation) (stri
 	if err != nil || n < 20 {
 		return "", false
 	}
+	// Validate RFC 5389 Binding Success Response (0x0101), magic cookie, and 96-bit transaction ID.
 	if binary.BigEndian.Uint16(buf[0:2]) != 0x0101 ||
 		binary.BigEndian.Uint32(buf[4:8]) != 0x2112A442 ||
 		!bytes.Equal(buf[8:20], pkt[8:20]) {

@@ -59,7 +59,8 @@ func getLegacyRows[T any](ctx context.Context, c *Controller, path string) ([]T,
 	return env.Data, err
 }
 
-// UnmarshalJSON requires legacy data to be present; meta errors are checked by the transport.
+// UnmarshalJSON requires a non-nil legacy data array so missing or malformed
+// envelopes fail cleanly; meta.rc errors are checked by the HTTP transport.
 func (env *apiEnvelope[T]) UnmarshalJSON(raw []byte) error {
 	type plain apiEnvelope[T]
 	var value plain
@@ -73,7 +74,10 @@ func (env *apiEnvelope[T]) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
-// finishSessionLogin resolves the site's routing name without recursively acquiring loginMu.
+// finishSessionLogin resolves the site's internal routing reference via
+// /api/self/sites using getJSONOnce (avoiding recursive loginMu acquisition),
+// tolerates permission/404 denials on restricted accounts, and commits the
+// active session state and authEpoch under authMu.
 func (c *Controller) finishSessionLogin(ctx context.Context, prefix, kind string) error {
 	_, wanted := c.sessionPrefixAndSite()
 	var env apiEnvelope[struct {
@@ -163,7 +167,9 @@ func signalDBM(signal, rssi int) int {
 	return 0
 }
 
-// networkAliases joins legacy and external network IDs only within the current site.
+// networkAliases maps legacy network _id and external_id references to
+// canonical network IDs within the current site, falling back to unambiguous
+// name/VLAN matches only when external_id is absent and the hints agree.
 func networkAliases(networks []Network, legacy []rawNetwork) aliases {
 	a, names, vlans := make(aliases), make(aliases), make(aliases)
 	for _, n := range networks {
@@ -280,7 +286,10 @@ func assignClientNetwork(c *Client, id, name string, ids aliases, nets []Network
 	}
 }
 
-// aclCoverage reports schema errors even on rows missing a valid enabled flag.
+// aclCoverage summarizes switch ACL completeness as "unavailable", "partial",
+// or "complete". Unsupported selectors and duplicate IDs downgrade coverage
+// even on disabled rows, while duplicate (RuleType, Index) priorities are
+// checked across enabled rules.
 func aclCoverage(rows []SwitchACL, err error) *SwitchACLCoverage {
 	if err != nil {
 		return &SwitchACLCoverage{Status: "unavailable", Reason: shortFetchErr(err)}
@@ -362,6 +371,9 @@ func (feeds sessionPolicyFeeds) apply(s *Snapshot, raw []rawNetwork, devices ali
 		if n.ZoneID == "" {
 			id = byNet[n.ID]
 		} else if member, ok := byNet[n.ID]; ok && member != id {
+			// Clear the zone assignment when rest/networkconf and the v2 zone
+			// membership list disagree so isolation evaluation reports unknown
+			// rather than guessing which zone owns the network.
 			id = ""
 		}
 		s.Networks[i].ZoneID, s.Networks[i].ZoneName = id, zones[id].Name
@@ -421,7 +433,9 @@ func normalizeNetworkRefs(ep *PolicyEndpoint, nets aliases) {
 	}
 }
 
-// joinByUniqueField restricts legacy name and VLAN fallbacks to unambiguous entries.
+// joinByUniqueField indexes legacy rest/networkconf rows by _id and builds
+// unambiguous lowercase-name and VLAN-tag fallback lookup maps only for rows
+// that omit external_id.
 func joinByUniqueField(legacy []rawNetwork) (map[string]rawNetwork, aliases, aliases) {
 	rows := make(map[string]rawNetwork)
 	names, vlans := make(aliases), make(aliases)

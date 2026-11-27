@@ -42,6 +42,9 @@ import (
 	"github.com/karalabe/uniblue/internal/risk"
 )
 
+// Browser session cookie lifetime/capacity and per-IP brute-force lockout
+// schedule: 5 failed token attempts within 15 minutes trigger a 15-minute
+// lockout that doubles on consecutive lockouts up to 1 hour.
 const (
 	sessionCookieName = "uniblue_session"
 	sessionTTL        = 30 * 24 * time.Hour
@@ -54,13 +57,16 @@ const (
 	authMaxTrackedClients  = 1024
 )
 
-// Session cookies are independent random secrets. Only their digests and
-// expirations are stored alongside the digest of the configured API token.
+// sessionData is the persisted JSON representation of active browser sessions.
+// Session cookies are independent random secrets; only their SHA-256 digests
+// and Unix expiration timestamps are stored alongside the active API token digest.
 type sessionData struct {
 	TokenHash string           `json:"token_hash"`
 	Expires   map[string]int64 `json:"expires"`
 }
 
+// sessionStore manages persisted HttpOnly browser sessions bound to the active
+// API token, invalidating saved sessions automatically if the token rotates.
 type sessionStore struct {
 	mu    sync.Mutex
 	path  string
@@ -157,6 +163,9 @@ func (s *sessionStore) commitLocked(next sessionData) error {
 	return nil
 }
 
+// create generates a random 256-bit session cookie, prunes expired entries
+// (evicting the oldest active session if maxActiveSessions is reached), and
+// atomically persists the updated store.
 func (s *sessionStore) create(token string) (string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -188,7 +197,8 @@ func (s *sessionStore) create(token string) (string, error) {
 	return cookie, nil
 }
 
-// lookup validates the cookie under the same lock used to revoke it.
+// lookup verifies cookie against the active API token and expiration under
+// s.mu, optionally revoking the session and committing the change atomically.
 func (s *sessionStore) lookup(cookie, token string, revoke bool) (bool, error) {
 	if len(cookie) != 64 || token == "" {
 		return false, nil
@@ -239,8 +249,9 @@ func (l *authFailureLimiter) now() time.Time {
 	return time.Now()
 }
 
-// verifyToken checks lockout, compares the credential and records a failure
-// under one lock, including when several attempts arrive concurrently.
+// verifyToken checks lockout state, performs a constant-time comparison against
+// token, and records failed attempts under a single lock so concurrent requests
+// cannot race past authMaxFailedAttempts.
 func (l *authFailureLimiter) verifyToken(ip, candidate, token string) (valid bool, retryAfter time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -283,6 +294,9 @@ func (l *authFailureLimiter) verifyToken(ip, candidate, token string) (valid boo
 	return false, 0
 }
 
+// evictStaleLocked bounds the tracked-IP map to authMaxTrackedClients, pruning
+// expired records first and preferring to evict the oldest unlocked entry;
+// when every tracked entry is locked, it evicts the oldest locked entry.
 func (l *authFailureLimiter) evictStaleLocked(now time.Time) {
 	for k, st := range l.clients {
 		if !now.Before(st.lockedUntil) && now.Sub(st.lastSeen) > authFailureWindow {
@@ -292,8 +306,8 @@ func (l *authFailureLimiter) evictStaleLocked(now time.Time) {
 	if len(l.clients) < authMaxTrackedClients {
 		return
 	}
-	// Prefer evicting the oldest UNLOCKED entry so flooding fresh addresses
-	// cannot evict an actively locked-out client.
+	// Prefer evicting the oldest UNLOCKED entry; fall back to the oldest
+	// locked entry only if every tracked entry is currently locked.
 	var oldestUnlockedKey string
 	var oldestUnlockedTime time.Time
 	var oldestLockedKey string
@@ -318,6 +332,8 @@ func (l *authFailureLimiter) evictStaleLocked(now time.Time) {
 	}
 }
 
+// clientRemoteIP extracts and normalizes the peer IP from r.RemoteAddr,
+// stripping any port, IPv6 brackets, or IPv4-mapped IPv6 prefix.
 func clientRemoteIP(r *http.Request) string {
 	raw := strings.TrimSpace(r.RemoteAddr)
 	if raw == "" {
@@ -343,18 +359,30 @@ type apiError struct {
 // HealthResponse is the lightweight liveness and scan-watchdog payload served by
 // GET /api/v1/health.
 type HealthResponse struct {
-	Status         string    `json:"status"`
-	Site           string    `json:"site"`
-	ControllerType string    `json:"controller_type,omitempty"`
-	StartedAt      time.Time `json:"started_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// Status is "ok", "scanning" (during the initial baseline), or "degraded" (when LastScanError is non-empty).
+	Status string `json:"status"`
+	// Site is the UniFi site name monitored by this server.
+	Site string `json:"site"`
+	// ControllerType identifies the detected UniFi API mode (e.g., "integration-v1", "unifi-os").
+	ControllerType string `json:"controller_type,omitempty"`
+	// StartedAt records when the server started.
+	StartedAt time.Time `json:"started_at"`
+	// UpdatedAt records when the published state snapshot last changed.
+	UpdatedAt time.Time `json:"updated_at"`
+	// LastFullScanAt records when the most recent full LAN reconciliation completed.
 	LastFullScanAt time.Time `json:"last_full_scan_at,omitempty"`
-	LastScanError  string    `json:"last_scan_error,omitempty"`
-	Scanning       bool      `json:"scanning"`
-	EventMode      string    `json:"event_mode"`
-	CVELoaded      bool      `json:"cve_loaded"`
-	ClientCount    int       `json:"client_count"`
-	FindingCount   int       `json:"finding_count"`
+	// LastScanError holds the most recent full-scan error message, cleared on the next successful full scan.
+	LastScanError string `json:"last_scan_error,omitempty"`
+	// Scanning reports whether a full or targeted host scan is currently running.
+	Scanning bool `json:"scanning"`
+	// EventMode describes the active UniFi ingestion or export mode ("websocket", "poll-<interval>", or "demo").
+	EventMode string `json:"event_mode"`
+	// CVELoaded reports whether CVE data is available in the snapshot (demo mode sets this with synthetic data without a local cache).
+	CVELoaded bool `json:"cve_loaded"`
+	// ClientCount is the number of active UniFi clients in the latest snapshot.
+	ClientCount int `json:"client_count"`
+	// FindingCount is the total number of findings in the latest risk report.
+	FindingCount int `json:"finding_count"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -429,8 +457,9 @@ func (e *Engine) Serve(ctx context.Context) error {
 // endpoints wrapped with Host (DNS-rebinding), Origin/Sec-Fetch-Site (CSRF),
 // and optional Bearer token / HttpOnly session cookie protection.
 func (e *Engine) Handler() http.Handler {
-	// Bind persistence to the same state file as the engine. Initializing here
-	// also invalidates saved sessions when starting with a rotated token.
+	// Store sessions in a sibling .sessions.json file alongside e.cfg.State.Path.
+	// Initializing here also invalidates saved sessions if the server starts with
+	// a rotated API token.
 	var path string
 	if e.cfg != nil && e.cfg.State.Path != "" {
 		path = e.cfg.State.Path + ".sessions.json"
@@ -464,6 +493,9 @@ func (e *Engine) Handler() http.Handler {
 	mux.HandleFunc("GET /assets/favicon.svg", serveEmbeddedSVG("logo-light.svg"))
 	mux.HandleFunc("GET /favicon.ico", serveEmbeddedSVG("logo-light.svg"))
 
+	// Intercept unmatched /api/* paths so API clients always receive structured
+	// JSON 405 Method Not Allowed or 404 Not Found envelopes instead of plain-text
+	// ServeMux errors.
 	jsonFallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			if _, pat := mux.Handler(r); pat == "" {
@@ -568,6 +600,8 @@ func isAllowedLANHostName(host string) bool {
 	return false
 }
 
+// matchesAllowedHost checks hostHeader against explicit reverse-proxy allowlist
+// entries, normalizing URL prefixes, trailing slashes/dots, and optional ports.
 func matchesAllowedHost(hostHeader string, allowed []string) bool {
 	raw := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostHeader), "."))
 	if raw == "" || len(allowed) == 0 {
@@ -612,8 +646,10 @@ func requestHostName(hostHeader string) string {
 	return strings.Trim(h, "[]")
 }
 
-// authenticateAPI checks a browser session before applying the per-IP token
-// limiter. handled indicates that a storage error or lockout response was sent.
+// authenticateAPI validates a browser HttpOnly session cookie first (clearing
+// invalid or expired cookies) before falling back to Bearer token auth guarded
+// by the per-IP failure limiter. When handled is true, an error or 429 lockout
+// response has already been written to w.
 func (e *Engine) authenticateAPI(w http.ResponseWriter, r *http.Request, tok string) (authenticated, handled bool) {
 	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
 		valid, err := e.sessions.lookup(ck.Value, tok, false)
@@ -684,6 +720,8 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 			}
 		}
 
+		// Allow /api/v1/session through the middleware auth gate because its
+		// handlers manage login, auth status checks, and cookie revocation directly.
 		isSessionEndpoint := r.URL.Path == "/api/v1/session" &&
 			(r.Method == http.MethodGet || r.Method == http.MethodPost || r.Method == http.MethodDelete)
 		if isAPI && !isSessionEndpoint {
@@ -704,6 +742,8 @@ func (e *Engine) protectHTTP(next http.Handler) http.Handler {
 	})
 }
 
+// isSecureRequest reports whether the request arrived over TLS directly or
+// behind an HTTPS-terminating reverse proxy (via X-Forwarded-Proto).
 func isSecureRequest(r *http.Request) bool {
 	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
@@ -733,6 +773,8 @@ func (e *Engine) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleSessionCreate verifies the submitted Bearer or JSON API token under
+// the per-IP failure limiter and issues a persisted HttpOnly session cookie.
 func (e *Engine) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	tok := e.effectiveAPIToken()
 	if tok == "" {
@@ -797,7 +839,7 @@ func (e *Engine) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 
 // RenderStaticHTML renders a self-contained, offline interactive HTML snapshot
 // of the full UniBlue console (with embedded logos and baked JSON state) for
-// `uniblue topology -out topology.html`.
+// `uniblue topology -out` and `uniblue demo -out`.
 func RenderStaticHTML(w io.Writer, snap StateSnapshot) error {
 	rawState, err := json.Marshal(snap)
 	if err != nil {
@@ -816,6 +858,9 @@ func RenderStaticHTML(w io.Writer, snap StateSnapshot) error {
 		html = strings.ReplaceAll(html, `srcset="/assets/logo-dark.svg"`, `srcset="`+uri+`"`)
 	}
 
+	// Inject the static JSON blob immediately before the first <script> tag;
+	// dashboardHTML keeps the main app script as its first <script> element so
+	// uniblue-static-state is present in the DOM before boot code executes.
 	tag := `<script id="uniblue-static-state" type="application/json">` + safeJSON + `</script>` + "\n<script>"
 	html = strings.Replace(html, "<script>", tag, 1)
 
@@ -866,6 +911,8 @@ func (e *Engine) handleState(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, e.Snapshot())
 }
 
+// handleFindings serves GET /api/v1/findings with optional minimum severity,
+// category, and host query filters.
 func (e *Engine) handleFindings(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var (
@@ -902,6 +949,8 @@ func (e *Engine) handleFindings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"findings": out})
 }
 
+// handleCVEs serves GET /api/v1/cves with optional minimum severity, KEV-only,
+// and host filters applied to both exact and potential CVE product rollups.
 func (e *Engine) handleCVEs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var (
@@ -955,6 +1004,9 @@ func (e *Engine) handleCVEs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// resolveHostFilterAliases expands a host query (IP, MAC, entity ID, or display
+// name) into the lowercase set of matching names and IPv4/IPv6 addresses across
+// clients and host entities so CVE rollups match regardless of identifier form.
 func resolveHostFilterAliases(snap StateSnapshot, hostFilter string) map[string]struct{} {
 	if hostFilter == "" {
 		return nil
@@ -1008,6 +1060,9 @@ func matchesCVESummaryHost(s cve.ProductSummary, hostFilter string, aliases map[
 	return false
 }
 
+// collectHostEntities returns all host entities sorted worst-verdict-first then
+// alphabetically, preferring finalized PresentationModel entities and falling
+// back to snap.Clients before the first presentation model is built.
 func collectHostEntities(snap StateSnapshot) []Entity {
 	var hosts []Entity
 	if snap.View != nil && len(snap.View.Entities) > 0 {
@@ -1079,6 +1134,8 @@ func entityMatchesIdentifier(ent Entity, query string) bool {
 	return false
 }
 
+// handleHosts serves GET /api/v1/hosts with optional vlan, role, and verdict
+// state query filters.
 func (e *Engine) handleHosts(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	vlanFilter := strings.TrimSpace(q.Get("vlan"))
@@ -1110,6 +1167,8 @@ func (e *Engine) handleHosts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"hosts": out})
 }
 
+// collectDeviceEntities returns all UniFi infrastructure device entities from
+// snap.View sorted worst-verdict-first then alphabetically by label.
 func collectDeviceEntities(snap StateSnapshot) []Entity {
 	var devices []Entity
 	if snap.View != nil && len(snap.View.Entities) > 0 {
@@ -1160,7 +1219,8 @@ func (e *Engine) handleHostByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, host)
 }
 
-// resolveHostEntity prefers clients and recognizes the gateway's external address.
+// resolveHostEntity resolves id against LAN clients first and then UniFi
+// infrastructure devices (including the gateway's external WAN IP).
 func resolveHostEntity(snap StateSnapshot, id string) (Entity, bool) {
 	for _, h := range collectHostEntities(snap) {
 		if entityMatchesIdentifier(h, id) {
@@ -1175,7 +1235,10 @@ func resolveHostEntity(snap StateSnapshot, id string) (Entity, bool) {
 	return Entity{}, false
 }
 
-// resolveBlastHost prefers live inventory aliases over simulation nodes and offline backends.
+// resolveBlastHost maps a host or device identifier to its canonical
+// blast-simulation asset key and optional UniFi device entity, checking live
+// clients and infrastructure devices first, then simulation nodes, and finally
+// offline port-forward backend IPs that have no inventory drawer.
 func resolveBlastHost(snap StateSnapshot, id string) (string, *Entity) {
 	id = strings.TrimSpace(id)
 	if id == "" || strings.EqualFold(id, "host:ip/") {
@@ -1226,7 +1289,9 @@ func resolveBlastHost(snap StateSnapshot, id string) (string, *Entity) {
 	return "", nil
 }
 
-// deviceInfraBlast matches the logical controller to its host independently of device names.
+// deviceInfraBlast selects infrastructure compromise reports belonging to a
+// single device, matching the logical Controller scope by HostedOnID and
+// hardware scopes by canonical TargetID (falling back to device label/ID).
 func deviceInfraBlast(reports []blast.InfraReport, device *Entity, key string) []blast.InfraReport {
 	out := []blast.InfraReport{}
 	matchesDevice := func(s string) bool {
@@ -1458,6 +1523,8 @@ func (e *Engine) handleDeviceByID(w http.ResponseWriter, r *http.Request) {
 	writeAPIError(w, http.StatusNotFound, "not_found", fmt.Sprintf("device %q not found", id))
 }
 
+// handleIsolation serves GET /api/v1/isolation with optional verdict, source,
+// and dest filters, recomputing summary verdict counts over the filtered cells.
 func (e *Engine) handleIsolation(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	verdictFilter := strings.ToLower(strings.TrimSpace(q.Get("verdict")))
@@ -1506,6 +1573,8 @@ func (e *Engine) handleIsolation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// handleEventsList serves GET /api/v1/events with optional since_id, limit,
+// severity, and comma-separated type filters over the recent event history.
 func (e *Engine) handleEventsList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var sinceID int64
@@ -1574,6 +1643,9 @@ func (e *Engine) handleEventsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": out})
 }
 
+// handleEventsStream serves GET /api/v1/events/stream over Server-Sent Events,
+// replaying missed events after Last-Event-ID (or last_event_id) without
+// duplicates and sending 15-second comment pings to keep proxies alive.
 func (e *Engine) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {

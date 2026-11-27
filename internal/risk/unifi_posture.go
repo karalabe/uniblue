@@ -32,12 +32,23 @@ var oobVLANPattern = regexp.MustCompile(`(?i)\b(oob|mgmt|management|bmc|ipmi|idr
 // Wi-Fi SSID inventory, neighboring AP counts, WAN/VPN health, and recent
 // controller security/admin log highlights for JSON reports and the Web UI.
 type UniFiPostureSummary struct {
-	Settings      *unifi.SiteSecuritySettings `json:"settings,omitempty"`
-	Health        *unifi.SystemHealth         `json:"health,omitempty"`
-	WLANs         []unifi.WLANConfig          `json:"wlans,omitempty"`
-	NeighborAPs   int                         `json:"neighbor_aps"`
-	EvilTwinCount int                         `json:"evil_twin_count"`
-	RecentLogs    []unifi.ControllerLogEvent  `json:"recent_logs,omitempty"`
+	// Settings holds non-secret site-wide security controls (SSH, UPnP, IDS/IPS, Honeypot, DoH, Teleport).
+	Settings *unifi.SiteSecuritySettings `json:"settings,omitempty"`
+
+	// Health holds gateway WAN status, reported WAN IP, and active VPN session counts.
+	Health *unifi.SystemHealth `json:"health,omitempty"`
+
+	// WLANs lists configured Wi-Fi SSIDs and their encryption and isolation settings.
+	WLANs []unifi.WLANConfig `json:"wlans,omitempty"`
+
+	// NeighborAPs is the total count of neighboring/foreign BSSIDs observed in stat/rogueap.
+	NeighborAPs int `json:"neighbor_aps"`
+
+	// EvilTwinCount counts unique foreign BSSIDs advertising one of the site's enabled SSIDs.
+	EvilTwinCount int `json:"evil_twin_count"`
+
+	// RecentLogs holds recent security and admin activity events collected from the controller.
+	RecentLogs []unifi.ControllerLogEvent `json:"recent_logs,omitempty"`
 }
 
 // AnalyzeUniFiPosture audits Wi-Fi security (WLAN configs + Evil-Twin/Rogue APs),
@@ -196,6 +207,9 @@ func AnalyzeUniFiPosture(
 	seenEvil := make(map[string]struct{})
 	seenRogueWired := make(map[string]struct{})
 	for _, rap := range snap.RogueAPs {
+		// Pass nil for knownOwnedVAPBSSIDs: stat/rogueap already excludes owned
+		// radios and evil twins frequently spoof adopted AP BSSIDs, so never
+		// suppress entries heuristically.
 		if rap.BSSID == "" || isOwnedUniFiRadio(rap, nil) {
 			continue
 		}
@@ -425,6 +439,9 @@ func AnalyzeUniFiPosture(
 	return summary, findings, notes
 }
 
+// primaryGatewayDevice locates the site's primary UniFi gateway from
+// snap.Devices, matching gateway types/models first, then a root device with
+// no uplink, then the first listed device, and finally a placeholder record.
 func primaryGatewayDevice(snap *unifi.Snapshot) unifi.Device {
 	for _, d := range snap.Devices {
 		t := strings.ToLower(d.Type)

@@ -44,35 +44,65 @@ const (
 
 // Reason represents one concrete evidenced fact contributing to an entity's Verdict.
 type Reason struct {
-	ID          string       `json:"id"`
-	State       VerdictState `json:"state"`
-	Kind        string       `json:"kind"` // "check" | "cve" | "policy" | "placement" | "coverage" | "firmware"
-	Ref         string       `json:"ref"`
-	Title       string       `json:"title"`
-	Severity    string       `json:"severity"`
-	Expected    string       `json:"expected,omitempty"`
-	Observed    string       `json:"observed,omitempty"`
-	Evidence    string       `json:"evidence,omitempty"`
-	Remediation string       `json:"remediation,omitempty"`
-	Source      string       `json:"source"` // "probe" | "lldp" | "config" | "name-heuristic" | "nvd-cve" | "unifi-policy"
-	Port        int          `json:"port,omitempty"`
-	Secondary   bool         `json:"secondary,omitempty"`
+	// ID identifies this reason within the presentation model (a cross-linked reason can share its ID across entities).
+	ID string `json:"id"`
+	// State is the verdict level contributed by this reason ("exposed", "review", "unknown", or "ok").
+	State VerdictState `json:"state"`
+	// Kind classifies the finding category ("check", "cve", "policy", "placement", "coverage", or "firmware").
+	Kind string `json:"kind"`
+	// Ref is the check ID, CVE list, or synthetic policy code backing this reason.
+	Ref string `json:"ref"`
+	// Title is a concise headline describing the issue.
+	Title string `json:"title"`
+	// Severity is the normalized severity string ("critical", "high", "medium", "low", "info", or "unknown").
+	Severity string `json:"severity"`
+	// Expected states the desired compliant configuration or posture.
+	Expected string `json:"expected,omitempty"`
+	// Observed summarizes the live state that triggered this reason.
+	Observed string `json:"observed,omitempty"`
+	// Evidence holds the concrete probe output or controller detail proving the finding.
+	Evidence string `json:"evidence,omitempty"`
+	// Remediation describes the recommended operator action to clear this reason.
+	Remediation string `json:"remediation,omitempty"`
+	// Source identifies the subsystem that produced this reason ("probe",
+	// "nvd-cve", "unifi-policy", "unifi-controller", "unifi-port",
+	// "unifi-isolation", or "topology-placement").
+	Source string `json:"source"`
+	// Port is the associated TCP/UDP port or physical switch port index, when applicable.
+	Port int `json:"port,omitempty"`
+	// Secondary marks a cross-linked copy of a reason whose primary owner is another
+	// entity (such as a port, rule, or network) so it is not double-counted in queues or census totals.
+	Secondary bool `json:"secondary,omitempty"`
 }
 
 // ServiceView represents one discovered network service on a host along with
 // its computed reachability boundary and evidence provenance.
 type ServiceView struct {
-	Port             int    `json:"port"`
-	Proto            string `json:"proto"` // "tcp" | "udp"
-	AddressFamily    string `json:"address_family,omitempty"`
-	Name             string `json:"name,omitempty"`
-	Reachable        string `json:"reachable"` // "wan" | "wan-restricted" | "wan-unknown" | "wan-cgnat" | "lan" | "vlan-only" | "advertised" | "unknown"
-	State            string `json:"state,omitempty"`
-	SourceRestricted bool   `json:"source_restricted,omitempty"`
-	Exposed          bool   `json:"exposed,omitempty"`
-	Severity         string `json:"severity,omitempty"`
-	Label            string `json:"label,omitempty"`
-	// observedIPs keeps later findings on the service row that supplied their address.
+	// Port is the TCP or UDP port number (or start port for a wide UDP forward range).
+	Port int `json:"port"`
+	// Proto is the transport protocol ("tcp" or "udp").
+	Proto string `json:"proto"`
+	// AddressFamily is "ipv4", "ipv6", "dual", or empty when merged or unknown/unspecified.
+	AddressFamily string `json:"address_family,omitempty"`
+	// Name is the detected protocol or well-known service name (e.g., "ssh", "https").
+	Name string `json:"name,omitempty"`
+	// Reachable describes the computed network boundary ("wan", "wan-restricted",
+	// "wan-unknown", "wan-cgnat", "lan", "vlan-only", "advertised", or "unknown").
+	Reachable string `json:"reachable"`
+	// State records how the service was observed (e.g., "observed-protocol",
+	// "candidate-port", "connect-only", "advertised-service", or "configured-forward").
+	State string `json:"state,omitempty"`
+	// SourceRestricted reports whether WAN access is limited to specific source IPs or CIDRs.
+	SourceRestricted bool `json:"source_restricted,omitempty"`
+	// Exposed is true when any non-inventory finding flagged this service (does not require an active check).
+	Exposed bool `json:"exposed,omitempty"`
+	// Severity is the highest finding severity attached to this service when Exposed is true.
+	Severity string `json:"severity,omitempty"`
+	// Label is the compact UI chip text rendered for this service (e.g., "HTTPS :443").
+	Label string `json:"label,omitempty"`
+	// observedIPs retains the exact listener addresses observed for this row so
+	// subsequent findings attach to the matching listener instead of conflating
+	// distinct addresses on dual-stack or multi-IP hosts.
 	observedIPs []netip.Addr
 }
 
@@ -85,195 +115,339 @@ type ServiceView struct {
 //	port:<mac>/<portIdx>
 //	net:<id-or-name>
 //	host:<mac>  (or host:ip/<ip> when MAC absent)
-//	rule:<id>
-//	wlan:<name>
+//	rule:<idx>  (includes the finding's slice index and can shift between snapshots)
+//	child:<parentID>/<childID>
 type Entity struct {
 	// controllerID preserves the adopted device ID alongside its MAC-based drawer ID.
 	controllerID string
 
-	ID               string               `json:"id"`
-	Kind             string               `json:"kind"` // "device" | "port" | "network" | "host" | "rule" | "wlan"
-	Label            string               `json:"label"`
-	Subtitle         string               `json:"subtitle,omitempty"`
-	Role             string               `json:"role,omitempty"`        // "gateway"|"switch"|"ap"|"bmc"|"camera"|"server"|"iot"|...
-	Side             string               `json:"side,omitempty"`        // "inside"|"outside"|"unknown"
-	ZoneSource       string               `json:"zone_source,omitempty"` // "config"|"auto"|"parent_link"|"default"
-	Weight           int                  `json:"weight"`
-	State            VerdictState         `json:"state"`
-	MaxSeverity      string               `json:"max_severity"`
-	StateLabel       string               `json:"state_label"`
-	Reasons          []Reason             `json:"reasons,omitempty"`
-	PinNumber        int                  `json:"pin_number,omitempty"`
-	ScannedAt        *time.Time           `json:"scanned_at,omitempty"`
-	Skipped          bool                 `json:"skipped,omitempty"`
-	SkipReason       string               `json:"skip_reason,omitempty"`
-	DeviceID         string               `json:"device_id,omitempty"`
-	PortID           string               `json:"port_id,omitempty"`
-	NetworkID        string               `json:"network_id,omitempty"`
-	NetworkName      string               `json:"network_name,omitempty"`
-	APID             string               `json:"ap_id,omitempty"`
-	ESSID            string               `json:"essid,omitempty"`
-	IP               string               `json:"ip,omitempty"`
-	IPv6             []string             `json:"ipv6,omitempty"`
-	MAC              string               `json:"mac,omitempty"`
-	Vendor           string               `json:"vendor,omitempty"`
-	Model            string               `json:"model,omitempty"`
-	Firmware         string               `json:"firmware,omitempty"`
-	IsWired          bool                 `json:"is_wired,omitempty"`
-	IsBMC            bool                 `json:"is_bmc,omitempty"`
-	ExactCVECount    int                  `json:"exact_cve_count,omitempty"`
-	PotCVECount      int                  `json:"pot_cve_count,omitempty"`
-	Services         []ServiceView        `json:"services,omitempty"`
-	ConnectOnlyPorts []int                `json:"connect_only_ports,omitempty"`
-	ExactCVEs        []cve.ProductSummary `json:"exact_cves,omitempty"`
-	PotentialCVEs    []cve.ProductSummary `json:"potential_cves,omitempty"`
+	// ID is the entity identifier following the conventions documented above (rule:<idx> IDs can shift between snapshots).
+	ID string `json:"id"`
+	// Kind identifies the entity category ("device", "port", "network", "host", "rule", or "child").
+	Kind string `json:"kind"`
+	// Label is the primary human-readable display name.
+	Label string `json:"label"`
+	// Subtitle holds secondary identity metadata such as device role, model/IP, or VLAN subnet.
+	Subtitle string `json:"subtitle,omitempty"`
+	// Role classifies the entity's function (e.g., "gateway", "switch", "ap", "bmc", "camera", "server", "iot", "firewall").
+	Role string `json:"role,omitempty"`
+	// Side indicates physical perimeter placement ("inside", "outside", or "unknown").
+	Side string `json:"side,omitempty"`
+	// ZoneSource records how Side or port zoning was determined ("config", "auto", "parent_link", or "default").
+	ZoneSource string `json:"zone_source,omitempty"`
+	// Weight is the priority multiplier used when ranking items in the Fix-Next queue.
+	Weight int `json:"weight"`
+	// State is the finalized four-state security verdict for this entity.
+	State VerdictState `json:"state"`
+	// MaxSeverity is the highest active reason severity on this entity, or "ok" / "unknown".
+	MaxSeverity string `json:"max_severity"`
+	// StateLabel is the short status phrase displayed in badges (e.g., "No findings", "Exposed", "Mismatch").
+	StateLabel string `json:"state_label"`
+	// Reasons lists all evidenced findings, CVEs, and review notes attached to this entity, sorted worst-first.
+	Reasons []Reason `json:"reasons,omitempty"`
+	// PinNumber is the 1-based Fix-Next queue rank assigned to this entity, or 0 if unpinned.
+	PinNumber int `json:"pin_number,omitempty"`
+	// ScannedAt records when this host was last actively probed, or nil if unscanned.
+	ScannedAt *time.Time `json:"scanned_at,omitempty"`
+	// Skipped is true when active probing was intentionally skipped for this host.
+	Skipped bool `json:"skipped,omitempty"`
+	// SkipReason explains why active probing was skipped.
+	SkipReason string `json:"skip_reason,omitempty"`
+	// DeviceID links a port, rule, or wired host to its parent UniFi infrastructure device entity ID.
+	DeviceID string `json:"device_id,omitempty"`
+	// PortID links a wired host (or port itself) to its physical switch port entity ID.
+	PortID string `json:"port_id,omitempty"`
+	// NetworkID links an entity to its owning VLAN network entity ID.
+	NetworkID string `json:"network_id,omitempty"`
+	// NetworkName is the human-readable VLAN or network name.
+	NetworkName string `json:"network_name,omitempty"`
+	// APID links a wireless host to the UniFi access point entity ID it is associated with.
+	APID string `json:"ap_id,omitempty"`
+	// ESSID is the Wi-Fi SSID name for wireless hosts.
+	ESSID string `json:"essid,omitempty"`
+	// IP is the primary IPv4 address (or primary management IP for devices).
+	IP string `json:"ip,omitempty"`
+	// IPv6 lists observed IPv6 addresses for this host.
+	IPv6 []string `json:"ipv6,omitempty"`
+	// MAC is the lowercase hardware MAC address.
+	MAC string `json:"mac,omitempty"`
+	// Vendor is the resolved hardware manufacturer name.
+	Vendor string `json:"vendor,omitempty"`
+	// Model is the hardware model string for UniFi devices and enrolled child devices.
+	Model string `json:"model,omitempty"`
+	// Firmware is the reported firmware version for UniFi devices and enrolled child devices.
+	Firmware string `json:"firmware,omitempty"`
+	// IsWired reports whether a host is connected over Ethernet rather than Wi-Fi.
+	IsWired bool `json:"is_wired,omitempty"`
+	// IsBMC reports whether a host was identified as an out-of-band server management controller.
+	IsBMC bool `json:"is_bmc,omitempty"`
+	// ExactCVECount is the total number of exact-version CVE matches on this host or device.
+	ExactCVECount int `json:"exact_cve_count,omitempty"`
+	// PotCVECount is the total number of non-exact potential CVE matches on this host or device (including known versions with ambiguous vendor backports).
+	PotCVECount int `json:"pot_cve_count,omitempty"`
+	// Services lists deduplicated listening and forwarded network services on this host.
+	Services []ServiceView `json:"services,omitempty"`
+	// ConnectOnlyPorts lists protected print or serial sink TCP ports where probing deliberately stopped after TCP connect.
+	ConnectOnlyPorts []int `json:"connect_only_ports,omitempty"`
+	// ExactCVEs holds the rolled-up exact-version CVE summaries attached to this entity.
+	ExactCVEs []cve.ProductSummary `json:"exact_cves,omitempty"`
+	// PotentialCVEs holds the rolled-up non-exact CVE verification summaries attached to this entity (including known versions with ambiguous vendor backports).
+	PotentialCVEs []cve.ProductSummary `json:"potential_cves,omitempty"`
 
-	// Bridge-to-child and outbound dependency metadata.
-	ParentID              string                     `json:"parent_id,omitempty"`
-	ChildIDs              []string                   `json:"child_ids,omitempty"`
-	IdentitySource        string                     `json:"identity_source,omitempty"`
-	DirectLANReachability string                     `json:"direct_lan_reachability,omitempty"`
-	OutboundDependencies  []probe.OutboundDependency `json:"outbound_dependencies,omitempty"`
+	// ParentID links an enrolled child device to its owning bridge, NVR, or UniFi device entity ID.
+	ParentID string `json:"parent_id,omitempty"`
+	// ChildIDs lists enrolled child entity IDs managed behind this host or device.
+	ChildIDs []string `json:"child_ids,omitempty"`
+	// IdentitySource records which inventory feed supplied a child device's identity.
+	IdentitySource string `json:"identity_source,omitempty"`
+	// DirectLANReachability reports whether a child device is directly reachable on the LAN ("unknown", "non-ip-radio", or "routed", copied from inventory).
+	DirectLANReachability string `json:"direct_lan_reachability,omitempty"`
+	// OutboundDependencies lists external internet or cloud endpoints associated with this host (can come from owner config or vendor feeds without observed traffic).
+	OutboundDependencies []probe.OutboundDependency `json:"outbound_dependencies,omitempty"`
 
-	// Port telemetry (Kind == "port")
-	PortIdx      int    `json:"port_idx,omitempty"`
-	PortZone     string `json:"port_zone,omitempty"`
-	PortState    string `json:"port_state,omitempty"`
-	Speed        int    `json:"speed,omitempty"`
-	Media        string `json:"media,omitempty"`
-	PoEEnabled   bool   `json:"poe_enabled,omitempty"`
-	PoEPower     string `json:"poe_power,omitempty"`
-	NativeVLAN   string `json:"native_vlan,omitempty"`
+	// PortIdx is the 1-based physical port number on the parent switch or gateway (Kind == "port").
+	PortIdx int `json:"port_idx,omitempty"`
+	// PortZone is the physical perimeter zone classification (e.g., "internal", "external", "external_uplink", "unused", "wan").
+	PortZone string `json:"port_zone,omitempty"`
+	// PortState is the operational port status ("active", "inactive_enabled", or "disabled").
+	PortState string `json:"port_state,omitempty"`
+	// Speed is the negotiated link speed in Mbps.
+	Speed int `json:"speed,omitempty"`
+	// Media is the physical port media type (e.g., "GE", "SFP+").
+	Media string `json:"media,omitempty"`
+	// PoEEnabled reports whether Power over Ethernet is active on this port.
+	PoEEnabled bool `json:"poe_enabled,omitempty"`
+	// PoEPower is the formatted PoE power draw in watts.
+	PoEPower string `json:"poe_power,omitempty"`
+	// NativeVLAN is the untagged native network name assigned to this port.
+	NativeVLAN string `json:"native_vlan,omitempty"`
+	// TaggedPolicy summarizes tagged VLAN handling (e.g., "block_all", "all", "custom").
 	TaggedPolicy string `json:"tagged_policy,omitempty"`
-	// PortSecurityUnknown indicates missing MAC restriction settings.
-	PortSecurityUnknown  bool     `json:"port_security_unknown,omitempty"`
-	PortSecurity         bool     `json:"port_security,omitempty"`
-	PortIsolation        bool     `json:"port_isolation,omitempty"`
-	PortIsolationUnknown bool     `json:"port_isolation_unknown,omitempty"`
-	MACTableCount        int      `json:"mac_table_count,omitempty"`
-	STPState             string   `json:"stp_state,omitempty"`
-	PeerIDs              []string `json:"peer_ids,omitempty"`
+	// PortSecurityUnknown is true when the controller did not report MAC restriction state for this port.
+	PortSecurityUnknown bool `json:"port_security_unknown,omitempty"`
+	// PortSecurity reports whether MAC-address port security locking is enabled on this port.
+	PortSecurity bool `json:"port_security,omitempty"`
+	// PortIsolation reports whether switch port isolation is enabled on this port.
+	PortIsolation bool `json:"port_isolation,omitempty"`
+	// PortIsolationUnknown is true when the controller did not report port isolation state.
+	PortIsolationUnknown bool `json:"port_isolation_unknown,omitempty"`
+	// MACTableCount is the number of active MAC addresses learned on this switch port.
+	MACTableCount int `json:"mac_table_count,omitempty"`
+	// STPState is the Spanning Tree Protocol port state (e.g., "forwarding", "discarding", "blocking").
+	STPState string `json:"stp_state,omitempty"`
+	// PeerIDs lists the entity IDs of UniFi devices or clients connected to this port.
+	PeerIDs []string `json:"peer_ids,omitempty"`
 }
 
 // QueueItem is one ranked entry in the Fix-Next rail. Queue[0] drives the
 // top-of-page verdict sentence.
 type QueueItem struct {
-	Pin       int          `json:"pin"`
-	Sentence  string       `json:"sentence"`
-	Category  string       `json:"category"` // "perimeter"|"wan"|"bmc"|"service"|"controller"
-	Severity  string       `json:"severity"`
-	State     VerdictState `json:"state"`
-	Score     int          `json:"score"`
-	SubjectID string       `json:"subject_id"`
-	EntityIDs []string     `json:"entity_ids"`
-	ReasonRef string       `json:"reason_ref,omitempty"`
+	// Pin is the 1-based rank displayed on map pins and queue rows.
+	Pin int `json:"pin"`
+	// Sentence is the plain-English summary rendered for this queue item.
+	Sentence string `json:"sentence"`
+	// Category groups the item ("perimeter", "wan", "bmc", "service", or "controller").
+	Category string `json:"category"`
+	// Severity is the item's effective severity string.
+	Severity string `json:"severity"`
+	// State is the underlying subject entity's verdict state.
+	State VerdictState `json:"state"`
+	// Score is the numeric priority score used to sort the queue descending.
+	Score int `json:"score"`
+	// SubjectID is the primary Entity.ID opened when the operator clicks this item.
+	SubjectID string `json:"subject_id"`
+	// EntityIDs lists the subject and related entity IDs highlighted together on the map.
+	EntityIDs []string `json:"entity_ids"`
+	// ReasonRef is the check ID, CVE reference, or policy code of the specific reason behind this queue item (a device can produce multiple queue items with different reasons).
+	ReasonRef string `json:"reason_ref,omitempty"`
 }
 
 // WallGate represents one physical cable crossing the building perimeter wall.
 type WallGate struct {
-	PortID     string       `json:"port_id"`
-	SwitchID   string       `json:"switch_id"`
-	SwitchName string       `json:"switch_name"`
-	PortIdx    int          `json:"port_idx"`
-	TargetID   string       `json:"target_id,omitempty"`
-	TargetName string       `json:"target_name"`
-	Kind       string       `json:"kind"` // "feeder" | "drop"
-	Inferred   bool         `json:"inferred"`
-	State      VerdictState `json:"state"`
-	PinNumber  int          `json:"pin_number,omitempty"`
-	InlineFact string       `json:"inline_fact,omitempty"`
+	// PortID is the indoor switch port entity ID feeding this exterior cable.
+	PortID string `json:"port_id"`
+	// SwitchID is the parent indoor switch entity ID.
+	SwitchID string `json:"switch_id"`
+	// SwitchName is the display name of the parent indoor switch.
+	SwitchName string `json:"switch_name"`
+	// PortIdx is the 1-based physical port number on the parent switch.
+	PortIdx int `json:"port_idx"`
+	// TargetID is the connected outdoor device or client entity ID, if resolved.
+	TargetID string `json:"target_id,omitempty"`
+	// TargetName is the display label of the outdoor peer or cable port.
+	TargetName string `json:"target_name"`
+	// Kind distinguishes a trunk uplink to an outdoor switch ("feeder") from an end-host cable ("drop").
+	Kind string `json:"kind"`
+	// Inferred is true when perimeter zoning was detected heuristically rather than via explicit config.
+	Inferred bool `json:"inferred"`
+	// State mirrors the backing port entity's finalized verdict state.
+	State VerdictState `json:"state"`
+	// PinNumber mirrors the backing port entity's Fix-Next pin number, if any.
+	PinNumber int `json:"pin_number,omitempty"`
+	// InlineFact summarizes the port's native VLAN, tagged policy, and MAC-lock status.
+	InlineFact string `json:"inline_fact,omitempty"`
 }
 
-// WANFlow represents one inbound WAN firewall rule or port forward pointing to
-// a concrete host, gateway, or zone boundary.
+// WANFlow represents one inbound WAN firewall rule, port forward, or missing
+// edge-telemetry indicator pointing to a host, gateway, or zone boundary.
 type WANFlow struct {
-	ID         string       `json:"id"`
-	Kind       string       `json:"kind"` // "firewall" | "forward"
-	Label      string       `json:"label"`
-	RuleName   string       `json:"rule_name"`
-	TargetID   string       `json:"target_id,omitempty"`
-	TargetIP   string       `json:"target_ip,omitempty"`
-	TargetName string       `json:"target_name,omitempty"`
-	Expected   bool         `json:"expected,omitempty"`
-	State      VerdictState `json:"state"`
-	Severity   string       `json:"severity"`
-	PinNumber  int          `json:"pin_number,omitempty"`
+	// ID is the backing rule entity ID, synthetic "wanfwd:<idx>", or "wan-coverage:missing".
+	ID string `json:"id"`
+	// Kind distinguishes inbound firewall rules ("firewall"), port forwards ("forward"),
+	// and incomplete WAN telemetry warnings ("coverage").
+	Kind string `json:"kind"`
+	// Label is the compact protocol/port mapping or telemetry notice shown on the badge.
+	Label string `json:"label"`
+	// RuleName is the display name for this WAN entry (a UniFi rule or port-forward name, finding title, or coverage message).
+	RuleName string `json:"rule_name"`
+	// TargetID is the destination host or gateway entity ID, if resolved.
+	TargetID string `json:"target_id,omitempty"`
+	// TargetIP is the destination IP display field (from a port forward or firewall finding), if any.
+	TargetIP string `json:"target_ip,omitempty"`
+	// TargetName is the display name of the destination host or gateway.
+	TargetName string `json:"target_name,omitempty"`
+	// Expected is true for low-risk expected forwards (such as standard P2P or VPN ports).
+	Expected bool `json:"expected,omitempty"`
+	// State is the verdict state for this WAN entry.
+	State VerdictState `json:"state"`
+	// Severity is the assessed severity string ("critical", "high", "medium", "low", "info", or "unknown").
+	Severity string `json:"severity"`
+	// PinNumber mirrors the rule or target entity's Fix-Next pin number when unexpected.
+	PinNumber int `json:"pin_number,omitempty"`
 }
 
 // PhysicalRow represents one UniFi device row in the Physical Blueprint lens,
 // ordered in real LLDP tree order with depth indentation (or UplinkUnknown).
 type PhysicalRow struct {
-	DeviceID      string   `json:"device_id"`
-	Name          string   `json:"name"`
-	Model         string   `json:"model"`
-	IP            string   `json:"ip"`
-	Type          string   `json:"type"`
-	Version       string   `json:"version,omitempty"`
-	Upgradable    bool     `json:"upgradable,omitempty"`
-	Side          string   `json:"side"` // "inside" | "outside"
-	ZoneSource    string   `json:"zone_source,omitempty"`
-	Depth         int      `json:"depth"`
-	UplinkUnknown bool     `json:"uplink_unknown,omitempty"`
-	ParentID      string   `json:"parent_id,omitempty"`
-	ParentPortID  string   `json:"parent_port_id,omitempty"`
-	ParentLabel   string   `json:"parent_label,omitempty"`
-	PortIDs       []string `json:"port_ids,omitempty"`
-	SFPStartIdx   int      `json:"sfp_start_idx,omitempty"`
-	ClientCount   int      `json:"client_count,omitempty"`
-	SSIDs         []string `json:"ssids,omitempty"`
+	// DeviceID is the UniFi device entity ID ("dev:<mac>").
+	DeviceID string `json:"device_id"`
+	// Name is the device display name.
+	Name string `json:"name"`
+	// Model is the UniFi hardware model string.
+	Model string `json:"model"`
+	// IP is the device management IP address.
+	IP string `json:"ip"`
+	// Type is the UniFi device type code (e.g., "udm", "usw", "uap").
+	Type string `json:"type"`
+	// Version is the currently installed firmware version.
+	Version string `json:"version,omitempty"`
+	// Upgradable reports whether the controller advertises a newer firmware release.
+	Upgradable bool `json:"upgradable,omitempty"`
+	// Side indicates perimeter placement ("inside" or "outside").
+	Side string `json:"side"`
+	// ZoneSource records why an outdoor device was marked "outside" ("config", "auto", or "parent_link").
+	ZoneSource string `json:"zone_source,omitempty"`
+	// Depth is the zero-based tree indentation depth below the root gateway.
+	Depth int `json:"depth"`
+	// UplinkUnknown is true when the device's parent uplink could not be resolved in the LLDP tree.
+	UplinkUnknown bool `json:"uplink_unknown,omitempty"`
+	// ParentID is the upstream UniFi device entity ID, if known.
+	ParentID string `json:"parent_id,omitempty"`
+	// ParentPortID is the upstream switch port entity ID feeding this device, if known.
+	ParentPortID string `json:"parent_port_id,omitempty"`
+	// ParentLabel is the formatted uplink label (including port index and PoE draw when available).
+	ParentLabel string `json:"parent_label,omitempty"`
+	// PortIDs lists the physical port entity IDs belonging to this device in port order.
+	PortIDs []string `json:"port_ids,omitempty"`
+	// SFPStartIdx is the first port index using SFP/SFP+ media (0 if none), used to split copper and fiber banks.
+	SFPStartIdx int `json:"sfp_start_idx,omitempty"`
+	// ClientCount is the number of wireless clients currently associated with this AP.
+	ClientCount int `json:"client_count,omitempty"`
+	// SSIDs is the site-wide enabled Wi-Fi SSID list copied onto each AP row (not per-AP radio broadcast telemetry).
+	SSIDs []string `json:"ssids,omitempty"`
 }
 
 // LogicalLane represents one VLAN lane inside the Logical Zones lens.
 type LogicalLane struct {
-	NetworkID      string                   `json:"network_id"`
-	Name           string                   `json:"name"`
-	VLAN           string                   `json:"vlan,omitempty"`
-	Subnet         string                   `json:"subnet,omitempty"`
-	ZoneName       string                   `json:"zone_name"`
-	Isolated       bool                     `json:"isolated"`
-	ValveState     VerdictState             `json:"valve_state"`
-	ValveReason    string                   `json:"valve_reason,omitempty"`
-	BMCIDs         []string                 `json:"bmc_ids,omitempty"`
-	PinnedHostIDs  []string                 `json:"pinned_host_ids,omitempty"`
-	CleanHostIDs   []string                 `json:"clean_host_ids,omitempty"`
-	UnknownHostIDs []string                 `json:"unknown_host_ids,omitempty"`
-	TotalHosts     int                      `json:"total_hosts"`
-	MigrationHint  string                   `json:"migration_hint,omitempty"`
-	Containment    *risk.NetworkContainment `json:"containment,omitempty"`
+	// NetworkID is the network entity ID ("net:<id-or-name>").
+	NetworkID string `json:"network_id"`
+	// Name is the VLAN or network display name.
+	Name string `json:"name"`
+	// VLAN is the numeric VLAN tag string, if assigned.
+	VLAN string `json:"vlan,omitempty"`
+	// Subnet is the IPv4 CIDR configured for this network.
+	Subnet string `json:"subnet,omitempty"`
+	// ZoneName is the UniFi firewall zone name containing this network.
+	ZoneName string `json:"zone_name"`
+	// Isolated reports whether this VLAN is configured as isolated or guest-segmented.
+	Isolated bool `json:"isolated"`
+	// ValveState reflects the network entity's finalized verdict state for peer containment.
+	ValveState VerdictState `json:"valve_state"`
+	// ValveReason summarizes same-VLAN peer isolation details from Containment.
+	ValveReason string `json:"valve_reason,omitempty"`
+	// BMCIDs lists out-of-band BMC host entity IDs residing on this VLAN.
+	BMCIDs []string `json:"bmc_ids,omitempty"`
+	// PinnedHostIDs lists non-BMC hosts in Exposed or Review state on this VLAN.
+	PinnedHostIDs []string `json:"pinned_host_ids,omitempty"`
+	// CleanHostIDs lists non-BMC hosts in OK state on this VLAN.
+	CleanHostIDs []string `json:"clean_host_ids,omitempty"`
+	// UnknownHostIDs lists non-BMC hosts in Unknown (unassessed or skipped) state on this VLAN.
+	UnknownHostIDs []string `json:"unknown_host_ids,omitempty"`
+	// TotalHosts is the total number of hosts assigned to this VLAN lane.
+	TotalHosts int `json:"total_hosts"`
+	// MigrationHint suggests moving exposed trusted-VLAN IoT devices onto an empty isolated VLAN.
+	MigrationHint string `json:"migration_hint,omitempty"`
+	// Containment holds the four-axis isolation assessment (peers, LAN egress, internet, LAN inbound).
+	Containment *risk.NetworkContainment `json:"containment,omitempty"`
 }
 
 // Census holds exact clickable filter counts derived from the same predicates
 // used by the Map and Inventory views.
 type Census struct {
-	ExposedCount    int `json:"exposed_count"`
-	ReviewCount     int `json:"review_count"`
-	BMCCount        int `json:"bmc_count"`
-	ExactCVEHosts   int `json:"exact_cve_hosts"`
+	// ExposedCount is the number of host, port, rule, and device entities with a primary Exposed reason.
+	ExposedCount int `json:"exposed_count"`
+	// ReviewCount is the number of host, port, rule, and device entities in Review state.
+	ReviewCount int `json:"review_count"`
+	// BMCCount is the number of hosts classified as out-of-band server management controllers.
+	BMCCount int `json:"bmc_count"`
+	// ExactCVEHosts is the number of hosts and UniFi devices with at least one exact-version CVE match.
+	ExactCVEHosts int `json:"exact_cve_hosts"`
+	// UnassessedCount is the number of non-skipped hosts still awaiting an active probe.
 	UnassessedCount int `json:"unassessed_count"`
-	OpenWallGates   int `json:"open_wall_gates"`
-	TotalWallGates  int `json:"total_wall_gates"`
+	// OpenWallGates is the number of perimeter wall gates in Exposed or Review state.
+	OpenWallGates int `json:"open_wall_gates"`
+	// TotalWallGates is the total number of detected indoor-to-outdoor perimeter cables.
+	TotalWallGates int `json:"total_wall_gates"`
 }
 
 // PresentationModel is the complete single-source-of-truth UI model built in Go.
 type PresentationModel struct {
-	Headline        string                       `json:"headline"`
-	Census          Census                       `json:"census"`
-	GatewayID       string                       `json:"gateway_id,omitempty"`
-	Entities        map[string]*Entity           `json:"entities"`
-	Queue           []QueueItem                  `json:"queue,omitempty"`
-	Physical        []PhysicalRow                `json:"physical,omitempty"`
-	WallGates       []WallGate                   `json:"wall_gates,omitempty"`
-	Logical         []LogicalLane                `json:"logical,omitempty"`
-	WANFlows        []WANFlow                    `json:"wan_flows,omitempty"`
-	Isolation       *risk.IsolationMatrix        `json:"isolation,omitempty"`
+	// Headline is the one-sentence top-of-page posture verdict.
+	Headline string `json:"headline"`
+	// Census holds summary entity counts for dashboard filter pills.
+	Census Census `json:"census"`
+	// GatewayID is the entity ID of the primary UniFi gateway ("dev:<mac>").
+	GatewayID string `json:"gateway_id,omitempty"`
+	// Entities maps every entity ID to its finalized Entity record.
+	Entities map[string]*Entity `json:"entities"`
+	// Queue holds the score-ranked Fix-Next remediation items.
+	Queue []QueueItem `json:"queue,omitempty"`
+	// Physical holds UniFi infrastructure devices ordered in LLDP tree order.
+	Physical []PhysicalRow `json:"physical,omitempty"`
+	// WallGates lists physical switch ports feeding exterior cables across the perimeter wall.
+	WallGates []WallGate `json:"wall_gates,omitempty"`
+	// Logical holds VLAN lanes with grouped host IDs and containment metadata.
+	Logical []LogicalLane `json:"logical,omitempty"`
+	// WANFlows lists inbound WAN firewall rules, port forwards, and missing edge-telemetry indicators.
+	WANFlows []WANFlow `json:"wan_flows,omitempty"`
+	// Isolation holds the effective cross-zone and same-VLAN isolation matrix.
+	Isolation *risk.IsolationMatrix `json:"isolation,omitempty"`
+	// ServiceCoverage summarizes active-probe service identification coverage across probed hosts.
 	ServiceCoverage *probe.ServiceCoverageReport `json:"service_coverage,omitempty"`
-	Visibility      *unifi.SiteVisibility        `json:"visibility,omitempty"`
-	Blast           *blast.Report                `json:"blast,omitempty"`
-	InfraBlast      []blast.InfraReport          `json:"infra_blast,omitempty"`
-	Copyright       string                       `json:"copyright"`
-	AuthorURL       string                       `json:"author_url,omitempty"`
-	License         string                       `json:"license"`
-	RepoURL         string                       `json:"repo_url"`
+	// Visibility records which UniFi controller telemetry feeds succeeded or were missing.
+	Visibility *unifi.SiteVisibility `json:"visibility,omitempty"`
+	// Blast holds the evaluated 3-lane counterfactual action queue, egress profiles, and simulation graph.
+	Blast *blast.Report `json:"blast,omitempty"`
+	// InfraBlast holds per-device infrastructure compromise assessments for gateways, switches, APs, and controllers.
+	InfraBlast []blast.InfraReport `json:"infra_blast,omitempty"`
+	// Copyright is the footer attribution string rendered in the UI and offline exports.
+	Copyright string `json:"copyright"`
+	// AuthorURL is the author profile link shown alongside Copyright.
+	AuthorURL string `json:"author_url,omitempty"`
+	// License is the SPDX license identifier rendered in the footer.
+	License string `json:"license"`
+	// RepoURL is the project repository URL rendered in the footer.
+	RepoURL string `json:"repo_url"`
 }
 
 func devEntityID(mac string) string { return "dev:" + strings.ToLower(strings.TrimSpace(mac)) }
@@ -417,12 +591,19 @@ func ActionAlertsFromBlast(actions []blast.Action) []risk.ActionAlert {
 	return alerts
 }
 
-// ApplyBlastActionsToDiff adds action changes to the outbound diff and returns the
-// action baseline to persist. A current baseline with no action history keeps its
-// finding alerts for the cycle in which actions are first seeded.
+// ApplyBlastActionsToDiff adds action changes to the outbound diff and returns
+// the action baseline to persist. To avoid duplicate webhook alerts for the
+// same root cause, it suppresses new patch actions already covered by a
+// same-or-higher-severity CVE alert in newCVEs, and once an action baseline is
+// live (or on a fresh baseline), suppresses new/escalated findings covered by
+// an equally-or-more-severe blast action. A pre-existing baseline with no
+// action history keeps its finding alerts for the cycle in which actions are
+// first seeded.
 func ApplyBlastActionsToDiff(diff *risk.Diff, prev *risk.State, snap *unifi.Snapshot, blastRep blast.Report, probedHostKeys map[string]struct{}, newCVEs []risk.CVEAlert, cveMatched bool) (map[string]string, map[string]time.Time, map[string]time.Time, map[string]bool, map[string]map[string]time.Time, map[string]string) {
 	alerts := ActionAlertsFromBlast(blastRep.Actions)
 	newActions, escalated, resolved, next, seen, peakAt, carried, assets, owners := risk.ComputeActionDiff(prev, snap, alerts, probedHostKeys, cveMatched)
+	// Drop new patch actions that duplicate an exact CVE alert at equal or
+	// higher severity in this same diff.
 	if len(newCVEs) > 0 && len(newActions) > 0 {
 		patchSevs := alertedPatchIDs(snap, newCVEs)
 		newActions = slices.DeleteFunc(newActions, func(a risk.ActionAlert) bool {
@@ -431,6 +612,8 @@ func ApplyBlastActionsToDiff(diff *risk.Diff, prev *risk.State, snap *unifi.Snap
 		})
 	}
 	diff.NewActions, diff.EscalatedActions, diff.ResolvedActionIDs = newActions, escalated, resolved
+	// Once action history is live, drop finding alerts already superseded by a
+	// blast action that meets or exceeds the finding's notification severity.
 	live := prev == nil || (!prev.NeedsScoringRebaseline() && prev.Actions != nil)
 	if live && (len(diff.NewFindings) > 0 || len(diff.EscalatedFindings) > 0) {
 		alertSevByID := make(map[string]checks.Severity, len(alerts))
@@ -518,8 +701,9 @@ func blastCoversFinding(alertSevByID map[string]checks.Severity, snap *unifi.Sna
 	return has(key + port + ":" + proto)
 }
 
-// blastCoversForward resolves ID-less rules by their controller tuple. A bundle
-// can cover the forward only if it closes the same backend service.
+// blastCoversForward resolves ID-less rules by their controller tuple. An
+// aggregated act:wan-service: action can cover the forward only if it closes
+// the same backend service.
 func blastCoversForward(snap *unifi.Snapshot, f checks.Finding, has func(string) bool) bool {
 	id, ok := strings.CutPrefix(strings.ToLower(f.Property), "portfwd:")
 	if !ok || id == "" {
@@ -602,6 +786,10 @@ func AttachDeviceChildren(pm *PresentationModel, devChildren map[string][]probe.
 	}
 }
 
+// registerChildEntities deduplicates and registers enrolled child devices
+// (e.g., cameras behind an NVR or bridge) under "child:<parentID>/<childID>",
+// leaving children with unknown direct LAN reachability in VerdictUnknown so
+// unverified private segments are never presented as clean.
 func registerChildEntities(pm *PresentationModel, parent *Entity, children []probe.ChildDevice) {
 	if pm == nil || parent == nil || len(children) == 0 {
 		return
@@ -1213,7 +1401,7 @@ func BuildPresentationModel(
 				PeerIDs:              peerIDs,
 			}
 
-			// Add subtle Review reason for indoor active trunk access ports or inferred external drops.
+			// Add a subtle Review reason for indoor active access ports carrying all tagged VLANs.
 			if p.Zone == "internal" && p.State == "active" && p.TaggedPolicy == "all" && len(p.Peers) > 0 {
 				ent.Reasons = append(ent.Reasons, Reason{
 					ID:          "port-trunk:" + pid,
@@ -1295,6 +1483,10 @@ func BuildPresentationModel(
 
 		switch {
 		case strings.HasPrefix(f.CheckID, "UB-UNIFI-PORT-"):
+			// Recover the owning switch MAC and port index across four fallbacks:
+			// direct Client.SwitchMAC/SwitchPort, f.Property ("port:<mac>/<idx>"),
+			// direct switch-MAC match on Client.MAC, or scanning switch port peers
+			// by client MAC/IP so client-shaped port findings attach cleanly.
 			swMAC := strings.ToLower(strings.TrimSpace(f.Client.SwitchMAC))
 			portIdx := f.Client.SwitchPort
 			if portIdx <= 0 {
@@ -1661,7 +1853,8 @@ func BuildPresentationModel(
 				observed := f.Evidence
 				if f.CheckID == "UB-UNIFI-ISO-SAME-VLAN" {
 					expected = "Block traffic between VLAN peers"
-					// Both drawers already render the self-contained peer summary.
+					// Leave Observed empty because Evidence already holds the complete
+					// peer-isolation summary rendered in both network and host drawers.
 					observed = ""
 				}
 				reason := Reason{
@@ -1679,8 +1872,10 @@ func BuildPresentationModel(
 					Port:        f.Port,
 				}
 				target.Reasons = append(target.Reasons, reason)
-				// Hosts can be exposed behind compliant sockets. Only the evaluator
-				// knows which physical settings contribute to the peer finding.
+				// Cross-link the finding as a secondary reason onto the specific clients
+				// and switch ports identified by the isolation evaluator so inspecting
+				// those entities surfaces the peer exposure without double-counting it
+				// in the Fix-Next queue or census totals.
 				reason.Secondary = true
 				seen := map[string]bool{target.ID: true}
 				attach := func(id string) {
@@ -1990,6 +2185,9 @@ func BuildPresentationModel(
 	return pm
 }
 
+// hasPrimaryExposedReason reports whether ent owns at least one primary
+// (non-secondary) Exposed reason, preventing cross-linked copies from inflating
+// Census.ExposedCount.
 func hasPrimaryExposedReason(ent *Entity) bool {
 	if ent == nil || ent.State != VerdictExposed {
 		return false
@@ -2006,6 +2204,8 @@ func hasPrimaryExposedReason(ent *Entity) bool {
 	return !hasAnyExposed
 }
 
+// primaryExposedReason returns the highest-ranked non-secondary Exposed reason
+// on ent (relying on finalizeEntityVerdict having sorted ent.Reasons worst-first).
 func primaryExposedReason(ent *Entity) (Reason, bool) {
 	if ent == nil {
 		return Reason{}, false
@@ -2018,6 +2218,9 @@ func primaryExposedReason(ent *Entity) (Reason, bool) {
 	return Reason{}, false
 }
 
+// finalizeEntityVerdict sorts ent.Reasons worst-first and derives ent.State,
+// ent.MaxSeverity, and ent.StateLabel, preserving VerdictUnknown for skipped or
+// unscanned hosts unless concrete Exposed evidence already applies.
 func finalizeEntityVerdict(ent *Entity) {
 	// Sort reasons worst-first so the highest-priority reason appears first in the inspector.
 	sort.SliceStable(ent.Reasons, func(i, j int) bool {
@@ -2098,6 +2301,9 @@ func finalizeEntityVerdict(ent *Entity) {
 	}
 }
 
+// buildFixNextQueue converts primary Exposed entities into score-ranked
+// QueueItem entries, deduplicating secondary cross-links and aggregating
+// unused open switch ports once per switch device.
 func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 	var items []QueueItem
 	for _, ent := range pm.Entities {
@@ -2279,6 +2485,9 @@ func buildFixNextQueue(pm *PresentationModel) []QueueItem {
 	return items
 }
 
+// buildPhysicalRows walks the adopted UniFi infrastructure hierarchy in LLDP
+// uplink tree order from the root gateway, appending devices with unresolved
+// uplinks afterward with UplinkUnknown set.
 func buildPhysicalRows(
 	snap *unifi.Snapshot,
 	swByMAC map[string]risk.SwitchDeviceView,
@@ -2407,6 +2616,9 @@ func buildPhysicalRows(
 	return rows
 }
 
+// buildLogicalLanes groups host entities into per-VLAN LogicalLane entries
+// (preserving BMCs in their actual VLAN, attaching containment verdicts, and
+// ensuring hosts on unlisted or unassigned networks still appear in a lane).
 func buildLogicalLanes(
 	snap *unifi.Snapshot,
 	topo *topology.Model,
@@ -2562,13 +2774,15 @@ func portForwardAddressFamily(pf unifi.PortForward) string {
 	}
 }
 
-// serviceAddr gives service observations and forward targets a common address key.
+// serviceAddr parses and unmaps an IP literal so service observations and
+// port-forward targets compare identically across IPv4 and IPv6 representations.
 func serviceAddr(ip string) netip.Addr {
 	addr, _ := netip.ParseAddr(strings.TrimSpace(ip))
 	return addr.Unmap()
 }
 
-// serviceAddrs retains the exact listeners available for matching later findings.
+// serviceAddrs parses a slice of IP strings into valid unmapped netip.Addr
+// values retained on each ServiceView for exact listener-address matching.
 func serviceAddrs(ips ...string) []netip.Addr {
 	var addrs []netip.Addr
 	for _, ip := range ips {
@@ -2801,8 +3015,10 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 		svcs := servicesByEndpoint[epKey]
 		if open {
 			reach, restricted := wanReachForEndpoint(port, transport, openFamily, openAddr)
-			// A protocol observed at another address leaves the scanned listener unidentified.
-			// An addressless observation may be this listener, but cannot carry its forward.
+			// Treat openAddr as already represented only if an observed service row
+			// explicitly recorded openAddr, or if an addressless row of matching family
+			// shares default reachability (never letting an addressless row inherit a
+			// WAN port forward targeting a specific IP).
 			observed := slices.ContainsFunc(svcs, func(s ServiceView) bool {
 				return slices.Contains(s.observedIPs, openAddr) || (len(s.observedIPs) == 0 && (s.AddressFamily == "" || s.AddressFamily == openFamily) && reach == defaultReach)
 			})
@@ -2906,6 +3122,10 @@ func buildHostServices(cv ClientView, hp probe.HostProfile, wan []risk.ExposureA
 	return out
 }
 
+// isSnapshotWANBehindCGNAT is a reachability heuristic reporting whether the
+// gateway's WAN IP falls in private (RFC 1918 or IPv6 ULA via Addr.IsPrivate),
+// CGNAT (100.64.0.0/10), loopback, or link-local space; a private upstream
+// address alone cannot prove whether an upstream router forwards traffic.
 func isSnapshotWANBehindCGNAT(snap *unifi.Snapshot) bool {
 	if snap == nil || snap.Health == nil || snap.Health.WANIP == "" {
 		return false
@@ -2983,6 +3203,9 @@ func appendFamilyTagIfNeeded(label, fam string, services []ServiceView, port int
 	}
 }
 
+// recordObservedService enriches or appends a non-exposed ServiceView row from
+// an inventory-only check finding (such as an mDNS advertisement or protocol
+// banner) without turning the host into Exposed.
 func recordObservedService(ent *Entity, f checks.Finding) {
 	if f.Port <= 0 {
 		return
@@ -3018,6 +3241,10 @@ func recordObservedService(ent *Entity, f checks.Finding) {
 	})
 }
 
+// markServiceExposed flags the matching ServiceView row on ent as Exposed with
+// its highest finding severity and compact chip label, or appends a new service
+// row (with computed WAN/LAN/VLAN reachability) for findings on services not
+// discovered by TCP port scanning (such as UDP IPMI/SNMP or HomeKit).
 func markServiceExposed(ent *Entity, f checks.Finding, endpointWAN []risk.ExposureAssessment, vlanIsolated, behindCGNAT bool) {
 	if f.Port <= 0 {
 		return
@@ -3065,6 +3292,8 @@ func markServiceExposed(ent *Entity, f checks.Finding, endpointWAN []risk.Exposu
 	})
 }
 
+// compactCheckChip maps well-known UniBlue check IDs to short, readable service
+// chip labels for host rows and inspector badges.
 func compactCheckChip(f checks.Finding) string {
 	switch f.CheckID {
 	case "UB-0002":
@@ -3123,6 +3352,8 @@ func compactCheckChip(f checks.Finding) string {
 	return f.CheckID
 }
 
+// commonPortLabel returns a fallback lowercase protocol name for well-known
+// ports when active protocol fingerprinting did not identify one.
 func commonPortLabel(p int) string {
 	switch p {
 	case 22:

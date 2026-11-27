@@ -28,6 +28,10 @@ func MatchesRange(version string, m CPEMatch) (bool, Confidence) {
 	return matchesRange(version, m, isUniFiFirmwareCPE(m))
 }
 
+// matchesRange evaluates version against m's exact or range bounds. When
+// unifiFirmware is true, 4-part UniFi firmware versions (major.minor.patch.build)
+// are mapped to their 3-part release prefix before comparing against 3-part NVD
+// bounds so build numbers do not falsely exceed inclusive upper bounds.
 func matchesRange(version string, m CPEMatch, unifiFirmware bool) (bool, Confidence) {
 	version = strings.TrimSpace(version)
 	if version == "" {

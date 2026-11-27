@@ -127,6 +127,7 @@ func LookupProtocol(name string) (ProtocolTrait, bool) {
 		name = "postgres"
 	}
 	trait, ok := builtinProtocols()[name]
+	// Clone AnonGrants so callers cannot mutate the shared built-in catalog.
 	trait.AnonGrants = slices.Clone(trait.AnonGrants)
 	return trait, ok
 }

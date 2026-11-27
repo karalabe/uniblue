@@ -43,8 +43,9 @@ type TargetVelocity struct {
 	LatestKEV string
 	// RansomwareCount counts KEVs with known ransomware campaign use.
 	RansomwareCount int
-	// NetworkHigh counts AV:N High or Critical CVEs by trailing window length.
-	// A missing key means one or more years failed the coverage threshold.
+	// NetworkHigh counts AV:N High or Critical CVEs across trailing 1-, 3-, and
+	// 5-year windows (keys 1, 3, and 5). A missing key means one or more calendar
+	// years touched by that window failed the 60% CPE coverage threshold.
 	NetworkHigh map[int]int
 	// IncompleteYears lists missing or under-enriched publication years in order.
 	IncompleteYears []string
@@ -122,13 +123,19 @@ func summarizeVelocity(records map[string]Record, trusted bool, now time.Time, c
 	for year := now.Year() - 5; year <= now.Year(); year++ {
 		key := strconv.Itoa(year)
 		c := coverage[key]
+		// Require at least 60% CPE enrichment (WithCPE/Total >= 3/5) for a year
+		// to count as complete; NVD backfill lag otherwise undercounts recent years.
 		if c.Total == 0 || 5*c.WithCPE < 3*c.Total {
 			h.IncompleteYears = append(h.IncompleteYears, key)
 		}
 	}
 
+	// annual[i] counts AV:N High/Critical CVEs published in trailing 1-year
+	// intervals: [since[1], since[0]] for i=0 (inclusive of the query date) and
+	// [since[i+1], since[i]) for i=1..4 (up to 4-5 years ago).
 	var annual [5]int
 	for _, r := range records {
+		// Guard against future-dated catalog entries relative to the query date.
 		kev := r.KEV && r.KEVDateAdded <= since[0]
 		if kev {
 			h.KEVCount++
@@ -137,6 +144,10 @@ func summarizeVelocity(records map[string]Record, trusted bool, now time.Time, c
 				h.RansomwareCount++
 			}
 		}
+		// Exclude future-dated non-KEV NVD records (relative to the query date) and
+		// orphan non-KEV placeholders with neither a publication date nor CPE
+		// matches; a CVE already listed in KEV by the query date still counts toward
+		// TotalCVEs while remaining excluded from NetworkHigh below.
 		if !kev && (r.Published > since[0] || r.Published == "" && len(r.Matches) == 0) {
 			continue
 		}
@@ -164,8 +175,13 @@ func summarizeVelocity(records map[string]Record, trusted bool, now time.Time, c
 				active++
 			}
 		}
+		// Sustained velocity requires activity in the most recent year plus at
+		// least three distinct annual intervals within a complete window.
 		sustained = sustained || (annual[0] > 0 && active >= 3)
 	}
+	// Promote trusted identities with history to VelocityHighProfile when a KEV
+	// was added in the last 3 years, any KEV has known ransomware use, or remote
+	// High/Critical CVEs recur across at least three annual intervals.
 	if trusted && h.TotalCVEs > 0 {
 		h.Class = VelocityObserved
 		if h.LatestKEV >= since[3] || h.RansomwareCount > 0 || sustained {

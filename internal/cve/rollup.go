@@ -30,14 +30,17 @@ type ProductSummary struct {
 	// TotalCVEs is the total number of matching CVEs in this rollup.
 	TotalCVEs int `json:"total_cves"`
 
-	// CriticalCount, HighCount, and KEVCount break down the matched CVEs.
+	// CriticalCount is the number of Critical-severity CVEs in this rollup.
 	CriticalCount int `json:"critical_count"`
-	HighCount     int `json:"high_count"`
-	KEVCount      int `json:"kev_count"`
+	// HighCount is the number of High-severity CVEs in this rollup.
+	HighCount int `json:"high_count"`
+	// KEVCount is the number of CISA KEV-listed CVEs in this rollup.
+	KEVCount int `json:"kev_count"`
 
-	// MaxSeverity and MaxCVSS reflect the worst CVE in this rollup.
+	// MaxSeverity is the highest severity observed across CVEs in this rollup.
 	MaxSeverity checks.Severity `json:"max_severity"`
-	MaxCVSS     float64         `json:"max_cvss"`
+	// MaxCVSS is the highest CVSS base score observed across CVEs in this rollup.
+	MaxCVSS float64 `json:"max_cvss"`
 
 	// TopCVEs lists up to 3 highest-priority CVE IDs for quick `uniblue cve show` inspection.
 	TopCVEs []string `json:"top_cves"`
@@ -58,6 +61,8 @@ type ProductSummary struct {
 
 // RollupMatches deterministically collapses a slice of granular CVE Matches
 // into per-(Host, Product, Confidence) ProductSummaries, sorted by urgency.
+// Callers should pre-sort matches by priority (as MatchProducts does) because
+// TopCVEs retains the first three CVE IDs encountered in each group.
 func RollupMatches(matches []Match) []ProductSummary {
 	if len(matches) == 0 {
 		return nil
