@@ -17,6 +17,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -247,7 +248,9 @@ type SSHInfo struct {
 	WeakCiphers []string `json:"weak_ciphers,omitempty"`
 	// WeakMACs lists weak MAC algorithms advertised in SSH_MSG_KEXINIT.
 	WeakMACs []string `json:"weak_macs,omitempty"`
-	// NoneAuthAccepted reports that the server accepted SSH "none" auth (opt-in audit only).
+	// AuthMethods lists the methods offered after the credential-free SSH query.
+	AuthMethods []string `json:"auth_methods,omitempty"`
+	// NoneAuthAccepted reports that the server accepted SSH without credentials.
 	NoneAuthAccepted bool `json:"none_auth_accepted,omitempty"`
 	// BruteForceProtected is set when the host refuses connections mid-audit (Fail2ban/rate-limit signal).
 	BruteForceProtected bool `json:"brute_force_protected,omitempty"`
@@ -466,15 +469,84 @@ func CompareSSHHostKeys(profiles []HostProfile, previous map[string]string) map[
 	return next
 }
 
-// SSHKeyAuditCacheEntry stores the outcome of an opt-in SSH PK_OK audit for an
-// unchanged host key so watch/serve cycles replay confirmed findings without
-// sending repeat authentication probes.
+// SSHKeyAuditCache shares per-listener results between full and targeted scans.
+type SSHKeyAuditCache struct {
+	entries sync.Map // Stable listener identity to *SSHKeyAuditCacheEntry.
+}
+
+// SSHKeyAuditCacheEntry serializes queries for one listener across concurrent scans.
 type SSHKeyAuditCacheEntry struct {
-	HostKeyFingerprint  string
-	NoneAuthAccepted    bool
-	BruteForceProtected bool
-	CanaryFalsePositive bool
-	AcceptedKeys        []SSHAcceptedKey
+	mu             sync.Mutex
+	result         SSHInfo
+	methodsQueried bool
+	keysAudited    bool
+	expiresAt      time.Time
+	retryAfter     time.Time
+}
+
+// auditSSH reuses the initial none request of a configured key audit. Without
+// configured keys, the client stops as soon as the server advertises its methods.
+func (f *Fingerprinter) auditSSH(ctx context.Context, hp *HostProfile) {
+	info := hp.SSH
+	if info == nil || info.HostKeyFingerprint == "" || f.isInfrastructure(*hp) || ctx.Err() != nil {
+		return
+	}
+	key := sshBaselineKey(*hp, info.Port)
+	if prev := f.prevSSHHostKeys[key]; prev != "" && prev != info.HostKeyFingerprint {
+		info.HostKeyChanged = true
+	}
+	auditKeys := !info.HostKeyChanged && f.matchesSSHKeyAuditTarget(*hp)
+	if f.DisableSSHAuthProbe && !auditKeys {
+		return
+	}
+	ip, err := netip.ParseAddr(hp.EffectiveProbeIP())
+	if err != nil {
+		return
+	}
+	addr := net.JoinHostPort(ip.Unmap().String(), strconv.Itoa(info.Port))
+	cacheKey := struct{ host, listener string }{key, addr}
+	cached, _ := f.auditedSSHHosts.entries.LoadOrStore(cacheKey, new(SSHKeyAuditCacheEntry))
+	entry := cached.(*SSHKeyAuditCacheEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	now := time.Now()
+	if entry.result.HostKeyFingerprint != info.HostKeyFingerprint {
+		entry.result = SSHInfo{HostKeyFingerprint: info.HostKeyFingerprint}
+		entry.methodsQueried, entry.keysAudited = false, false
+	}
+	if !now.Before(entry.retryAfter) && (!now.Before(entry.expiresAt) || auditKeys && !entry.keysAudited || !f.DisableSSHAuthProbe && !entry.methodsQueried) {
+		answer := SSHInfo{HostKeyFingerprint: info.HostKeyFingerprint}
+		dropped := false
+		if auditKeys {
+			AuditSSHKeys(ctx, addr, f.sshAuditKeys, f.sshKeyAudit.Usernames, f.sshKeyAudit.MaxProbesPerHost, f.timeout, &answer)
+		} else {
+			answer.NoneAuthAccepted, _, dropped = probeSSHKeyBatch(ctx, addr, info.HostKeyFingerprint, "uniblue", nil, f.timeout, &answer.AuthMethods)
+		}
+		// Keep any authentication evidence received before a key audit was rate-limited.
+		learned := answer.NoneAuthAccepted || len(answer.AuthMethods) > 0 || len(answer.AcceptedKeys) > 0
+		if ctx.Err() == nil && learned && (!dropped || answer.BruteForceProtected) {
+			entry.result = answer
+			entry.methodsQueried, entry.keysAudited = true, auditKeys
+			entry.expiresAt = now.Add(time.Hour)
+			entry.retryAfter = time.Time{}
+		} else if ctx.Err() == nil {
+			// Keep the previous answer while backing off, even if successive probes fail.
+			entry.retryAfter = now.Add(5 * time.Minute)
+		}
+	}
+	result := &entry.result
+	if !f.DisableSSHAuthProbe {
+		info.AuthMethods = slices.Clone(result.AuthMethods)
+	}
+	info.NoneAuthAccepted = result.NoneAuthAccepted
+	if auditKeys {
+		info.AcceptedKeys = slices.Clone(result.AcceptedKeys)
+		info.CanaryFalsePositive = result.CanaryFalsePositive
+		info.BruteForceProtected = result.BruteForceProtected
+	}
 }
 
 const (
@@ -554,9 +626,9 @@ func (s *pkQuerySigner) SignWithAlgorithm(_ io.Reader, _ []byte, algorithm strin
 
 // probeSSHKeyBatch opens one bounded connection, verifies expectedHostKeyFP
 // before sending any public key, and queries all signers on that same connection.
-// It returns which signer (if any) received PK_OK, whether "none" auth succeeded,
-// and whether the server dropped or refused the connection unexpectedly.
-func probeSSHKeyBatch(ctx context.Context, addr, expectedHostKeyFP, user string, signers []*pkQuerySigner, timeout time.Duration) (noneOK bool, acceptedIdx int, connDropped bool) {
+// It returns whether "none" authentication succeeded, the signer that received
+// PK_OK (if any), and whether the server dropped or refused the connection.
+func probeSSHKeyBatch(ctx context.Context, addr, expectedHostKeyFP, user string, signers []*pkQuerySigner, timeout time.Duration, methods *[]string) (noneOK bool, acceptedIdx int, connDropped bool) {
 	dialer := net.Dialer{Timeout: timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -569,10 +641,22 @@ func probeSSHKeyBatch(ctx context.Context, addr, expectedHostKeyFP, user string,
 	for i, s := range signers {
 		rawSigners[i] = s
 	}
+	var auth []ssh.AuthMethod
+	if len(rawSigners) > 0 {
+		auth = []ssh.AuthMethod{ssh.PublicKeys(rawSigners...)}
+	}
 	cc, _, _, err := ssh.NewClientConn(conn, addr, &ssh.ClientConfig{
 		User:          user,
 		ClientVersion: sshClientVersion(),
-		Auth:          []ssh.AuthMethod{ssh.PublicKeys(rawSigners...)},
+		Auth:          auth,
+		AuthCallback: func(ctx *ssh.ClientAuthContext) (ssh.AuthMethod, error) {
+			for _, method := range ctx.AllowedMethods {
+				if !slices.Contains(*methods, method) {
+					*methods = append(*methods, method)
+				}
+			}
+			return nil, nil
+		},
 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
 			if expectedHostKeyFP == "" || ssh.FingerprintSHA256(key) != expectedHostKeyFP {
 				return errors.New("ssh host key mismatch")
@@ -661,14 +745,15 @@ func AuditSSHKeys(ctx context.Context, addr string, keys []SSHPublicKey, usernam
 				budget--
 			}
 			connsUsed++
-			noneOK, hit, dropped := probeSSHKeyBatch(ctx, addr, info.HostKeyFingerprint, user, batch, timeout)
+			noneOK, hit, dropped := probeSSHKeyBatch(ctx, addr, info.HostKeyFingerprint, user, batch, timeout, &info.AuthMethods)
 			if hit >= 0 {
 				queriesUsed += hit + 1
 			} else {
 				queriesUsed += len(batch)
 			}
 			if dropped {
-				info.BruteForceProtected = true
+				// A refusal before the first auth response gives no evidence of rate limiting.
+				info.BruteForceProtected = len(info.AuthMethods) > 0 || len(info.AcceptedKeys) > 0
 				return
 			}
 			if noneOK {

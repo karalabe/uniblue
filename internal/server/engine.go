@@ -415,7 +415,7 @@ type Engine struct {
 	lastDiscovery    *probe.LANDiscovery
 	lastDiscoveryAt  time.Time
 	prevRiskState    *risk.State
-	auditedSSHHosts  map[string]probe.SSHKeyAuditCacheEntry
+	auditedSSHHosts  *probe.SSHKeyAuditCache
 	events           []LiveEvent
 	current          StateSnapshot
 	scanProgress     *ScanProgress
@@ -494,7 +494,7 @@ func NewEngine(cfg *config.Config, checkList []*checks.Check, scanPorts []int, o
 		anomalies:             newAnomalyTracker(),
 		lastClasses:           make(map[string]classify.Result),
 		prevRiskState:         prevState,
-		auditedSSHHosts:       make(map[string]probe.SSHKeyAuditCacheEntry),
+		auditedSSHHosts:       new(probe.SSHKeyAuditCache),
 		webhookCoalesceWindow: defaultWebhookCoalesceWindow,
 		fullRescanCh:          make(chan string, 1),
 		hostScanCh:            make(chan hostScanTask, 64),
@@ -1430,6 +1430,10 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	e.mu.RLock()
 	hints := e.snap.PortHintsByIP()
 	sitePrefixes := snapshotSubnets(e.snap)
+	var prevSSHKeys map[string]string
+	if e.prevRiskState != nil {
+		prevSSHKeys = e.prevRiskState.SSHHostKeys
+	}
 	var devices []unifi.Device
 	if e.snap != nil {
 		devices = e.snap.Devices
@@ -1446,6 +1450,12 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	e.mu.RUnlock()
 
 	fp := probe.NewFingerprinter(e.scanPorts, 1, e.cfg.Scan.Timeout, e.cfg.Network.ExcludedSet())
+	if err := fp.SetSSHKeyAudit(e.cfg.Scan.SSHKeyAudit); err != nil {
+		e.logger.Warn("ssh key audit disabled due to key load error", "err", err)
+	}
+	fp.SetPreviousSSHHostKeys(prevSSHKeys)
+	fp.DisableSSHAuthProbe = e.cfg.Scan.DisableSSHAuthProbe
+	fp.SetAuditedSSHHostKeys(e.auditedSSHHosts)
 	fp.SetInfrastructure(devices)
 	fp.SetAllowedSubnets(sitePrefixes)
 	fp.SetTrustedReflectors(reflectorIPs)
@@ -1488,16 +1498,6 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 	if !stillMatches {
 		e.mu.Unlock()
 		return
-	}
-	if prev, ok := e.profilesByMAC[k]; ok && prev.SSH != nil && hp.SSH != nil &&
-		prev.SSH.Port == hp.SSH.Port && prev.SSH.HostKeyFingerprint != "" &&
-		prev.SSH.HostKeyFingerprint == hp.SSH.HostKeyFingerprint {
-		// Preserve opt-in SSH audit outcomes across single-host rescans so
-		// confirmed findings are never dropped and re-alerted on the next full scan.
-		hp.SSH.NoneAuthAccepted = prev.SSH.NoneAuthAccepted
-		hp.SSH.BruteForceProtected = prev.SSH.BruteForceProtected
-		hp.SSH.CanaryFalsePositive = prev.SSH.CanaryFalsePositive
-		hp.SSH.AcceptedKeys = append([]probe.SSHAcceptedKey(nil), prev.SSH.AcceptedKeys...)
 	}
 	e.profilesByMAC[k] = hp
 	e.findingsByMAC[k] = hostCheckFindings
@@ -1676,6 +1676,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	}
 	fp.SetPreviousSSHHostKeys(prevSSHKeys)
 	fp.SetAuditedSSHHostKeys(e.auditedSSHHosts)
+	fp.DisableSSHAuthProbe = e.cfg.Scan.DisableSSHAuthProbe
 	fp.SetInfrastructure(snap.Devices)
 	fp.SetAllowedSubnets(snapshotSubnets(snap))
 	fp.SetTrustedReflectors(snapshotReflectorIPs(snap))
@@ -1971,7 +1972,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	keys := prevRisk.CompareSSHHostKeys(profiles)
 	rawFindings := append([]checks.Finding(nil), cachedFindings...)
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
-	report := risk.Evaluate(snap, rawFindings, e.cfg.Network)
+	report := risk.Evaluate(snap, rawFindings, e.cfg.Network, profiles...)
 	report.SSHHostKeys = keys
 
 	var exactCVEs, potentialCVEs []cve.ProductSummary
@@ -1994,8 +1995,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		}
 		e.mu.Unlock()
 		matches, err := cveCache.MatchProducts(products, cve.MatchOptions{
-			MinSeverity:          checks.SeverityHigh,
-			PotentialMaxAgeYears: 2,
+			MinSeverity: checks.SeverityHigh,
 		})
 		if err == nil {
 			// Missing vendor shards yield no matches. Check the cache metadata
@@ -2104,7 +2104,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	if baselineReady {
 		rebaselining := prevRisk.NeedsScoringRebaseline()
 		if rebaselining {
-			e.logger.Info("upgrading state baseline to scoring version 2 (silent first-run re-baseline)")
+			e.logger.Info("upgrading scoring baseline silently", "version", risk.CurrentScoringVersion)
 		}
 		diff := risk.ComputeDiffWithProbed(prevRisk, snap, report, e.cfg.Network, probedHostKeys)
 		var nextExactCVEs map[string]string

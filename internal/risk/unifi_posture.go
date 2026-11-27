@@ -254,7 +254,7 @@ func AnalyzeUniFiPosture(
 
 	// 3. Audit UniFi Site/Gateway Security Controls (SSH, UPnP, IDS/IPS, Honeypot, DoH, Teleport).
 	if s := snap.SecuritySettings; s != nil {
-		if s.SSHEnabled && s.SSHPasswordAuth {
+		if s.SSHEnabled && s.SSHPasswordAuthKnown && s.SSHPasswordAuth {
 			sev := checks.SeverityHigh
 			detail := "password authentication enabled"
 			if s.SSHKeyCount == 0 {
@@ -281,9 +281,13 @@ func AnalyzeUniFiPosture(
 				},
 			})
 		} else if s.SSHEnabled {
+			mode := "auth mode unknown"
+			if s.SSHPasswordAuthKnown {
+				mode = "key-only"
+			}
 			notes = append(notes, PostureNote{
 				Severity: checks.SeverityLow,
-				Title:    fmt.Sprintf("UniFi Device SSH is enabled (key-only, %d SSH key(s))", s.SSHKeyCount),
+				Title:    fmt.Sprintf("UniFi Device SSH is enabled (%s, %d SSH key(s))", mode, s.SSHKeyCount),
 				Detail:   "Disable Device SSH when not actively troubleshooting to minimize the management attack surface on switches and APs.",
 			})
 		}

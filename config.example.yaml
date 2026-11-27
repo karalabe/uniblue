@@ -76,6 +76,7 @@ unifi:
 # scan:
 #   extra_ports: []        # Added on top of UniBlue's curated port list
 #   checks_dir: ""         # Extra local directory of community YAML checks
+#   disable_ssh_auth_probe: false  # Set to true if Fail2ban counts the default SSH auth query
 #   interval: 15m          # Polling interval for `uniblue watch`
 
 # notify:

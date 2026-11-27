@@ -1121,11 +1121,6 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 		}
 	}
 
-	var cutoffDate string
-	if opts.PotentialMaxAgeYears > 0 {
-		cutoffDate = time.Now().UTC().AddDate(-opts.PotentialMaxAgeYears, 0, 0).Format("2006-01-02")
-	}
-
 	var matches []Match
 	seenIdx := make(map[string]int)
 	exactByHostLabelCVE := make(map[string]struct{})
@@ -1165,12 +1160,6 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					}
 				}
 				if bestConf == "" {
-					continue
-				}
-
-				// For potential matches, suppress ancient non-KEV CVEs so
-				// operators see current risks rather than decade-old noise.
-				if bestConf == ConfidencePotential && !rec.KEV && cutoffDate != "" && rec.Published != "" && rec.Published < cutoffDate {
 					continue
 				}
 

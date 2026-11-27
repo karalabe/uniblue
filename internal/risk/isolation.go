@@ -138,11 +138,16 @@ func EvaluateIsolation(
 		return nil, nil, nil
 	}
 
+	return NewOracle(snap, netCfg).evaluateIsolation(rawFindings, netCfg)
+}
+
+// evaluateIsolation shares the snapshot indexes with the per-listener exposure assessment.
+func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.NetworkConfig) (*IsolationMatrix, []checks.Finding, []PostureNote) {
+	snap := o.snap
 	matrix := &IsolationMatrix{}
 	var findings []checks.Finding
 	var notes []PostureNote
 
-	o := NewOracle(snap, netCfg)
 	trustedSet, isolatedSet := vlanTiers(snap, netCfg, o.isolatedZones())
 	intendedIsoZones := intendedIsolatedZoneSet(snap)
 	intent := o.intent
@@ -583,8 +588,8 @@ func EvaluateIsolation(
 				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, unifi.Client{}) {
 					continue
 				}
-				cell := o.evaluateBoundary(
-					rawFindings, intent, srcNet, dstNet, srcZone, dstZone, fam, "deny", nil,
+				cell := o.boundaryWithApproval(
+					rawFindings, intent, srcNet, dstNet, srcZone, dstZone, fam, "deny", nil, o.builtinDNS,
 				)
 				if cell.Verdict == IsolationViolation {
 					cell.RecommendedFix = fmt.Sprintf(
@@ -2590,6 +2595,32 @@ func (o *Oracle) evaluateBoundary(
 	srcZone, dstZone, fam, expected string,
 	peers *peerEndpoints,
 ) IsolationCell {
+	return o.boundaryWithApproval(rawFindings, intent, srcNet, dstNet, srcZone, dstZone, fam, expected, peers, nil)
+}
+
+// builtinDNS recognizes the controller's DNS exception only on the actual winning policy.
+func (o *Oracle) builtinDNS(cell IsolationCell) bool {
+	if !strings.EqualFold(cell.DecisiveRuleName, "Allow Public DNS") || cell.Port != 53 || cell.PathKind != "gateway-routed" || !strings.EqualFold(cell.DestZone, "Internal") {
+		return false
+	}
+	found := false
+	for _, p := range o.sortedPolicies {
+		if !p.Enabled || p.ID != cell.DecisiveRuleID || p.Name != cell.DecisiveRuleName {
+			continue
+		}
+		if !strings.EqualFold(p.Origin, "SYSTEM_DEFINED") || !p.Destination.OnlyPort(53) {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
+// boundaryWithApproval continues past permitted exceptions so another opening on
+// the same boundary can still determine the isolation verdict.
+func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent config.IsolationIntent,
+	srcNet, dstNet unifi.Network, srcZone, dstZone, fam, expected string, peers *peerEndpoints, approve func(IsolationCell) bool) IsolationCell {
+	var approvedCell *IsolationCell
 	srcIPSample := sampleNetworkIPForFamily(srcNet, o.snap, fam)
 	dstIPSample := sampleNetworkIPForFamily(dstNet, o.snap, fam)
 
@@ -2716,6 +2747,11 @@ func (o *Oracle) evaluateBoundary(
 				state:      "new",
 			}, dstNet.Name, "trusted-lan-transit", expected,
 		)
+		if cell.Verdict == IsolationViolation && approve != nil && approve(cell) {
+			cell.Expected, cell.Verdict = "allow", IsolationApproved
+			approvedCell = &cell
+			return IsolationCell{}, false
+		}
 		if cell.Verdict == IsolationViolation || cell.Verdict == IsolationBrokenDependency {
 			if expected == "deny" && isTransitProbeApproved(o.snap, rawFindings, intent.ApprovedPaths, srcZone, srcNet.Name, dstNet, k.dstIP, k.proto, k.port, fam) {
 				return IsolationCell{}, false
@@ -3240,6 +3276,9 @@ func (o *Oracle) evaluateBoundary(
 			srcNet.Name, dstNet.Name, strings.ToUpper(fam), maxExactBoundaryEvals,
 		)
 		return cell
+	}
+	if approvedCell != nil {
+		return *approvedCell
 	}
 	return firstCell
 }

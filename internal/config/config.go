@@ -117,13 +117,10 @@ type NetworkConfig struct {
 	// Assets declares the impact and platform relations of individual devices and clients.
 	Assets []AssetOverride `yaml:"assets,omitempty"`
 
-	// TrustedVLANs lists VLAN names (case-insensitive) or numeric VLAN IDs whose
-	// hosts have elevated trust. Findings on these networks are escalated.
+	// TrustedVLANs identifies trusted networks for isolation policy evaluation.
 	TrustedVLANs []string `yaml:"trusted_vlans"`
 
-	// IsolatedVLANs lists VLAN names or numeric VLAN IDs reserved for untrusted
-	// IoT gear. Non-WAN findings on these networks are de-escalated because
-	// lateral movement is already constrained.
+	// IsolatedVLANs identifies networks intended to contain untrusted devices.
 	IsolatedVLANs []string `yaml:"isolated_vlans"`
 
 	// ExcludeIPs lists IP addresses that UniBlue must never actively probe.
@@ -257,6 +254,9 @@ type ScanConfig struct {
 	// Interval sets the delay between consecutive scans in `uniblue watch`.
 	Interval time.Duration `yaml:"interval"`
 
+	// DisableSSHAuthProbe skips discovery of the authentication methods offered by SSH servers.
+	DisableSSHAuthProbe bool `yaml:"disable_ssh_auth_probe,omitempty"`
+
 	// SSHKeyAudit configures the strictly opt-in, Fail2ban-safe SSH public-key
 	// reachability check (RFC 4252 section 7). Disabled by default.
 	SSHKeyAudit *SSHKeyAuditConfig `yaml:"ssh_key_audit,omitempty"`
@@ -266,8 +266,8 @@ type ScanConfig struct {
 // It accepts only local OpenSSH .pub files, refuses private keys, and caps
 // probes per host to stay below Fail2ban and sshd MaxStartups thresholds.
 type SSHKeyAuditConfig struct {
-	// Enabled must be explicitly set to true to run any SSH authentication query.
-	Enabled bool `yaml:"enabled,omitempty"`
+	// Enabled overrides the default of auditing when public key files are configured.
+	Enabled *bool `yaml:"enabled,omitempty"`
 
 	// PublicKeyFiles lists local OpenSSH .pub file paths to test.
 	PublicKeyFiles []string `yaml:"public_key_files,omitempty"`
@@ -284,7 +284,17 @@ type SSHKeyAuditConfig struct {
 	MaxProbesPerHost int `yaml:"max_probes_per_host,omitempty"`
 }
 
-// StateConfig controls local persistence between scans.
+// Active reports whether the operator has configured the public-key audit.
+func (c *SSHKeyAuditConfig) Active() bool {
+	if c == nil {
+		return false
+	}
+	if c.Enabled != nil {
+		return *c.Enabled
+	}
+	return len(c.PublicKeyFiles) > 0
+}
+
 // StateConfig controls where UniBlue persists its baseline scan state.
 type StateConfig struct {
 	// Path is the filesystem location of the JSON state file used for diffing.
@@ -423,7 +433,7 @@ func Load(path string) (*Config, error) {
 	if cfg.Scan.Interval <= 0 {
 		cfg.Scan.Interval = 15 * time.Minute
 	}
-	if cfg.Scan.SSHKeyAudit != nil && cfg.Scan.SSHKeyAudit.Enabled && cfg.Scan.SSHKeyAudit.MaxProbesPerHost <= 0 {
+	if cfg.Scan.SSHKeyAudit.Active() && cfg.Scan.SSHKeyAudit.MaxProbesPerHost <= 0 {
 		cfg.Scan.SSHKeyAudit.MaxProbesPerHost = 3
 	}
 	if cfg.State.Path == "" {
@@ -544,7 +554,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: invalid scan port %d", p)
 		}
 	}
-	if ka := c.Scan.SSHKeyAudit; ka != nil && ka.Enabled {
+	if ka := c.Scan.SSHKeyAudit; ka.Active() {
 		if ka.MaxProbesPerHost > 3 {
 			return fmt.Errorf("config: scan.ssh_key_audit.max_probes_per_host %d exceeds Fail2ban-safe hard cap 3", ka.MaxProbesPerHost)
 		}

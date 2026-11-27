@@ -18,6 +18,7 @@ import (
 
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
+	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
@@ -719,12 +720,12 @@ func TestVerifiedContainmentPreservesSeverity(t *testing.T) {
 // including an empty action queue followed by its first actionable exposure.
 func TestLegacyStateScoringVersionSilentRebaseline(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "uniblue-state.json")
-	const legacy = `{"findings":{"service|02:00:00:00:00:01|23":"medium"}}`
+	const legacy = `{"scoring_version":2,"actions":{"act:retired":"P2"},"findings":{"service|02:00:00:00:00:01|23":"medium"}}`
 	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
 		t.Fatal(err)
 	}
 	prev, err := LoadState(path)
-	if err != nil || !prev.NeedsScoringRebaseline() || prev.Actions != nil {
+	if err != nil || !prev.NeedsScoringRebaseline() || prev.Actions["act:retired"] != "P2" {
 		t.Fatalf("legacy baseline = %+v, err = %v", prev, err)
 	}
 	cfg := config.NetworkConfig{IsolatedVLANs: []string{"Sensors"}}
@@ -742,7 +743,7 @@ func TestLegacyStateScoringVersionSilentRebaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	prev, err = LoadState(path)
-	if err != nil || prev == nil || prev.ScoringVersion != 2 || prev.Actions == nil || len(prev.Actions) != 0 {
+	if err != nil || prev == nil || prev.ScoringVersion != 3 || prev.Actions == nil || len(prev.Actions) != 0 {
 		t.Fatalf("reloaded baseline = %+v, err = %v", prev, err)
 	}
 	action := ActionAlert{ID: "act:check:service:" + cl.MAC + ":23", Priority: "P3"}
@@ -816,6 +817,23 @@ func TestLegacyOfflineFindingRebaseline(t *testing.T) {
 		if len(d.NewActions) != 1 || d.NewActions[0].ID != added.ID {
 			t.Fatalf("new service after reconnect: %+v", d)
 		}
+	}
+}
+
+// TestOfflineV2FindingEscalation keeps the last observed score until the host returns.
+func TestOfflineV2FindingEscalation(t *testing.T) {
+	cl := unifi.Client{MAC: "02:00:00:00:00:0a", IP: "192.0.2.2"}
+	f := checks.Finding{CheckID: "service", Client: cl, Port: 23, BaseSeverity: checks.SeverityHigh}
+	prev := &State{ScoringVersion: 2, Findings: map[string]checks.Severity{f.Key(): checks.SeverityHigh}}
+	cfg := config.NetworkConfig{}
+	st := BuildStateWithPrev(prev, &unifi.Snapshot{}, Report{}, cfg, nil)
+	if got := st.Findings[f.Key()]; got != checks.SeverityHigh {
+		t.Fatalf("offline score = %v", got)
+	}
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}, PortForwards: []unifi.PortForward{{Enabled: true, Proto: "tcp", FwdIP: cl.IP, FwdPort: "23"}}}
+	d := ComputeDiff(st, snap, Evaluate(snap, []checks.Finding{f}, cfg), cfg)
+	if len(d.EscalatedFindings) != 1 || d.EscalatedFindings[0].Key() != f.Key() || d.EscalatedFindings[0].EffectiveSeverity != checks.SeverityCritical {
+		t.Fatalf("new WAN exposure = %+v", d.EscalatedFindings)
 	}
 }
 
@@ -1279,5 +1297,92 @@ func TestWANServiceActionIdentity(t *testing.T) {
 	st, d = actionCycle(st, online, []ActionAlert{a}, nil, true)
 	if !slices.Equal(d.ResolvedActionIDs, []string{macID}) || len(d.NewActions) != 1 || d.NewActions[0].ID != a.ID || st.KnownClientIPs["2001:db8::a"] != online.Clients[0].MAC {
 		t.Fatalf("reassigned forward = %+v, state = %+v", d, st)
+	}
+}
+
+// TestPrivateRecursiveDNS keeps LAN recursion in inventory until a forward publishes it.
+func TestPrivateRecursiveDNS(t *testing.T) {
+	oracle := NewOracle(&unifi.Snapshot{Networks: []unifi.Network{{ID: "lan", Name: "LAN", ZoneName: "Internal"}}, Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true, GatewayPoliciesAvailable: true}}, config.NetworkConfig{})
+	f := checks.Finding{CheckID: "UB-0010", BaseSeverity: checks.SeverityLow, ClaimKind: checks.ClaimConfirmedPermission, Client: unifi.Client{NetworkID: "lan"}, Port: 53, Transport: "udp", ObservedIPs: []string{"10.0.0.3", "fd00::3"}}
+	if got := scoreFinding(f, nil, oracle); got.EffectiveSeverity != checks.SeverityInfo || !got.IsInventoryOnly() {
+		t.Fatal(got)
+	}
+	pf := unifi.PortForward{Enabled: true, Proto: "udp", DstPort: "53", FwdIP: "fd00::3", FwdPort: "53"}
+	oracle.snap.PortForwards = []unifi.PortForward{pf}
+	if got := scoreFinding(f, []unifi.PortForward{pf}, oracle); got.EffectiveSeverity != checks.SeverityCritical || got.IsInventoryOnly() {
+		t.Fatal(got)
+	}
+	f.ObservedIPs = append(f.ObservedIPs, "2001:db8::3")
+	if got := scoreFinding(f, nil, oracle); got.EffectiveSeverity != checks.SeverityCritical || got.IsInventoryOnly() {
+		t.Fatal(got)
+	}
+}
+
+// TestResolverWANPaths checks DNS scoring against configured ingress and incomplete telemetry.
+func TestResolverWANPaths(t *testing.T) {
+	cl := unifi.Client{ID: "resolver", IP: "10.0.0.53", NetworkID: "lan"}
+	f := checks.Finding{CheckID: "UB-0010", Client: cl, Port: 53, Transport: "tcp", ClaimKind: checks.ClaimConfirmedPermission, BaseSeverity: checks.SeverityLow}
+	for _, tc := range []struct {
+		name   string
+		modify func(*unifi.Snapshot)
+		want   checks.Severity
+	}{
+		{"local", func(s *unifi.Snapshot) {}, checks.SeverityInfo},
+		{"unresolved forward source", func(s *unifi.Snapshot) {
+			s.PortForwards = []unifi.PortForward{{Enabled: true, Proto: "tcp", DstPort: "53", FwdIP: cl.IP, SourceUnknown: true}}
+		}, checks.SeverityMedium},
+		{"mapping", func(s *unifi.Snapshot) {
+			s.DynamicMappings = []unifi.DynamicPortMapping{{Protocol: "upnp", InternalIP: cl.IP, IntPort: 53, ExtPort: 53, Transport: "tcp"}}
+		}, checks.SeverityCritical},
+		{"other socket", func(s *unifi.Snapshot) {
+			s.DynamicMappings = []unifi.DynamicPortMapping{{InternalIP: cl.IP, IntPort: 53, Transport: "udp"}}
+		}, checks.SeverityInfo},
+		{"proxy", func(s *unifi.Snapshot) {
+			s.ProxyRoutes = []unifi.ProxyRoute{{PublicExposed: true, BackendIP: cl.IP, BackendPort: 53}}
+		}, checks.SeverityCritical},
+		{"tunnel", func(s *unifi.Snapshot) {
+			s.PublishedTunnels = []unifi.PublishedTunnel{{BackendIP: cl.IP, BackendPort: 53}}
+		}, checks.SeverityCritical},
+		{"firewall", func(s *unifi.Snapshot) {
+			s.FirewallPolicies = []unifi.FirewallPolicy{{ID: "dns", Enabled: true, Action: "ALLOW", Protocol: "tcp", Source: unifi.PolicyEndpoint{ZoneName: "External", AnyTarget: true, AnyPort: true}, Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, Ports: []int{53}}}}
+		}, checks.SeverityCritical},
+		{"unknown leases", func(s *unifi.Snapshot) { s.SecuritySettings = &unifi.SiteSecuritySettings{UPnPEnabled: true} }, checks.SeverityLow},
+		{"unknown forwards", func(s *unifi.Snapshot) { s.Visibility.PortForwardsAvailable = false }, checks.SeverityLow},
+		{"unknown firewall", func(s *unifi.Snapshot) { s.Visibility.GatewayPoliciesAvailable = false }, checks.SeverityLow},
+	} {
+		s := &unifi.Snapshot{Networks: []unifi.Network{{ID: "lan", Name: "LAN", ZoneName: "Internal"}}, Clients: []unifi.Client{cl}, Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true, GatewayPoliciesAvailable: true}}
+		tc.modify(s)
+		r := Evaluate(s, []checks.Finding{f}, config.NetworkConfig{})
+		i := slices.IndexFunc(r.Findings, func(g checks.Finding) bool { return g.CheckID == f.CheckID })
+		if i < 0 || r.Findings[i].EffectiveSeverity != tc.want || r.Findings[i].IsInventoryOnly() != (tc.want == checks.SeverityInfo) {
+			t.Fatalf("%s: %+v", tc.name, r.Findings)
+		}
+	}
+}
+
+// TestSSHForwardAssessment uses the same host and port evidence for both address families.
+func TestSSHForwardAssessment(t *testing.T) {
+	cl := unifi.Client{ID: "dual", IP: "192.0.2.2", IPv6: []string{"2001:db8::2"}}
+	s := &unifi.Snapshot{Clients: []unifi.Client{cl}, PortForwards: []unifi.PortForward{{Enabled: true, Proto: "tcp", FwdPort: "22", FwdIP: cl.IPv6[0]}}}
+	for _, tc := range []struct {
+		method   string
+		accepted bool
+		want     checks.Severity
+	}{
+		{"publickey", false, checks.SeverityMedium}, {"none", false, checks.SeverityMedium}, {"none", true, checks.SeverityCritical}, {"password", false, checks.SeverityHigh}, {"keyboard-interactive", false, checks.SeverityHigh},
+	} {
+		hp := probe.HostProfile{Client: cl, ProbeIP: cl.IP, SSH: &probe.SSHInfo{Port: 22, AuthMethods: []string{tc.method}, NoneAuthAccepted: tc.accepted}}
+		v6 := probe.HostProfile{Client: cl, ProbeIP: cl.IPv6[0], SSH: &probe.SSHInfo{Port: 22}}
+		r := Evaluate(s, nil, config.NetworkConfig{}, hp, v6)
+		if a := r.WANSurface[0]; a.Class != "ssh-entrypoint" || a.Severity != tc.want {
+			t.Fatal(a)
+		}
+		v6.SSH.AuthMethods = []string{"publickey"}
+		for _, profiles := range [][]probe.HostProfile{{hp, v6}, {v6, hp}} {
+			r := Evaluate(s, nil, config.NetworkConfig{}, profiles...)
+			if a := r.WANSurface[0]; a.Severity != checks.SeverityMedium {
+				t.Fatalf("IPv6 key-only listener with IPv4 %s: %+v", tc.method, a)
+			}
+		}
 	}
 }

@@ -513,9 +513,10 @@ func TestWatchSessionPreservesUnavailableSettingsAcrossTransientOutage(t *testin
 		return &unifi.Snapshot{
 			Site: "default",
 			SecuritySettings: &unifi.SiteSecuritySettings{
-				SSHEnabled:      true,
-				SSHPasswordAuth: true,
-				UPnPEnabled:     true,
+				SSHEnabled:           true,
+				SSHPasswordAuth:      true,
+				SSHPasswordAuthKnown: true,
+				UPnPEnabled:          true,
 			},
 			Visibility: &unifi.SiteVisibility{
 				SettingsAvailable: true,
@@ -759,7 +760,7 @@ func TestWatchActionBaselineUpgrade(t *testing.T) {
 	}
 	w.runCycle(t.Context())
 	st, err := risk.LoadState(cfg.State.Path)
-	if err != nil || st == nil || st.ScoringVersion != 2 || st.Actions == nil || len(sent) != 0 {
+	if err != nil || st == nil || st.ScoringVersion != 3 || st.Actions == nil || len(sent) != 0 {
 		t.Fatalf("upgrade state=%+v err=%v alerts=%+v", st, err, sent)
 	}
 	w.stateLoaded = false
@@ -789,5 +790,32 @@ func TestWatchDiffFingerprintIgnoresResolvedActions(t *testing.T) {
 	d.NewActions[0].Priority = "P1"
 	if watchDiffFingerprint("lab", d) == first {
 		t.Fatal("a changed outbound priority reused the retry fingerprint")
+	}
+}
+
+// TestSSHProbeSummary identifies the credential-free observation in redirected output.
+func TestSSHProbeSummary(t *testing.T) {
+	var out bytes.Buffer
+	printLocalSSHKeyAudit(&out, []probe.HostProfile{{SSH: &probe.SSHInfo{NoneAuthAccepted: true}}})
+	if !strings.Contains(out.String(), "SSH auth probe") || strings.Contains(out.String(), "key audit") {
+		t.Fatal(out.String())
+	}
+}
+
+// TestCheckTestScanSettings loads the SSH opt-out without controller credentials.
+func TestCheckTestScanSettings(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	fp, err := checkTestFingerprinter("config.yaml", nil, time.Second)
+	if err != nil || fp.DisableSSHAuthProbe {
+		t.Fatal("default scan settings", err)
+	}
+	path := filepath.Join(dir, "scan-settings.yaml")
+	if err := os.WriteFile(path, []byte("scan:\n  disable_ssh_auth_probe: true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fp, err = checkTestFingerprinter(path, nil, time.Second)
+	if err != nil || !fp.DisableSSHAuthProbe {
+		t.Fatal("SSH opt-out", err)
 	}
 }

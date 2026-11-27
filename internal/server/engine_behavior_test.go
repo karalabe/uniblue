@@ -1931,7 +1931,7 @@ func TestEngineActionBaselineUpgrade(t *testing.T) {
 	publish(80)
 	st, err := risk.LoadState(cfg.State.Path)
 	id := "act:check:service-80:" + cl.MAC + ":tcp/80"
-	if err != nil || st == nil || st.ScoringVersion != 2 || st.Actions[id] == "" || st.ActionPeakAt[id].IsZero() || e.webhookSeq != 0 {
+	if err != nil || st == nil || st.ScoringVersion != 3 || st.Actions[id] == "" || st.ActionPeakAt[id].IsZero() || e.webhookSeq != 0 {
 		t.Fatalf("upgrade state=%+v err=%v queued=%d", st, err, e.webhookSeq)
 	}
 	publish(443)
@@ -1967,7 +1967,7 @@ func TestBlastAlertCoverage(t *testing.T) {
 	v6 := unifi.Client{IPv6: []string{"2001:DB8::A"}}
 	const expanded = "2001:0db8:0000:0000:0000:0000:0000:000a"
 	device := unifi.Device{MAC: "02-00-00-00-00-0B", IP: "192.0.2.11"}
-	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}, Devices: []unifi.Device{device}, PortForwards: []unifi.PortForward{
+	snap := &unifi.Snapshot{Clients: []unifi.Client{cl}, Devices: []unifi.Device{device, {MAC: "02:00:00:00:00:06", IP: "2001:db8::a"}}, PortForwards: []unifi.PortForward{
 		{ID: "https", Enabled: true, FwdIP: cl.IP, Proto: "tcp_udp", FwdPort: "443"},
 		{ID: "ssh", Enabled: true, FwdIP: cl.IP, Proto: "tcp", FwdPort: "22"},
 		{Name: "Web", Enabled: true, FwdIP: cl.IP, Proto: "tcp", DstPort: "8443", FwdPort: "443"},
@@ -2003,6 +2003,9 @@ func TestBlastAlertCoverage(t *testing.T) {
 		{"zero credit", "act:check:UB-0002:" + cl.MAC + ":5900", "", blast.LaneFixNow, vnc, false},
 		{"high finding with medium action", "act:check:UB-0002:" + cl.MAC + ":5900", blast.P3, blast.LaneFixNow, high, false},
 		{"high finding with low action", "act:check:UB-0002:" + cl.MAC + ":5900", blast.P4, blast.LaneFixNow, high, false},
+		{"host check bundle", "act:check-host:UB-0002:" + cl.MAC, blast.P2, blast.LaneFixNow, high, true},
+		{"lower priority host check bundle", "act:check-host:UB-0002:" + cl.MAC, blast.P3, blast.LaneReduceExposure, high, false},
+		{"IPv6 infra bundle", "act:wan-service:02:00:00:00:00:06:tcp/8000", blast.P2, blast.LaneFixNow, forward("tcp-18000-18002-"+expanded+"-8000-8002", 0), true},
 		{"high finding with high action", "act:check:UB-0002:" + cl.MAC + ":5900", blast.P2, blast.LaneFixNow, high, true},
 		{"posture", "act:gateway-local:rule", blast.P2, blast.LaneFixNow, checks.Finding{CheckID: "UB-UNIFI-SSH-PASSWORD", Client: gw.Client}, false},
 		{"WAN to gateway", "act:gateway-local:RULE", blast.P2, blast.LaneFixNow, gw, true},
@@ -2017,6 +2020,7 @@ func TestBlastAlertCoverage(t *testing.T) {
 		{"translated range", "act:wan-service:" + cl.IP + ":tcp/8443", blast.P2, blast.LaneFixNow, forward("tcp-8443-"+cl.IP+"-8000-8002", 0), false},
 		{"untranslated range", "act:wan-pf:" + cl.IP + ":tcp/8000", blast.P2, blast.LaneFixNow, forward("tcp-8000-8002-"+cl.IP+"-", 0), true},
 		{"translated IPv6 range", "act:wan-pf:2001:db8::a:tcp/8000", blast.P2, blast.LaneFixNow, forward("tcp-18000-18002-"+expanded+"-8000-8002", 0), true},
+		{"canonical IPv6 bundle", "act:wan-service:2001:db8::a:tcp/8000", blast.P2, blast.LaneFixNow, forward("tcp-18000-18002-"+expanded+"-8000-8002", 0), true},
 		{"device bundle", "act:wan-service:02:00:00:00:00:0b:tcp/25", blast.P2, blast.LaneFixNow, deviceForward, true},
 		{"bundle by MAC", "act:wan-service:" + cl.MAC + ":tcp/443", blast.P1, blast.LaneFixNow, forward("https", 443), true},
 		{"bundle by IP and translated port", "act:wan-service:" + cl.IP + ":udp/443", blast.P1, blast.LaneFixNow, forward("https", 0), true},
@@ -2088,6 +2092,15 @@ func TestPatchActionCoverageAtWebhookThreshold(t *testing.T) {
 			}
 		})
 	}
+	high.Product = "Web Server"
+	bundle := "act:patch-product:web-server:" + strings.ToLower(cl.MAC)
+	rep.Actions[0] = blast.Action{ID: bundle, HighestTierReduced: blast.P2, Lane: blast.LaneFixNow}
+	d := risk.Diff{NewCVEs: []risk.CVEAlert{high}}
+	ApplyBlastActionsToDiff(&d, nil, snap, rep, nil, d.NewCVEs, true)
+	if len(d.NewActions) != 1 || d.NewActions[0].ID != other.ID || len(d.NewCVEs) != 1 {
+		t.Fatal(d)
+	}
+
 }
 
 func TestActionsPreventWebhookCoalescing(t *testing.T) {

@@ -413,7 +413,7 @@ func ActionAlertsFromBlast(actions []blast.Action) []risk.ActionAlert {
 }
 
 // ApplyBlastActionsToDiff adds action changes to the outbound diff and returns the
-// action baseline to persist. A v2 baseline with no action history keeps its
+// action baseline to persist. A current baseline with no action history keeps its
 // finding alerts for the cycle in which actions are first seeded.
 func ApplyBlastActionsToDiff(diff *risk.Diff, prev *risk.State, snap *unifi.Snapshot, blastRep blast.Report, probedHostKeys map[string]struct{}, newCVEs []risk.CVEAlert, cveMatched bool) (map[string]string, map[string]time.Time, map[string]time.Time, map[string]bool, map[string]map[string]time.Time, map[string]string) {
 	alerts := ActionAlertsFromBlast(blastRep.Actions)
@@ -458,15 +458,20 @@ func alertedPatchIDs(snap *unifi.Snapshot, alerts []risk.CVEAlert) map[string]ch
 	for _, c := range alerts {
 		ip := strings.ToLower(strings.TrimSpace(c.HostIP))
 		if ip != "" {
-			prefix := "act:patch:" + strings.ToLower(c.CVEID) + ":"
+			prefixes := []string{"act:patch:" + strings.ToLower(c.CVEID) + ":"}
+			if slug := blast.ProductSlug(c.Product); slug != "" {
+				prefixes = append(prefixes, "act:patch-product:"+slug+":")
+			}
 			sev := c.Severity
 			if c.KEV {
 				sev = checks.SeverityCritical
 			}
-			ids[prefix+ip] = max(ids[prefix+ip], sev)
-			if host := hostByIP[ip]; host != "" {
-				id := prefix + strings.ToLower(host)
-				ids[id] = max(ids[id], sev)
+			for _, prefix := range prefixes {
+				ids[prefix+ip] = max(ids[prefix+ip], sev)
+				if host := hostByIP[ip]; host != "" {
+					id := prefix + strings.ToLower(host)
+					ids[id] = max(ids[id], sev)
+				}
 			}
 		}
 	}
@@ -499,7 +504,7 @@ func blastCoversFinding(alertSevByID map[string]checks.Severity, snap *unifi.Sna
 	}
 	key := "act:check:" + checkID + ":" + host + ":"
 	proto, port := strings.ToLower(f.EffectiveTransport()), strconv.Itoa(f.Port)
-	if has(key + proto + "/" + port) {
+	if has("act:check-host:"+checkID+":"+host) || has(key+proto+"/"+port) {
 		return true
 	}
 	if proto == "tcp" {
@@ -548,8 +553,9 @@ func blastCoversForward(snap *unifi.Snapshot, f checks.Finding, has func(string)
 			}
 		}
 		backend := strings.TrimSpace(pf.FwdIP)
-		if addr, err := netip.ParseAddr(backend); err == nil {
-			backend = addr.Unmap().String()
+		backendAddr, err := netip.ParseAddr(backend)
+		if err == nil {
+			backend = backendAddr.Unmap().String()
 		}
 		for _, proto := range []string{"tcp", "udp"} {
 			if port <= 0 || !pf.MatchesTransport(proto) {
@@ -560,11 +566,12 @@ func blastCoversForward(snap *unifi.Snapshot, f checks.Finding, has func(string)
 				return true
 			}
 			if (host != "" && has("act:wan-service:"+host+suffix)) ||
-				(pf.FwdIP != "" && has("act:wan-service:"+pf.FwdIP+suffix)) {
+				(backend != "" && has("act:wan-service:"+backend+suffix)) {
 				return true
 			}
 			for _, dev := range snap.Devices {
-				if pf.FwdIP != "" && strings.EqualFold(dev.IP, pf.FwdIP) &&
+				addr, err := netip.ParseAddr(strings.TrimSpace(dev.IP))
+				if err == nil && addr.Unmap() == backendAddr.Unmap() &&
 					has("act:wan-service:"+cmp.Or(config.CanonicalMAC(dev.MAC), dev.ID, dev.IP)+suffix) {
 					return true
 				}

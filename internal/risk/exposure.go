@@ -7,16 +7,20 @@
 package risk
 
 import (
+	"cmp"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/config"
+	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
 	"gopkg.in/yaml.v3"
 )
@@ -147,11 +151,11 @@ func LoadExposureClassifier(fsys fs.FS) (*ExposureClassifier, error) {
 
 // Classify matches an enabled UniFi PortForward against the ordered rule list,
 // falling back to an unclassified MEDIUM assessment when no rule matches.
-func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client) ExposureAssessment {
+func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client, profiles ...probe.HostProfile) ExposureAssessment {
 	if c != nil {
 		for _, r := range c.rules {
 			if r.matches(pf) {
-				return ExposureAssessment{
+				assessment := ExposureAssessment{
 					Forward:  pf,
 					Client:   cl,
 					Class:    r.Class,
@@ -160,6 +164,18 @@ func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client) Exp
 					Summary:  strings.TrimSpace(r.Summary),
 					Actions:  r.Actions,
 				}
+				if assessment.Class == "ssh-entrypoint" {
+					switch ObservedSSHAccess(profiles, cl, pf.FwdIP, 22) {
+					case "none":
+						assessment.Severity = checks.SeverityCritical
+						assessment.Summary = "The SSH server accepted login without credentials. Require authentication and restrict WAN access."
+					case "password":
+						assessment.Severity = checks.SeverityHigh
+						assessment.Summary = "SSH offers password or keyboard-interactive authentication. Restrict WAN access and verify account authentication settings."
+					}
+				}
+
+				return assessment
 			}
 		}
 	}
@@ -175,9 +191,53 @@ func (c *ExposureClassifier) Classify(pf unifi.PortForward, cl unifi.Client) Exp
 	}
 }
 
+// ObservedSSHAccess prefers the listener's own SSH auth posture. An observation
+// from the other address family can identify password or credential-free access.
+func ObservedSSHAccess(profiles []probe.HostProfile, cl unifi.Client, ip string, port int) string {
+	identity := func(c unifi.Client) string {
+		return cmp.Or(config.CanonicalMAC(c.MAC), c.ID, canonicalIsolationIP(c.PrimaryIP()))
+	}
+	host := identity(cl)
+	listener, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if host == "" || err != nil {
+		return ""
+	}
+	listener = listener.Unmap()
+	var exact, fallback string
+	for _, hp := range profiles {
+		s := hp.SSH
+		if s == nil || s.Port != port || identity(hp.Client) != host {
+			continue
+		}
+		addr, err := netip.ParseAddr(hp.EffectiveProbeIP())
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		auth := &fallback
+		if addr == listener {
+			auth = &exact
+		} else if addr.Is4() == listener.Is4() {
+			continue
+		}
+		switch {
+		case s.NoneAuthAccepted:
+			*auth = "none"
+		case *auth != "none" && (slices.Contains(s.AuthMethods, "password") || slices.Contains(s.AuthMethods, "keyboard-interactive")):
+			*auth = "password"
+		case addr == listener && exact == "" && slices.Equal(s.AuthMethods, []string{"publickey"}):
+			exact = "publickey"
+		}
+	}
+	return cmp.Or(exact, fallback)
+}
+
 // matches evaluates whether a PortForward satisfies an ExposureRule's protocol,
 // port list, or optional rule-name regex.
 func (r *ExposureRule) matches(pf unifi.PortForward) bool {
+	if r.Class == "ssh-entrypoint" {
+		return pf.Enabled && strings.EqualFold(pf.Proto, r.Proto) && pf.OnlyBackendPort(r.Ports...)
+	}
 	if r.Proto != "" && !pf.MatchesTransport(r.Proto) {
 		return false
 	}

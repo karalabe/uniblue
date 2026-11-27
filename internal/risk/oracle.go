@@ -184,13 +184,19 @@ func PositionForClient(cl unifi.Client) Position {
 // Effective reports configured policy reachability, while Verdict evaluates it
 // against a deny expectation.
 func (o *Oracle) Service(src Position, dst unifi.Client, proto string, port int, fam string) IsolationCell {
-	return o.reach(src, dst, strings.ToLower(strings.TrimSpace(proto)), port, strings.ToLower(fam))
+	return o.reach(src, dst, strings.ToLower(strings.TrimSpace(proto)), port, strings.ToLower(fam), nil)
 }
 
 // AnyPort searches for any permitted new connection across all protocols and
 // ports, recording a concrete witness port when a service-scoped rule matches.
 func (o *Oracle) AnyPort(src Position, dst unifi.Client, fam string) IsolationCell {
-	return o.reach(src, dst, "", 0, strings.ToLower(fam))
+	return o.reach(src, dst, "", 0, strings.ToLower(fam), nil)
+}
+
+// Transit searches for a general network opening, accepting the built-in DNS
+// exception while still evaluating every independent packet class.
+func (o *Oracle) Transit(src Position, dst unifi.Client, fam string) IsolationCell {
+	return o.reach(src, dst, "", 0, strings.ToLower(fam), o.builtinDNS)
 }
 
 // InternetEgress searches public destinations for a permitted connection from
@@ -202,7 +208,7 @@ func (o *Oracle) InternetEgress(cl unifi.Client, fam string) IsolationCell {
 	external := unifi.Network{Name: "Internet", ZoneName: "External", Subnet: "0.0.0.0/0", IPv6Subnet: "2000::/3"}
 	peers := peerEndpoints{src: cl}
 	if n.InternetAccessEnabled != nil && !*n.InternetAccessEnabled && !o.compromised[config.CanonicalMAC(o.gwMAC)] {
-		return o.endpointPath(n, external, n.ZoneName, "External", peers, "", 0, fam)
+		return o.endpointPath(n, external, n.ZoneName, "External", peers, "", 0, fam, nil)
 	}
 	if len(peerAddresses(cl, fam)) == 0 {
 		return IsolationCell{Effective: "unknown", Verdict: IsolationUnknown, MissingInput: "The client address is missing"}
@@ -361,6 +367,43 @@ func (o *Oracle) Internet(dst unifi.Client, proto string, port int, fam string) 
 		cells = append(cells, o.firewallIngress(net, dst, proto, port, fam)...)
 	}
 	return cells
+}
+
+// ListenerWAN reports allow, deny or unknown for the exact observed socket.
+// A missing lease inventory cannot rule out an automatic port mapping.
+func (o *Oracle) ListenerWAN(cl unifi.Client, ip, proto string, port int) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return "unknown"
+	}
+	addr = addr.Unmap()
+	fam := "ipv4"
+	if addr.Is6() {
+		fam = "ipv6"
+	}
+	cl.IP, cl.IPv6 = addr.String(), nil
+	state := "deny"
+	if o.snap.Visibility == nil && o.snap.PortForwards == nil {
+		state = "unknown"
+	}
+	if o.snap.SecuritySettings != nil && o.snap.SecuritySettings.UPnPEnabled && len(o.snap.DynamicMappings) == 0 {
+		state = "unknown"
+	}
+	for _, cell := range o.Internet(cl, proto, port, fam) {
+		if cell.Effective == "allow" {
+			return "allow"
+		}
+		if cell.Effective == "unknown" {
+			state = "unknown"
+		}
+	}
+	return state
+}
+
+// PrivateLANListener identifies private listeners with no permitted or unresolved WAN path.
+func (o *Oracle) PrivateLANListener(cl unifi.Client, ip, proto string, port int) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	return err == nil && addr.Unmap().IsPrivate() && o.ListenerWAN(cl, ip, proto, port) == "deny"
 }
 
 // WithCompromised returns an independent scenario that bypasses only the named enforcers.
@@ -594,7 +637,7 @@ func (o *Oracle) hydrateClient(cl unifi.Client, fam string) unifi.Client {
 
 // reach hydrates source and destination identities from inventory before
 // dispatching to either the same-VLAN L2 peer solver or the routed solver.
-func (o *Oracle) reach(src Position, dst unifi.Client, proto string, port int, fam string) IsolationCell {
+func (o *Oracle) reach(src Position, dst unifi.Client, proto string, port int, fam string, approve func(IsolationCell) bool) IsolationCell {
 	a := o.hydrateClient(unifi.Client{
 		NetworkID: src.NetworkID, NetworkName: src.NetworkName, MAC: src.MAC, IP: src.IP,
 		SwitchMAC: src.SwitchMAC, SwitchPort: src.SwitchPort, IsWired: src.IsWired, APMAC: src.APMAC, ESSID: src.SSID,
@@ -620,7 +663,7 @@ func (o *Oracle) reach(src Position, dst unifi.Client, proto string, port int, f
 		if peers.dst, nonRoutable = routableClient(peers.dst, fam); nonRoutable {
 			return o.nonRoutableCell(srcNet, dstNet, srcZone, dstNet.ZoneName, dst, proto, port, fam)
 		}
-		cell := o.endpointPath(srcNet, dstNet, srcZone, dstNet.ZoneName, peers, proto, port, fam)
+		cell := o.endpointPath(srcNet, dstNet, srcZone, dstNet.ZoneName, peers, proto, port, fam, approve)
 		cell.DestHost = dst.DisplayName()
 		if proto == "" {
 			cell.DestFunction = "any-port"
@@ -676,7 +719,7 @@ func (o *Oracle) nonRoutableCell(srcNet, dstNet unifi.Network, srcZone, dstZone 
 
 // endpointPath uses the same first-match policy solver for concrete services
 // and the same full-domain boundary search for routed and switched clients.
-func (o *Oracle) endpointPath(srcNet, dstNet unifi.Network, srcZone, dstZone string, peers peerEndpoints, proto string, port int, fam string) IsolationCell {
+func (o *Oracle) endpointPath(srcNet, dstNet unifi.Network, srcZone, dstZone string, peers peerEndpoints, proto string, port int, fam string, approve func(IsolationCell) bool) IsolationCell {
 	eval := o
 	if strings.EqualFold(dstZone, "External") {
 		if srcNet.InternetAccessEnabled != nil && !*srcNet.InternetAccessEnabled && !o.compromised[config.CanonicalMAC(o.gwMAC)] {
@@ -712,7 +755,7 @@ func (o *Oracle) endpointPath(srcNet, dstNet unifi.Network, srcZone, dstZone str
 		eval = &scoped
 	}
 	if proto == "" {
-		return eval.evaluateBoundary(nil, config.IsolationIntent{}, srcNet, dstNet, srcZone, dstZone, fam, "deny", &peers)
+		return eval.boundaryWithApproval(nil, config.IsolationIntent{}, srcNet, dstNet, srcZone, dstZone, fam, "deny", &peers, approve)
 	}
 	return eval.firstServicePath(srcNet, dstNet, srcZone, dstZone, peers, proto, port, fam)
 }

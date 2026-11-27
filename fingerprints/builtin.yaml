@@ -43,8 +43,8 @@
   products: ["llama.cpp"]
 
 - name: HP LaserJet
-  hostname_regex: "(?i)laserjet[^a-z0-9]*([a-z][0-9]{3,4})?"
-  http_title_regex: "(?i)hp\\s+laserjet[^a-z0-9]*([a-z][0-9]{3,4})?"
+  hostname_regex: "(?i)laserjet(?:[ -]+(?:pro|enterprise|color|mfp))*[^a-z0-9]*([a-z][0-9]{3,4})?"
+  http_title_regex: "(?i)hp\\s+laserjet(?:[ -]+(?:pro|enterprise|color|mfp))*[^a-z0-9]*([a-z][0-9]{3,4})?"
   vendors: ["hp"]
   products: ["*laserjet*{model}*"]
   model_group: 1

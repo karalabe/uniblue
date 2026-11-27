@@ -253,7 +253,7 @@ func runBlast(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	activeChecks := list
 	var profiles []probe.HostProfile
 	if !*noProbe {
-		fp := newSiteFingerprinter(mergePorts(cfg.Scan.Ports, list), cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+		fp := newSiteFingerprinter(mergePorts(cfg.Scan.Ports, list), cfg.Scan, cfg.Network.ExcludedSet(), snap)
 		if err := fp.SetSSHKeyAudit(cfg.Scan.SSHKeyAudit); err != nil {
 			return err
 		}
@@ -301,7 +301,7 @@ func runBlast(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 	findings = append(findings, checks.FindingsFromProfiles(profiles, findings)...)
-	base := risk.Evaluate(snap, findings, cfg.Network)
+	base := risk.Evaluate(snap, findings, cfg.Network, profiles...)
 	in.Findings, in.Checks = findings, list
 	in.Isolation, in.SwitchPorts = base.Isolation, base.SwitchPorts
 	if !*noCVE {
@@ -348,8 +348,11 @@ func printLocalSSHKeyAudit(w io.Writer, profiles []probe.HostProfile) {
 				invitedHosts++
 			}
 		}
-		if noneHosts > 0 || invitedHosts > 0 {
-			fmt.Fprintf(w, "\nSSH key audit summary: %d host(s) accepted 'none' auth, %d host(s) invited configured public keys (run in an interactive terminal to view key details).\n", noneHosts, invitedHosts)
+		if noneHosts > 0 {
+			fmt.Fprintf(w, "\nSSH auth probe: %d host(s) accepted login without credentials.\n", noneHosts)
+		}
+		if invitedHosts > 0 {
+			fmt.Fprintf(w, "\nSSH key audit: %d host(s) invited configured public keys (run in an interactive terminal to view key details).\n", invitedHosts)
 		}
 		return
 	}
@@ -731,7 +734,7 @@ func (w *watchSession) runCycle(ctx context.Context) {
 	w.lastSnap = cloneWatchTelemetrySnapshot(snap)
 
 	if w.prevState.NeedsScoringRebaseline() {
-		w.logger.Info("upgrading state baseline to scoring version 2 (silent first-run re-baseline)")
+		w.logger.Info("upgrading scoring baseline silently", "version", risk.CurrentScoringVersion)
 	}
 	probedKeys := probedHostKeys(profiles)
 	diff := risk.ComputeDiffWithProbed(w.prevState, snap, report, w.cfg.Network, probedKeys)
@@ -971,7 +974,7 @@ func runInventory(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			return err
 		}
 		scanPorts := mergePorts(cfg.Scan.Ports, checkList)
-		fp := newSiteFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+		fp := newSiteFingerprinter(scanPorts, cfg.Scan, cfg.Network.ExcludedSet(), snap)
 		fp.SetHostPortHints(snap.PortHintsByIP())
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
 	} else {
@@ -1045,6 +1048,7 @@ func runCheckValidate(args []string, stdout, stderr io.Writer) error {
 func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("check test", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "config.yaml", "path to optional scan settings")
 	target := fs.String("target", "", "target LAN IP address to test")
 	hostname := fs.String("hostname", "", "optional target hostname for hostname-gated checks")
 	mac := fs.String("mac", "", "optional target MAC address for MAC/OUI-gated checks")
@@ -1099,12 +1103,10 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 
 	targetCl := buildCheckTestClient(*target, *hostname, *mac, *ouiVendor)
-	fp := probe.NewFingerprinter(ports, 1, *timeout, nil)
-	// Keep single-target `check test` strictly scoped to the target IP: inject
-	// an empty discovery snapshot so FingerprintAll still runs TCP/HTTP/SSH and
-	// Nerva protocol fingerprinting on the target without broadcasting LAN-wide
-	// mDNS/SSDP/WSD sweeps or sending UPnP HTTP GETs to unrelated LAN hosts.
-	fp.SetCachedDiscovery(&probe.LANDiscovery{})
+	fp, err := checkTestFingerprinter(*cfgPath, ports, *timeout)
+	if err != nil {
+		return err
+	}
 	profiles := fp.FingerprintAll(ctx, []unifi.Client{targetCl})
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1139,6 +1141,24 @@ func runCheckTest(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		reportUnevaluableCheckHints(stderr, list, targetCl, false)
 	}
 	return nil
+}
+
+// checkTestFingerprinter applies the standalone scan settings without requiring
+// a controller login or issuing network-wide discovery requests.
+func checkTestFingerprinter(cfgPath string, ports []int, timeout time.Duration) (*probe.Fingerprinter, error) {
+	cfg := config.Default()
+	raw, err := os.ReadFile(cfgPath)
+	if err == nil {
+		if err := yaml.Unmarshal(raw, cfg); err != nil {
+			return nil, fmt.Errorf("parse scan settings: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) || cfgPath != "config.yaml" {
+		return nil, err
+	}
+	fp := probe.NewFingerprinter(ports, 1, timeout, nil)
+	fp.DisableSSHAuthProbe = cfg.Scan.DisableSSHAuthProbe
+	fp.SetCachedDiscovery(&probe.LANDiscovery{})
+	return fp, nil
 }
 
 // buildCheckTestClient constructs the target Client for `check test`, resolving
@@ -1230,7 +1250,7 @@ func executeCycle(ctx context.Context, cfg *config.Config, checkList []*checks.C
 // watchAuditedSSHHostKeys caches opt-in SSH key audit outcomes for unchanged
 // host keys during this process so periodic watch scans replay findings without
 // sending repeat PK_OK queries.
-var watchAuditedSSHHostKeys = map[string]probe.SSHKeyAuditCacheEntry{}
+var watchAuditedSSHHostKeys = new(probe.SSHKeyAuditCache)
 
 func executeCycleWithPrev(ctx context.Context, cfg *config.Config, checkList []*checks.Check, prevSnap *unifi.Snapshot, prev *risk.State) (*unifi.Snapshot, []probe.HostProfile, risk.Report, error) {
 	snap, profiles, _, _, report, err := executeCycleDetailed(ctx, cfg, checkList, prevSnap, prev)
@@ -1258,7 +1278,7 @@ func executeCycleDetailed(ctx context.Context, cfg *config.Config, checkList []*
 	// community checks so dropping a YAML check into checks/ works automatically.
 	scanPorts := mergePorts(cfg.Scan.Ports, checkList)
 
-	fp := newSiteFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+	fp := newSiteFingerprinter(scanPorts, cfg.Scan, cfg.Network.ExcludedSet(), snap)
 	if err := fp.SetSSHKeyAudit(cfg.Scan.SSHKeyAudit); err != nil {
 		return nil, nil, nil, nil, risk.Report{}, err
 	}
@@ -1291,7 +1311,7 @@ func executeCycleDetailed(ctx context.Context, cfg *config.Config, checkList []*
 	keys := prev.CompareSSHHostKeys(profiles)
 	rawFindings = append(rawFindings, checks.FindingsFromProfiles(profiles, rawFindings)...)
 
-	report := risk.Evaluate(snap, rawFindings, cfg.Network)
+	report := risk.Evaluate(snap, rawFindings, cfg.Network, profiles...)
 	report.SSHHostKeys = keys
 	return snap, profiles, rawFindings, devChildren, report, nil
 }
@@ -1357,8 +1377,9 @@ func siteGatewayReflectorIPs(snap *unifi.Snapshot) []string {
 
 // newSiteFingerprinter constructs a Fingerprinter pre-populated with all site
 // IPv4/IPv6 subnets and gateway mDNS reflector IPs from snap.
-func newSiteFingerprinter(ports []int, concurrency int, timeout time.Duration, excluded map[string]struct{}, snap *unifi.Snapshot) *probe.Fingerprinter {
-	fp := probe.NewFingerprinter(ports, concurrency, timeout, excluded)
+func newSiteFingerprinter(ports []int, scan config.ScanConfig, excluded map[string]struct{}, snap *unifi.Snapshot) *probe.Fingerprinter {
+	fp := probe.NewFingerprinter(ports, scan.Concurrency, scan.Timeout, excluded)
+	fp.DisableSSHAuthProbe = scan.DisableSSHAuthProbe
 	if snap != nil {
 		fp.SetInfrastructure(snap.Devices)
 	}
@@ -1529,8 +1550,7 @@ func localCVEMatchesAndSignals(cfg *config.Config, snap *unifi.Snapshot, profile
 	}
 	products := identifier.Identify(snap, profiles)
 	matches, err := cache.MatchProducts(products, cve.MatchOptions{
-		MinSeverity:          checks.SeverityHigh,
-		PotentialMaxAgeYears: 2,
+		MinSeverity: checks.SeverityHigh,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -2005,7 +2025,6 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 	cfgPath := fs.String("config", "config.yaml", "path to UniBlue YAML config file")
 	cacheDir := fs.String("cache", "", "local CVE cache directory (overrides config)")
 	minSevStr := fs.String("min-severity", "high", "minimum CVE severity (info, low, medium, high, critical)")
-	recentYears := fs.Int("recent-years", 2, "limit version-unknown non-KEV matches to CVEs published in the last N years (0 = all)")
 	limit := fs.Int("limit", 40, "max potential (version-unknown) CVEs to print")
 	jsonOut := fs.Bool("json", false, "output matches as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -2045,7 +2064,7 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return err
 	}
 
-	fp := newSiteFingerprinter(cfg.Scan.Ports, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+	fp := newSiteFingerprinter(cfg.Scan.Ports, cfg.Scan, cfg.Network.ExcludedSet(), snap)
 	profiles := fp.FingerprintAll(ctx, snap.Clients)
 
 	identifier, err := cve.LoadFingerprinter(fingerprints.BuiltinFS)
@@ -2055,8 +2074,7 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 	products := identifier.Identify(snap, profiles)
 
 	matches, err := cache.MatchProducts(products, cve.MatchOptions{
-		MinSeverity:          minSev,
-		PotentialMaxAgeYears: *recentYears,
+		MinSeverity: minSev,
 	})
 	if err != nil {
 		return err
@@ -2450,7 +2468,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	}
 	if !*noProbe {
 		scanPorts := mergePorts(cfg.Scan.Ports, checkList)
-		fp := newSiteFingerprinter(scanPorts, cfg.Scan.Concurrency, cfg.Scan.Timeout, cfg.Network.ExcludedSet(), snap)
+		fp := newSiteFingerprinter(scanPorts, cfg.Scan, cfg.Network.ExcludedSet(), snap)
 		fp.SetHostPortHints(checks.PlanHostPorts(snap.Clients, checkList, snap.PortHintsByIP()))
 		profiles = fp.FingerprintAll(ctx, snap.Clients)
 		if err := ctx.Err(); err != nil {
@@ -2496,7 +2514,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return writeJSON(stdout, model)
 	}
 	if *outPath != "" {
-		report := risk.Evaluate(snap, rawFindings, cfg.Network)
+		report := risk.Evaluate(snap, rawFindings, cfg.Network, profiles...)
 		var exactCVEs, potentialCVEs []cve.ProductSummary
 		var exportCVEs []cve.Match
 		var exportSignals []blast.TargetSignal

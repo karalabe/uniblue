@@ -8,6 +8,7 @@ package server
 
 import (
 	"bytes"
+	"github.com/karalabe/uniblue/internal/blast"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -57,33 +58,30 @@ func TestNewDemoEngineBuildsCompletePresentationModel(t *testing.T) {
 	}
 	lanes := map[string]int{}
 	priorities := 0
-	var hasHighProfile, hasDemoKEV bool
+	var hasDemoKEV bool
 	for _, a := range snap.View.Blast.Actions {
 		if strings.Contains(a.ID, "UB-UNIFI-") {
 			t.Fatalf("synthetic controller posture finding leaked into blast action queue: %+v", a)
 		}
 		lanes[string(a.Lane)]++
-		if priorities < 3 && a.HighestTierReduced != "" && a.Lane != "verify" {
+		if priorities < 5 && a.HighestTierReduced != "" && a.Lane != "verify" {
 			priorities++
 			if a.Reason == "" || !slices.ContainsFunc(a.AffectedAssets, func(id string) bool { return drawers[id] }) {
 				t.Errorf("Checkup priority %q needs a reason and a device drawer", a.Title)
 			}
 		}
-		if a.HighProfile {
-			hasHighProfile = true
+		if a.ID == "act:wan-pf:pf-https" && (a.HighProfile || a.HighestTierReduced != blast.P3) {
+			t.Fatalf("unexpected proxy priority: %+v", a)
 		}
 		if strings.Contains(a.ID, "CVE-2024-6387") {
 			hasDemoKEV = true
 		}
 	}
-	if priorities != 3 {
-		t.Errorf("demo Checkup shows %d top priorities, want 3", priorities)
+	if priorities != 5 {
+		t.Errorf("demo Checkup shows %d top priorities, want 5", priorities)
 	}
 	if lanes["fix-now"] == 0 || lanes["reduce-exposure"] == 0 {
 		t.Fatalf("expected fix-now and reduce-exposure demo actions, got lanes=%+v", lanes)
-	}
-	if !hasHighProfile {
-		t.Fatalf("expected at least one high-profile target signal on demo actions, got %+v", snap.View.Blast.Actions)
 	}
 	if !hasDemoKEV {
 		t.Fatalf("expected demo CVE-2024-6387 KEV patch action derived from shared demo CVE matches, got %+v", snap.View.Blast.Actions)

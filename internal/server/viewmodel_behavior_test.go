@@ -799,6 +799,9 @@ func TestDashboardHTMLInvariants(t *testing.T) {
 		`includes("security-settings")`,
 		`"Unknown (feed unavailable)"`,
 		`!hasSettings ? settingsUnknownVal`,
+		`sshModeUnknown = s.ssh_enabled && !s.ssh_password_auth_known`,
+		`sshModeUnknown ? "Unknown"`,
+		`sshModeUnknown ? "neutral"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("index.html missing stale/absent settings guard %q", needle)

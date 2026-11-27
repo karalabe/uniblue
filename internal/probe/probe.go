@@ -24,7 +24,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/karalabe/uniblue/internal/config"
@@ -198,7 +197,7 @@ type HostProfile struct {
 	// SMB holds server capabilities from one read-only negotiation on TCP 445.
 	SMB *SMBInfo `json:"smb,omitempty"`
 
-	// SSH holds the identification and host key offered before authentication.
+	// SSH holds the host key, algorithms, and observed authentication posture.
 	SSH *SSHInfo `json:"ssh,omitempty"`
 
 	// SSHBanner stores the passive greeting line advertised on port 22 (e.g.,
@@ -313,6 +312,7 @@ func (h HostProfile) Clone() HostProfile {
 	}
 	if h.SSH != nil {
 		info := *h.SSH
+		info.AuthMethods = slices.Clone(info.AuthMethods)
 		cp.SSH = &info
 	}
 	cp.ConnectOnlyPorts = slices.Clone(h.ConnectOnlyPorts)
@@ -443,8 +443,9 @@ type Fingerprinter struct {
 	sshKeyAudit     *config.SSHKeyAuditConfig
 	sshAuditKeys    []SSHPublicKey
 	prevSSHHostKeys map[string]string
-	auditedSSHHosts map[string]SSHKeyAuditCacheEntry
-	sshAuditMu      sync.Mutex
+	auditedSSHHosts *SSHKeyAuditCache
+	// DisableSSHAuthProbe disables the credential-free SSH method query.
+	DisableSSHAuthProbe bool
 }
 
 // SetPreviousSSHHostKeys provides saved host-key fingerprints from the prior
@@ -455,17 +456,18 @@ func (f *Fingerprinter) SetPreviousSSHHostKeys(prev map[string]string) {
 }
 
 // SetAuditedSSHHostKeys provides a caller-owned cache recording SSH key audit
-// outcomes by host/port so watch/serve cycles replay confirmed findings without
-// repeatedly querying an unchanged SSH server.
-func (f *Fingerprinter) SetAuditedSSHHostKeys(audited map[string]SSHKeyAuditCacheEntry) {
-	f.auditedSSHHosts = audited
+// outcomes and retry cooldowns by host identity, listener IP, and port.
+func (f *Fingerprinter) SetAuditedSSHHostKeys(audited *SSHKeyAuditCache) {
+	if audited != nil {
+		f.auditedSSHHosts = audited
+	}
 }
 
 // SetSSHKeyAudit enables the strictly opt-in Fail2ban-safe SSH public-key
-// reachability check when cfg is non-nil and cfg.Enabled is true. Returns an
+// reachability check when the configuration enables it. It returns an
 // error if any configured file contains a private key or fails to parse.
 func (f *Fingerprinter) SetSSHKeyAudit(cfg *config.SSHKeyAuditConfig) error {
-	if cfg == nil || !cfg.Enabled {
+	if !cfg.Active() {
 		f.sshKeyAudit = nil
 		f.sshAuditKeys = nil
 		return nil
@@ -480,7 +482,7 @@ func (f *Fingerprinter) SetSSHKeyAudit(cfg *config.SSHKeyAuditConfig) error {
 }
 
 func (f *Fingerprinter) matchesSSHKeyAuditTarget(h HostProfile) bool {
-	if f.sshKeyAudit == nil || !f.sshKeyAudit.Enabled || len(f.sshAuditKeys) == 0 {
+	if !f.sshKeyAudit.Active() || len(f.sshAuditKeys) == 0 {
 		return false
 	}
 	if len(f.sshKeyAudit.TargetHosts) == 0 {
@@ -653,10 +655,11 @@ func NewFingerprinter(ports []int, concurrency int, timeout time.Duration, exclu
 	sort.Ints(sortedPorts)
 
 	return &Fingerprinter{
-		ports:       sortedPorts,
-		concurrency: concurrency,
-		timeout:     timeout,
-		excludeIPs:  excludeIPs,
+		ports:           sortedPorts,
+		auditedSSHHosts: new(SSHKeyAuditCache),
+		concurrency:     concurrency,
+		timeout:         timeout,
+		excludeIPs:      excludeIPs,
 		httpClient: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
@@ -969,43 +972,7 @@ func (f *Fingerprinter) FingerprintHost(ctx context.Context, cl unifi.Client) Ho
 		f.walkVNCDisplays(ctx, dialer, targetIP, ports, &profile)
 	}
 
-	// Run strictly opt-in Fail2ban-safe SSH PK_OK audit sequentially per host
-	// after port observation and host-key fingerprinting complete. Never send
-	// configured usernames/keys if the host key changed since the prior scan,
-	// and skip unchanged host keys already audited in this process.
-	if profile.SSH != nil && !f.isInfrastructure(profile) && f.matchesSSHKeyAuditTarget(profile) {
-		bkey := sshBaselineKey(profile, profile.SSH.Port)
-		if bkey != "" && f.prevSSHHostKeys != nil && f.prevSSHHostKeys[bkey] != "" && f.prevSSHHostKeys[bkey] != profile.SSH.HostKeyFingerprint {
-			profile.SSH.HostKeyChanged = true
-		}
-		replayed := false
-		if bkey != "" && f.auditedSSHHosts != nil {
-			f.sshAuditMu.Lock()
-			if cached, ok := f.auditedSSHHosts[bkey]; ok && cached.HostKeyFingerprint == profile.SSH.HostKeyFingerprint {
-				profile.SSH.NoneAuthAccepted = cached.NoneAuthAccepted
-				profile.SSH.BruteForceProtected = cached.BruteForceProtected
-				profile.SSH.CanaryFalsePositive = cached.CanaryFalsePositive
-				profile.SSH.AcceptedKeys = slices.Clone(cached.AcceptedKeys)
-				replayed = true
-			}
-			f.sshAuditMu.Unlock()
-		}
-		if !profile.SSH.HostKeyChanged && !replayed {
-			addr := net.JoinHostPort(targetIP, strconv.Itoa(profile.SSH.Port))
-			AuditSSHKeys(ctx, addr, f.sshAuditKeys, f.sshKeyAudit.Usernames, f.sshKeyAudit.MaxProbesPerHost, f.timeout, profile.SSH)
-			if bkey != "" && f.auditedSSHHosts != nil && profile.SSH.HostKeyFingerprint != "" {
-				f.sshAuditMu.Lock()
-				f.auditedSSHHosts[bkey] = SSHKeyAuditCacheEntry{
-					HostKeyFingerprint:  profile.SSH.HostKeyFingerprint,
-					NoneAuthAccepted:    profile.SSH.NoneAuthAccepted,
-					BruteForceProtected: profile.SSH.BruteForceProtected,
-					CanaryFalsePositive: profile.SSH.CanaryFalsePositive,
-					AcceptedKeys:        slices.Clone(profile.SSH.AcceptedKeys),
-				}
-				f.sshAuditMu.Unlock()
-			}
-		}
-	}
+	f.auditSSH(ctx, &profile)
 
 	sort.Ints(profile.OpenPorts)
 	return profile

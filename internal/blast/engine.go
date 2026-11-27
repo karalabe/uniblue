@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/risk"
 	"github.com/karalabe/uniblue/internal/unifi"
@@ -37,8 +38,8 @@ type fact struct {
 	asset, detail string
 }
 type edge struct {
-	to, cut, bundle int
-	level           uint8
+	to, cut, bundle, tagCut int
+	level                   uint8
 }
 
 const (
@@ -64,8 +65,8 @@ type asset struct {
 	profile classify.AssetProfile
 }
 type highProfileEdge struct {
-	src int
-	cut int
+	src         int
+	from, index int
 }
 
 type graph struct {
@@ -81,6 +82,8 @@ type graph struct {
 	highProfilePorts   map[string]bool
 	highProfileSockets map[string]bool
 	highProfileSources map[int][]highProfileEdge
+	patchProducts      map[int]string
+	settingSeverity    map[int]checks.Severity
 }
 type candidate struct {
 	Action
@@ -110,6 +113,8 @@ func Evaluate(in Input) Report {
 		highProfilePorts:   make(map[string]bool),
 		highProfileSockets: make(map[string]bool),
 		highProfileSources: make(map[int][]highProfileEdge),
+		patchProducts:      make(map[int]string),
+		settingSeverity:    make(map[int]checks.Severity),
 	}
 	for i, s := range starts {
 		g.roots[i] = g.node(root(s.entry))
@@ -144,16 +149,17 @@ func (g *graph) node(f fact) int {
 }
 
 // link keeps alternate routes separate, including cuts narrower than a whole service.
-func (g *graph) link(from, to fact, level uint8, cut, bundle int) {
+func (g *graph) link(from, to fact, level uint8, cut, bundle int) *edge {
 	a, b := g.node(from), g.node(to)
-	g.edges[a] = append(g.edges[a], edge{b, cut, bundle, level})
+	g.edges[a] = append(g.edges[a], edge{to: b, cut: cut, bundle: bundle, level: level})
+	return &g.edges[a][len(g.edges[a])-1]
 }
 
 func (g *graph) action(id, title, reason string, lane Lane, effort int) int {
 	if i, ok := g.actionIDs[id]; ok {
 		// A shared rule can have several witnesses. Choose its wording independently of input order.
 		a := &g.actions[i]
-		if cmp.Or(cmp.Compare(title, a.Title), cmp.Compare(reason, a.Reason)) < 0 {
+		if (lane == LaneFixNow && a.Lane != LaneFixNow) || (lane == a.Lane && cmp.Or(cmp.Compare(title, a.Title), cmp.Compare(reason, a.Reason)) < 0) {
 			a.Title, a.Reason = title, reason
 		}
 		if lane == LaneFixNow {
@@ -200,7 +206,7 @@ func (g *graph) solveRoot(r int, cuts []bool, dist []uint8, queue []int) {
 	for head := 0; head < len(queue); head++ {
 		n := queue[head]
 		for _, e := range g.edges[n] {
-			if cuts != nil && (cuts[e.cut] || cuts[e.bundle]) {
+			if cuts != nil && (cuts[e.cut] || cuts[e.bundle] || cuts[e.tagCut]) {
 				continue
 			}
 			level := max(dist[n], e.level)
@@ -212,25 +218,25 @@ func (g *graph) solveRoot(r int, cuts []bool, dist []uint8, queue []int) {
 	}
 }
 
-// addHighProfileSource records that consequence node cf is backed by high-profile
-// listener or entry node src gated by action cut so target velocity applies only
-// when that exact edge survives and src is reachable in the same entry state.
-func (g *graph) addHighProfileSource(cf, src, cut int) {
-	he := highProfileEdge{src: src, cut: cut}
-	if !slices.Contains(g.highProfileSources[cf], he) {
-		g.highProfileSources[cf] = append(g.highProfileSources[cf], he)
-	}
+// markHighProfile records the last edge linked from a node. Remember its index
+// so bundles assigned later cut the same evidence as the individual remedy.
+func (g *graph) markHighProfile(from, source fact) {
+	node := g.ids[from]
+	index := len(g.edges[node]) - 1
+	to := g.edges[node][index].to
+	g.highProfileSources[to] = append(g.highProfileSources[to], highProfileEdge{g.ids[source], node, index})
 }
 
 // isHighProfileIn reports whether fact n/f is backed by a high-profile target
 // signal reachable in state dist (falling back to base when a listener degraded
 // to unknown under a counterfactual cut) along an uncut edge.
 func (g *graph) isHighProfileIn(n int, f fact, dist, base []uint8, cuts []bool) bool {
-	if g.highProfileHost[f.asset] {
+	if g.highProfileHost[f.asset] && !strings.HasPrefix(f.detail, "public access to ") {
 		return true
 	}
 	for _, he := range g.highProfileSources[n] {
-		if cuts != nil && he.cut != 0 && cuts[he.cut] {
+		e := g.edges[he.from][he.index]
+		if cuts != nil && (cuts[e.cut] || cuts[e.bundle]) {
 			continue
 		}
 		if he.src >= len(dist) {
@@ -253,8 +259,16 @@ func (g *graph) isHighProfileIn(n int, f fact, dist, base []uint8, cuts []bool) 
 // outranks or inverts an exact KEV match on the same product.
 func (g *graph) factPriority(s start, n int, f fact, d uint8, dist, base []uint8, cuts []bool) Priority {
 	p := PriorityFor(s.audience, difficulties[d], g.assets[f.asset].profile.Tier)
+	// A clean published listener warrants an exposure review even on the gateway.
+	if d == moderate && strings.HasPrefix(f.detail, "public access to ") {
+		return max(p, P3)
+	}
 	if s.audience == AudienceInternetAny && d < unknown && p > P1 && !strings.HasPrefix(f.detail, "CVE-") && g.isHighProfileIn(n, f, dist, base, cuts) {
-		return PromotePriority(p)
+		p = PromotePriority(p)
+	}
+	// A hardening setting retains its severity limit even on a frequently targeted host.
+	if sev, ok := g.settingSeverity[n]; ok && sev <= checks.SeverityLow {
+		p = max(p, P3)
 	}
 	return p
 }
@@ -278,6 +292,8 @@ func (g *graph) exposure(s start, n int, f fact, level uint8, dist []uint8) Expo
 	case level == unknown:
 		e.State = "unknown"
 		e.Lane = LaneVerify
+	case level == moderate && strings.HasPrefix(f.detail, "public access to "):
+		e.Lane = LaneReduceExposure
 	case level == moderate && f.kind != permission:
 		e.State = "needs-verification"
 		e.Lane = LaneVerify

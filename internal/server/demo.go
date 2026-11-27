@@ -57,7 +57,7 @@ func NewDemoEngine(opts Options) (*Engine, error) {
 	nervaFindings := checks.FindingsFromProfiles(profiles, rawFindings)
 	allRaw := append(rawFindings, nervaFindings...)
 
-	report := risk.Evaluate(snap, allRaw, netCfg)
+	report := risk.Evaluate(snap, allRaw, netCfg, profiles...)
 	classes := classifier.ClassifyAll(snap, profiles)
 	topo := topology.Build(snap, classes, netCfg)
 
@@ -660,15 +660,16 @@ func buildDemoDataset(now time.Time) (
 			{ESSID: "FiberBox-8821", BSSID: "dc:9f:db:44:55:66", Channel: 11, RSSI: -81},
 		},
 		SecuritySettings: &unifi.SiteSecuritySettings{
-			SSHEnabled:      true,
-			SSHPasswordAuth: true,
-			UPnPEnabled:     false,
-			IPSMode:         "ips",
-			HoneypotEnabled: true,
-			HoneypotIPs:     []string{"192.168.1.254", "192.168.10.254"},
-			DNSFiltering:    true,
-			DoHState:        "auto",
-			TeleportEnabled: true,
+			SSHEnabled:           true,
+			SSHPasswordAuth:      true,
+			SSHPasswordAuthKnown: true,
+			UPnPEnabled:          false,
+			IPSMode:              "ips",
+			HoneypotEnabled:      true,
+			HoneypotIPs:          []string{"192.168.1.254", "192.168.10.254"},
+			DNSFiltering:         true,
+			DoHState:             "auto",
+			TeleportEnabled:      true,
 		},
 		Health: &unifi.SystemHealth{
 			WANStatus:      "ok",

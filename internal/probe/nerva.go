@@ -265,6 +265,7 @@ func (f *Fingerprinter) enrichWithNerva(ctx context.Context, profiles []HostProf
 									if obs := observeSSH(conn, port, nervaTimeout); obs != nil {
 										if hp.SSH == nil {
 											hp.SSH = obs
+											f.auditSSH(ctx, hp)
 										}
 										svc.Findings = append(svc.Findings, sshWeakAlgorithmFindings(obs)...)
 									}

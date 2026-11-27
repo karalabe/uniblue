@@ -1024,3 +1024,42 @@ func TestGatewayDNSDependencyPerVLANGatewayIP(t *testing.T) {
 		}
 	}
 }
+
+// TestBuiltInDNSTransit keeps the DNS exception local to its winning firewall rule.
+func TestBuiltInDNSTransit(t *testing.T) {
+	dns := unifi.FirewallPolicy{ID: "dns", Name: "Allow Public DNS", Origin: "SYSTEM_DEFINED", Enabled: true, Action: "ALLOW", Protocol: "tcp_udp",
+		Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
+		Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, Ports: []int{53}}}
+	snap := &unifi.Snapshot{Networks: []unifi.Network{
+		{ID: "guest", Name: "Guest", ZoneName: "Hotspot", Purpose: "guest", Subnet: "198.51.100.1/24"},
+		{ID: "lan", Name: "LAN", ZoneName: "Internal", Subnet: "192.0.2.1/24"},
+	}, Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true}}
+	other := dns
+	other.ID, other.Index, other.Origin = "user", 10, "USER_DEFINED"
+	extra := other
+	extra.Destination.Ports = []int{2222}
+	for _, tc := range []struct {
+		policies  []unifi.FirewallPolicy
+		violation bool
+	}{
+		{[]unifi.FirewallPolicy{dns}, false}, {[]unifi.FirewallPolicy{other}, true},
+		{[]unifi.FirewallPolicy{dns, extra}, true},
+	} {
+		snap.FirewallPolicies = tc.policies
+		matrix, findings, _ := EvaluateIsolation(snap, nil, config.NetworkConfig{TrustedVLANs: []string{"LAN"}})
+		found, approved := false, false
+		for _, f := range findings {
+			if f.CheckID == "UB-UNIFI-ISO-TRUSTED-TRANSIT" && f.EffectiveSeverity == checks.SeverityHigh {
+				found = true
+			}
+		}
+		for _, c := range matrix.Cells {
+			if c.DecisiveRuleID == "dns" && c.DestFunction == "trusted-lan-transit" && c.Verdict == IsolationApproved {
+				approved = true
+			}
+		}
+		if found != tc.violation || !tc.violation && !approved {
+			t.Fatalf("violation=%t approved=%t, want violation=%t", found, approved, tc.violation)
+		}
+	}
+}

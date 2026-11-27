@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -189,6 +190,7 @@ func TestMissingEnforcementAndVersionEvidence(t *testing.T) {
 	iot := client("plug", "192.0.2.2", "iot")
 	s := &unifi.Snapshot{Networks: []unifi.Network{network("iot"), network("storage")}, Clients: []unifi.Client{iot, cl}, Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true}}
 	in := Input{Snapshot: s, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot"}}}}
+	observed(&in, cl, 5900, checks.GrantControl)
 	for _, kind := range []string{"firewall", "switch", "router"} {
 		switch kind {
 		case "switch":
@@ -206,6 +208,11 @@ func TestMissingEnforcementAndVersionEvidence(t *testing.T) {
 			return e.From == iot.ID && e.To == cl.ID && e.Tier == "unknown" && len(e.CutIDs) == 0
 		}) {
 			t.Fatalf("%s telemetry gap missing from the map: %+v", kind, r.Simulation.Edges)
+		}
+		if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+			return e.From == iot.ID && e.To == cl.ID && e.Tier == "unknown-takeover" && slices.Contains(e.CutIDs, "act:check:control-storage:storage:5900")
+		}) {
+			t.Fatal("missing unknown takeover", kind)
 		}
 		if !slices.ContainsFunc(r.Actions, func(a Action) bool { return a.Lane == LaneVerify && strings.Contains(a.ID, kind) }) {
 			t.Fatal(kind, r.Actions)
@@ -280,7 +287,7 @@ func TestCloudEgressVelocityTieBreak(t *testing.T) {
 	in := Input{Snapshot: &unifi.Snapshot{
 		Networks: []unifi.Network{network("a"), network("b")}, Clients: []unifi.Client{a, b},
 		FirewallPolicies: []unifi.FirewallPolicy{allow("a", "External"), allow("b", "External")},
-	}, Profiles: []probe.HostProfile{{Client: a, OutboundDependencies: vendor}, {Client: b, OutboundDependencies: vendor}},
+	}, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"a", "b"}}}, Profiles: []probe.HostProfile{{Client: a, OutboundDependencies: vendor}, {Client: b, OutboundDependencies: vendor}},
 		TargetSignals: []TargetSignal{{Asset: b.IP, Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}}}}
 	var ranked []Action
 	for _, a := range Evaluate(in).Actions {
@@ -965,8 +972,8 @@ func TestTargetVelocityPriorityAndTieBreak(t *testing.T) {
 	}
 	rDS := Evaluate(inDS)
 	dsExp := exposure(t, rDS, Internet, ds.MAC, "public access to tcp/443")
-	if dsExp.Priority != P2 || dsExp.HighProfile {
-		t.Fatalf("IPv6-only high-profile signal must not promote IPv4 forward (want P2, HighProfile=false), got %+v", dsExp)
+	if dsExp.Priority != P3 || dsExp.HighProfile {
+		t.Fatalf("IPv6-only high-profile signal must not promote IPv4 forward (want P3, HighProfile=false), got %+v", dsExp)
 	}
 
 	// 10. Closing a port forward when UPnP leases are unknown must earn zero
@@ -1315,7 +1322,7 @@ func TestGatewayControlTraffic(t *testing.T) {
 		rule("Allow DHCPv6", "SYSTEM_DEFINED", "udp", 547),
 		rule("Allow Neighbor Solicitations", "SYSTEM_DEFINED", "icmpv6", 0),
 		rule("Allow Return Traffic", "SYSTEM_DEFINED", "all", 0),
-		rule("Secure Shell", "USER_DEFINED", "tcp", 22),
+		rule("Secure Shell", "USER_DEFINED", "all", 0),
 	}
 	in := Input{Snapshot: s, Assets: map[string]classify.AssetProfile{gw.MAC: {Tier: classify.TierCrown}}}
 	r := Evaluate(in)
@@ -1435,5 +1442,380 @@ func TestSimulationInfrastructurePaths(t *testing.T) {
 	if !slices.ContainsFunc(edges, func(e SimEdge) bool { return e.From == cloudKey && e.To == gw && e.Tier == "takeover" }) ||
 		slices.ContainsFunc(edges, func(e SimEdge) bool { return e.From == gw && e.Tier == "takeover" }) {
 		t.Error("a standalone gateway must be managed by its Cloud Key")
+	}
+}
+
+// TestPublicListenerPosture checks WAN priority and simulator entry against listener evidence.
+func TestPublicListenerPosture(t *testing.T) {
+	cl := client("server", "192.0.2.20", "lan")
+	for _, tc := range []struct {
+		name             string
+		port             int
+		methods          []string
+		open, vulnerable bool
+		lane             Lane
+		tier             Priority
+	}{
+		{"HTTP", 80, nil, false, false, LaneReduceExposure, P3}, {"HTTPS", 443, nil, false, false, LaneReduceExposure, P3},
+		{"vulnerable HTTPS", 443, nil, false, true, LaneFixNow, P1}, {"SSH key", 22, []string{"publickey"}, false, false, LaneReduceExposure, P3},
+		{"SSH password", 22, []string{"publickey", "password"}, false, false, LaneFixNow, P1}, {"SSH interactive", 22, []string{"keyboard-interactive"}, false, false, LaneFixNow, P1},
+		{"SSH advertised none", 22, []string{"none"}, false, false, LaneReduceExposure, P3}, {"SSH none", 22, nil, true, false, LaneFixNow, P1}, {"SSH unknown", 22, nil, false, false, LaneReduceExposure, P3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			port := strconv.Itoa(tc.port)
+			pf := unifi.PortForward{ID: "forward", Enabled: true, Proto: "tcp", DstPort: port, FwdIP: cl.IP, FwdPort: port}
+			in := Input{Snapshot: &unifi.Snapshot{Networks: []unifi.Network{network("lan")}, Clients: []unifi.Client{cl}, PortForwards: []unifi.PortForward{pf}, Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true, GatewayPoliciesAvailable: true}},
+				Assets: map[string]classify.AssetProfile{cl.ID: {Tier: classify.TierHigh}}, TargetSignals: []TargetSignal{{Asset: cl.ID, Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}}},
+				Profiles: []probe.HostProfile{{Client: cl, ProbeIP: cl.IP, SSH: &probe.SSHInfo{Port: 22, AuthMethods: tc.methods, NoneAuthAccepted: tc.open}}}}
+			if tc.vulnerable {
+				observed(&in, cl, tc.port, checks.GrantControl)
+			}
+			r := Evaluate(in)
+			if a := action(t, r, "act:wan-pf:forward"); a.Lane != tc.lane || a.HighestTierReduced != tc.tier {
+				t.Fatal(a)
+			}
+			if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool { return e.To == cl.ID && e.Tier == "wan" }) {
+				t.Fatal("lost WAN entry")
+			}
+			verify := slices.ContainsFunc(r.Actions, func(a Action) bool { return a.Lane == LaneVerify && strings.HasPrefix(a.ID, "act:verify:ssh-auth:") })
+			if verify != (tc.name == "SSH unknown" || tc.name == "SSH key" || tc.name == "SSH advertised none") {
+				t.Fatal("unexpected SSH verification status", verify)
+			}
+		})
+	}
+}
+
+// TestGatewaySSHScope separates a confirmed TCP/22 rule from broad gateway access.
+func TestGatewaySSHScope(t *testing.T) {
+	gw := unifi.Device{MAC: "02:00:00:00:00:01", IP: "192.0.2.1", Type: "udm"}
+	policy := allow("External", "Gateway")
+	policy.Protocol = "tcp"
+	policy.Destination.AnyPort, policy.Destination.Ports = false, []int{22}
+	snap := &unifi.Snapshot{Devices: []unifi.Device{gw}, FirewallPolicies: []unifi.FirewallPolicy{policy}}
+	in := Input{Snapshot: snap, Assets: map[string]classify.AssetProfile{gw.MAC: {Tier: classify.TierCrown}}}
+	for _, tc := range []struct {
+		settings *unifi.SiteSecuritySettings
+		want     Priority
+	}{
+		{nil, P3}, {&unifi.SiteSecuritySettings{SSHEnabled: true, SSHPasswordAuthKnown: true}, P3},
+		{&unifi.SiteSecuritySettings{SSHPasswordAuth: true}, P1},
+	} {
+		snap.SecuritySettings = tc.settings
+		r := Evaluate(in)
+		verify := slices.ContainsFunc(r.Actions, func(a Action) bool {
+			return strings.HasPrefix(a.ID, "act:verify:ssh-auth:") && strings.Contains(a.Reason, "unknown")
+		})
+		if verify != (tc.want == P3) {
+			t.Fatal("console SSH verification", tc.settings, verify)
+		}
+		if a := action(t, r, "act:gateway-local:"+policy.ID); a.HighestTierReduced != tc.want {
+			t.Fatal(a)
+		}
+	}
+}
+
+// TestApplianceOnSharedNetworks preserves internet access for ordinary and guest devices.
+func TestApplianceOnSharedNetworks(t *testing.T) {
+	for _, zone := range []string{"Internal", "Hotspot"} {
+		cl := client("printer", "192.0.2.31", "shared")
+		cl.MAC = "02:00:00:00:00:31"
+		n := network("shared")
+		n.Name, n.ZoneName = "Default", zone
+		if zone == "Hotspot" {
+			n.Name = "Guest"
+			n.IsolationEnabled = true
+		}
+		in := Input{Snapshot: &unifi.Snapshot{Networks: []unifi.Network{n}, Clients: []unifi.Client{cl}, FirewallPolicies: []unifi.FirewallPolicy{allow(zone, "External")}}, Profiles: []probe.HostProfile{{Client: cl, OpenPorts: []int{631}}}}
+		r := Evaluate(in)
+		if a := action(t, r, "act:move-iot:shared"); a.Lane != LaneReduceExposure || a.HighestTierReduced == "" {
+			t.Fatal(a)
+		}
+		if exposure(t, r, AssumeBreach, cl.MAC, "shared network placement on "+n.Name).Lane != LaneReduceExposure ||
+			slices.ContainsFunc(r.Exposures, func(x Exposure) bool { return x.Entry == CloudEgress && x.Consequence == "internet access" }) ||
+			len(r.Simulation.Nodes[0].EgressCutIDs) > 0 {
+			t.Fatal(r.Exposures)
+		}
+		if slices.ContainsFunc(r.Actions, func(a Action) bool { return a.ID == "act:vlan-egress:shared->internet" }) {
+			t.Fatal(zone, "blanket egress cut")
+		}
+	}
+}
+
+// TestServiceRemedyBundles checks credit for controls that remove every parallel witness.
+func TestServiceRemedyBundles(t *testing.T) {
+	cl := client("compute", "192.0.2.9", "lan")
+	in := Input{Snapshot: &unifi.Snapshot{Clients: []unifi.Client{cl}, Networks: []unifi.Network{network("lan")}},
+		Checks: []*checks.Check{{ID: "UB-0002", Title: "Passwordless VNC", Grants: []checks.GrantSpec{{Effect: checks.GrantControl, Basis: checks.BasisProven}}}}}
+	for _, p := range []int{5900, 5901} {
+		in.Findings = append(in.Findings, checks.Finding{CheckID: "UB-0002", Client: cl, Port: p, BaseSeverity: checks.SeverityCritical})
+	}
+	product := cve.Product{HostIP: cl.IP, Label: "Web Server", Ports: []cve.EndpointPort{{Transport: "tcp", Port: 443}}}
+	for _, id := range []string{"CVE-2022-1000", "CVE-2023-1000"} {
+		m := cve.Match{Product: product, Record: cve.Record{ID: id, Severity: checks.SeverityCritical, AttackVector: "N"}, Confidence: cve.ConfidenceExact}
+		in.CVEMatches = append(in.CVEMatches, m)
+		proxy := m
+		proxy.Product.Label = "Proxy"
+		proxy.Record.ID = strings.Replace(id, "1000", "2000", 1)
+		in.CVEMatches = append(in.CVEMatches, proxy)
+		m.Product = cve.Product{HostIP: cl.IP, Label: "Printer OS"}
+		m.Confidence = cve.ConfidencePotential
+		in.CVEMatches = append(in.CVEMatches, m)
+	}
+	for _, tc := range []struct{ label, version, vector string }{
+		{"Packaged OS", "3.2", "N"}, {"Local Printer", "", "L"}, {"Local Package", "4.1", "L"},
+	} {
+		in.CVEMatches = append(in.CVEMatches, cve.Match{Product: cve.Product{Label: tc.label, HostIP: cl.IP, Version: tc.version}, Record: cve.Record{KEV: true, AttackVector: tc.vector}, Confidence: cve.ConfidencePotential})
+	}
+	r := Evaluate(in)
+	for _, id := range []string{"act:check-host:UB-0002:compute", "act:patch-product:web-server:compute", "act:patch-product:proxy:compute"} {
+		if a := action(t, r, id); a.HighestTierReduced == "" || a.Lane != LaneFixNow {
+			t.Fatal(a)
+		}
+	}
+	if a := action(t, r, "act:verify:potential:compute:packaged-os"); a.Lane != LaneVerify || !strings.Contains(a.Reason, "version was reported") {
+		t.Fatal(a)
+	}
+	for _, a := range r.Actions {
+		if strings.HasPrefix(a.ID, "act:verify:") && (strings.Contains(a.ID, ":local-") || a.ID == "act:verify:unversioned:compute:packaged-os") {
+			t.Fatal(a)
+		}
+	}
+	notices := 0
+	for _, a := range r.Actions {
+		if a.ID == "act:verify:unversioned:compute:printer-os" && a.Lane == LaneVerify {
+			notices++
+		}
+	}
+	if notices != 1 {
+		t.Fatal("unversioned verification count", notices)
+	}
+}
+
+// TestSwitchOutdoorBundle confirms that two exposed sockets require a shared remedy.
+func TestSwitchOutdoorBundle(t *testing.T) {
+	cl := client("recorder", "192.0.2.10", "storage")
+	sw := risk.SwitchDeviceView{MAC: "02:00:00:00:00:09", Name: "Garden"}
+	for _, p := range []int{1, 2} {
+		sw.Ports = append(sw.Ports, risk.SwitchPortView{PortIdx: p, Enabled: true, Zone: "external", NativeVLAN: "cameras"})
+	}
+	in := Input{SwitchPorts: []risk.SwitchDeviceView{sw}, Snapshot: &unifi.Snapshot{Clients: []unifi.Client{cl}, Networks: []unifi.Network{network("cameras"), network("storage")}, FirewallPolicies: []unifi.FirewallPolicy{allow("cameras", "storage")}}}
+	observed(&in, cl, 5900, checks.GrantControl)
+	if a := action(t, Evaluate(in), "act:port-ext-switch:"+sw.MAC); a.HighestTierReduced == "" || a.Lane != LaneReduceExposure {
+		t.Fatal(a)
+	}
+}
+
+// TestLocalServiceHygiene keeps low-priority maintenance and LAN-only SNMP out of Fix now.
+func TestLocalServiceHygiene(t *testing.T) {
+	cl := client("storage", "192.0.2.7", "servers")
+	in := Input{Snapshot: &unifi.Snapshot{Clients: []unifi.Client{cl}, Networks: []unifi.Network{network("servers")}},
+		Assets: map[string]classify.AssetProfile{cl.ID: {Tier: classify.TierHigh}},
+		Findings: []checks.Finding{{CheckID: "NERVA-SSH-WEAK-MAC", Port: 22, Client: cl, BaseSeverity: checks.SeverityLow},
+			{CheckID: "UB-0012", Port: 161, Client: cl, BaseSeverity: checks.SeverityMedium}},
+		Checks: []*checks.Check{{ID: "UB-0012", Grants: []checks.GrantSpec{{Effect: checks.GrantRead, Basis: checks.BasisProven}}}}}
+	r := Evaluate(in)
+	if a := action(t, r, "act:check:NERVA-SSH-WEAK-MAC:storage:tcp/22"); a.HighestTierReduced != P4 {
+		t.Fatal(a)
+	}
+	if a := action(t, r, "act:check:UB-0012:storage:161:udp"); a.Lane != LaneReduceExposure {
+		t.Fatal(a)
+	}
+}
+
+// TestDNSListenerScope distinguishes private LAN service traits from public or unresolved sockets.
+func TestDNSListenerScope(t *testing.T) {
+	cl := client("resolver", "10.0.0.53", "lan")
+	for _, proto := range []string{"tcp", "udp"} {
+		hp := probe.HostProfile{Client: cl, Services: []probe.Service{{Protocol: "dns", Port: 53, Transport: proto}}}
+		s := &unifi.Snapshot{Clients: []unifi.Client{cl}, Networks: []unifi.Network{network("lan")}, Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true, GatewayPoliciesAvailable: true}}
+		in := Input{Snapshot: s, Profiles: []probe.HostProfile{hp}}
+		has := func() bool {
+			return slices.ContainsFunc(Evaluate(in).Actions, func(a Action) bool { return a.ID == "act:service:resolver:"+proto+"/53" })
+		}
+		if has() {
+			t.Fatal(proto, "local DNS trait")
+		}
+		s.DynamicMappings = []unifi.DynamicPortMapping{{InternalIP: cl.IP, Transport: proto, IntPort: 53, ExtPort: 5353}}
+		if !has() {
+			t.Fatal(proto, "missing mapped DNS trait")
+		}
+		s.DynamicMappings = nil
+		s.Visibility.GatewayPoliciesAvailable = false
+		if !has() {
+			t.Fatal(proto, "unknown visibility suppressed DNS")
+		}
+	}
+}
+
+// TestDNSOnlyTransit keeps generic transit separate from a system DNS exception.
+func TestDNSOnlyTransit(t *testing.T) {
+	src, dst := network("guest"), network("lan")
+	src.ZoneName, dst.ZoneName = "Hotspot", "Internal"
+	dns := allow("Hotspot", "Internal")
+	dns.ID, dns.Name, dns.Origin, dns.Protocol = "dns", "Allow Public DNS", "SYSTEM_DEFINED", "tcp_udp"
+	dns.Destination.AnyPort, dns.Destination.Ports = false, []int{53}
+	extra := dns
+	extra.ID, extra.Index, extra.Destination.Ports = "web", 10, []int{443}
+	for _, tc := range []struct {
+		name   string
+		rules  []unifi.FirewallPolicy
+		ranked bool
+	}{
+		{"built-in", []unifi.FirewallPolicy{dns}, false},
+		{"independent opening", []unifi.FirewallPolicy{dns, extra}, true},
+	} {
+		s := &unifi.Snapshot{Networks: []unifi.Network{src, dst}, Clients: []unifi.Client{client("guest", "198.51.100.2", "guest"), client("lan", "192.0.2.2", "lan")}, FirewallPolicies: tc.rules}
+		got := slices.ContainsFunc(Evaluate(Input{Snapshot: s}).Actions, func(a Action) bool { return a.ID == "act:vlan-egress:guest->lan" && a.HighestTierReduced != "" })
+		if got != tc.ranked {
+			t.Errorf("%s: ranked = %t", tc.name, got)
+		}
+	}
+}
+
+// TestDualStackWANListeners exercises actual IPv6 firewall rules alongside IPv4 forwards.
+func TestDualStackWANListeners(t *testing.T) {
+	cl := client("dual", "192.0.2.2", "lan")
+	cl.IPv6 = []string{"2001:db8::2"}
+	rule := allow("External", "lan")
+	rule.Protocol, rule.IPVersion = "tcp", "ipv6"
+	rule.Destination.AnyPort, rule.Destination.Ports = false, []int{22}
+	in := Input{Snapshot: &unifi.Snapshot{Clients: []unifi.Client{cl}, Networks: []unifi.Network{network("lan")}, FirewallPolicies: []unifi.FirewallPolicy{rule}},
+		Assets:   map[string]classify.AssetProfile{cl.ID: {Tier: classify.TierCrown}},
+		Profiles: []probe.HostProfile{{Client: cl, ProbeIP: cl.IP, SSH: &probe.SSHInfo{Port: 22, AuthMethods: []string{"keyboard-interactive"}}}}}
+	id := "act:gateway-routed:" + rule.ID
+	r := Evaluate(in)
+	if a := action(t, r, id); a.Lane != LaneFixNow || a.HighestTierReduced != P1 {
+		t.Fatal(a)
+	}
+	in.Profiles[0].SSH.AuthMethods = []string{"publickey"}
+	if a := action(t, Evaluate(in), "act:verify:ssh-auth:dual:"+cl.IPv6[0]); !strings.Contains(a.Reason, "unknown") {
+		t.Fatal(a)
+	}
+	in.Profiles[0].SSH.NoneAuthAccepted = true
+	in.Profiles = append(in.Profiles, probe.HostProfile{Client: cl, ProbeIP: cl.IPv6[0], SSH: &probe.SSHInfo{Port: 22, AuthMethods: []string{"publickey"}}})
+	r = Evaluate(in)
+	if a := action(t, r, id); a.Lane != LaneReduceExposure {
+		t.Fatal(a)
+	}
+	if a := action(t, r, "act:verify:ssh-auth:dual:"+cl.IPv6[0]); !strings.Contains(a.Reason, "only public-key") {
+		t.Fatal(a)
+	}
+	in.Snapshot.FirewallPolicies[0].Destination.Ports = []int{80, 443}
+	in.Snapshot.PortForwards = []unifi.PortForward{{ID: "web", Enabled: true, Proto: "tcp", FwdIP: cl.IP, DstPort: "80,443"}}
+	r = Evaluate(in)
+	for _, id := range []string{"act:wan-pf:web", id, "act:wan-service:dual:tcp/443"} {
+		if a := action(t, r, id); a.Lane != LaneReduceExposure || (a.HighestTierReduced != "" && a.HighestTierReduced != P3) {
+			t.Fatal(a)
+		}
+	}
+	in.Snapshot.PortForwards[0].DstPort = "80-89"
+	if a := action(t, Evaluate(in), "act:wan-pf:web"); a.Lane != LaneFixNow {
+		t.Fatal(a)
+	}
+	in.Snapshot.PortForwards[0].Name, in.Snapshot.PortForwards[0].DstPort = "NAS admin", "443"
+	in.Snapshot.FirewallPolicies[0].Name, in.Snapshot.FirewallPolicies[0].Destination.Ports = "NAS admin", []int{443}
+	r = Evaluate(in)
+	for _, route := range []string{"act:wan-pf:web", id} {
+		if a := action(t, r, route); a.Lane != LaneFixNow {
+			t.Fatal(a)
+		}
+	}
+}
+
+// TestStrictSSHRemedy binds confirmed unauthenticated login to its observed listener.
+func TestStrictSSHRemedy(t *testing.T) {
+	src, dst := client("source", "192.0.2.2", "lan"), client("server", "198.51.100.2", "lab")
+	hp := probe.HostProfile{Client: dst, ProbeIP: dst.IP, SSH: &probe.SSHInfo{Port: 22, NoneAuthAccepted: true}}
+	in := Input{Snapshot: &unifi.Snapshot{Clients: []unifi.Client{src, dst}, Networks: []unifi.Network{network("lan"), network("lab")}, FirewallPolicies: []unifi.FirewallPolicy{allow("lan", "lab")}}, Profiles: []probe.HostProfile{hp}}
+	in.Findings = checks.FindingsFromProfiles(in.Profiles, nil)
+	r := Evaluate(in)
+	id := "act:check:UB-SSH-NONE-AUTH:server:22"
+	if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+		return e.From == src.ID && e.To == dst.ID && e.Tier == "takeover" && slices.Contains(e.CutIDs, id)
+	}) {
+		t.Fatal(r.Simulation.Edges)
+	}
+}
+
+// TestGatewayManagementBundle preserves approved DNS for all sources of a gateway cut.
+func TestGatewayManagementBundle(t *testing.T) {
+	gw := unifi.Device{MAC: "02:00:00:00:00:01", IP: "192.0.2.1", Type: "udm"}
+	lan, iot := network("Default"), network("IoT")
+	lan.ZoneName = "Internal"
+	s := &unifi.Snapshot{Devices: []unifi.Device{gw}, Networks: []unifi.Network{lan, iot}, WLANs: []unifi.WLANConfig{{Enabled: true, Security: "open", NetworkID: lan.ID, Name: "wifi"}}, FirewallPolicies: []unifi.FirewallPolicy{allow("Internal", "Gateway"), allow("IoT", "Gateway")}}
+	in := Input{Snapshot: s, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"IoT"}, ApprovedPaths: []config.ApprovedPath{
+		{Name: "DNS", DestZone: "Gateway", Transport: "udp", Port: 53}, {Name: "Admin", DestZone: "Gateway", Transport: "tcp", Port: 443},
+	}}}}
+	vlan := network("user-vlan")
+	vlan.Name = "Gateway"
+	s.Networks = append(s.Networks, vlan)
+	s.Clients = append(s.Clients, client("storage", "198.51.100.2", vlan.ID))
+	s.FirewallPolicies = append(s.FirewallPolicies, allow("Internal", vlan.ZoneName), allow("IoT", vlan.ZoneName))
+	r := Evaluate(in)
+	for _, id := range []string{"act:vlan-egress:Default->" + risk.GatewayNetworkID, "act:vlan-ingress:" + risk.GatewayNetworkID} {
+		a := action(t, r, id)
+		if !strings.Contains(a.Title, "Gateway management") || !slices.Equal(a.BreaksApproved, []string{"Admin"}) {
+			t.Fatal(a)
+		}
+	}
+	for _, id := range []string{"act:vlan-egress:Default->" + vlan.ID, "act:vlan-ingress:" + vlan.ID} {
+		if a := action(t, r, id); strings.Contains(a.Title, "Gateway management") || len(a.BreaksApproved) > 0 {
+			t.Fatal(a)
+		}
+	}
+}
+
+// TestBundleCutsHighProfileEvidence leaves the ordinary parallel path reachable.
+func TestBundleCutsHighProfileEvidence(t *testing.T) {
+	g := graph{ids: map[fact]int{}, highProfileSources: map[int][]highProfileEdge{}}
+	s := socket{host: "web", ip: "192.0.2.1", proto: "tcp", port: 443}.fact()
+	cf := fact{consequence, "web", "control"}
+	g.link(s, cf, trivial, 1, 0)
+	g.markHighProfile(s, s)
+	g.edges[g.ids[s]][0].bundle = 2
+	g.link(s, cf, trivial, 3, 0)
+	dist := []uint8{trivial, trivial}
+	if !g.isHighProfileIn(g.ids[cf], cf, dist, nil, nil) || g.isHighProfileIn(g.ids[cf], cf, dist, nil, []bool{false, false, true, false}) {
+		t.Fatal("bundle did not remove high-profile evidence")
+	}
+}
+
+// TestSwitchRoutingLabel identifies the inter-VLAN hop for a reachable management service.
+func TestSwitchRoutingLabel(t *testing.T) {
+	const sw = "02:00:00:00:00:02"
+	a, b := network("a"), network("b")
+	a.RouterDeviceMAC, b.RouterDeviceMAC = sw, sw
+	src, dst := client("source", "192.0.2.2", "a"), client("target", "198.51.100.2", "b")
+	in := Input{Snapshot: &unifi.Snapshot{Clients: []unifi.Client{src, dst}, Networks: []unifi.Network{a, b}, Devices: []unifi.Device{{MAC: sw, Type: "usw"}}, SwitchACLCoverage: &unifi.SwitchACLCoverage{Status: "complete"}, Visibility: &unifi.SiteVisibility{SwitchACLsAvailable: true}}, Profiles: []probe.HostProfile{{Client: dst, ProbeIP: dst.IP, OpenPorts: []int{22}}}}
+	r := Evaluate(in)
+	if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+		return e.From == src.ID && e.To == dst.ID && e.Via == "Switch routing from a to b"
+	}) {
+		t.Fatal(r.Simulation.Edges)
+	}
+}
+
+// TestKeyOnlyHygiene caps the remaining benefit of a public SSH restriction on a high-profile host.
+func TestKeyOnlyHygiene(t *testing.T) {
+	cl := client("storage", "192.0.2.7", "lan")
+	in := Input{Snapshot: &unifi.Snapshot{Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true, GatewayPoliciesAvailable: true}, Clients: []unifi.Client{cl}, Networks: []unifi.Network{network("lan")}, PortForwards: []unifi.PortForward{{ID: "ssh", Enabled: true, FwdIP: cl.IP, Proto: "tcp", DstPort: "22"}}},
+		Assets:        map[string]classify.AssetProfile{cl.ID: {Tier: classify.TierCrown}},
+		TargetSignals: []TargetSignal{{Asset: cl.ID, Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}}},
+		Profiles:      []probe.HostProfile{{Client: cl, ProbeIP: cl.IP, SSH: &probe.SSHInfo{Port: 22, AuthMethods: []string{"publickey"}}}},
+		Findings:      []checks.Finding{{CheckID: "NERVA-SSH-WEAK-MAC", Port: 22, Client: cl, BaseSeverity: checks.SeverityLow}}}
+	r := Evaluate(in)
+	if x := exposure(t, r, Internet, cl.ID, "service setting: NERVA-SSH-WEAK-MAC"); x.Priority != P3 {
+		t.Fatal(x)
+	}
+	if a := action(t, r, "act:wan-pf:ssh"); a.HighestTierReduced != P3 || a.Lane != LaneReduceExposure {
+		t.Fatal(a)
+	}
+	for _, method := range []string{"password", "none"} {
+		in.Snapshot.PortForwards[0].Src = "198.51.100.1"
+		in.Profiles[0].SSH.AuthMethods = []string{method}
+		in.Profiles[0].SSH.NoneAuthAccepted = method == "none"
+		if a := action(t, Evaluate(in), "act:wan-pf:ssh"); a.Lane != LaneReduceExposure {
+			t.Fatal(a)
+		}
 	}
 }

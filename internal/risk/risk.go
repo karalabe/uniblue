@@ -38,8 +38,8 @@ const offlineFindingTTL = 7 * 24 * time.Hour
 // transientPatchActionGrace keeps a missed version banner from resolving a known patch.
 const transientPatchActionGrace = 2 * time.Hour
 
-// CurrentScoringVersion identifies the baseline with VLAN-independent scores and stable action IDs.
-const CurrentScoringVersion = 2
+// CurrentScoringVersion identifies the baseline for finding scores and ranked action identities.
+const CurrentScoringVersion = 3
 
 // Report holds the complete risk-scored output of a single UniBlue scan.
 type Report struct {
@@ -328,7 +328,7 @@ func IsClientOnTrustedVLAN(snap *unifi.Snapshot, cl unifi.Client, netCfg config.
 // Evaluate applies UniFi blast-radius scoring to raw check findings and appends
 // built-in UniFi posture findings (such as active WAN port forwards or
 // upgradable UniFi infrastructure firmware).
-func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.NetworkConfig) Report {
+func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.NetworkConfig, profiles ...probe.HostProfile) Report {
 	trustedSet, isolatedSet := resolveVLANTiers(snap, netCfg)
 
 	// Index active clients by IP so port-forward rules can link back to client
@@ -351,14 +351,15 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 
 	classifier, _ := LoadExposureClassifier(rules.BuiltinFS)
 
-	isoMatrix, isoFindings, isoNotes := EvaluateIsolation(snap, rawFindings, netCfg)
+	oracle := NewOracle(snap, netCfg)
+	isoMatrix, isoFindings, isoNotes := oracle.evaluateIsolation(rawFindings, netCfg)
 	scored := make([]checks.Finding, 0, len(rawFindings)+len(snap.PortForwards))
 	for _, f := range rawFindings {
 		var forwards []unifi.PortForward
 		for _, ip := range f.EndpointIPs() {
 			forwards = append(forwards, forwardsByIP[canonicalIsolationIP(ip)]...)
 		}
-		scored = append(scored, scoreFinding(f, forwards))
+		scored = append(scored, scoreFinding(f, forwards, oracle))
 	}
 
 	// Classify every enabled WAN port forward using declarative exposure rules
@@ -379,7 +380,7 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 			}
 		}
 
-		assessment := classifier.Classify(pf, cl)
+		assessment := classifier.Classify(pf, cl, profiles...)
 		var reasons []string
 		if pf.SourceUnknown {
 			reasons = append(reasons, "WAN source filter unresolved")
@@ -533,7 +534,7 @@ func Evaluate(snap *unifi.Snapshot, rawFindings []checks.Finding, netCfg config.
 // port, and WAN source restrictions).
 // Pure inventory observations (asset-identity / service-advertised /
 // service-observed at Info severity) are preserved as Info without escalation.
-func scoreFinding(f checks.Finding, forwards []unifi.PortForward) checks.Finding {
+func scoreFinding(f checks.Finding, forwards []unifi.PortForward, oracle *Oracle) checks.Finding {
 	f.EffectiveSeverity = f.BaseSeverity
 	f.RiskReasons = nil
 
@@ -541,10 +542,37 @@ func scoreFinding(f checks.Finding, forwards []unifi.PortForward) checks.Finding
 		return f
 	}
 
+	if f.CheckID == "UB-0010" && f.Port == 53 && len(f.EndpointIPs()) > 0 {
+		local := PrivateResolver(f)
+		unknown := false
+		for _, ip := range f.EndpointIPs() {
+			switch oracle.ListenerWAN(f.Client, ip, f.EffectiveTransport(), f.Port) {
+			case "allow":
+				f.EffectiveSeverity = checks.SeverityCritical
+				f.RiskReasons = append(f.RiskReasons, "WAN traffic can reach the recursive DNS listener at "+ip)
+				local = false
+			case "unknown":
+				f.RiskReasons = append(f.RiskReasons, "WAN reachability is unknown for the DNS listener at "+ip)
+				local = false
+				unknown = true
+			}
+		}
+		if local {
+			f.EffectiveSeverity, f.ClaimKind = checks.SeverityInfo, checks.ClaimServiceObserved
+		}
+		// A forward with an unresolved source still publishes the listener.
+		if !unknown || f.EffectiveSeverity == checks.SeverityCritical {
+			return f
+		}
+	}
+
 	transport := f.EffectiveTransport()
 	// Check WAN exposure across ALL matching forwards (worst severity wins so an
 	// earlier source-restricted forward never hides a later open src=any forward).
 	for _, pf := range forwards {
+		if pf.FwdPort == "" {
+			pf.FwdPort = pf.DstPort
+		}
 		if !pf.ExposesEndpoint(f.Port, transport) {
 			continue
 		}
@@ -573,6 +601,21 @@ func scoreFinding(f checks.Finding, forwards []unifi.PortForward) checks.Finding
 		}
 	}
 	return f
+}
+
+// PrivateResolver reports whether recursion was observed exclusively on private LAN addresses.
+func PrivateResolver(f checks.Finding) bool {
+	ips := f.EndpointIPs()
+	if f.CheckID != "UB-0010" || f.Port != 53 || len(ips) == 0 {
+		return false
+	}
+	for _, raw := range ips {
+		ip, err := netip.ParseAddr(raw)
+		if err != nil || !ip.Unmap().IsPrivate() {
+			return false
+		}
+	}
+	return true
 }
 
 // CompareSSHHostKeys compares current observations with the last saved scan, if any.
@@ -687,10 +730,11 @@ func BuildStateWithPrev(prev *State, snap *unifi.Snapshot, report Report, netCfg
 				}
 				st.CarriedFindings[k] = true
 			}
-			// Legacy scores could include an isolated-VLAN discount. The first
-			// probe establishes the client's action baseline at the new score.
-			if prev.NeedsScoringRebaseline() {
+			// Only scores saved before version 2 could include a VLAN discount.
+			if prev.ScoringVersion < 2 {
 				sev = sev.Bump(1)
+			}
+			if prev.NeedsScoringRebaseline() {
 				st.recordUpgradeHost(hostLow, lastSeen)
 			}
 			st.Findings[k] = sev
@@ -1292,7 +1336,7 @@ func actionAssetObservations(prev *State, id string, current []string, lastSeen,
 // carryMissingAction distinguishes unavailable evidence from a confirmed fix.
 // Network actions can still protect an absent client even if another returned.
 func carryMissingAction(id string, prev *State, snap *unifi.Snapshot, lastSeen, now time.Time, cveMatched bool, infraHosts, activeHosts, probedHostKeys map[string]struct{}) (keep, onlineUnprobed bool, assets map[string]time.Time) {
-	if strings.HasPrefix(id, "act:patch:") && (!cveMatched || now.Sub(lastSeen) <= transientPatchActionGrace) {
+	if (strings.HasPrefix(id, "act:patch:") || strings.HasPrefix(id, "act:patch-product:")) && (!cveMatched || now.Sub(lastSeen) <= transientPatchActionGrace) {
 		return true, prev.CarriedActions[id], nil
 	}
 	if snap == nil {
@@ -1524,7 +1568,7 @@ func (s wanService) firewallTargets(snap *unifi.Snapshot, ip, mac string) bool {
 // assetTrackedAction identifies controls whose measured benefit depends on
 // which protected hosts were visible during the scan.
 func assetTrackedAction(id string) bool {
-	return strings.HasPrefix(id, "act:vlan-") || strings.HasPrefix(id, "act:l2-") ||
+	return strings.HasPrefix(id, "act:move-iot:") || strings.HasPrefix(id, "act:port-ext-switch:") || strings.HasPrefix(id, "act:vlan-") || strings.HasPrefix(id, "act:l2-") ||
 		strings.HasPrefix(id, "act:wifi-iso:") || strings.HasPrefix(id, "act:port-ext:") || strings.HasPrefix(id, "act:port-tags:") ||
 		strings.HasPrefix(id, "act:gateway-routed:") || strings.HasPrefix(id, "act:switch-routed:") || strings.HasPrefix(id, "act:wan-service:")
 }
@@ -1538,7 +1582,7 @@ func actionClientHost(id string) string {
 	}
 	kind, tail, _ := strings.Cut(body, ":")
 	switch kind {
-	case "patch":
+	case "patch", "patch-product", "check-host":
 		_, host, _ := strings.Cut(tail, ":")
 		return host
 	case "check":

@@ -58,6 +58,19 @@
     - disable_wan_port_forward
     - move_to_iot_vlan
 
+- id: ssh-entrypoint
+  name: Public SSH Entrypoint
+  class: ssh-entrypoint
+  severity: medium
+  proto: tcp
+  ports: [22]
+  summary: >
+    Check the authentication methods offered by the public SSH listener.
+    Restrict source addresses or use a VPN.
+  actions:
+    - restrict_wan_source_ip
+    - prefer_vpn_access
+
 - id: admin-panel-exposed
   name: Direct Admin / SSH Entrypoint
   class: remote-admin

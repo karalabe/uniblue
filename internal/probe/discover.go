@@ -169,7 +169,7 @@ var safeMDNSTXTKeys = map[string]struct{}{
 	"api_version": {}, "version": {}, "ver": {}, "fw": {}, "firmware": {},
 	"model": {}, "product": {}, "board": {}, "platform": {}, "mac": {}, "macaddress": {},
 	"api_encryption": {}, "network": {}, "gen": {}, "auth": {}, "auth_en": {},
-	"usb_mfg": {}, "usb_mdl": {}, "pdl": {}, "txtvers": {}, "am": {},
+	"usb_mfg": {}, "usb_mdl": {}, "printer-type": {}, "pdl": {}, "txtvers": {}, "am": {},
 	// Matter, Thread (MeshCoP), IPP/IPPS, Shelly, and NUT allowlisted metadata keys:
 	"d": {}, "vp": {}, "cm": {}, "dt": {}, "ph": {}, "pi": {}, "sii": {}, "sai": {}, "t": {},
 	"tv": {}, "sb": {}, "at": {}, "pt": {}, "sq": {}, "vn": {}, "mn": {}, "id": {},

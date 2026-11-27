@@ -238,12 +238,6 @@ type Product struct {
 type MatchOptions struct {
 	// MinSeverity filters out non-KEV CVEs below this severity threshold.
 	MinSeverity checks.Severity
-
-	// PotentialMaxAgeYears restricts version-unknown (Potential) non-KEV matches
-	// to CVEs published within the last N years so ancient vulnerabilities do not
-	// drown out current risks. Zero disables the age cutoff. Exact-version
-	// matches and CISA KEV entries are never hidden by this cutoff.
-	PotentialMaxAgeYears int
 }
 
 // Match links a cached CVE Record to a specific detected Product on the user's network.

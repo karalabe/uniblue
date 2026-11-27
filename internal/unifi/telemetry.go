@@ -445,7 +445,7 @@ func parseSecuritySettings(items []map[string]any) *SiteSecuritySettings {
 		switch strings.ToLower(key) {
 		case "mgmt":
 			s.SSHEnabled = mapBool(m, "x_ssh_enabled")
-			s.SSHPasswordAuth = mapBool(m, "x_ssh_auth_password_enabled")
+			s.SSHPasswordAuth, s.SSHPasswordAuthKnown = m["x_ssh_auth_password_enabled"].(bool)
 			if keys, ok := m["x_ssh_keys"].([]any); ok {
 				s.SSHKeyCount = len(keys)
 			}

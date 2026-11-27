@@ -9,10 +9,12 @@ package blast
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
@@ -267,15 +269,68 @@ func grantLevel(g checks.GrantSpec) uint8 {
 // independent findings supporting the same consequence survive a single cut.
 func (b *builder) grant(s socket, g checks.GrantSpec, id int) {
 	cf := fact{consequence, s.host, string(g.Effect)}
-	if b.isHighProfileSocket(s) {
-		b.addHighProfileSource(b.node(cf), b.node(s.fact()), id)
-	}
 	b.link(s.fact(), cf, grantLevel(g), id, 0)
+	if b.isHighProfileSocket(s) {
+		b.markHighProfile(s.fact(), s.fact())
+	}
+}
+
+type serviceBundleKey struct{ host, label string }
+type serviceMember struct{ node, edge, port int }
+
+// serviceBundles indexes confirmed remedy edges by host and product or check.
+type serviceBundles map[serviceBundleKey][]serviceMember
+
+// record remembers the edge just linked to this listener, even if its adjacency list grows.
+func (groups serviceBundles) record(b *builder, s socket, label string) {
+	n := b.node(s.fact())
+	k := serviceBundleKey{s.host, label}
+	groups[k] = append(groups[k], serviceMember{n, len(b.edges[n]) - 1, s.port})
+}
+
+// bundleServices assigns a single remedy to all confirmed CVEs on a product or
+// all affected ports for a check, preserving each narrower remedy alongside it.
+func (b *builder) bundleServices(groups serviceBundles, checksByID map[string]*checks.Check) {
+	for key, members := range groups {
+		ports := map[int]bool{}
+		ids := map[int]bool{}
+		for _, m := range members {
+			ports[m.port] = true
+			ids[b.edges[m.node][m.edge].cut] = true
+		}
+		if len(ids) < 2 {
+			continue
+		}
+		name := b.assets[key.host].name
+		var bundle int
+		if checksByID != nil {
+			if len(ports) < 2 {
+				continue
+			}
+			var list []string
+			for _, p := range slices.Sorted(maps.Keys(ports)) {
+				list = append(list, strconv.Itoa(p))
+			}
+			title := cmp.Or(checksByID[key.label].Title, key.label)
+			bundle = b.action("act:check-host:"+key.label+":"+key.host, "Require sign-in or disable "+name+" ("+title+", ports "+strings.Join(list, ", ")+")", "Apply the same access restriction on every affected port.", LaneFixNow, 1)
+		} else {
+			bundle = b.action("act:patch-product:"+ProductSlug(key.label)+":"+key.host, "Update "+key.label+" on "+name+" ("+strconv.Itoa(len(ids))+" CVEs)", "One product update can address these version-matched vulnerabilities.", LaneFixNow, 2)
+		}
+		for _, m := range members {
+			b.edges[m.node][m.edge].bundle = bundle
+		}
+	}
+}
+
+// ProductSlug gives product-wide actions a stable, readable identifier.
+func ProductSlug(label string) string {
+	return strings.Join(strings.FieldsFunc(strings.ToLower(label), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }), "-")
 }
 
 // services wires check grants, protocol traits, CVEs, management ownership, and
 // declared publications into the graph before network reachability is added.
 func (b *builder) services() {
+	checkBundles, productBundles := serviceBundles{}, serviceBundles{}
 	byID := map[string]*checks.Check{}
 	for _, c := range b.Checks {
 		byID[c.ID] = c
@@ -285,9 +340,9 @@ func (b *builder) services() {
 		if f.Port == 0 {
 			continue
 		}
-		var grants []checks.GrantSpec
+		grants := slices.Clone(f.Grants)
 		if c != nil {
-			grants = checks.EffectiveGrants(c, f.Observation)
+			grants = append(grants, checks.EffectiveGrants(c, f.Observation)...)
 		}
 		inventoryOnly := f.IsInventoryOnly() || (c != nil && c.IsInventoryOnly())
 		if inventoryOnly {
@@ -306,18 +361,27 @@ func (b *builder) services() {
 				continue
 			}
 			b.link(root(TrustedLAN), s.fact(), trivial, 0, 0)
+			if f.CheckID == "UB-0010" && s.port == 53 && b.Oracle.PrivateLANListener(f.Client, ip, s.proto, s.port) {
+				continue
+			}
 			if !inventoryOnly && len(grants) == 0 && (c == nil || len(c.Grants) == 0) {
 				title := fmt.Sprintf("Review %s on port %d", b.assets[host].name, s.port)
 				a := b.action("act:check:"+f.CheckID+":"+host+":"+serviceName(s.proto, s.port), title, cmp.Or(f.Title, "A service check found a setting that needs attention."), LaneReduceExposure, 1)
 				cf := fact{consequence, host, "service setting: " + f.CheckID}
-				if b.isHighProfileSocket(s) {
-					b.addHighProfileSource(b.node(cf), b.node(s.fact()), a)
+				node := b.node(cf)
+				b.settingSeverity[node] = max(b.settingSeverity[node], f.BaseSeverity)
+				level := low
+				if f.BaseSeverity <= checks.SeverityLow {
+					level = moderate
 				}
-				b.link(s.fact(), cf, low, a, 0)
+				b.link(s.fact(), cf, level, a, 0)
+				if b.isHighProfileSocket(s) {
+					b.markHighProfile(s.fact(), s.fact())
+				}
 			}
 			for _, g := range grants {
 				name := b.assets[host].name
-				id := "act:check:" + c.ID + ":" + host + ":" + strconv.Itoa(f.Port)
+				id := "act:check:" + f.CheckID + ":" + host + ":" + strconv.Itoa(f.Port)
 				if s.proto != "tcp" {
 					id += ":" + s.proto
 				}
@@ -327,13 +391,21 @@ func (b *builder) services() {
 					if req := strings.TrimRight(strings.TrimSpace(g.Requires), "."); req != "" {
 						reason = "Check whether this applies: " + req + "."
 					}
-					b.verify(s.fact(), c.ID, host+":"+serviceName(s.proto, s.port), title, reason)
+					b.verify(s.fact(), f.CheckID, host+":"+serviceName(s.proto, s.port), title, reason)
 					b.grant(s, g, 0)
 				} else {
 					title := fmt.Sprintf("Require sign-in or disable %s on port %d", name, f.Port)
 					reason := cmp.Or(strings.TrimSpace(g.Note), strings.TrimSpace(f.Title), "Anyone who can reach this service can use it without signing in.")
-					a := b.action(id, title, reason, LaneFixNow, 1)
+					lane := LaneFixNow
+					if f.CheckID == "UB-0012" && b.Oracle.ListenerWAN(f.Client, s.ip, s.proto, s.port) != "allow" {
+						lane = LaneReduceExposure
+						title = "Restrict SNMP read access on " + name
+					}
+					a := b.action(id, title, reason, lane, 1)
 					b.grant(s, g, a)
+					if lane == LaneFixNow && c != nil {
+						checkBundles.record(b, s, f.CheckID)
+					}
 				}
 			}
 		}
@@ -355,6 +427,9 @@ func (b *builder) services() {
 					continue
 				}
 				b.link(root(TrustedLAN), s.fact(), trivial, 0, 0)
+				if svc.Protocol == "dns" && s.port == 53 && b.Oracle.PrivateLANListener(hp.Client, ip, s.proto, s.port) {
+					continue
+				}
 				for _, effect := range trait.AnonGrants {
 					basis := checks.BasisConditional
 					if trait.AuthModel == classify.AuthNone || svc.AnonymousAccess {
@@ -375,8 +450,10 @@ func (b *builder) services() {
 		}
 	}
 	for _, m := range b.CVEMatches {
-		b.cve(m)
+		b.cve(m, productBundles)
 	}
+	b.bundleServices(checkBundles, byID)
+	b.bundleServices(productBundles, nil)
 	for key, p := range b.Assets {
 		if _, ok := b.assets[key]; !ok {
 			b.addAsset(key, key, p)
@@ -434,11 +511,27 @@ func family(ip string) string {
 
 // cve binds network-reachable CVEs to observed endpoints. Distribution-backport
 // ambiguity stays in Verify even for KEV entries; local-only CVEs are ignored.
-func (b *builder) cve(m cve.Match) {
+func (b *builder) cve(m cve.Match, bundles serviceBundles) {
 	ip := address(m.Product.HostIP)
 	hosts := b.byIP[ip]
 	r := m.Record
-	if (!r.KEV && r.Severity < checks.SeverityHigh) || (r.AttackVector != "N" && !(r.AttackVector == "" && r.KEV)) {
+	if r.AttackVector != "N" && !(r.AttackVector == "" && r.KEV) {
+		return
+	}
+	if m.Confidence == cve.ConfidencePotential && (r.KEV || r.Severity >= checks.SeverityCritical) && len(hosts) == 1 {
+		host := hosts[0]
+		label := m.Product.Label
+		target := host + ":" + ProductSlug(label)
+		code, reason := "unversioned", "No installed version was reported. Check the build and patch status against the vendor advisory."
+		if strings.TrimSpace(m.Product.Version) != "" {
+			code, reason = "potential", "A version was reported, but the advisory could apply to a different build or platform. Check the affected versions and platform with the vendor."
+		}
+		if _, ok := b.actionIDs["act:verify:"+code+":"+target]; !ok {
+			b.verify(root(TrustedLAN), code, target, "Verify "+label+" patches on "+b.assets[host].name, reason)
+		}
+		return
+	}
+	if !r.KEV && r.Severity < checks.SeverityHigh {
 		return
 	}
 	if len(hosts) > 1 {
@@ -472,10 +565,20 @@ func (b *builder) cve(m cve.Match) {
 		}
 		a := b.action("act:patch:"+r.ID+":"+host, "Update "+b.assets[host].name+" to fix "+r.ID, "The running service version matches a known remote vulnerability.", LaneFixNow, 2)
 		cf := fact{consequence, host, r.ID}
+		edge := b.link(s.fact(), cf, d, a, 0)
 		if b.isHighProfileSocket(s) {
-			b.addHighProfileSource(b.node(cf), b.node(s.fact()), a)
+			b.markHighProfile(s.fact(), s.fact())
 		}
-		b.link(s.fact(), cf, d, a, 0)
+		// One CVE can affect several products on the same host. Its shared
+		// consequence survives while any of those products still supplies evidence.
+		label := m.Product.Label
+		if previous, ok := b.patchProducts[edge.to]; ok && previous != label {
+			label = ""
+		}
+		b.patchProducts[edge.to] = label
+		if m.Product.Label != "" {
+			bundles.record(b, s, m.Product.Label)
+		}
 	}
 }
 

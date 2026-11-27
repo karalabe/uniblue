@@ -871,3 +871,17 @@ func TestAPIV1EndpointsAndSSEReplay(t *testing.T) {
 		t.Fatalf("expected chronological replay [ev2, ev3], got [%s, %s]", replayed[0].Summary, replayed[1].Summary)
 	}
 }
+
+// TestDashboardSimulationControls checks the controls shared by the live and offline dashboards.
+func TestDashboardSimulationControls(t *testing.T) {
+	html := string(dashboardHTML)
+	for _, s := range []string{`data-action="checkup-page"`, `data-action="checkup-lane"`, "const checkupPageSize = 5", `let blastMode = "strict"`, `<select id="blast-device"`, "For this device", "All simulatable", "WAN Gateway"} {
+		if !strings.Contains(html, s) {
+			t.Errorf("missing %s", s)
+		}
+	}
+	legend, canvas := strings.Index(html, `<div class="br-legend"`), strings.Index(html, `<div class="br-map"`)
+	if legend < 0 || canvas < legend {
+		t.Fatal("map legend must precede the canvas")
+	}
+}

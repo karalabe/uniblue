@@ -7,6 +7,8 @@
 package risk
 
 import (
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,13 +134,14 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 			},
 		},
 		SecuritySettings: &unifi.SiteSecuritySettings{
-			SSHEnabled:      true,
-			SSHPasswordAuth: true,
-			SSHKeyCount:     0,
-			UPnPEnabled:     true,
-			IPSMode:         "disabled",
-			HoneypotEnabled: false,
-			DoHState:        "off",
+			SSHEnabled:           true,
+			SSHPasswordAuth:      true,
+			SSHPasswordAuthKnown: true,
+			SSHKeyCount:          0,
+			UPnPEnabled:          true,
+			IPSMode:              "disabled",
+			HoneypotEnabled:      false,
+			DoHState:             "off",
 		},
 		RecentLogs: []unifi.ControllerLogEvent{
 			{
@@ -191,6 +194,22 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 	}
 	if len(notes) < 3 {
 		t.Errorf("expected posture notes for WPA2-only, IPS disabled, Honeypot disabled, DoH off; got %d", len(notes))
+	}
+}
+
+// TestDeviceSSHAuthMode distinguishes missing telemetry from an explicit key-only setting.
+func TestDeviceSSHAuthMode(t *testing.T) {
+	for _, tc := range []struct {
+		known bool
+		want  string
+	}{{false, "auth mode unknown"}, {true, "key-only"}} {
+		snap := &unifi.Snapshot{SecuritySettings: &unifi.SiteSecuritySettings{SSHEnabled: true, SSHPasswordAuthKnown: tc.known, SSHKeyCount: 1}}
+		_, _, notes := AnalyzeUniFiPosture(snap, nil, nil)
+		if !slices.ContainsFunc(notes, func(n PostureNote) bool {
+			return strings.Contains(n.Title, "Device SSH is enabled ("+tc.want+",")
+		}) {
+			t.Errorf("password setting known = %t: %v", tc.known, notes)
+		}
 	}
 }
 

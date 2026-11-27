@@ -112,6 +112,15 @@ Built-in checks live in `checks/generic/` and `checks/community/` and are compil
 ./uniblue check test -target 192.168.1.42
 ```
 
+The default SSH auth probe sends one credential-free authentication request with the username `uniblue` to learn which login methods a listener offers. Fail2ban's `sshd` invalid-user filter may count that request. To turn off the default query, set `scan.disable_ssh_auth_probe` in your configuration.
+
+```yaml
+scan:
+  disable_ssh_auth_probe: true
+```
+
+`uniblue check test` honors `scan.disable_ssh_auth_probe` and skips `scan.ssh_key_audit`. During full and targeted rescans, an explicitly configured key audit still runs on its selected targets. Those rescans share answers for one hour and keep the last answer during the five-minute cooldown after a failed refresh.
+
 ### 4. Offline security bug (CVE) & hardware vendor databases
 
 UniBlue matches your UniFi firmware and LAN services offline against the official NVD + CISA KEV vulnerability catalog and IEEE MAC vendor tables (~550 KB).

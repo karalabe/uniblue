@@ -12,6 +12,7 @@ package unifi
 
 import (
 	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -622,18 +623,20 @@ type RogueAP struct {
 // SiteSecuritySettings summarizes non-secret controller/gateway security posture
 // parsed from /rest/setting (mgmt, usg, ips, doh, teleport).
 type SiteSecuritySettings struct {
-	SSHEnabled        bool     `json:"ssh_enabled"`
-	SSHPasswordAuth   bool     `json:"ssh_password_auth"`
-	SSHKeyCount       int      `json:"ssh_key_count"`
-	UPnPEnabled       bool     `json:"upnp_enabled"`
-	UPnPNATPMPEnabled bool     `json:"upnp_nat_pmp_enabled"`
-	UPnPSecureMode    bool     `json:"upnp_secure_mode"`
-	IPSMode           string   `json:"ips_mode,omitempty"` // "ips", "ids", "disabled"
-	HoneypotEnabled   bool     `json:"honeypot_enabled"`
-	HoneypotIPs       []string `json:"honeypot_ips,omitempty"`
-	DNSFiltering      bool     `json:"dns_filtering"`
-	DoHState          string   `json:"doh_state,omitempty"` // "off", "auto", "custom"
-	TeleportEnabled   bool     `json:"teleport_enabled"`
+	SSHEnabled      bool `json:"ssh_enabled"`
+	SSHPasswordAuth bool `json:"ssh_password_auth"`
+	// SSHPasswordAuthKnown distinguishes an explicit password setting from missing telemetry.
+	SSHPasswordAuthKnown bool     `json:"ssh_password_auth_known,omitempty"`
+	SSHKeyCount          int      `json:"ssh_key_count"`
+	UPnPEnabled          bool     `json:"upnp_enabled"`
+	UPnPNATPMPEnabled    bool     `json:"upnp_nat_pmp_enabled"`
+	UPnPSecureMode       bool     `json:"upnp_secure_mode"`
+	IPSMode              string   `json:"ips_mode,omitempty"` // "ips", "ids", "disabled"
+	HoneypotEnabled      bool     `json:"honeypot_enabled"`
+	HoneypotIPs          []string `json:"honeypot_ips,omitempty"`
+	DNSFiltering         bool     `json:"dns_filtering"`
+	DoHState             string   `json:"doh_state,omitempty"` // "off", "auto", "custom"
+	TeleportEnabled      bool     `json:"teleport_enabled"`
 }
 
 // VPNConnection describes one currently active remote-access VPN session.
@@ -893,6 +896,24 @@ func (ep PolicyEndpoint) MatchesPort(port int) bool {
 	return false
 }
 
+// OnlyPort reports whether a positive port selector is confined to the supplied ports.
+func (ep PolicyEndpoint) OnlyPort(ports ...int) bool {
+	if ep.AnyPort || ep.NegatePort || !ep.HasPortConstraint() {
+		return false
+	}
+	for _, p := range ep.Ports {
+		if !slices.Contains(ports, p) {
+			return false
+		}
+	}
+	for _, r := range ep.PortRanges {
+		if !rangeWithinPorts(r.Start, r.End, ports) {
+			return false
+		}
+	}
+	return true
+}
+
 // HasPortConstraint reports whether this endpoint carries any concrete port or port range.
 func (ep PolicyEndpoint) HasPortConstraint() bool {
 	return len(ep.Ports) > 0 || len(ep.PortRanges) > 0
@@ -958,6 +979,52 @@ func (p PortForward) ExposesPort(port int) bool {
 		return false
 	}
 	return portMatchesSpec(p.FwdPort, port)
+}
+
+// OnlyBackendPort reports whether the backend is confined to the supplied ports.
+// A forward without port translation inherits its WAN port specification.
+func (p PortForward) OnlyBackendPort(ports ...int) bool {
+	spec := strings.TrimSpace(p.FwdPort)
+	if spec == "" {
+		spec = p.DstPort
+	}
+	return onlyListedPorts(spec, ports)
+}
+
+// OnlyPorts reports whether the WAN and backend port lists both stay within ports.
+func (p PortForward) OnlyPorts(ports ...int) bool {
+	return p.OnlyBackendPort(ports...) && (p.DstPort == "" || onlyListedPorts(p.DstPort, ports))
+}
+
+// onlyListedPorts checks every token so a range cannot be classified by its first port.
+func onlyListedPorts(spec string, ports []int) bool {
+	for token := range strings.SplitSeq(spec, ",") {
+		lo, hi, ranged := strings.Cut(token, "-")
+		first, err := strconv.Atoi(strings.TrimSpace(lo))
+		if err != nil || !slices.Contains(ports, first) {
+			return false
+		}
+		if ranged {
+			last, err := strconv.Atoi(strings.TrimSpace(hi))
+			if err != nil || !rangeWithinPorts(first, last, ports) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// rangeWithinPorts rejects wide ranges before checking their individual members.
+func rangeWithinPorts(first, last int, ports []int) bool {
+	if first < 1 || last > 65535 || last < first || last-first >= len(ports) {
+		return false
+	}
+	for port := first; port <= last; port++ {
+		if !slices.Contains(ports, port) {
+			return false
+		}
+	}
+	return true
 }
 
 // MatchesTransport reports whether this port-forward's transport protocol covers

@@ -63,8 +63,10 @@ func FindingsFromProfiles(profiles []probe.HostProfile, existing []Finding) []Fi
 				nf := f
 				nf.CheckID, nf.Property = "UB-SSH-NONE-AUTH", "ssh-none-auth"
 				nf.BaseSeverity, nf.EffectiveSeverity = SeverityCritical, SeverityCritical
+				nf.Grants = []GrantSpec{{Effect: GrantControl, Basis: BasisImplied}}
+				nf.ClaimKind = ClaimConfirmedPermission
 				nf.Title = "SSH server accepts unauthenticated login"
-				nf.Evidence = "During the opt-in SSH audit, this server accepted 'none' authentication without any password or key."
+				nf.Evidence = "The SSH server accepted 'none' authentication without a password or key."
 				out = append(out, nf)
 			} else if len(s.AcceptedKeys) > 0 && !s.CanaryFalsePositive {
 				kf := f

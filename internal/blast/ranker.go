@@ -66,16 +66,16 @@ func (g *graph) prioritiesByFact(baseline, states [][]uint8, cuts []bool, pairs 
 	return out, hp, untrustedHP
 }
 
-// pairIndexes collapses multiple CVEs or generic service settings on the same
-// host into one pair so noisy scanners cannot inflate ranking counts. Published
-// services keep their port and transport because each is a distinct exposure.
+// pairIndexes counts one patch benefit per product and one hygiene benefit per
+// host. This keeps unrelated product updates independently actionable while
+// several advisories fixed by the same update count only once.
 func (g *graph) pairIndexes() []int {
 	pairs := make([]int, len(g.facts))
 	first := map[fact]int{}
 	for n, f := range g.facts {
 		switch {
 		case strings.HasPrefix(f.detail, "CVE-"):
-			f.detail = "unpatched software"
+			f.detail = "unpatched software: " + g.patchProducts[n]
 		case strings.HasPrefix(f.detail, "service setting: "):
 			f.detail = "service settings"
 		}
@@ -149,9 +149,10 @@ func (g *graph) activeByRoot(states [][]uint8, cuts []bool) ([len(starts)][]bool
 				continue
 			}
 			for _, e := range g.edges[n] {
-				if e.level < unknown && !cuts[e.cut] && !cuts[e.bundle] {
+				if e.level < unknown && !cuts[e.cut] && !cuts[e.bundle] && !cuts[e.tagCut] {
 					row[e.cut] = true
 					row[e.bundle] = true
+					row[e.tagCut] = true
 				}
 			}
 		}

@@ -572,36 +572,68 @@ func (r *FingerprintRule) matchAll(hp probe.HostProfile) []ruleHit {
 			}
 		}
 	}
-	if len(hits) > 0 {
-		// Also emit a host-level hit when a versionless appliance rule matches
-		// hostname or MAC so host-wide exposure is preserved alongside the web port.
-		if !slices.ContainsFunc(hits, func(h ruleHit) bool { return h.version != "" || h.model != "" }) {
-			if h, ok := r.matchHostIdentity(hp); ok && h.version == "" && h.model == "" {
-				hits = append(hits, h)
+	if !slices.ContainsFunc(hits, func(h ruleHit) bool { return h.version != "" }) {
+		if h, ok := r.matchHostIdentity(hp); ok && (len(hits) == 0 || h.version == "") {
+			hits = append(hits, h)
+		}
+	}
+	if r.ModelGroup > 0 {
+		// A family-only hit on another port belongs to the same model when
+		// the concrete banners agree. Conflicting models cannot refine it.
+		model := ""
+		for _, h := range hits {
+			if h.model == "" {
+				continue
+			}
+			if model != "" && !strings.EqualFold(model, h.model) {
+				return slices.DeleteFunc(hits, func(h ruleHit) bool { return h.model == "" })
+			}
+			model = h.model
+		}
+		for i := range hits {
+			if hits[i].model == "" {
+				hits[i].model = model
 			}
 		}
-		return hits
 	}
-	if h, ok := r.matchHostIdentity(hp); ok {
-		return []ruleHit{h}
-	}
-	return nil
+	return hits
 }
 
-// matchHostIdentity checks host-level hostname and MAC OUI selectors.
+// matchHostIdentity prefers a concrete hardware model over a generic family name.
 func (r *FingerprintRule) matchHostIdentity(hp probe.HostProfile) (ruleHit, bool) {
-	if r.hostnameRe != nil {
-		for _, candidate := range []string{hp.Client.Name, hp.Client.Hostname} {
-			if candidate != "" {
-				if m := r.hostnameRe.FindStringSubmatch(candidate); m != nil {
-					return ruleHit{
-						version: captureGroup(m, r.VersionGroup),
-						model:   captureGroup(m, r.ModelGroup),
-						source:  "hostname",
-					}, true
-				}
+	var best ruleHit
+	consider := func(re *regexp.Regexp, candidate, source string) {
+		if re == nil || candidate == "" {
+			return
+		}
+		if m := re.FindStringSubmatch(candidate); m != nil {
+			hit := ruleHit{version: captureGroup(m, r.VersionGroup), model: captureGroup(m, r.ModelGroup), source: source}
+			if best.source == "" || (best.model == "" && hit.model != "") {
+				best = hit
 			}
 		}
+	}
+	consider(r.hostnameRe, hp.Client.Name, "hostname")
+	consider(r.hostnameRe, hp.Client.Hostname, "hostname")
+	for _, md := range hp.MDNSServices {
+		if !hardwarePrinterService(md, hp.HTTP[md.Port]) || md.Withdrawn || (md.Reflected && !md.TrustedReflector) {
+			continue
+		}
+		match := func(value string) {
+			consider(r.hostnameRe, value, "mdns")
+			consider(r.httpTitleRe, value, "mdns")
+		}
+		match(md.Instance)
+		for _, txt := range md.TXT {
+			key, value, _ := strings.Cut(txt, "=")
+			switch strings.ToLower(key) {
+			case "product", "ty", "usb_mdl":
+				match(value)
+			}
+		}
+	}
+	if best.source != "" {
+		return best, true
 	}
 	if len(r.MACPrefix) > 0 && hp.Client.MAC != "" {
 		macLower := strings.ToLower(hp.Client.MAC)
@@ -612,6 +644,25 @@ func (r *FingerprintRule) matchHostIdentity(hp probe.HostProfile) (ruleHit, bool
 		}
 	}
 	return ruleHit{}, false
+}
+
+// hardwarePrinterService excludes shared queues whose model describes a remote printer.
+func hardwarePrinterService(md probe.MDNSService, banner probe.HTTPBanner) bool {
+	switch strings.ToLower(md.Type) {
+	case "_ipp._tcp", "_ipps._tcp", "_printer._tcp", "_pdl-datastream._tcp":
+	default:
+		return false
+	}
+	if strings.Contains(md.Instance, " @ ") || strings.HasPrefix(strings.ToLower(banner.Server), "cups/") {
+		return false
+	}
+	for _, txt := range md.TXT {
+		value := strings.ToLower(txt)
+		if strings.HasPrefix(value, "printer-type=") || strings.HasPrefix(value, "rp=printers/") || strings.Contains(value, "cups") {
+			return false
+		}
+	}
+	return true
 }
 
 // distroPackage recognizes Linux/BSD distribution names and package revision

@@ -1204,3 +1204,20 @@ func TestFetchRecentLogsInterpolatesAdminTemplateParameters(t *testing.T) {
 		t.Fatalf("unexpected fallback admin message with missing params: %q", logs[1].Message)
 	}
 }
+
+// TestAdoptedSSHPasswordSetting preserves the distinction between false and missing telemetry.
+func TestAdoptedSSHPasswordSetting(t *testing.T) {
+	for _, tc := range []struct {
+		value          any
+		enabled, known bool
+	}{{nil, false, false}, {"false", false, false}, {false, false, true}, {true, true, true}} {
+		row := map[string]any{"key": "mgmt", "x_ssh_enabled": true}
+		if tc.value != nil {
+			row["x_ssh_auth_password_enabled"] = tc.value
+		}
+		s := parseSecuritySettings([]map[string]any{row})
+		if s.SSHPasswordAuth != tc.enabled || s.SSHPasswordAuthKnown != tc.known {
+			t.Fatal(tc, s)
+		}
+	}
+}

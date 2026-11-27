@@ -308,3 +308,30 @@ notify:
 		t.Fatalf("unexpected env notify config: %+v", cfgEnv.Notify)
 	}
 }
+
+// TestSSHProbeDefaults distinguishes omitted audit settings from an explicit opt-out.
+func TestSSHProbeDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name, settings     string
+		authDisabled, keys bool
+	}{
+		{"default", "", false, false},
+		{"configured", "  ssh_key_audit:\n    public_key_files: [audit.pub]\n    usernames: [admin]\n", false, true},
+		{"disabled", "  disable_ssh_auth_probe: true\n  ssh_key_audit:\n    enabled: false\n    public_key_files: [audit.pub]\n", true, false},
+		{"explicit", "  ssh_key_audit:\n    enabled: true\n    public_key_files: [audit.pub]\n    usernames: [admin]\n", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings")
+			if err := os.WriteFile(path, []byte("unifi:\n  url: https://controller.test\n  api_key: test\nscan:\n"+tc.settings), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Scan.DisableSSHAuthProbe != tc.authDisabled || cfg.Scan.SSHKeyAudit.Active() != tc.keys {
+				t.Fatal("unexpected SSH configuration")
+			}
+		})
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // TestCompareVersionsAndRange verifies version ordering (including patch and
@@ -182,23 +183,18 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 	}
 	products := fp.Identify(nil, profiles)
 
-	// With PotentialMaxAgeYears=2, ancient 2012 non-KEV potential CVE is filtered
-	// while recent 2026 TrueNAS + exact OpenSSH KEV remain.
-	matches, err := cache.MatchProducts(products, MatchOptions{
-		MinSeverity:          checks.SeverityMedium,
-		PotentialMaxAgeYears: 2,
-	})
+	matches, err := cache.MatchProducts(products, MatchOptions{MinSeverity: checks.SeverityMedium})
 	if err != nil {
 		t.Fatalf("MatchProducts: %v", err)
 	}
-	if len(matches) != 2 {
-		t.Fatalf("expected 2 matches (exact OpenSSH KEV + recent TrueNAS), got %d: %+v", len(matches), matches)
+	if len(matches) != 3 {
+		t.Fatalf("expected OpenSSH KEV and both TrueNAS matches, got %d: %+v", len(matches), matches)
 	}
 	if matches[0].Record.ID != "CVE-2026-9999" || matches[0].Confidence != ConfidenceExact || !matches[0].Record.KEV {
 		t.Fatalf("expected first match to be exact KEV CVE-2026-9999, got %+v", matches[0])
 	}
-	if matches[1].Record.ID != "CVE-2026-8888" || matches[1].Confidence != ConfidencePotential {
-		t.Fatalf("expected second match to be recent potential CVE-2026-8888, got %+v", matches[1])
+	if matches[1].Record.ID != "CVE-2012-0001" || matches[1].Confidence != ConfidencePotential {
+		t.Fatalf("expected second match to be older critical potential CVE-2012-0001, got %+v", matches[1])
 	}
 
 	// Verify single-CVE offline inspection.
@@ -222,8 +218,8 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 		t.Fatalf("unexpected OpenSSH rollup summary: %+v", summaries[0])
 	}
 	profiles[0].SSHBanner += " Debian-2+deb12u3"
-	matches, err = cache.MatchProducts(fp.Identify(nil, profiles), MatchOptions{PotentialMaxAgeYears: 2})
-	if err != nil || len(matches) != 2 {
+	matches, err = cache.MatchProducts(fp.Identify(nil, profiles), MatchOptions{})
+	if err != nil || len(matches) != 3 {
 		t.Fatalf("packaged OpenSSH matches: %v, %v", matches, err)
 	}
 	m := matches[0]
@@ -236,8 +232,8 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 		t.Fatalf("packaged OpenSSH verification: %+v", summary)
 	}
 	profiles[0].SSHBanner = "SSH-2.0-OpenSSH_9.8p1 Ubuntu-1"
-	matches, err = cache.MatchProducts(fp.Identify(nil, profiles), MatchOptions{PotentialMaxAgeYears: 2})
-	if err != nil || len(matches) != 1 || matches[0].Product.Label == "OpenSSH" {
+	matches, err = cache.MatchProducts(fp.Identify(nil, profiles), MatchOptions{})
+	if err != nil || len(matches) != 2 || matches[0].Product.Label == "OpenSSH" {
 		t.Fatalf("out-of-range packaged OpenSSH: %v, %v", matches, err)
 	}
 
@@ -1802,7 +1798,7 @@ func TestFirmwareHardwareANDAndDistroBackports(t *testing.T) {
 		t.Fatalf("wildcard OS prerequisite must set NeedsContext: %+v", osMatches)
 	}
 
-	// 2. Wildcard CPE + VersionAmbiguous stays ConfidencePotential and honors age cutoff.
+	// 2. Wildcard CPE + VersionAmbiguous stays ConfidencePotential.
 	cache := NewCache(t.TempDir())
 	if err := os.Mkdir(filepath.Join(cache.dir, "vendors"), 0o755); err != nil {
 		t.Fatal(err)
@@ -1831,20 +1827,15 @@ func TestFirmwareHardwareANDAndDistroBackports(t *testing.T) {
 	if byID["CVE-2024-9999"] != ConfidenceVersionAmbiguous {
 		t.Fatalf("bounded CPE on distro package should be version-ambiguous, got %+v", byID)
 	}
-	aged, err := cache.MatchProducts([]Product{prod}, MatchOptions{PotentialMaxAgeYears: 5})
-	if err != nil || len(aged) != 1 || aged[0].Record.ID != "CVE-2024-9999" {
-		t.Fatalf("ancient wildcard CPE should be filtered by PotentialMaxAgeYears: %+v, %v", aged, err)
-	}
-	// Versionless product with NeedsContext still respects PotentialMaxAgeYears,
-	// and NeedsContext outranks distro ambiguity on a bounded range.
+	// Missing platform context outranks distro ambiguity on a bounded range.
 	if _, err := writeGzipJSONAtomic(filepath.Join(cache.dir, "vendors", "apache.json.gz"), []Record{
 		{ID: "CVE-2010-0001", Published: "2010-01-01", Severity: checks.SeverityHigh, NeedsContext: true,
 			Matches: []CPEMatch{{Part: "a", Vendor: "apache", Product: "http_server", EndExcl: "2.4.60", NeedsContext: true}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if aged, err := cache.MatchProducts([]Product{{Vendors: []string{"apache"}, Products: []string{"http_server"}}}, MatchOptions{PotentialMaxAgeYears: 5}); err != nil || len(aged) != 0 {
-		t.Fatalf("ancient versionless NeedsContext CVE bypassed PotentialMaxAgeYears: %+v, %v", aged, err)
+	if aged, err := cache.MatchProducts([]Product{{Vendors: []string{"apache"}, Products: []string{"http_server"}}}, MatchOptions{}); err != nil || len(aged) != 1 {
+		t.Fatalf("missing older versionless CVE: %+v, %v", aged, err)
 	}
 	if m, err := cache.MatchProducts([]Product{prod}, MatchOptions{}); err != nil || len(m) != 1 || m[0].Confidence != ConfidencePotential {
 		t.Fatalf("NeedsContext must outrank VersionAmbiguous: %+v, %v", m, err)
@@ -1932,6 +1923,118 @@ func TestFirmwareHardwareANDAndDistroBackports(t *testing.T) {
 	for _, p := range fp.Identify(nginxSnap, []probe.HostProfile{hpPlain}) {
 		if p.Version == "1.25.0" && p.WANExposed {
 			t.Fatalf("port 443 WANExposed leaked onto unforwarded port 8443: %+v", p)
+		}
+	}
+}
+
+// TestPrinterModelAdvisories binds older firmware advisories to the advertised model.
+func TestPrinterModelAdvisories(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := NewCache(t.TempDir())
+	dir := filepath.Join(cache.dir, "vendors")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	records := []Record{
+		{ID: "CVE-2022-1000", Published: "2022-01-01", Severity: checks.SeverityHigh},
+		{ID: "CVE-2023-1000", Published: "2023-01-01", Severity: checks.SeverityCritical},
+		{ID: "CVE-2023-1001", Severity: checks.SeverityCritical},
+	}
+	for i := range records {
+		model := "laserjet_pro_m453_firmware"
+		if i == 2 {
+			model = "laserjet_m404_firmware"
+		}
+		records[i].Matches = []CPEMatch{{Vendor: "hp", Product: model, EndExcl: "2"}}
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(dir, "hp.json.gz"), records); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"instance", "product", "ty", "usb_mdl"} {
+		const name = "HP Color LaserJet Pro M453-4"
+		md := probe.MDNSService{Type: "_ipp._tcp", Instance: "Office LaserJet"}
+		if key == "instance" {
+			md.Instance = name
+		} else {
+			md.TXT = []string{key + "=" + name}
+		}
+		hp := probe.HostProfile{Client: unifi.Client{Name: "Office", IP: "192.0.2.3"}, MDNSServices: []probe.MDNSService{md}}
+		hp.HTTP = map[int]probe.HTTPBanner{80: {Title: "HP LaserJet"}}
+		got, err := cache.MatchProducts(fp.Identify(nil, []probe.HostProfile{hp}), MatchOptions{MinSeverity: checks.SeverityHigh})
+		if err != nil || len(got) != 2 {
+			t.Fatalf("%s: %v, %v", key, got, err)
+		}
+		for _, m := range got {
+			if m.Product.Label != "HP LaserJet M453" || m.Confidence != ConfidencePotential || m.Record.ID == records[2].ID {
+				t.Fatal(key, m)
+			}
+		}
+	}
+}
+
+// TestPrinterModelEvidence binds mixed web banners to one model and ignores proxied DNS-SD queues.
+func TestPrinterModelEvidence(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hp := probe.HostProfile{Client: unifi.Client{IP: "192.0.2.3"}, HTTP: map[int]probe.HTTPBanner{80: {Title: "HP LaserJet"}, 443: {Title: "HP LaserJet Pro M453"}}}
+	products := fp.Identify(nil, []probe.HostProfile{hp})
+	if len(products) != 1 || products[0].Label != "HP LaserJet M453" || len(products[0].Ports) != 2 || matchesAnyPattern(products[0].Products, "laserjet_m404_firmware") {
+		t.Fatal(products)
+	}
+	hp.HTTP = map[int]probe.HTTPBanner{631: {Server: "CUPS/2.4"}}
+	for _, md := range []probe.MDNSService{
+		{Type: "_ipp._tcp", Instance: "HP LaserJet M453 @ Mac"},
+		{Type: "_ipp._tcp", Instance: "HP LaserJet M453", Port: 631},
+		{Type: "_ipps._tcp", TXT: []string{"ty=HP LaserJet M453", "rp=printers/office"}},
+		{Type: "_printer._tcp", TXT: []string{"product=HP LaserJet M453", "printer-type=0x8046"}},
+		{Type: "_http._tcp", TXT: []string{"usb_mdl=HP LaserJet M453"}},
+	} {
+		hp.MDNSServices = []probe.MDNSService{md}
+		if p := fp.Identify(nil, []probe.HostProfile{hp}); len(p) != 1 || p[0].Label != "CUPS Print Server" {
+			t.Fatal(md, p)
+		}
+	}
+}
+
+// TestDiscoveredPrinterType ingests a printer advertisement before matching its model.
+func TestDiscoveredPrinterType(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ip = "192.0.2.3"
+	host := dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("office.local."), TTL: 120, Class: dnsmessage.ClassINET}
+	service := host
+	service.Name = dnsmessage.MustNewName("Office._ipp._tcp.local.")
+	for _, shared := range []bool{false, true} {
+		txt := []string{"product=HP LaserJet M453"}
+		if shared {
+			txt = append(txt, "printer-type=0x8046")
+		}
+		msg := dnsmessage.Message{Header: dnsmessage.Header{Response: true}, Answers: []dnsmessage.Resource{
+			{Header: host, Body: &dnsmessage.AResource{A: [4]byte{192, 0, 2, 3}}},
+			{Header: service, Body: &dnsmessage.SRVResource{Port: 631, Target: host.Name}},
+			{Header: service, Body: &dnsmessage.TXTResource{TXT: txt}},
+		}}
+		packet, err := msg.Pack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cache, now := probe.NewDiscoveryCache(), time.Now()
+		cache.IngestMDNSPacket(packet, ip, "eth0", "LAN", now)
+		services := cache.Snapshot(now).MDNS[ip]
+		if len(services) != 1 || !slices.Contains(services[0].TXT, "product=HP LaserJet M453") {
+			t.Fatalf("missing printer advertisement: %+v", services)
+		}
+		products := fp.Identify(nil, []probe.HostProfile{{Client: unifi.Client{IP: ip}, MDNSServices: services}})
+		hasModel := slices.ContainsFunc(products, func(p Product) bool { return p.Label == "HP LaserJet M453" })
+		if hasModel == shared {
+			t.Errorf("shared = %t: products = %+v", shared, products)
 		}
 	}
 }

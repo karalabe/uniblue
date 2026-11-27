@@ -110,7 +110,7 @@ func (b *builder) simListeners() map[string]map[socket][]SimEdge {
 			disruptionOnly[m.Record.ID] = true
 		}
 	}
-	add := func(s socket, tier, label, cut string) {
+	add := func(s socket, tier, label string, cuts ...string) {
 		if s.ip == "" {
 			return
 		}
@@ -118,9 +118,7 @@ func (b *builder) simListeners() map[string]map[socket][]SimEdge {
 			out[s.host] = make(map[socket][]SimEdge)
 		}
 		e := SimEdge{To: s.host, Tier: tier, Label: label + " · " + serviceName(s.proto, s.port)}
-		if cut != "" {
-			e.CutIDs = []string{cut}
-		}
+		e.CutIDs = cuts
 		out[s.host][s] = append(out[s.host][s], e)
 	}
 	for s := range b.sockets {
@@ -147,13 +145,17 @@ func (b *builder) simListeners() map[string]map[socket][]SimEdge {
 			default:
 				continue // Read-only and disruption findings do not grant control.
 			}
-			add(s, tier, detail, b.actions[e.cut].ID)
+			cuts := []string{b.actions[e.cut].ID}
+			if e.bundle != 0 {
+				cuts = append(cuts, b.actions[e.bundle].ID)
+			}
+			add(s, tier, detail, cuts...)
 		}
 	}
 	addAdmin := func(host, ip, proto string, port int) {
 		switch port {
 		case 22, 80, 443, 445, 623, 3389, 5900, 8006, 8443:
-			add(socket{host, address(ip), cmp.Or(proto, "tcp"), port}, "pivot", "Management service", "")
+			add(socket{host, address(ip), cmp.Or(proto, "tcp"), port}, "pivot", "Management service")
 		}
 	}
 	for _, p := range b.Profiles {
@@ -421,16 +423,28 @@ func (b *builder) buildSimulation(report Report) *Simulation {
 			sim.Nodes[i].EgressCutIDs = ids
 		}
 	}
-	add := func(src attachment, pos risk.Position, cell risk.IsolationCell, e SimEdge) {
+	add := func(src attachment, pos risk.Position, dstID string, cell risk.IsolationCell, e SimEdge) {
 		if cell.Effective == "unknown" {
-			sim.Edges = append(sim.Edges, SimEdge{From: src.host, To: e.To, Tier: "unknown", Label: "Reachability unverified", Via: cell.MissingInput})
+			tier := "unknown"
+			if e.Tier == "takeover" {
+				tier = "unknown-takeover"
+			}
+			sim.Edges = append(sim.Edges, SimEdge{From: src.host, To: e.To, Tier: tier, Label: "Reachability unverified", Via: cell.MissingInput, CutIDs: slices.Clone(e.CutIDs)})
 			return
 		}
 		if cell.Effective != "allow" {
 			return
 		}
-		cut, from, dst, to := b.boundaryID(pos, cell)
-		e.From, e.Via = src.host, cmp.Or(cell.DecisiveRuleName, cell.PathKind+" · "+from+" → "+to)
+		cut, from, dst, to := b.boundaryID(pos, dstID, cell)
+		e.From, e.Via = src.host, cmp.Or(cell.DecisiveRuleName, cell.PathKind+" via "+from+" -> "+to)
+		if e.Via == "Switch L2/L3 Default" {
+			switch cell.PathKind {
+			case "wired-same-vlan", "mixed-same-vlan", "cross-ap-wifi", "same-ap-wifi":
+				e.Via = "Same network (no client isolation)"
+			case "switch-routed":
+				e.Via = "Switch routing from " + from + " to " + to
+			}
+		}
 		e.CutIDs = slices.Clone(e.CutIDs)
 		if valid[cut] {
 			e.CutIDs = append(e.CutIDs, cut)
@@ -455,7 +469,7 @@ func (b *builder) buildSimulation(report Report) *Simulation {
 					cell := b.Oracle.AnyPort(pos, dst.client, fam)
 					// A routed allow needs a listener to pivot, but missing policy also matters on a quiet peer.
 					if sameNet || cell.Effective == "unknown" {
-						add(src, pos, cell, SimEdge{To: dst.host, Tier: "l2", Label: "Same-VLAN peer"})
+						add(src, pos, dst.client.NetworkID, cell, SimEdge{To: dst.host, Tier: "l2", Label: "Same-VLAN peer"})
 					}
 				}
 				for s, services := range listeners[dst.host] {
@@ -464,7 +478,7 @@ func (b *builder) buildSimulation(report Report) *Simulation {
 					}
 					cell := b.Oracle.Service(pos, pin(dst.client, s.ip), s.proto, s.port, fam)
 					for _, service := range services {
-						add(src, pos, cell, service)
+						add(src, pos, dst.client.NetworkID, cell, service)
 					}
 				}
 			}

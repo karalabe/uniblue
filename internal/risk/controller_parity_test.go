@@ -220,7 +220,7 @@ func TestACLClassAndCompoundTargets(t *testing.T) {
 	// Port forward with unresolved source must still bump severity (at least as restricted).
 	scored := scoreFinding(
 		checks.Finding{BaseSeverity: checks.SeverityMedium, Port: 443, Transport: "tcp"},
-		[]unifi.PortForward{{Name: "Web", Enabled: true, Proto: "tcp", DstPort: "443", FwdPort: "443", FwdIP: "192.0.2.10", SourceUnknown: true}},
+		[]unifi.PortForward{{Name: "Web", Enabled: true, Proto: "tcp", DstPort: "443", FwdPort: "443", FwdIP: "192.0.2.10", SourceUnknown: true}}, nil,
 	)
 	if scored.EffectiveSeverity != checks.SeverityHigh {
 		t.Fatalf("expected unresolved WAN forward to bump medium -> high, got %s (%v)", scored.EffectiveSeverity, scored.RiskReasons)

@@ -99,6 +99,9 @@ type Finding struct {
 	// Observation carries probe fields for evaluation during this scan.
 	Observation Observation `json:"-"`
 
+	// Grants records permissions established directly by a protocol probe.
+	Grants []GrantSpec `json:"-"`
+
 	// Evidence summarizes what the probe observed without leaking redacted secrets.
 	Evidence string `json:"evidence"`
 
@@ -150,7 +153,7 @@ func (f Finding) EffectiveTransport() string {
 // or service visibility at informational severity without asserting a policy
 // violation or unauthorized permission.
 func (f Finding) IsInventoryOnly() bool {
-	if f.BaseSeverity != SeverityInfo {
+	if f.BaseSeverity != SeverityInfo && !(f.CheckID == "UB-0010" && f.EffectiveSeverity == SeverityInfo && f.ClaimKind == ClaimServiceObserved) {
 		return false
 	}
 	switch f.ClaimKind {

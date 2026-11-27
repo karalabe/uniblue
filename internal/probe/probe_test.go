@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/unifi"
 	"github.com/praetorian-inc/nerva/pkg/plugins"
 	"golang.org/x/crypto/ssh"
@@ -508,5 +510,271 @@ func TestSSHKeyAuditSafetyAndPrivacy(t *testing.T) {
 	wk, wc, wm := parseServerKexInit(pkt)
 	if len(wk) != 1 || len(wc) != 1 || len(wm) != 1 {
 		t.Fatalf("expected weak kex/cipher/mac from KEXINIT, got kex=%v cipher=%v mac=%v", wk, wc, wm)
+	}
+}
+
+// TestSSHAuthDiscovery counts wire requests across scans, including after key rotation.
+func TestSSHAuthDiscovery(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var current atomic.Pointer[ssh.ServerConfig]
+	var none, other atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				conn.SetDeadline(time.Now().Add(time.Second))
+				ssh.NewServerConn(conn, current.Load())
+			}()
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	cl := unifi.Client{ID: "fixture", IP: "127.0.0.1"}
+	cache := new(SSHKeyAuditCache)
+	scan := func(disable bool, infra bool) *SSHInfo {
+		fp := NewFingerprinter([]int{port}, 1, time.Second, nil)
+		fp.SetAuditedSSHHostKeys(cache)
+		fp.DisableSSHAuthProbe = disable
+		if infra {
+			fp.SetInfrastructure([]unifi.Device{{IP: cl.IP}})
+		}
+		fp.SetCachedDiscovery(&LANDiscovery{MDNS: map[string][]MDNSService{cl.IP: {{Type: "_ssh._tcp", TargetIPs: []string{cl.IP}, Port: port}}}})
+		hp := fp.FingerprintHost(context.Background(), cl)
+		return hp.SSH
+	}
+	for i, method := range []string{"publickey", "password", "keyboard-interactive", "none"} {
+		cfg := &ssh.ServerConfig{AuthLogCallback: func(_ ssh.ConnMetadata, m string, _ error) {
+			if m == "none" {
+				none.Add(1)
+			} else {
+				other.Add(1)
+			}
+		}}
+		switch method {
+		case "none":
+			cfg.NoClientAuth = true
+		case "publickey":
+			cfg.PublicKeyCallback = func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) { return nil, fmt.Errorf("denied") }
+		case "password":
+			cfg.PasswordCallback = func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) { return nil, fmt.Errorf("denied") }
+		case "keyboard-interactive":
+			cfg.KeyboardInteractiveCallback = func(ssh.ConnMetadata, ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+				return nil, fmt.Errorf("denied")
+			}
+		}
+		_, key, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signer, err := ssh.NewSignerFromKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.AddHostKey(signer)
+		current.Store(cfg)
+		scan(true, false)
+		scan(false, true)
+		if none.Load() != int32(i) {
+			t.Fatal("disabled or infrastructure scan queried auth")
+		}
+		for range 2 {
+			got := scan(false, false)
+			if got.NoneAuthAccepted != (method == "none") || (method != "none" && !slices.Equal(got.AuthMethods, []string{method})) {
+				t.Fatalf("%s: %+v", method, got)
+			}
+		}
+		if none.Load() != int32(i+1) || other.Load() != 0 {
+			t.Fatalf("%s: none=%d other=%d", method, none.Load(), other.Load())
+		}
+	}
+}
+
+// TestSSHAuthCacheLifetime exercises one listener through a drop, a retry and a policy change.
+func TestSSHAuthCacheLifetime(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostFP := ssh.FingerprintSHA256(signer.PublicKey())
+	var connects, requests atomic.Int32
+	cancelled, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var drop, allowNone, cancelOnReply, limitAudit atomic.Bool
+	drop.Store(true)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connects.Add(1)
+			if drop.Load() {
+				c.Close()
+				continue
+			}
+			cfg := &ssh.ServerConfig{
+				NoClientAuth:     allowNone.Load(),
+				PasswordCallback: func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) { return nil, fmt.Errorf("denied") },
+				AuthLogCallback: func(_ ssh.ConnMetadata, method string, _ error) {
+					if method == "none" {
+						requests.Add(1)
+						if cancelOnReply.Load() {
+							cancel()
+						}
+					}
+				}}
+			if limitAudit.Load() {
+				cfg.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+					if ssh.FingerprintSHA256(key) == hostFP {
+						// Accept the fixture key, then refuse the next connection in this audit.
+						drop.Store(true)
+						return &ssh.Permissions{}, nil
+					}
+					return nil, fmt.Errorf("denied")
+				}
+			}
+			cfg.AddHostKey(signer)
+			c.SetDeadline(time.Now().Add(time.Second))
+			ssh.NewServerConn(c, cfg)
+			c.Close()
+		}
+	}()
+	cache := new(SSHKeyAuditCache)
+	port := ln.Addr().(*net.TCPAddr).Port
+	scan := func(ctx context.Context, ip string) *SSHInfo {
+		fp := NewFingerprinter(nil, 1, time.Second, nil)
+		fp.SetAuditedSSHHostKeys(cache)
+		hp := HostProfile{Client: unifi.Client{ID: "fixture"}, ProbeIP: ip, SSH: &SSHInfo{HostKeyFingerprint: hostFP, Port: port}}
+		fp.auditSSH(ctx, &hp)
+		return hp.SSH
+	}
+	ctx := context.Background()
+	const ip = "127.0.0.1"
+	scan(ctx, ip)
+	var entry *SSHKeyAuditCacheEntry
+	cache.entries.Range(func(_, value any) bool { entry = value.(*SSHKeyAuditCacheEntry); return false })
+	if entry == nil || entry.methodsQueried || !entry.retryAfter.After(time.Now()) {
+		t.Fatal("drop recorded as a completed answer")
+	}
+	drop.Store(false)
+	scan(ctx, ip)
+	if connects.Load() != 1 {
+		t.Fatal("rapid rescan retried dropped connection")
+	}
+	entry.retryAfter = time.Now().Add(-time.Second)
+	if got := scan(ctx, ip); !slices.Equal(got.AuthMethods, []string{"password"}) || !entry.methodsQueried || !entry.retryAfter.IsZero() {
+		t.Fatal(got)
+	}
+	allowNone.Store(true)
+	if got := scan(ctx, ip); got.NoneAuthAccepted || requests.Load() != 1 {
+		t.Fatal("fresh answer re-queried")
+	}
+	if ttl := time.Until(entry.expiresAt); ttl < 59*time.Minute || ttl > time.Hour {
+		t.Fatal(ttl)
+	}
+	entry.expiresAt = time.Now().Add(-time.Second)
+	if got := scan(ctx, ip); !got.NoneAuthAccepted || len(got.AuthMethods) != 0 || requests.Load() != 2 {
+		t.Fatal("stale authentication policy", got)
+	}
+	// The same host and port on IPv6 have no listening server or cached IPv4 answer.
+	if got := scan(ctx, "::1"); got.NoneAuthAccepted || len(got.AuthMethods) > 0 {
+		t.Fatal(got)
+	}
+	count := 0
+	cache.entries.Range(func(_, v any) bool {
+		count++
+		if v != entry && (v.(*SSHKeyAuditCacheEntry).methodsQueried || !v.(*SSHKeyAuditCacheEntry).retryAfter.After(time.Now())) {
+			t.Error("dial error should back off")
+		}
+		return true
+	})
+	if count != 2 {
+		t.Fatal("listener cache entries", count)
+	}
+	drop.Store(true)
+	entry.expiresAt = time.Now().Add(-time.Second)
+	before := connects.Load()
+	for range 2 {
+		if got := scan(ctx, ip); !got.NoneAuthAccepted || connects.Load() != before+1 {
+			t.Fatal("failed refresh lost the last answer or retried during cooldown", got)
+		}
+	}
+	if ttl := time.Until(entry.retryAfter); ttl < 4*time.Minute || ttl > 5*time.Minute {
+		t.Fatal("retry cooldown", ttl)
+	}
+	drop.Store(false)
+	allowNone.Store(false)
+	cancelOnReply.Store(true)
+	entry.retryAfter = time.Time{}
+	if got := scan(cancelled, ip); !got.NoneAuthAccepted || len(got.AuthMethods) != 0 || !entry.retryAfter.IsZero() || requests.Load() != 3 {
+		t.Fatal("cancelled reply was cached", got)
+	}
+	cancelOnReply.Store(false)
+	allowNone.Store(true)
+	// A configured key audit performs its own initial none request. Both scanners
+	// must use that answer without opening a second method-discovery connection.
+	enabled := true
+	audit := func(users ...string) *SSHInfo {
+		fp := NewFingerprinter(nil, 1, time.Second, nil)
+		fp.SetAuditedSSHHostKeys(cache)
+		fp.sshKeyAudit = &config.SSHKeyAuditConfig{Enabled: &enabled, Usernames: users}
+		fp.sshAuditKeys = []SSHPublicKey{{Key: signer.PublicKey(), Fingerprint: hostFP}}
+		hp := HostProfile{Client: unifi.Client{ID: "fixture"}, ProbeIP: ip, SSH: &SSHInfo{HostKeyFingerprint: hostFP, Port: port}}
+		fp.auditSSH(ctx, &hp)
+		return hp.SSH
+	}
+	for range 2 {
+		if got := audit("fixture"); !got.NoneAuthAccepted || requests.Load() != 4 || !entry.keysAudited {
+			t.Fatal("key audit repeated the none request", got)
+		}
+	}
+	allowNone.Store(false)
+	limitAudit.Store(true)
+	entry.expiresAt = time.Now().Add(-time.Second)
+	before = connects.Load()
+	for range 2 {
+		got := audit("fixture", "second")
+		if !got.BruteForceProtected || len(got.AcceptedKeys) != 1 || got.AcceptedKeys[0].Fingerprint != hostFP || connects.Load() != before+2 {
+			t.Fatal("rate-limited audit lost its partial answer or retried", got)
+		}
+	}
+	if ttl := time.Until(entry.expiresAt); ttl < 59*time.Minute || ttl > time.Hour {
+		t.Fatal("rate-limited audit TTL", ttl)
+	}
+
+	// Complete a single-user audit before taking the listener offline.
+	drop.Store(false)
+	entry.expiresAt = time.Time{}
+	cached := audit("fixture")
+	if cached.BruteForceProtected || len(cached.AcceptedKeys) != 1 || cached.AcceptedKeys[0].Fingerprint != hostFP || !slices.Contains(cached.AuthMethods, "publickey") {
+		t.Fatal("expected an accepted key and advertised methods", cached)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entry.expiresAt = time.Time{}
+	start := time.Now()
+	got := audit("fixture")
+	if got.BruteForceProtected || !slices.Equal(got.AcceptedKeys, cached.AcceptedKeys) || !slices.Equal(got.AuthMethods, cached.AuthMethods) || !entry.expiresAt.IsZero() {
+		t.Fatal("refused refresh replaced the cached audit or renewed its TTL", got)
+	}
+	if entry.retryAfter.Before(start.Add(5*time.Minute)) || entry.retryAfter.After(time.Now().Add(5*time.Minute)) {
+		t.Fatal("refused refresh retry time", entry.retryAfter)
 	}
 }

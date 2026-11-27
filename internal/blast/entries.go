@@ -53,13 +53,13 @@ func (b *builder) entries() {
 	for _, n := range b.Snapshot.Networks {
 		k := networkKey(n)
 		switch {
-		case namesNetwork(policy.GuestVLANs, n) || strings.EqualFold(n.Purpose, "guest"):
+		case namesNetwork(policy.GuestVLANs, n) || strings.EqualFold(n.Purpose, "guest") || strings.EqualFold(n.ZoneName, "Hotspot"):
 			roles[k] = "guest"
 		case namesNetwork(policy.IoTVLANs, n):
 			roles[k] = "iot"
 		case namesNetwork(policy.CameraVLANs, n):
 			roles[k] = "camera"
-		case n.IsolationEnabled:
+		case n.IsolationEnabled || namesNetwork(b.NetCfg.IsolatedVLANs, n):
 			roles[k] = "isolated"
 		}
 	}
@@ -93,7 +93,7 @@ func (b *builder) entries() {
 			compromised[a.host] = true
 		}
 		if siteClients[a.host] || isAppliance || observedVendor(byHost[a.host]) {
-			cloud[a.host] = append(cloud[a.host], b.egress(a, byHost[a.host], isAppliance))
+			cloud[a.host] = append(cloud[a.host], b.egress(a, byHost[a.host], isAppliance, role))
 		}
 	}
 	// A compromised device can originate traffic from every interface it owns.
@@ -191,11 +191,15 @@ func observedVendor(deps []probe.OutboundDependency) bool {
 
 // egress evaluates outbound internet reachability for one client attachment.
 // Observed vendor traffic takes precedence over firewall policy alone.
-func (b *builder) egress(a attachment, deps []probe.OutboundDependency, isAppliance bool) ClientEgress {
+func (b *builder) egress(a attachment, deps []probe.OutboundDependency, isAppliance bool, role string) ClientEgress {
 	e, allowed, missing := b.assessEgress(a, deps, isAppliance)
 	n := b.network(a.client.NetworkID, a.client.NetworkName)
 	netName := cmp.Or(n.Name, "this network")
-	if allowed && (isAppliance || e.State == cloudConnected) {
+	dedicated := (role == "iot" || role == "camera" || role == "isolated") && !namesNetwork(b.NetCfg.TrustedVLANs, n)
+	if isAppliance && !dedicated {
+		id := b.action("act:move-iot:"+networkKey(n), "Move IoT devices off "+netName+" to an isolated IoT network", "A dedicated IoT network separates these appliances from other devices on "+netName+".", LaneReduceExposure, 2)
+		b.link(root(AssumeBreach), fact{consequence, a.host, "shared network placement on " + netName}, low, id, 0)
+	} else if allowed && dedicated && (isAppliance || e.State == cloudConnected) {
 		id := b.action("act:vlan-egress:"+networkKey(n)+"->internet", "Limit internet access from "+netName, "Blocking outbound internet traffic stops these devices from contacting external servers. Confirm they do not need cloud access or updates first.", LaneReduceExposure, 2)
 		b.link(root(CloudEgress), fact{consequence, a.host, "internet access"}, low, id, 0)
 		for _, ap := range b.NetCfg.IsolationPolicy.ApprovedPaths {
@@ -252,10 +256,14 @@ func (b *builder) outdoor() {
 		}
 	}
 	for _, sw := range b.SwitchPorts {
-		for _, p := range sw.Ports {
-			if (p.Zone != "external" && p.Zone != "external_uplink") || p.State == "disabled" || (!p.Enabled && p.State == "") {
-				continue
-			}
+		outdoor := slices.DeleteFunc(slices.Clone(sw.Ports), func(p risk.SwitchPortView) bool {
+			return (p.Zone != "external" && p.Zone != "external_uplink") || p.State == "disabled" || (!p.Enabled && p.State == "")
+		})
+		bundle := 0
+		if len(outdoor) > 1 {
+			bundle = b.action("act:port-ext-switch:"+canonicalMAC(sw.MAC), "Lock down outdoor ports on "+cmp.Or(sw.Name, sw.MAC), "Secure every outdoor socket on this switch to close the remaining physical entry points.", LaneReduceExposure, 2)
+		}
+		for _, p := range outdoor {
 			key := ref(sw.MAC, p.PortIdx)
 			sp := raw[key]
 			name := fmt.Sprintf("port %d on %s", p.PortIdx, cmp.Or(sw.Name, sw.MAC))
@@ -299,7 +307,7 @@ func (b *builder) outdoor() {
 					tag = b.action("act:port-tags:"+key, "Remove unused tagged VLANs from "+name, "Extra tagged VLANs on this outdoor port can be reached from outside. Keep only the VLAN this device needs.", LaneReduceExposure, 1)
 				}
 				pos := risk.Position{NetworkID: n.ID, NetworkName: n.Name, SwitchMAC: sw.MAC, SwitchPort: p.PortIdx, IsWired: true}
-				b.link(root(Physical), b.position(pos), level, secure, tag)
+				b.link(root(Physical), b.position(pos), level, secure, bundle).tagCut = tag
 			}
 		}
 	}

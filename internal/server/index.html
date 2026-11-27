@@ -515,26 +515,23 @@
   #view-blast h1, #view-blast h2, #view-blast h3, #view-blast p { margin: 0; }
   #view-blast h1 { font-size: clamp(19px, 2vw, 23px); letter-spacing: -.035em; line-height: 1.25; }
   #view-blast h2 { font-size: 16px; letter-spacing: -.02em; line-height: 1.4; }
-  .br-banner { padding: 22px; }
-  .br-intro, .br-pickers, .br-heading, .br-path-title, .br-tabs { display: flex; align-items: center; gap: 10px; }
-  .br-intro { justify-content: space-between; align-items: flex-start; flex-wrap: wrap; }
-  .br-intro > div:first-child { flex: 1 1 370px; }
+  .br-controls, .br-heading, .br-path-title, .br-tabs { display: flex; align-items: center; gap: 10px; }
+  .br-controls { flex-wrap: wrap; padding: 10px 14px; font-size: 13px; font-weight: 650; }
+  .br-controls select { max-width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; }
+  .priority-head { flex-wrap: wrap; gap: 6px; }
+  .priority-head .br-filters { margin: 0; }
+  .priority-pages { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 6px 16px; font-size: 12px; color: var(--muted); }
   #view-blast .br-sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
   .br-segment { display: inline-flex; flex-wrap: wrap; padding: 3px; border: 1px solid var(--border); background: var(--surface-2); border-radius: 11px; }
   .br-control { appearance: none; color: var(--muted); border: 0; background: transparent; font: inherit; font-size: 12px; font-weight: 650; padding: 6px 9px; border-radius: 8px; cursor: pointer; }
   .br-control:hover { color: var(--text); }
   .br-segment .br-control[aria-pressed=true] { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
-  .br-pickers { flex-wrap: wrap; border-top: 1px solid var(--border); margin-top: 16px; padding-top: 14px; gap: 6px; }
   .br-overline { font-size: 10.5px; font-weight: 750; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
-  .br-quick { border: 1px solid var(--border-strong); border-radius: 99px; background: var(--surface-2); padding: 4px 10px; color: var(--text-2); }
-  .br-quick::before { content: ''; display: inline-block; width: 6px; height: 6px; background: var(--muted); border-radius: 50%; margin-right: 6px; }
-  .br-quick[aria-pressed=true] { color: var(--crit); border-color: var(--crit-solid); background: var(--crit-bg); }
-  .br-quick[aria-pressed=true]::before { background: var(--crit-solid); }
   .br-names summary { cursor: pointer; color: var(--muted); font-size: 11px; }
   .br-status { margin-left: auto; display: flex; gap: 4px; align-items: center; }
-  .br-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
-  .br-kpi { padding: 14px 16px; border-color: var(--br-border); background: linear-gradient(155deg, var(--br-fill), transparent 90%), var(--surface); }
-  .br-kpi strong { font-size: 20px; color: var(--br-ink); line-height: 1.35; display: inline-block; margin: 5px 0; }
+  .br-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
+  .br-kpi { padding: 8px 12px; border-color: var(--br-border); background: linear-gradient(155deg, var(--br-fill), transparent 90%), var(--surface); }
+  .br-kpi strong { font-size: 16px; color: var(--br-ink); line-height: 1.35; display: inline-block; margin: 2px 0; }
   .br-kpi small { font-size: 12px; color: var(--muted); }
   .br-detail { color: var(--text-2); font-size: 12px; overflow-wrap: anywhere; }
   .br-crit { --br-border: var(--crit-bd); --br-fill: var(--crit-bg); --br-ink: var(--crit); --br-line: var(--crit-solid); }
@@ -543,16 +540,22 @@
   .br-ok { --br-border: var(--ok-bd); --br-fill: var(--ok-bg); --br-ink: var(--ok); --br-line: var(--ok-solid); }
   .br-l2 { --br-border: var(--l2-bd); --br-fill: var(--l2-bg); --br-ink: var(--l2); --br-line: var(--l2); }
   .br-neutral { --br-border: var(--border); --br-fill: var(--surface-2); --br-ink: var(--text-2); }
-  .br-workspace { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.9fr); gap: 16px; align-items: start; }
+  .br-workspace { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(310px, 0.85fr); gap: 16px; align-items: start; }
   .br-heading { padding: 16px 18px; align-items: flex-start; flex-direction: column; gap: 0; border-bottom: 1px solid var(--border); }
-  .br-map { position: relative; isolation: isolate; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; padding: 16px; background-image: radial-gradient(var(--border-strong) .8px, transparent .8px); background-size: 16px 16px; }
+  .br-map { position: relative; isolation: isolate; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 10px; background-image: radial-gradient(var(--border-strong) .8px, transparent .8px); background-size: 16px 16px; }
   .br-zone { min-width: 0; padding: 10px; border: 1px dashed var(--border-strong); border-radius: 10px; }
   .br-zone.wide { grid-column: 1 / -1; }
   .br-zone h3 { font-size: 11px; padding-left: 6px; border-left: 3px solid var(--zone, var(--blue)); color: var(--text-2); }
   .br-zone small { font-size: 10px; color: var(--muted); display: block; padding-left: 9px; }
-  .br-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); align-items: center; gap: 18px 12px; margin: 14px 0 5px; }
-  .br-node { position: relative; z-index: 2; min-width: 0; border: 1px solid var(--br-line, var(--border-strong)); background: linear-gradient(var(--br-fill), var(--br-fill)), var(--surface); border-radius: 8px; min-height: 67px; }
-  .br-node.br-ok { border-color: var(--ok-bd); background: var(--surface); color: var(--muted); }
+  .br-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(160px, 100%), 1fr)); align-items: center; gap: 6px; margin: 6px 0 0; }
+  .br-node { position: relative; z-index: 2; min-width: 0; border: 1px solid var(--br-line, var(--border-strong)); background: linear-gradient(var(--br-fill), var(--br-fill)), var(--surface); border-radius: 8px; min-height: 54px; }
+  .br-node.br-ok { min-height: 40px; border-color: var(--border); background: var(--surface); color: var(--muted); }
+  .br-node.br-ok .br-node-main { padding: 5px 8px; }
+  .br-node.br-ok strong { -webkit-line-clamp: 1; }
+  .br-node.br-ok .br-address, .br-node.br-ok .br-role { display: none; }
+  .br-node.br-ok .br-badges { margin: 0; }
+  .br-node.br-ok .br-state { background: transparent; color: var(--muted); padding: 0; border: 0; }
+  .br-node.br-ok .br-state::before, .br-unreached::before { content: ''; display: inline-block; margin-right: 4px; border-radius: 50%; width: 5px; height: 5px; background: var(--muted); }
   .br-node.patient { border-width: 2px; box-shadow: 0 0 0 3px var(--crit-bg); }
   .br-node-main { cursor: pointer; display: block; width: 100%; background: none; color: inherit; border: 0; text-align: left; padding: 8px; font: inherit; }
   .br-node-main:focus-visible, .br-node-main:hover { outline: 2px solid var(--blue); border-radius: 7px; }
@@ -564,17 +567,22 @@
   .br-role { color: var(--muted); background: var(--surface-2); }
   .br-drawer { position: absolute; top: 3px; right: 3px; padding: 1px 4px; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; cursor: pointer; }
   .br-svg { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; overflow: visible; pointer-events: none; }
-  .br-legend { padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface-2); border-radius: 0 0 var(--radius) var(--radius); display: flex; flex-wrap: wrap; gap: 5px 14px; color: var(--text-2); font-size: 11px; }
-  .br-legend span::before { content: ''; display: inline-block; width: 17px; border-top: 2px solid var(--br-line); margin-right: 5px; vertical-align: middle; }
-  .br-legend .br-l2::before { border-top-style: dashed; }
-  .br-legend .br-blue::before { border-top-style: dotted; }
-  .br-legend .br-ok::before, .br-legend .br-neutral::before { width: 6px; height: 6px; border: 1px solid var(--br-line, var(--muted)); border-radius: 2px; }
-  .br-inspector { overflow: hidden; }
+  .br-legend { padding: 9px 14px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 5px 12px; align-items: center; color: var(--text-2); font-size: 11px; }
+  .br-legend b, .patient .br-state { padding: 2px 5px; border-radius: 4px; background: var(--br-fill); color: var(--br-ink); border: 1px solid var(--br-border); }
+  .br-legend .br-source, .patient .br-state { background: var(--crit-solid); color: white; }
+  .br-unreached { color: var(--muted); }
+  .br-wan-line::before { content: ''; display: inline-block; width: 18px; vertical-align: middle; margin-right: 4px; border-top: 2px dotted var(--blue); }
+  .br-svg [data-edge-to] { opacity: 0.45; }
+  .br-svg .path-active { opacity: 1; stroke-width: 3; }
+  .br-svg .path-dim { opacity: 0.12; }
+  .br-inspector { position: sticky; top: 72px; align-self: start; overflow: hidden; }
+  .br-verify-list { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .br-verify-list summary { cursor: pointer; font-size: 12px; color: var(--muted); }
   .br-tabs { flex-wrap: wrap; border-bottom: 1px solid var(--border); background: var(--surface-2); gap: 0; padding: 0 5px; }
   .br-tabs .br-control { padding: 11px 7px; border-radius: 0; border-bottom: 2px solid transparent; }
   .br-tabs .br-control[aria-pressed=true] { color: var(--blue); border-bottom-color: var(--blue); }
   .br-count { font-size: 10px; background: var(--surface-3); border-radius: 8px; padding: 1px 5px; }
-  .br-inspect-body { max-height: 610px; overflow-y: auto; padding: 14px; }
+  .br-inspect-body { max-height: min(610px, 73vh); overflow-y: auto; padding: 14px; }
   .br-path, .br-fix { display: block; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 10px 12px; margin: 7px 0; color: var(--text); width: 100%; text-align: left; font: inherit; cursor: pointer; }
   .br-path:hover, label.br-fix:hover { border-color: var(--border-strong); }
   .br-path-title { flex-wrap: wrap; gap: 5px; font-size: 13px; }
@@ -622,7 +630,7 @@
     .br-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .br-status { margin-left: 0; }
     .br-map { gap: 8px; padding: 10px; }
-    .br-banner { padding: 15px; }
+    .br-controls { padding: 8px; }
     .br-table table { min-width: 760px; }
   }
   @media (max-width: 500px) {
@@ -1409,11 +1417,14 @@ let deviceFilter = "all";     // "all" | "issues" | "bmc" | "cve" | "wan" | "che
 let deviceSearch = "";
 let activityFilter = "all";
 const dashboardTabs = ["checkup", "house", "blast", "devices", "activity"];
-let blastLaneFilter = "all";
+let checkupLane = "all";
+let checkupPage = 0;
+const checkupPageSize = 5;
+let blastFixScope = "device";
 let blastInspector = "paths";
 let blastAllFixes = false;
 let blastAllDevices = false;
-let blastMode = "worst";
+let blastMode = "strict";
 let blastPatient = "";
 let selectedInfraKey = "";
 const blastAppliedFixes = new Set();
@@ -2134,13 +2145,21 @@ document.addEventListener("click", e => {
       setDeviceFilter(actEl.getAttribute("data-filter") || "all");
     } else if (act === "activity-filter") {
       setActivityFilter(actEl.getAttribute("data-filter") || "all");
+    } else if (act === "checkup-lane" || act === "checkup-page") {
+      if (act === "checkup-lane") {
+        checkupLane = actEl.dataset.value;
+        checkupPage = 0;
+      } else {
+        checkupPage += Number(actEl.dataset.value);
+      }
+      renderCheckup();
     } else if (act.startsWith("blast-")) {
       const value = actEl.dataset.value;
       switch (act) {
         case "blast-patient": blastPatient = value; break;
         case "blast-inspector": blastInspector = value; break;
         case "blast-mode": blastMode = value; break;
-        case "blast-lane": blastLaneFilter = value; blastAllFixes = false; break;
+        case "blast-scope": blastFixScope = value; blastAllFixes = false; break;
         case "blast-more-fixes": blastAllFixes = !blastAllFixes; break;
         case "blast-more-devices": blastAllDevices = !blastAllDevices; break;
         case "blast-gear": selectedInfraKey = value; break;
@@ -2168,6 +2187,11 @@ document.addEventListener("click", e => {
 });
 
 document.addEventListener("change", e => {
+  if (e.target.id === "blast-device") {
+    blastPatient = e.target.value;
+    renderBlast();
+    return;
+  }
   const id = e.target.dataset.blastFix;
   if (!id) return;
   if (e.target.checked) blastAppliedFixes.add(id);
@@ -2606,9 +2630,13 @@ function renderCheckup() {
 
   html += `<div class="checkup-grid"><div>`;
 
-  const top = (vm.blast?.actions || []).filter(a => a.highest_tier_reduced && a.lane !== "verify").slice(0, 3);
-  html += `<div class="story"><div class="card-hd"><div class="card-title">Top Priorities</div>
-    <button class="btn sm" data-action="switch-tab" data-tab-target="blast">Open Blast Radius Simulator →</button></div>`;
+  const priorities = (vm.blast?.actions || []).filter(a => a.highest_tier_reduced && a.lane !== "verify" && (checkupLane === "all" || checkupLane === a.lane));
+  checkupPage = Math.max(0, Math.min(checkupPage, Math.ceil(priorities.length / checkupPageSize) - 1));
+  const start = checkupPage * checkupPageSize;
+  const top = priorities.slice(start, start + checkupPageSize);
+  html += `<div class="story"><div class="card-hd priority-head"><div class="card-title">Top Priorities</div>
+    <div class="br-filters" role="group" aria-label="Priority lane">${[["all","All"],["fix-now","Fix now"],["reduce-exposure","Reduce exposure"]].map(([id,label]) =>
+      `<button class="br-control" data-action="checkup-lane" data-value="${id}" aria-pressed="${checkupLane === id}">${label}</button>`).join("")}</div></div>`;
   for (const a of top) {
     const chips = (a.affected_assets || []).slice(0, 3).map((key, i) => {
       const entity = blastAssetEntity(vm, key);
@@ -2620,6 +2648,9 @@ function renderCheckup() {
       <div class="priority-reason" title="${esc(a.reason)}">${esc(a.reason)}</div><div class="aq-meta">${chips.join("")}</div></div></div>`;
   }
   if (!top.length) html += '<p class="br-empty">No changes with measured risk reduction.</p>';
+  if (top.length) html += `<div class="priority-pages"><span>${start + 1}-${start + top.length} of ${priorities.length}</span>
+    <button class="btn sm" data-action="checkup-page" data-value="-1" ${start ? "" : "disabled"}>Prev</button>
+    <button class="btn sm" data-action="checkup-page" data-value="1" ${start + top.length < priorities.length ? "" : "disabled"}>Next</button></div>`;
   html += '</div><div class="section-kicker">Details by Category</div>';
 
   // 1. Hardware Remote Controls (BMCs)
@@ -2856,6 +2887,7 @@ function renderCheckup() {
   const settingsUnknownTone = settingsFeedMissing ? "warn" : "neutral";
   const settingsUnknownVal = settingsFeedMissing ? "Unknown (feed unavailable)" : "Unknown";
   const s = hasSettings ? rawSettings : {};
+  const sshModeUnknown = s.ssh_enabled && !s.ssh_password_auth_known;
   const rawHealth = state.report?.unifi_posture?.health;
   const hasHealth = rawHealth != null && typeof rawHealth === "object";
   const h = hasHealth ? rawHealth : {};
@@ -2885,8 +2917,8 @@ function renderCheckup() {
     {
       name: "Router Admin Login",
       hint: "SSH password protection",
-      tone: !hasSettings ? settingsUnknownTone : ((s.ssh_enabled && s.ssh_password_auth) ? "warn" : "ok"),
-      val: !hasSettings ? settingsUnknownVal : (s.ssh_enabled ? (s.ssh_password_auth ? "Password on" : "Key-only") : "Turned off")
+      tone: !hasSettings ? settingsUnknownTone : sshModeUnknown ? "neutral" : (s.ssh_enabled && s.ssh_password_auth ? "warn" : "ok"),
+      val: !hasSettings ? settingsUnknownVal : sshModeUnknown ? "Unknown" : !s.ssh_enabled ? "Turned off" : s.ssh_password_auth ? "Password on" : "Key-only"
     },
     {
       name: "Encrypted DNS",
@@ -3036,8 +3068,8 @@ function blastPriority(a) {
   if (a.lane === "verify") return blastTag("unk", "Verify");
   switch (a.highest_tier_reduced) {
     case "P1": return blastTag("crit", "Urgent");
-    case "P2": return blastTag("warn", "High");
-    case "P3": return blastTag("blue", "Medium");
+    case "P2": return blastTag("crit", "High");
+    case "P3": return blastTag("warn", "Medium");
     case "P4":
     case "P5": return blastTag("neutral", "Low");
     default: return blastTag("neutral", "Optional");
@@ -3046,14 +3078,14 @@ function blastPriority(a) {
 
 // Keep only the strongest surviving witness per ordered pair. Removing a cut
 // restores the original alternatives, including independently published WAN routes.
-function blastGraph(sim) {
+function blastGraph(sim, applied = blastAppliedFixes) {
   const nodes = sim?.nodes || [];
   const indices = new Map(nodes.map((n, i) => [n.id, i]));
   const outgoing = nodes.map(() => new Map());
   const unknown = nodes.map(() => new Set());
   const wan = new Map();
   for (const edge of sim?.edges || []) {
-    if (edge.cut_ids?.some(id => blastAppliedFixes.has(id))) continue;
+    if (edge.cut_ids?.some(id => applied.has(id))) continue;
     const to = indices.get(edge.to);
     if (to === undefined) continue;
     if (edge.tier === "wan") {
@@ -3062,8 +3094,8 @@ function blastGraph(sim) {
     }
     const from = indices.get(edge.from);
     if (from === undefined) continue;
-    // In either mode, unknown edges from any reached node mark unverified peers without adding a hop.
-    if (edge.tier === "unknown") {
+    // Unverified management and peer paths only participate in the worst-case simulation.
+    if (edge.tier === "unknown-takeover" || (edge.tier === "unknown" && blastMode === "worst")) {
       unknown[from].add(to);
       continue;
     }
@@ -3125,7 +3157,7 @@ function blastKPI(title, value, suffix, detail, tone, more = []) {
 function blastNode(node, index, reach) {
   const patient = index === reach.root;
   const tier = reach.via[index]?.tier;
-  let tone = "ok", badge = "SAFE";
+  let tone = "ok", badge = "Unreached";
   if (patient) {
     tone = "crit";
     badge = "Source";
@@ -3136,7 +3168,7 @@ function blastNode(node, index, reach) {
     tone = "neutral";
     badge = "Unknown";
   }
-  return `<div class="br-node br-${esc(tone)} ${esc(patient ? "patient" : "")}" data-map-node="${esc(node.id)}">
+  return `<div class="br-node br-${esc(tone)} ${esc(patient ? "patient" : "")}" data-map-node="${esc(node.id)}" ${patient || tier ? `data-path-target="${esc(node.id)}"` : ""}>
     <button class="br-node-main" data-action="blast-patient" data-value="${esc(node.id)}" aria-pressed="${esc(patient)}" aria-label="Simulate ${esc(node.name)} as Patient Zero">
       <strong title="${esc(node.name)}">${esc(node.name)}</strong><span class="br-address">${esc(node.ip || "IP unknown")}</span>
       <span class="br-badges"><span class="br-role">${esc(node.role.toUpperCase())}</span><span class="br-state">${esc(badge)}</span></span></button>
@@ -3160,17 +3192,20 @@ function blastMap(graph, row, inventoryCount) {
   const coverage = inventoryCount > graph.nodes.length ? ` Showing ${graph.nodes.length} of ${inventoryCount} devices.` : "";
   return `<section class="br-panel"><div class="br-heading"><h2>Infection Map · ${esc(row.node.name)}</h2>
     <p class="br-sub">Pick a node to simulate a compromise. Use ↗ for device details.${esc(coverage)}</p></div>
+    <div class="br-legend" aria-label="Map legend"><span class="br-crit"><b class="br-source">Source</b> Patient Zero</span>
+      <span class="br-crit"><b>H1/H2</b> Direct takeover</span><span class="br-warn"><b>H1/H2</b> Admin pivot</span>
+      <span class="br-l2"><b>L2</b> Same-VLAN peer</span><span class="br-unreached">Unreached</span>
+      <span class="br-neutral"><b>Unknown</b></span><span class="br-wan-line">WAN entry</span></div>
     <div class="br-map" id="blast-map">
       <svg class="br-svg" id="blast-connectors" aria-hidden="true"></svg>
       <div class="br-zone"><h3>Internet / WAN</h3><small>External</small><div class="br-nodes">
         <div class="br-node br-blue" data-map-node="internet"><div class="br-node-main"><strong>Public Internet</strong><span class="br-address">WAN entry</span></div></div></div></div>
       ${groups.map(g => `<div class="br-zone ${esc(g.nodes.length > 2 ? "wide" : "")}" style="--zone:${esc(vlanColor(g.vlan))}">
         <h3>${esc(g.vlan)}</h3><small>${esc(g.zone || "Zone unknown")}</small><div class="br-nodes">${g.nodes.join("")}</div></div>`).join("")}
-    </div><div class="br-legend"><span class="br-crit">Direct takeover</span><span class="br-warn">Admin pivot</span>
-    <span class="br-l2">Same-VLAN peer</span><span class="br-blue">WAN entry</span><span class="br-ok">Unreached</span><span class="br-neutral">Reachability unknown</span></div></section>`;
+    </div></section>`;
 }
 
-// Reserve space for both hops so a busy first hop cannot hide the cascade.
+// Each reached node has one incoming edge in the displayed shortest-path tree.
 let blastDrawEdges = [];
 let blastDrawFrame = 0;
 function scheduleBlastSVG() {
@@ -3215,9 +3250,29 @@ function drawBlastSVG() {
     const y2 = b.top - frame.top + b.height * (1 - sy) / 2;
     const bend = Math.min(84, Math.max(12, Math.hypot(x2-x1, y2-y1) / 3));
     svg.append(element("path", {d: `M ${x1} ${y1} C ${x1+sx*bend} ${y1+sy*bend}, ${x2-sx*bend} ${y2-sy*bend}, ${x2} ${y2}`,
-      fill: "none", stroke: colors[edge.tier], "stroke-width": 1.7, "stroke-linecap": "round",
+      "data-edge-to": edge.to, fill: "none", stroke: colors[edge.tier], "stroke-width": 1.7, "stroke-linecap": "round",
       "stroke-dasharray": edge.tier === "wan" ? "1 4" : edge.tier === "l2" ? "5 4" : "none", "marker-end": "url(#br-tip-" + edge.tier + ")"}));
   }
+}
+// Following the displayed predecessor edges keeps highlights on the same path
+// the inspector describes, including a surviving internet entry to Patient Zero.
+function highlightBlastPath(target) {
+  const parents = new Map(blastDrawEdges.map(e => [e.to, e.from]));
+  const path = new Set();
+  while (parents.has(target) && !path.has(target)) {
+    path.add(target);
+    target = parents.get(target);
+  }
+  for (const el of document.querySelectorAll("#blast-connectors [data-edge-to]")) {
+    el.classList.toggle("path-active", path.has(el.dataset.edgeTo));
+    el.classList.toggle("path-dim", path.size > 0 && !path.has(el.dataset.edgeTo));
+  }
+}
+for (const event of ["pointerover", "pointerout", "focusin", "focusout"]) {
+  document.getElementById("view-blast").addEventListener(event, e => {
+    const target = event.endsWith("out") ? e.relatedTarget : e.target;
+    highlightBlastPath(target?.closest?.("[data-path-target]")?.dataset.pathTarget);
+  });
 }
 const blastMapObserver = new ResizeObserver(scheduleBlastSVG);
 
@@ -3227,7 +3282,7 @@ function blastPaths(graph, reach) {
     const indices = reach.order.filter(i => (reach.hops[i] > 1) === Boolean(group));
     return `<div class="br-overline">${esc(heading)} · ${esc(indices.length)}</div>` + (indices.length ? indices.map(i => {
       const n = graph.nodes[i], edge = reach.via[i], tier = blastTiers[edge.tier];
-      return `<button class="br-path" data-entity-id="${esc(n.entity_id)}"><span class="br-path-title"><strong>${esc(n.name)}</strong>
+      return `<button class="br-path" data-path-target="${esc(n.id)}" data-entity-id="${esc(n.entity_id)}"><span class="br-path-title"><strong>${esc(n.name)}</strong>
         <span class="br-role">${esc(n.role.toUpperCase())}</span>${blastTag(tier.tone, tier.label)}</span>
         <span class="br-detail">via <b>${esc(names.get(edge.from))}</b> → ${esc(edge.label)}</span>
         <span class="small">${esc(edge.via)}</span></button>`;
@@ -3235,24 +3290,39 @@ function blastPaths(graph, reach) {
   }).join("");
 }
 
-function blastFixes(actions, cuts) {
-  const lanes = [["all", "All"], ["fix-now", "Fix now"], ["reduce-exposure", "Reduce exposure"]];
-  const filtered = actions.filter(a => blastLaneFilter === "all" || a.lane === blastLaneFilter);
+function blastFixes(actions, relevant) {
+  const local = actions.filter(a => relevant.has(a.id));
+  const all = blastFixScope === "all" || !local.length;
+  const filtered = all ? actions : local;
   const visible = blastAllFixes ? filtered : filtered.slice(0, 8);
-  return `<div class="br-filters">${lanes.map(([id, name]) => blastControl("lane", id, name, blastLaneFilter === id)).join("")}</div>`
+  return `<div class="br-filters">${blastControl("scope", "device", "For this device", !all)}
+    ${blastControl("scope", "all", "All simulatable", all)}</div>`
+    + (!local.length && actions.length ? '<p class="br-empty">No fixes affect this device in this mode. Showing all simulatable fixes.</p>' : "")
     + (visible.length ? visible.map(a => {
-      const simulated = cuts.has(a.id);
-      const tag = simulated ? "label" : "div";
       const checked = blastAppliedFixes.has(a.id);
-      const checkbox = simulated ? `<input type="checkbox" id="br-fix-${esc(a.id)}" data-blast-fix="${esc(a.id)}" ${esc(checked ? "checked" : "")}>` : "";
-      return `<${tag} class="br-fix ${esc(checked ? "applied" : "")}">${checkbox}
+      return `<label class="br-fix ${checked ? "applied" : ""}"><input type="checkbox" data-blast-fix="${esc(a.id)}" ${checked ? "checked" : ""}>
         <span><strong>${esc(a.title)}</strong><span class="br-detail">${esc(a.reason)}</span>
         <span class="aq-meta">${blastPriority(a)}${a.high_profile ? blastTag("warn", "Frequently targeted") : ""}
-        ${simulated ? "" : blastTag("neutral", "Not simulated on map")}
         ${checked ? blastTag("ok", "Applied in simulation") : ""}</span>
-        ${a.breaks_approved?.length ? `<span class="aq-warn">Would interrupt approved paths: ${esc(a.breaks_approved.join(", "))}</span>` : ""}</span></${tag}>`;
-    }).join("") : '<p class="br-empty">No actions in this lane.</p>')
-    + (filtered.length > 8 ? `<button class="btn sm br-more" data-action="blast-more-fixes" aria-expanded="${esc(blastAllFixes)}">${esc(blastAllFixes ? "Show fewer" : "Show all " + filtered.length)}</button>` : "");
+        ${a.breaks_approved?.length ? `<span class="aq-warn">Would interrupt approved paths: ${esc(a.breaks_approved.join(", "))}</span>` : ""}</span></label>`;
+    }).join("") : '<p class="br-empty">No simulatable fixes.</p>')
+    + (filtered.length > 8 ? `<button class="btn sm br-more" data-action="blast-more-fixes" aria-expanded="${blastAllFixes}">${esc(blastAllFixes ? "Show fewer" : "Show all " + filtered.length)}</button>` : "");
+}
+
+// Include alternate witnesses and applied fixes so an operator can undo a cut
+// even after it removes the last path from the selected device.
+function blastDeviceCuts(sim, row) {
+  const cuts = new Set(row?.node.egress_cut_ids || []);
+  if (!row) return cuts;
+  const base = blastGraph(sim, new Set());
+  const reach = blastReach(base, row.reach.root);
+  const sources = new Set([row.node.id, ...reach.order.map(i => base.nodes[i].id)]);
+  for (const edge of sim.edges || []) {
+    const relevant = edge.tier === "wan" ? edge.to === row.node.id :
+      sources.has(edge.from) && (blastMode === "worst" || ["takeover", "unknown-takeover"].includes(edge.tier));
+    if (relevant) for (const id of edge.cut_ids || []) cuts.add(id);
+  }
+  return cuts;
 }
 
 function blastVerify(actions) {
@@ -3320,26 +3390,22 @@ function renderBlast() {
   for (const node of sim?.nodes || []) {
     for (const id of node.egress_cut_ids || []) cuts.add(id);
   }
-  const fixes = actions.filter(a => a.lane !== "verify" && (a.highest_tier_reduced || cuts.has(a.id)));
+  const fixes = actions.filter(a => a.lane !== "verify" && cuts.has(a.id));
   const verify = actions.filter(a => a.lane === "verify");
   const fixIDs = new Set(fixes.map(a => a.id));
   for (const id of blastAppliedFixes) if (!fixIDs.has(id) || !cuts.has(id)) blastAppliedFixes.delete(id);
-  if (blastInspector === "verify" && !verify.length) blastInspector = "paths";
   const graph = blastGraph(sim);
   const rows = blastRanking(graph);
   const row = rows.find(r => r.node.id === blastPatient) || rows[0];
   blastPatient = row?.node.id || "";
-  const quick = rows.slice(0, 5);
-  if (row && !quick.includes(row)) quick.push(row);
   const applied = blastAppliedFixes.size;
-  let html = `<section class="br-panel br-banner"><div class="br-intro"><div>
-    <h1>Lateral Blast Radius &amp; Containment Simulator</h1><p class="br-sub">Choose Patient Zero to trace reachable devices and preview how containment changes limit the spread.</p></div>
+  let html = `<section class="br-panel br-controls" aria-label="Blast Radius Simulator">
+    <label for="blast-device">Simulate:</label><select id="blast-device" ${rows.length ? "" : "disabled"}>
+      ${rows.map(r => `<option value="${esc(r.node.id)}" ${r === row ? "selected" : ""}>${esc(r.node.name)} (${esc(r.node.vlan)})</option>`).join("")}</select>
     <div class="br-segment" role="group" aria-label="Simulation mode">${blastControl("mode", "strict", "Strict (Confirmed Vulns)", blastMode === "strict")}
-    ${blastControl("mode", "worst", "Worst-Case (Admin + L2 Pivot)", blastMode === "worst")}</div></div>
-    <div class="br-pickers"><span class="br-overline">Patient Zero</span>
-      ${quick.map(r => blastControl("patient", r.node.id, r.node.name, row === r, "br-quick")).join("")}
-      <div class="br-status">${blastTag(applied ? "ok" : "neutral", applied ? applied + " What-If " + (applied === 1 ? "fix" : "fixes") + " active" : "Live baseline")}
-      ${applied ? '<button class="btn sm" data-action="blast-reset">Reset</button>' : ""}</div></div></section>`;
+    ${blastControl("mode", "worst", "Worst-Case (Admin + L2 Pivot)", blastMode === "worst")}</div>
+    <div class="br-status">${blastTag(applied ? "ok" : "neutral", applied ? applied + " What-If " + (applied === 1 ? "fix" : "fixes") + " active" : "Live baseline")}
+      ${applied ? '<button class="btn sm" data-action="blast-reset">Reset</button>' : ""}</div></section>`;
   let map = '<div class="br-panel br-empty">No inventory devices available to simulate.</div>';
   const peers = Math.max(0, rows.length - 1);
   blastDrawEdges = [];
@@ -3352,22 +3418,19 @@ function renderBlast() {
     html += `<div class="br-kpis">` +
       blastKPI("Blast Radius", reach.total, `/ ${peers} peers (${pct}%)`, `${reach.direct} direct (Hop 1) · ${reach.total - reach.direct} cascaded (Hop 2+)`, reach.total ? (pct >= 50 ? "crit" : "warn") : "ok") +
       blastKPI("Critical Devices Threatened", reach.critical.length, "", reach.critical.slice(0, 2).map(n => n.name).join(" · ") || "No high-value peers reached", reach.critical.length ? "crit" : "ok", reach.critical.slice(2).map(n => n.name)) +
-      blastKPI("Internet Egress", egress.short, "", blocked ? "Simulated outbound block · Baseline: " + baseline.short : egress.detail, egress.tone) +
+      (node.role === "gateway" ? blastKPI("Internet Egress", "WAN Gateway", "", "Primary internet router", "neutral") : blastKPI("Internet Egress", egress.short, "", blocked ? "Simulated outbound block · Baseline: " + baseline.short : egress.detail, egress.tone)) +
       blastKPI("Initial Entry Exposure", exposure, "", [node.vlan, node.ip].filter(Boolean).join(" · "), weight > 2 ? "crit" : weight === 2 ? "warn" : "neutral") + "</div>";
     map = blastMap(graph, row, sim.inventory_count);
     if (graph.wan.has(reach.root)) blastDrawEdges.push(graph.wan.get(reach.root));
-    for (const group of [1, 2]) {
-      const targets = reach.order.filter(i => (group === 1 ? reach.hops[i] === 1 : reach.hops[i] > 1));
-      blastDrawEdges.push(...targets.slice(0, group === 1 ? 7 : 5).map(i => reach.via[i]));
-    }
+    blastDrawEdges.push(...reach.order.map(i => reach.via[i]));
   }
   const tabs = [["paths", "Blast Paths", row?.reach.total || 0], ["fixes", "What-If Fixes", fixes.length]];
-  if (verify.length) tabs.push(["verify", "Verify", verify.length]);
   tabs.push(["gear", "UniFi Gear", reports.length]);
   html += `<div class="br-workspace">${map}<section class="br-panel br-inspector"><div class="br-tabs">
     ${tabs.map(([id, label, count]) => `<button class="br-control" aria-pressed="${esc(blastInspector === id)}" data-action="blast-inspector" data-value="${esc(id)}">${esc(label)} <span class="br-count">(${esc(count)})</span></button>`).join("")}
-    </div><div class="br-inspect-body" id="blast-inspect-body">${blastInspector === "gear" ? blastGear(reports) : blastInspector === "fixes" ? blastFixes(fixes, cuts) : blastInspector === "verify" ? blastVerify(verify)
-      : row ? blastPaths(graph, row.reach) : '<p class="br-empty">No paths available.</p>'}</div></section></div>`;
+    </div><div class="br-inspect-body" id="blast-inspect-body">${blastInspector === "gear" ? blastGear(reports) : blastInspector === "fixes" ? blastFixes(fixes, blastDeviceCuts(sim, row))
+      : row ? blastPaths(graph, row.reach) : '<p class="br-empty">No paths available.</p>'}
+      ${verify.length ? `<details class="br-verify-list" data-details-key="blast-verify"><summary>Verify (${verify.length})</summary>${blastVerify(verify)}</details>` : ""}</div></section></div>`;
   if (rows.length) html += blastTable(rows, peers);
   const view = document.getElementById("view-blast");
   const panel = view.querySelector(".br-inspect-body");
