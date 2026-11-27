@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,59 @@ func TestNewDemoEngineBuildsCompletePresentationModel(t *testing.T) {
 	if snap.View.ServiceCoverage == nil || snap.View.ServiceCoverage.OutboundDependencies < 2 {
 		t.Fatalf("expected service coverage with outbound dependencies, got %+v", snap.View.ServiceCoverage)
 	}
+	if snap.View.Blast == nil || len(snap.View.Blast.Actions) == 0 {
+		t.Fatalf("expected populated 3-lane blast action queue in demo view, got %+v", snap.View.Blast)
+	}
+	sim := snap.View.Blast.Simulation
+	if sim == nil || len(sim.Nodes) < 2 || len(sim.Edges) == 0 {
+		t.Fatal("demo simulator has no selectable paths")
+	}
+	drawers := make(map[string]bool)
+	for _, n := range sim.Nodes {
+		if snap.View.Entities[n.EntityID] == nil {
+			t.Errorf("simulator node %q has no drawer for %q", n.Name, n.EntityID)
+		}
+		drawers[n.ID] = true
+	}
+	lanes := map[string]int{}
+	priorities := 0
+	var hasHighProfile, hasDemoKEV bool
+	for _, a := range snap.View.Blast.Actions {
+		if strings.Contains(a.ID, "UB-UNIFI-") {
+			t.Fatalf("synthetic controller posture finding leaked into blast action queue: %+v", a)
+		}
+		lanes[string(a.Lane)]++
+		if priorities < 3 && a.HighestTierReduced != "" && a.Lane != "verify" {
+			priorities++
+			if a.Reason == "" || !slices.ContainsFunc(a.AffectedAssets, func(id string) bool { return drawers[id] }) {
+				t.Errorf("Checkup priority %q needs a reason and a device drawer", a.Title)
+			}
+		}
+		if a.HighProfile {
+			hasHighProfile = true
+		}
+		if strings.Contains(a.ID, "CVE-2024-6387") {
+			hasDemoKEV = true
+		}
+	}
+	if priorities != 3 {
+		t.Errorf("demo Checkup shows %d top priorities, want 3", priorities)
+	}
+	if lanes["fix-now"] == 0 || lanes["reduce-exposure"] == 0 {
+		t.Fatalf("expected fix-now and reduce-exposure demo actions, got lanes=%+v", lanes)
+	}
+	if !hasHighProfile {
+		t.Fatalf("expected at least one high-profile target signal on demo actions, got %+v", snap.View.Blast.Actions)
+	}
+	if !hasDemoKEV {
+		t.Fatalf("expected demo CVE-2024-6387 KEV patch action derived from shared demo CVE matches, got %+v", snap.View.Blast.Actions)
+	}
+	if len(snap.View.InfraBlast) < 2 {
+		t.Fatalf("expected per-device infrastructure what-if reports in demo view, got %d", len(snap.View.InfraBlast))
+	}
+	if len(snap.View.Queue) == 0 || len(snap.View.Entities) == 0 {
+		t.Fatalf("expected existing queue and entity details to remain intact alongside action queue")
+	}
 
 	// Verify HTTP routes and static HTML rendering work cleanly in demo mode.
 	h := eng.Handler()
@@ -61,7 +115,10 @@ func TestNewDemoEngineBuildsCompletePresentationModel(t *testing.T) {
 	if err := RenderStaticHTML(&buf, snap); err != nil {
 		t.Fatalf("RenderStaticHTML(demo): %v", err)
 	}
-	if !strings.Contains(buf.String(), "cedar-home") {
-		t.Fatal("expected demo site name in static HTML export")
+	html := buf.String()
+	for _, want := range []string{"cedar-home", `"blast":`, `"simulation":`, `id="view-blast"`, `"infra_blast":`, `"target_id":"controller"`, `"CVE-2024-6387"`, `"act:wan-pf:pf-https"`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected %q in static HTML export", want)
+		}
 	}
 }

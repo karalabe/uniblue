@@ -88,7 +88,7 @@ func TestCLIHelpNegativeLimitCacheDirStateCheckAndReportCounts(t *testing.T) {
 	snap := &unifi.Snapshot{Site: "default", ControllerType: "integration-v1"}
 	rep := risk.Report{ClientCount: 10, CleanClients: 10}
 	profiles := make([]probe.HostProfile, 7)
-	printReport(&repBuf, snap, rep, profiles, nil, nil, false)
+	printReport(&repBuf, snap, rep, nil, profiles, nil, nil, false)
 	if !strings.Contains(repBuf.String(), "7/7 probed host(s) passed (3 skipped/excluded)") {
 		t.Fatalf("expected probed vs skipped count in report, got:\n%s", repBuf.String())
 	}
@@ -448,7 +448,7 @@ func TestPrintReportCleanProbedExcludesSkippedHostFindings(t *testing.T) {
 	profiles := []probe.HostProfile{{Client: probedClient}}
 
 	var buf bytes.Buffer
-	printReport(&buf, snap, rep, profiles, nil, nil, false)
+	printReport(&buf, snap, rep, nil, profiles, nil, nil, false)
 	if !strings.Contains(buf.String(), "1/1 probed host(s) passed (3 skipped/excluded)") {
 		t.Fatalf("expected 1/1 clean probed hosts when only excluded host has finding, got:\n%s", buf.String())
 	}
@@ -460,7 +460,7 @@ func TestPrintReportCleanProbedExcludesSkippedHostFindings(t *testing.T) {
 		Client:            probedClient,
 	})
 	buf.Reset()
-	printReport(&buf, snap, rep, profiles, nil, nil, false)
+	printReport(&buf, snap, rep, nil, profiles, nil, nil, false)
 	if !strings.Contains(buf.String(), "0/1 probed host(s) passed (3 skipped/excluded)") {
 		t.Fatalf("expected 0/1 clean probed hosts when probed host has finding, got:\n%s", buf.String())
 	}

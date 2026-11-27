@@ -14,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/karalabe/uniblue/internal/blast"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
+	"github.com/karalabe/uniblue/internal/config"
 	"github.com/karalabe/uniblue/internal/cve"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/risk"
@@ -259,6 +261,8 @@ type PresentationModel struct {
 	Isolation       *risk.IsolationMatrix        `json:"isolation,omitempty"`
 	ServiceCoverage *probe.ServiceCoverageReport `json:"service_coverage,omitempty"`
 	Visibility      *unifi.SiteVisibility        `json:"visibility,omitempty"`
+	Blast           *blast.Report                `json:"blast,omitempty"`
+	InfraBlast      []blast.InfraReport          `json:"infra_blast,omitempty"`
 	Copyright       string                       `json:"copyright"`
 	AuthorURL       string                       `json:"author_url,omitempty"`
 	License         string                       `json:"license"`
@@ -266,6 +270,128 @@ type PresentationModel struct {
 }
 
 func devEntityID(mac string) string { return "dev:" + strings.ToLower(strings.TrimSpace(mac)) }
+
+// AttachBlast attaches the evaluated 3-lane action queue, egress profiles, and
+// infrastructure compromise reports onto pm without altering existing entities.
+func AttachBlast(pm *PresentationModel, report blast.Report, infra []blast.InfraReport) {
+	if pm == nil {
+		return
+	}
+	cp := report
+	pm.Blast = &cp
+	pm.InfraBlast = infra
+}
+
+// CollectTargetSignals queries historical KEV/CVE velocity for high-confidence
+// fingerprinted products without mutating finding severities or alert baselines.
+func CollectTargetSignals(cache *cve.Cache, products []cve.Product, now time.Time) []blast.TargetSignal {
+	return CollectTargetSignalsCached(cache, products, now, nil)
+}
+
+// CollectTargetSignalsCached behaves like CollectTargetSignals while reusing
+// caller-supplied per-(vendor, product) velocity results across recomputes so
+// delta polls do not repeatedly re-read KEV and vendor shards.
+func CollectTargetSignalsCached(cache *cve.Cache, products []cve.Product, now time.Time, memo map[string]cve.TargetVelocity) []blast.TargetSignal {
+	if cache == nil || len(products) == 0 {
+		return nil
+	}
+	if memo == nil {
+		memo = make(map[string]cve.TargetVelocity)
+	}
+	var out []blast.TargetSignal
+	for _, p := range products {
+		if !p.HighConfidence || len(p.Vendors) == 0 || len(p.Products) == 0 {
+			continue
+		}
+		key := strings.Join(p.Vendors, ",") + "|" + strings.Join(p.Products, ",")
+		vel, ok := memo[key]
+		if !ok {
+			var err error
+			vel, err = cache.ProductVelocity(p, now)
+			if err != nil {
+				continue
+			}
+			memo[key] = vel
+		}
+		if vel.Class != cve.VelocityHighProfile {
+			continue
+		}
+		asset := strings.TrimSpace(p.HostIP)
+		if asset == "" {
+			continue
+		}
+		if len(p.Ports) == 0 {
+			out = append(out, blast.TargetSignal{Asset: asset, Product: p.Label, Velocity: vel})
+			continue
+		}
+		for _, ep := range p.Ports {
+			out = append(out, blast.TargetSignal{
+				Asset:    asset,
+				Proto:    ep.Transport,
+				Port:     ep.Port,
+				Product:  p.Label,
+				Velocity: vel,
+			})
+		}
+	}
+	return out
+}
+
+// AppendDeviceChildProfiles appends synthetic profiles for adopted UniFi
+// devices that own enrolled bridge children (such as Protect cameras) so every
+// CLI, UI, and export path evaluates the same child impact.
+func AppendDeviceChildProfiles(snap *unifi.Snapshot, profiles []probe.HostProfile, devChildren map[string][]probe.ChildDevice) []probe.HostProfile {
+	if snap == nil || len(devChildren) == 0 {
+		return profiles
+	}
+	out := append([]probe.HostProfile(nil), profiles...)
+	for _, d := range snap.Devices {
+		if ch := devChildren[strings.ToLower(d.MAC)]; len(ch) > 0 {
+			out = append(out, probe.HostProfile{
+				Client:   unifi.Client{ID: d.ID, MAC: d.MAC, IP: d.IP, Name: d.Name},
+				Children: ch,
+			})
+		}
+	}
+	return out
+}
+
+// EvaluateSiteBlast runs both the 3-lane counterfactual action queue and the
+// per-device infrastructure compromise assessments from one shared snapshot.
+// Callers must pass raw observed check findings (not scored report.Findings) so
+// synthetic controller posture findings never leak into host service actions.
+func EvaluateSiteBlast(
+	snap *unifi.Snapshot,
+	profiles []probe.HostProfile,
+	rawFindings []checks.Finding,
+	report risk.Report,
+	netCfg config.NetworkConfig,
+	checkList []*checks.Check,
+	cveMatches []cve.Match,
+	signals []blast.TargetSignal,
+	controllerHost string,
+) (blast.Report, []blast.InfraReport) {
+	if snap == nil {
+		return blast.Report{}, nil
+	}
+	assets, _ := classify.ResolveAssets(snap, profiles, netCfg.Assets)
+	oracle := risk.NewOracle(snap, netCfg)
+	in := blast.Input{
+		ControllerHost: controllerHost,
+		Snapshot:       snap,
+		Profiles:       profiles,
+		Findings:       rawFindings,
+		Checks:         checkList,
+		CVEMatches:     cveMatches,
+		TargetSignals:  signals,
+		Isolation:      report.Isolation,
+		SwitchPorts:    report.SwitchPorts,
+		Assets:         assets,
+		NetCfg:         netCfg,
+		Oracle:         oracle,
+	}
+	return blast.Evaluate(in), blast.EvaluateAllInfra(in)
+}
 
 // AttachDeviceChildren registers enrolled child devices (for example, UniFi
 // Protect cameras or accessories managed by a UDM Pro / UNVR gateway) beneath

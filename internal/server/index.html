@@ -15,6 +15,9 @@
 <style>
   :root {
     --bg: #f5f7fa;
+    --l2: #7045c5;
+    --l2-bg: #f5f0ff;
+    --l2-bd: #d5c3fa;
     --surface: #ffffff;
     --surface-2: #f8fafc;
     --surface-3: #eef2f6;
@@ -73,6 +76,9 @@
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #0b101b;
+      --l2: #b59aff;
+      --l2-bg: #251e39;
+      --l2-bd: #68508f;
       --surface: #111827;
       --surface-2: #162033;
       --surface-3: #1e293b;
@@ -150,7 +156,7 @@
     z-index: 30;
   }
   .hdr-inner {
-    max-width: 1180px;
+    max-width: 1240px;
     margin: 0 auto;
     padding: 0 24px;
     min-height: 64px;
@@ -177,7 +183,7 @@
     border: 0;
     background: transparent;
     color: var(--muted);
-    padding: 7px 14px;
+    padding: 7px 10px;
     border-radius: 9px;
     font-size: 13.5px;
     font-weight: 600;
@@ -252,7 +258,7 @@
   main {
     flex: 1;
     width: 100%;
-    max-width: 1180px;
+    max-width: 1240px;
     margin: 0 auto;
     padding: 28px 24px 64px;
   }
@@ -447,6 +453,7 @@
 
   .story-item {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 16px;
@@ -457,12 +464,170 @@
   }
   .story-item:last-child { border-bottom: 0; }
   .story-item:hover { background: var(--surface-2); }
-  .story-item-l { min-width: 0; flex: 1; }
+  .story-item-l { min-width: 220px; flex: 1 1 260px; }
   .story-item-name { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .story-item-sub { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
   .story-item-r { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
   .go-arrow { color: var(--muted); font-weight: 600; font-size: 13px; white-space: nowrap; }
   .story-item:hover .go-arrow { color: var(--blue); }
+
+  .aq-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 2px; font-size: 12px; color: var(--muted); }
+  .aq-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .aq-chip:hover { border-color: var(--blue); color: var(--blue); }
+  .aq-warn { font-size: 12px; color: var(--warn); font-weight: 600; }
+  .whatif-kv { font-size: 13px; color: var(--text-2); margin: 4px 0; line-height: 1.45; }
+  .whatif-leg {
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface-2);
+    margin-top: 8px;
+  }
+  .whatif-leg-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 13px; font-weight: 700; }
+  .whatif-blind {
+    margin-top: 14px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    font-size: 12.5px;
+    color: var(--text-2);
+  }
+  .whatif-blind ul { margin: 6px 0 0 18px; padding: 0; }
+  .whatif-blind li { margin: 3px 0; }
+
+  .priority-row { padding: 11px 20px; display: flex; align-items: baseline; gap: 10px; border-top: 1px solid var(--border); }
+  .priority-row .aq-meta:not(:empty) { margin-top: 4px; }
+  .priority-copy { min-width: 0; }
+  .priority-reason { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .br-panel, .br-kpi { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); min-width: 0; }
+  #view-blast h1, #view-blast h2, #view-blast h3, #view-blast p { margin: 0; }
+  #view-blast h1 { font-size: clamp(19px, 2vw, 23px); letter-spacing: -.035em; line-height: 1.25; }
+  #view-blast h2 { font-size: 16px; letter-spacing: -.02em; line-height: 1.4; }
+  .br-banner { padding: 22px; }
+  .br-intro, .br-pickers, .br-heading, .br-path-title, .br-tabs { display: flex; align-items: center; gap: 10px; }
+  .br-intro { justify-content: space-between; align-items: flex-start; flex-wrap: wrap; }
+  .br-intro > div:first-child { flex: 1 1 370px; }
+  #view-blast .br-sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .br-segment { display: inline-flex; flex-wrap: wrap; padding: 3px; border: 1px solid var(--border); background: var(--surface-2); border-radius: 11px; }
+  .br-control { appearance: none; color: var(--muted); border: 0; background: transparent; font: inherit; font-size: 12px; font-weight: 650; padding: 6px 9px; border-radius: 8px; cursor: pointer; }
+  .br-control:hover { color: var(--text); }
+  .br-segment .br-control[aria-pressed=true] { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+  .br-pickers { flex-wrap: wrap; border-top: 1px solid var(--border); margin-top: 16px; padding-top: 14px; gap: 6px; }
+  .br-overline { font-size: 10.5px; font-weight: 750; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+  .br-quick { border: 1px solid var(--border-strong); border-radius: 99px; background: var(--surface-2); padding: 4px 10px; color: var(--text-2); }
+  .br-quick::before { content: ''; display: inline-block; width: 6px; height: 6px; background: var(--muted); border-radius: 50%; margin-right: 6px; }
+  .br-quick[aria-pressed=true] { color: var(--crit); border-color: var(--crit-solid); background: var(--crit-bg); }
+  .br-quick[aria-pressed=true]::before { background: var(--crit-solid); }
+  .br-names summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+  .br-status { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+  .br-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+  .br-kpi { padding: 14px 16px; border-color: var(--br-border); background: linear-gradient(155deg, var(--br-fill), transparent 90%), var(--surface); }
+  .br-kpi strong { font-size: 20px; color: var(--br-ink); line-height: 1.35; display: inline-block; margin: 5px 0; }
+  .br-kpi small { font-size: 12px; color: var(--muted); }
+  .br-detail { color: var(--text-2); font-size: 12px; overflow-wrap: anywhere; }
+  .br-crit { --br-border: var(--crit-bd); --br-fill: var(--crit-bg); --br-ink: var(--crit); --br-line: var(--crit-solid); }
+  .br-warn { --br-border: var(--warn-bd); --br-fill: var(--warn-bg); --br-ink: var(--warn); --br-line: var(--warn-solid); }
+  .br-blue { --br-border: var(--blue-bd); --br-fill: var(--blue-bg); --br-ink: var(--blue); --br-line: var(--blue); }
+  .br-ok { --br-border: var(--ok-bd); --br-fill: var(--ok-bg); --br-ink: var(--ok); --br-line: var(--ok-solid); }
+  .br-l2 { --br-border: var(--l2-bd); --br-fill: var(--l2-bg); --br-ink: var(--l2); --br-line: var(--l2); }
+  .br-neutral { --br-border: var(--border); --br-fill: var(--surface-2); --br-ink: var(--text-2); }
+  .br-workspace { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.9fr); gap: 16px; align-items: start; }
+  .br-heading { padding: 16px 18px; align-items: flex-start; flex-direction: column; gap: 0; border-bottom: 1px solid var(--border); }
+  .br-map { position: relative; isolation: isolate; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; padding: 16px; background-image: radial-gradient(var(--border-strong) .8px, transparent .8px); background-size: 16px 16px; }
+  .br-zone { min-width: 0; padding: 10px; border: 1px dashed var(--border-strong); border-radius: 10px; }
+  .br-zone.wide { grid-column: 1 / -1; }
+  .br-zone h3 { font-size: 11px; padding-left: 6px; border-left: 3px solid var(--zone, var(--blue)); color: var(--text-2); }
+  .br-zone small { font-size: 10px; color: var(--muted); display: block; padding-left: 9px; }
+  .br-nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); align-items: center; gap: 18px 12px; margin: 14px 0 5px; }
+  .br-node { position: relative; z-index: 2; min-width: 0; border: 1px solid var(--br-line, var(--border-strong)); background: linear-gradient(var(--br-fill), var(--br-fill)), var(--surface); border-radius: 8px; min-height: 67px; }
+  .br-node.br-ok { border-color: var(--ok-bd); background: var(--surface); color: var(--muted); }
+  .br-node.patient { border-width: 2px; box-shadow: 0 0 0 3px var(--crit-bg); }
+  .br-node-main { cursor: pointer; display: block; width: 100%; background: none; color: inherit; border: 0; text-align: left; padding: 8px; font: inherit; }
+  .br-node-main:focus-visible, .br-node-main:hover { outline: 2px solid var(--blue); border-radius: 7px; }
+  .br-node strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 11.5px; line-height: 1.35; word-break: normal; overflow-wrap: anywhere; padding-right: 18px; }
+  .br-address { display: block; font: 10px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; color: var(--muted); }
+  .br-badges { margin-top: 4px; display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+  .br-state, .br-role { font-size: 9px; line-height: 1.4; padding: 1px 5px; border-radius: 5px; font-weight: 750; }
+  .br-state { color: var(--br-ink); border: 1px solid var(--br-border); background: var(--br-fill); }
+  .br-role { color: var(--muted); background: var(--surface-2); }
+  .br-drawer { position: absolute; top: 3px; right: 3px; padding: 1px 4px; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; cursor: pointer; }
+  .br-svg { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; overflow: visible; pointer-events: none; }
+  .br-legend { padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface-2); border-radius: 0 0 var(--radius) var(--radius); display: flex; flex-wrap: wrap; gap: 5px 14px; color: var(--text-2); font-size: 11px; }
+  .br-legend span::before { content: ''; display: inline-block; width: 17px; border-top: 2px solid var(--br-line); margin-right: 5px; vertical-align: middle; }
+  .br-legend .br-l2::before { border-top-style: dashed; }
+  .br-legend .br-blue::before { border-top-style: dotted; }
+  .br-legend .br-ok::before, .br-legend .br-neutral::before { width: 6px; height: 6px; border: 1px solid var(--br-line, var(--muted)); border-radius: 2px; }
+  .br-inspector { overflow: hidden; }
+  .br-tabs { flex-wrap: wrap; border-bottom: 1px solid var(--border); background: var(--surface-2); gap: 0; padding: 0 5px; }
+  .br-tabs .br-control { padding: 11px 7px; border-radius: 0; border-bottom: 2px solid transparent; }
+  .br-tabs .br-control[aria-pressed=true] { color: var(--blue); border-bottom-color: var(--blue); }
+  .br-count { font-size: 10px; background: var(--surface-3); border-radius: 8px; padding: 1px 5px; }
+  .br-inspect-body { max-height: 610px; overflow-y: auto; padding: 14px; }
+  .br-path, .br-fix { display: block; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 10px 12px; margin: 7px 0; color: var(--text); width: 100%; text-align: left; font: inherit; cursor: pointer; }
+  .br-path:hover, label.br-fix:hover { border-color: var(--border-strong); }
+  .br-path-title { flex-wrap: wrap; gap: 5px; font-size: 13px; }
+  .br-path-title > .tag:last-child { margin-left: auto; }
+  #view-blast .tag { font-size: 10.5px; padding: 1px 6px; }
+  .tag.l2 { color: var(--l2); border-color: var(--l2-bd); background: var(--l2-bg); }
+  .br-filters { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 9px; }
+  .br-filters .br-control { font-size: 11.5px; border-radius: 99px; border: 1px solid var(--border); }
+  .br-filters [aria-pressed=true] { color: var(--blue); background: var(--blue-bg); border-color: var(--blue-bd); }
+  .br-fix { display: grid; grid-template-columns: auto 1fr; gap: 9px; font-size: 13px; }
+  div.br-fix { display: block; cursor: default; }
+  .br-fix input { accent-color: var(--ok-solid); margin: 3px 0 0; }
+  .br-fix.applied { border-color: var(--ok-solid); background: var(--ok-bg); }
+  .br-fix .br-detail, .br-path .br-detail { display: block; margin-top: 4px; }
+  .br-verify { padding: 9px 0; font-size: 13px; }
+  .br-verify + .br-verify { border-top: 1px solid var(--border); }
+  .br-more { display: block; margin: 10px auto; }
+  .br-empty { padding: 14px 16px; color: var(--muted); font-size: 13px; }
+  .br-inspect-body .br-empty { padding: 8px 0; }
+  .br-gear details { border-top: 1px solid var(--border); padding: 8px 0; margin-top: 8px; }
+  .br-gear summary { font-weight: 650; font-size: 13px; cursor: pointer; }
+  .br-table { margin-top: 16px; overflow: hidden; }
+  .br-table-wrap { overflow-x: auto; }
+  .br-table table { border-collapse: collapse; width: 100%; font-size: 12.5px; text-align: left; }
+  .br-table th, .br-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .br-table th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; background: var(--surface-2); }
+  .br-table tr:last-child td { border: 0; }
+  .br-table tr[aria-current=true] { background: var(--blue-bg); }
+  .br-threats { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .br-threats .tag { display: block; max-width: 9em; overflow: hidden; text-overflow: ellipsis; }
+  .br-threats .tag.neutral { flex-shrink: 0; }
+  .br-radius { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .br-radius meter { width: 44px; height: 6px; border: 0; background: var(--surface-3); border-radius: 4px; }
+  .br-radius meter::-webkit-meter-bar { background: var(--surface-3); border: 0; height: 6px; }
+  .br-radius meter::-webkit-meter-optimum-value { background: var(--br-line); border-radius: 4px; }
+  .br-radius meter::-moz-meter-bar { background: var(--br-line); }
+  @media (max-width: 980px) {
+    .br-workspace { grid-template-columns: 1fr; }
+    .br-inspect-body { max-height: 480px; }
+    .hdr-inner { gap: 6px; padding-block: 6px; }
+    .nav-pills { order: 3; max-width: 100%; overflow-x: auto; }
+    .nav-btn { white-space: nowrap; }
+  }
+  @media (max-width: 700px) {
+    .br-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .br-status { margin-left: 0; }
+    .br-map { gap: 8px; padding: 10px; }
+    .br-banner { padding: 15px; }
+    .br-table table { min-width: 760px; }
+  }
+  @media (max-width: 500px) {
+    .br-map { grid-template-columns: minmax(0, 1fr); }
+  }
 
   /* Router Safety Checklist */
   .checklist { padding: 6px 0; }
@@ -480,11 +645,15 @@
   .chk-dot.ok { background: var(--ok-solid); }
   .chk-dot.warn { background: var(--warn-solid); }
   .chk-dot.crit { background: var(--crit-solid); }
+  .chk-dot.blue { background: var(--blue); }
+  .chk-dot.neutral { background: var(--muted); }
   .chk-name { font-weight: 600; font-size: 13.5px; }
   .chk-hint { font-size: 11.5px; color: var(--muted); }
   .chk-val { font-size: 12.5px; font-weight: 600; text-align: right; white-space: nowrap; }
   .chk-val.ok { color: var(--ok); }
   .chk-val.warn { color: var(--warn); }
+  .chk-val.blue { color: var(--blue); }
+  .chk-val.neutral { color: var(--muted); }
   .chk-val.crit { color: var(--crit); }
 
   /* ==========================================================================
@@ -1163,6 +1332,10 @@
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
         House &amp; Cables <span id="nb-hs" class="nav-cnt">0</span>
       </button>
+      <button class="nav-btn" data-tab="blast">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></svg>
+        Blast Radius <span id="nb-br" class="nav-cnt">Sim</span>
+      </button>
       <button class="nav-btn" data-tab="devices">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         Devices &amp; Wi-Fi <span id="nb-dv" class="nav-cnt">0</span>
@@ -1190,6 +1363,7 @@
   <section id="view-initial" class="view"></section>
   <section id="view-checkup" class="view active"></section>
   <section id="view-house" class="view"></section>
+  <section id="view-blast" class="view"></section>
   <section id="view-devices" class="view"></section>
   <section id="view-activity" class="view"></section>
 </main>
@@ -1234,6 +1408,15 @@ let portFilter = "all";       // "all" | "risk" | "external"
 let deviceFilter = "all";     // "all" | "issues" | "bmc" | "cve" | "wan" | "checking"
 let deviceSearch = "";
 let activityFilter = "all";
+const dashboardTabs = ["checkup", "house", "blast", "devices", "activity"];
+let blastLaneFilter = "all";
+let blastInspector = "paths";
+let blastAllFixes = false;
+let blastAllDevices = false;
+let blastMode = "worst";
+let blastPatient = "";
+let selectedInfraKey = "";
+const blastAppliedFixes = new Set();
 let drawerStack = [];
 let bypassInitialSplash = false;
 let fetchInFlight = false;
@@ -1273,7 +1456,7 @@ const ICONS = {
 /* ============================================================================
    PLAIN-ENGLISH TRANSLATOR (Friendly for non-network-gurus!)
    ============================================================================ */
-const vlanColorCache = {};
+const vlanColorCache = Object.create(null);
 const vlanPalette = ["var(--vlan-0)", "var(--vlan-1)", "var(--vlan-2)", "var(--vlan-3)", "var(--vlan-4)"];
 function vlanColor(name) {
   if (!name) return "var(--border-strong)";
@@ -1793,7 +1976,7 @@ function setDrawerOpenDOM(open) {
 function switchTab(tab, updateHash = true) {
   const mapOld = { overview: "checkup", physical: "house", logical: "devices" };
   tab = mapOld[tab] || tab;
-  if (!["checkup", "house", "devices", "activity"].includes(tab)) tab = "checkup";
+  if (!dashboardTabs.includes(tab)) tab = "checkup";
   drawerStack = [];
   setDrawerOpenDOM(false);
   setActiveTabDOM(tab);
@@ -1876,7 +2059,7 @@ function setActivityFilter(f) {
 
 function applyHash(histState) {
   if (histState && typeof histState === "object" && histState.tab) {
-    const tab = ["checkup", "house", "devices", "activity"].includes(histState.tab) ? histState.tab : "checkup";
+    const tab = dashboardTabs.includes(histState.tab) ? histState.tab : "checkup";
     if (histState.portFilter) portFilter = histState.portFilter;
     if (histState.deviceFilter) deviceFilter = histState.deviceFilter;
     if (histState.activityFilter) activityFilter = histState.activityFilter;
@@ -1908,7 +2091,7 @@ function applyHash(histState) {
       return;
     }
   }
-  if (["checkup", "house", "devices", "activity"].includes(tab)) {
+  if (dashboardTabs.includes(tab)) {
     setActiveTabDOM(tab);
   }
   if (ent && (ent.startsWith("panel:") || state?.view?.entities?.[ent])) {
@@ -1951,6 +2134,19 @@ document.addEventListener("click", e => {
       setDeviceFilter(actEl.getAttribute("data-filter") || "all");
     } else if (act === "activity-filter") {
       setActivityFilter(actEl.getAttribute("data-filter") || "all");
+    } else if (act.startsWith("blast-")) {
+      const value = actEl.dataset.value;
+      switch (act) {
+        case "blast-patient": blastPatient = value; break;
+        case "blast-inspector": blastInspector = value; break;
+        case "blast-mode": blastMode = value; break;
+        case "blast-lane": blastLaneFilter = value; blastAllFixes = false; break;
+        case "blast-more-fixes": blastAllFixes = !blastAllFixes; break;
+        case "blast-more-devices": blastAllDevices = !blastAllDevices; break;
+        case "blast-gear": selectedInfraKey = value; break;
+        case "blast-reset": blastAppliedFixes.clear(); break;
+      }
+      renderBlast();
     } else if (act === "show-splash") {
       bypassInitialSplash = false;
       renderActiveTab();
@@ -1969,6 +2165,14 @@ document.addEventListener("click", e => {
   if (panEl) {
     openEntity(panEl.getAttribute("data-panel-id"));
   }
+});
+
+document.addEventListener("change", e => {
+  const id = e.target.dataset.blastFix;
+  if (!id) return;
+  if (e.target.checked) blastAppliedFixes.add(id);
+  else blastAppliedFixes.delete(id);
+  renderBlast();
 });
 
 /* ============================================================================
@@ -2177,10 +2381,14 @@ function renderHeader() {
   const wanAlertCount = (vm.wan_flows || []).filter(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown").length;
   const perimCount = q.filter(x => x.category === "perimeter").length;
   const ctrlCount = q.filter(x => x.category === "controller").length;
-  const checkupTotal = exposedBMCCount + perimCount + wanAlertCount + exposedHostCount + ctrlCount;
+  const blastFixNowCount = (vm.blast?.actions || []).filter(a => a.lane === "fix-now" && a.highest_tier_reduced).length;
+  const blastUrgent = (vm.blast?.actions || []).some(a => a.lane === "fix-now" && a.highest_tier_reduced === "P1");
+  const legacyCheckupTotal = exposedBMCCount + perimCount + wanAlertCount + exposedHostCount + ctrlCount;
+  const checkupTotal = Math.max(legacyCheckupTotal, blastFixNowCount);
   const checkupHasCrit = q.some(x => x.severity === "critical")
     || hosts.some(e => hasPrimaryExposedReason(e) && e.max_severity === "critical")
-    || (vm.wan_flows || []).some(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown" && f.severity === "critical");
+    || (vm.wan_flows || []).some(f => !f.expected && f.kind !== "coverage" && f.state !== "unknown" && f.severity === "critical")
+    || blastUrgent;
   const ckB = document.getElementById("nb-ck");
   if (initial && !bypassInitialSplash) {
     ckB.textContent = "…";
@@ -2189,6 +2397,10 @@ function renderHeader() {
     ckB.textContent = checking && !checkupTotal ? "…" : checkupTotal;
     ckB.className = "nav-cnt" + (checkupHasCrit ? " crit" : checkupTotal ? " warn" : checking ? " blue" : "");
   }
+
+  const blastBadge = document.getElementById("nb-br");
+  blastBadge.classList.toggle("blue", Boolean(vm.blast?.simulation?.nodes?.length));
+  blastBadge.title = (vm.blast?.simulation?.nodes?.length || 0) + " simulator devices";
 
   const openGates = c.open_wall_gates || 0;
   const hsB = document.getElementById("nb-hs");
@@ -2247,11 +2459,15 @@ function renderCheckup() {
   const outdoorPerimItems = perimItems.filter(x => isOutdoorPerimeterItem(vm, x));
   const indoorPortItems = perimItems.filter(x => !isOutdoorPerimeterItem(vm, x));
   const ctrlItems = (vm.queue || []).filter(x => x.category === "controller");
+  const blastFixNow = (vm.blast?.actions || []).filter(a => a.lane === "fix-now" && a.highest_tier_reduced);
+  const blastUrgent = blastFixNow.some(a => a.highest_tier_reduced === "P1");
   const totalIssues = exposedBMCs.length + perimItems.length + wanAlerts.length + exposedHosts.length + ctrlItems.length;
+  const effectiveIssues = Math.max(totalIssues, blastFixNow.length);
   const hasCrit = (vm.queue || []).some(x => x.severity === "critical")
     || exposedBMCs.some(x => x.max_severity === "critical")
     || exposedHosts.some(x => x.max_severity === "critical")
-    || wanAlerts.some(x => x.severity === "critical");
+    || wanAlerts.some(x => x.severity === "critical")
+    || blastUrgent;
 
   // Compute SVG Progress Ring (r=36, circumference=226.2)
   const C = 226.2;
@@ -2264,7 +2480,7 @@ function renderCheckup() {
     ? `All ${assessedCount} checked devices (${skippedCount} skipped) and ${(vm.physical || []).length} network boxes checked out cleanly.`
     : `All ${hosts.length} devices and ${(vm.physical || []).length} network boxes checked out cleanly.`;
 
-  if (checking && totalIssues === 0) {
+  if (checking && effectiveIssues === 0) {
     const pct = scannableCount ? (assessedCount / scannableCount) : 0.25;
     ringColor = "var(--blue)";
     ringOffset = C * (1 - Math.max(0.18, pct));
@@ -2272,7 +2488,7 @@ function renderCheckup() {
     ringLabel = scannableCount ? `${Math.round(pct * 100)}%` : "…";
     heroTitle = "Checking your home network…";
     heroSub = `Checked ${assessedCount} of ${scannableCount} devices so far${skippedCount ? ` (${skippedCount} skipped)` : ""}. Results appear automatically as each device finishes; nothing is marked safe until checked.`;
-  } else if (totalIssues > 0) {
+  } else if (totalIssues > 0 && totalIssues >= blastFixNow.length) {
     ringColor = hasCrit ? "var(--crit-solid)" : "var(--warn-solid)";
     ringOffset = C * 0.22;
     ringLabel = String(totalIssues);
@@ -2288,6 +2504,14 @@ function renderCheckup() {
     if (ctrlItems.length) parts.push(`${ctrlItems.length} router setting${ctrlItems.length === 1 ? "" : "s"}`);
     heroSub = (checking ? `Still checking ${unassessed} device${unassessed === 1 ? "" : "s"} · Found so far: ` : "We found ")
       + parts.join(", ") + ". Click any item below for plain-English steps to fix it.";
+  } else if (blastFixNow.length > 0) {
+    ringColor = blastUrgent ? "var(--crit-solid)" : "var(--warn-solid)";
+    ringOffset = C * 0.22;
+    ringLabel = String(blastFixNow.length);
+    heroTitle = blastFixNow.length === 1
+      ? "1 priority action worth taking"
+      : `${blastFixNow.length} priority actions worth taking`;
+    heroSub = "Top Priorities shows the changes that remove the most exposure.";
   } else if (wanCoverageUnknown.length > 0) {
     ringColor = "var(--warn-solid)";
     ringOffset = C * 0.25;
@@ -2307,9 +2531,12 @@ function renderCheckup() {
   const devTone = exposedHosts.some(x => x.max_severity === "critical") || exposedBMCs.some(x => x.max_severity === "critical")
     ? "crit"
     : ((exposedHosts.length + exposedBMCs.length + secondaryExposedHosts.length) ? "warn" : ((checking || unassessed > 0) ? "blue" : "ok"));
-  const wanTone = wanAlerts.some(x => x.severity === "critical")
+  const blastWANFixNow = blastFixNow.filter(a =>
+    a.id && (a.id.startsWith("act:wan-") || a.id.startsWith("act:published-tunnel:") || a.id.startsWith("act:proxy-route:") || a.id.startsWith("act:dynamic-mapping:") || a.id.startsWith("act:gateway-"))
+  );
+  const wanTone = wanAlerts.some(x => x.severity === "critical") || blastUrgent
     ? "crit"
-    : ((wanAlerts.length + ctrlItems.length + wanCoverageUnknown.length) ? "warn" : "ok");
+    : ((wanAlerts.length + blastFixNow.length + ctrlItems.length + wanCoverageUnknown.length) ? "warn" : "ok");
 
   let devPillarVal = `All ${hosts.length} look good`;
   if (exposedHosts.length + exposedBMCs.length) {
@@ -2327,8 +2554,11 @@ function renderCheckup() {
   }
 
   let wanPillarVal = "Front door locked";
-  if (wanAlerts.length) {
-    wanPillarVal = `${wanAlerts.length} open door${wanAlerts.length === 1 ? "" : "s"} to review`;
+  const wanDoorCount = wanAlerts.length || blastWANFixNow.length;
+  if (wanDoorCount) {
+    wanPillarVal = `${wanDoorCount} open door${wanDoorCount === 1 ? "" : "s"} to review`;
+  } else if (blastFixNow.length || ctrlItems.length) {
+    wanPillarVal = "Review protection settings";
   } else if (wanCoverageUnknown.length) {
     wanPillarVal = "Coverage unknown";
   }
@@ -2375,7 +2605,22 @@ function renderCheckup() {
   </div>`;
 
   html += `<div class="checkup-grid"><div>`;
-  html += `<div class="section-kicker">Action Guide</div>`;
+
+  const top = (vm.blast?.actions || []).filter(a => a.highest_tier_reduced && a.lane !== "verify").slice(0, 3);
+  html += `<div class="story"><div class="card-hd"><div class="card-title">Top Priorities</div>
+    <button class="btn sm" data-action="switch-tab" data-tab-target="blast">Open Blast Radius Simulator →</button></div>`;
+  for (const a of top) {
+    const chips = (a.affected_assets || []).slice(0, 3).map((key, i) => {
+      const entity = blastAssetEntity(vm, key);
+      return entity
+        ? `<button class="aq-chip" data-entity-id="${esc(entity.id)}">${esc(entity.label)}</button>`
+        : blastTag("neutral", a.benefits?.[i] || "Associated device");
+    });
+    html += `<div class="priority-row">${blastPriority(a)}<div class="priority-copy"><strong>${esc(a.title)}</strong>
+      <div class="priority-reason" title="${esc(a.reason)}">${esc(a.reason)}</div><div class="aq-meta">${chips.join("")}</div></div></div>`;
+  }
+  if (!top.length) html += '<p class="br-empty">No changes with measured risk reduction.</p>';
+  html += '</div><div class="section-kicker">Details by Category</div>';
 
   // 1. Hardware Remote Controls (BMCs)
   if (bmcHosts.length) {
@@ -2587,7 +2832,7 @@ function renderCheckup() {
     html += `</div>`;
   }
 
-  if (!totalIssues && !checking && !wanCoverageUnknown.length && unassessed === 0) {
+  if (!effectiveIssues && !checking && !wanCoverageUnknown.length && unassessed === 0) {
     html += `<div class="card"><div class="card-body" style="display:flex;align-items:center;gap:14px">
       <div class="pillar-ico ok">${ICONS.shieldOk}</div>
       <div>
@@ -2738,8 +2983,403 @@ function renderCheckup() {
     </div>`;
   }
 
+  const cloudCounts = new Map();
+  for (const row of vm.blast?.cloud || []) {
+    const key = blastEgress.has(row.state) ? row.state : "unknown";
+    cloudCounts.set(key, (cloudCounts.get(key) || 0) + 1);
+  }
+  html += `<div class="card" style="margin-top:16px"><div class="card-hd"><div class="card-title">Device Internet Access</div>
+    <button class="btn sm" data-action="switch-tab" data-tab-target="blast">Explore →</button></div>
+    <div class="checklist">${Array.from(blastEgress, ([key, info]) =>
+      `<div class="chk-row"><span class="chk-name">${esc(info.label)}</span><strong>${esc(cloudCounts.get(key) || 0)}</strong></div>`).join("")}</div></div>`;
+
   html += `</div></div>`;
   patchContainerHTML(document.getElementById("view-checkup"), html);
+}
+
+const blastEgress = new Map([
+  ["cloud-connected (observed)", {label: "Cloud-connected (observed)", short: "Cloud-Connected", tone: "blue", detail: "Vendor traffic observed"}],
+  ["cloud-capable (unverified)", {label: "Cloud-capable (unverified)", short: "Cloud-Capable", tone: "warn", detail: "Outbound policy permits cloud access"}],
+  ["internet access allowed (policy)", {label: "Internet allowed (policy)", short: "Allowed", tone: "warn", detail: "Outbound connections permitted by policy"}],
+  ["local-only (policy)", {label: "Local-only (policy)", short: "Local-Only", tone: "ok", detail: "Outbound connections blocked by policy"}],
+  ["unknown", {label: "Unknown", short: "Unknown", tone: "neutral", detail: "Insufficient egress evidence"}]
+]);
+const blastTiers = {
+  takeover: {rank: 0, tone: "crit", label: "Direct Takeover"},
+  pivot: {rank: 1, tone: "warn", label: "Admin Pivot"},
+  l2: {rank: 2, tone: "l2", label: "L2 Peer"},
+  wan: {tone: "blue", label: "WAN entry"}
+};
+
+function blastTag(tone, label) {
+  return `<span class="tag ${esc(tone)}">${esc(label)}</span>`;
+}
+
+// Match benefit chips to the same inventory drawers as the map, including
+// enrolled devices whose dashboard IDs are namespaced by their parent.
+function blastAssetEntity(vm, key) {
+  const entities = vm.entities || {};
+  const node = vm.blast?.simulation?.nodes?.find(n => n.id === key);
+  const direct = entities[node?.entity_id] || entities["dev:" + key] || entities["host:" + key] || entities["host:ip/" + key];
+  if (direct) return direct;
+  for (const child of Object.values(entities)) {
+    if (child.kind !== "child") continue;
+    const parent = entities[child.parent_id];
+    if (!parent) continue;
+    const childKey = child.id.slice(("child:" + parent.id + "/").length);
+    if ("child:" + (parent.mac || parent.ip) + ":" + childKey === key) return child;
+  }
+  return null;
+}
+
+function blastPriority(a) {
+  if (a.lane === "verify") return blastTag("unk", "Verify");
+  switch (a.highest_tier_reduced) {
+    case "P1": return blastTag("crit", "Urgent");
+    case "P2": return blastTag("warn", "High");
+    case "P3": return blastTag("blue", "Medium");
+    case "P4":
+    case "P5": return blastTag("neutral", "Low");
+    default: return blastTag("neutral", "Optional");
+  }
+}
+
+// Keep only the strongest surviving witness per ordered pair. Removing a cut
+// restores the original alternatives, including independently published WAN routes.
+function blastGraph(sim) {
+  const nodes = sim?.nodes || [];
+  const indices = new Map(nodes.map((n, i) => [n.id, i]));
+  const outgoing = nodes.map(() => new Map());
+  const unknown = nodes.map(() => new Set());
+  const wan = new Map();
+  for (const edge of sim?.edges || []) {
+    if (edge.cut_ids?.some(id => blastAppliedFixes.has(id))) continue;
+    const to = indices.get(edge.to);
+    if (to === undefined) continue;
+    if (edge.tier === "wan") {
+      if (!wan.has(to)) wan.set(to, edge);
+      continue;
+    }
+    const from = indices.get(edge.from);
+    if (from === undefined) continue;
+    // In either mode, unknown edges from any reached node mark unverified peers without adding a hop.
+    if (edge.tier === "unknown") {
+      unknown[from].add(to);
+      continue;
+    }
+    if (!blastTiers[edge.tier] || (blastMode === "strict" && edge.tier !== "takeover")) continue;
+    const prev = outgoing[from].get(to);
+    if (!prev || blastTiers[edge.tier].rank < blastTiers[prev.tier].rank) outgoing[from].set(to, edge);
+  }
+  return {nodes, wan, unknown, adjacency: outgoing.map(row => Array.from(row, ([to, edge]) => ({to, edge})))};
+}
+
+// A visit records one shortest path. Dense numeric indices bound the traversal
+// by the size of the inventory even when several routes form a cycle.
+function blastReach(graph, root) {
+  const {nodes, adjacency} = graph;
+  const hops = new Uint8Array(nodes.length);
+  const via = new Array(nodes.length);
+  const queue = [root];
+  const critical = [];
+  let direct = 0;
+  for (let head = 0; head < queue.length && queue.length < nodes.length; head++) {
+    const from = queue[head];
+    for (const {to, edge} of adjacency[from]) {
+      if (to === root || hops[to]) continue;
+      hops[to] = hops[from] + 1;
+      via[to] = edge;
+      queue.push(to);
+      if (from === root) direct++;
+      if (nodes[to].tier === "crown" || nodes[to].tier === "high") critical.push(nodes[to]);
+    }
+  }
+  const unknown = new Set();
+  for (const i of queue) for (const to of graph.unknown[i]) if (to !== root && !hops[to]) unknown.add(to);
+  return {root, hops, via, unknown, order: queue.slice(1), total: queue.length - 1, direct, critical};
+}
+
+function blastRanking(graph) {
+  const rows = graph.nodes.map((node, i) => {
+    const reach = blastReach(graph, i);
+    const wan = graph.wan.get(i);
+    const exposure = wan?.label || node.local_exposure || node.entry_exposure;
+    const weight = wan ? (exposure.includes("(") ? 3 : 5)
+      : (["Outdoor cable", "Open / guest Wi-Fi", "Guest network", "IoT / appliance"].includes(exposure) ? 2 : 1);
+    return {node, reach, exposure, weight, score: weight * (1 + reach.total)};
+  });
+  return rows.sort((a, b) => b.score - a.score || b.weight - a.weight || b.reach.critical.length - a.reach.critical.length
+    || a.node.name.localeCompare(b.node.name) || a.node.id.localeCompare(b.node.id));
+}
+
+function blastControl(action, value, label, selected, extra = "") {
+  return `<button class="br-control ${esc(extra)}" data-action="blast-${esc(action)}" data-value="${esc(value)}" aria-pressed="${esc(selected)}">${esc(label)}</button>`;
+}
+
+function blastKPI(title, value, suffix, detail, tone, more = []) {
+  return `<div class="br-kpi br-${esc(tone)}"><div class="br-overline">${esc(title)}</div>
+    <strong>${esc(value)}</strong> <small>${esc(suffix)}</small><div class="br-detail">${esc(detail)}</div>
+    ${more.length ? `<details class="br-names" data-details-key="threatened"><summary>${esc(more.length)} more devices</summary><div class="br-detail">${esc(more.join(" · "))}</div></details>` : ""}</div>`;
+}
+
+function blastNode(node, index, reach) {
+  const patient = index === reach.root;
+  const tier = reach.via[index]?.tier;
+  let tone = "ok", badge = "SAFE";
+  if (patient) {
+    tone = "crit";
+    badge = "Source";
+  } else if (tier) {
+    tone = blastTiers[tier].tone;
+    badge = tier === "l2" ? "L2" : "H" + reach.hops[index];
+  } else if (reach.unknown.has(index)) {
+    tone = "neutral";
+    badge = "Unknown";
+  }
+  return `<div class="br-node br-${esc(tone)} ${esc(patient ? "patient" : "")}" data-map-node="${esc(node.id)}">
+    <button class="br-node-main" data-action="blast-patient" data-value="${esc(node.id)}" aria-pressed="${esc(patient)}" aria-label="Simulate ${esc(node.name)} as Patient Zero">
+      <strong title="${esc(node.name)}">${esc(node.name)}</strong><span class="br-address">${esc(node.ip || "IP unknown")}</span>
+      <span class="br-badges"><span class="br-role">${esc(node.role.toUpperCase())}</span><span class="br-state">${esc(badge)}</span></span></button>
+    <button class="br-drawer" data-stop-entity-id="${esc(node.entity_id)}" aria-label="Open device details for ${esc(node.name)}">↗</button></div>`;
+}
+
+function blastMap(graph, row, inventoryCount) {
+  const zones = new Map();
+  graph.nodes.forEach((n, i) => {
+    const key = JSON.stringify([n.vlan, n.zone]);
+    if (!zones.has(key)) zones.set(key, {vlan: n.vlan, zone: n.zone, nodes: []});
+    const group = zones.get(key);
+    if (n.id === row.node.id) {
+      group.patient = true;
+      group.nodes.unshift(blastNode(n, i, row.reach));
+    } else {
+      group.nodes.push(blastNode(n, i, row.reach));
+    }
+  });
+  const groups = Array.from(zones.values()).sort((a, b) => Number(Boolean(b.patient)) - Number(Boolean(a.patient)) || b.nodes.length - a.nodes.length || a.vlan.localeCompare(b.vlan));
+  const coverage = inventoryCount > graph.nodes.length ? ` Showing ${graph.nodes.length} of ${inventoryCount} devices.` : "";
+  return `<section class="br-panel"><div class="br-heading"><h2>Infection Map · ${esc(row.node.name)}</h2>
+    <p class="br-sub">Pick a node to simulate a compromise. Use ↗ for device details.${esc(coverage)}</p></div>
+    <div class="br-map" id="blast-map">
+      <svg class="br-svg" id="blast-connectors" aria-hidden="true"></svg>
+      <div class="br-zone"><h3>Internet / WAN</h3><small>External</small><div class="br-nodes">
+        <div class="br-node br-blue" data-map-node="internet"><div class="br-node-main"><strong>Public Internet</strong><span class="br-address">WAN entry</span></div></div></div></div>
+      ${groups.map(g => `<div class="br-zone ${esc(g.nodes.length > 2 ? "wide" : "")}" style="--zone:${esc(vlanColor(g.vlan))}">
+        <h3>${esc(g.vlan)}</h3><small>${esc(g.zone || "Zone unknown")}</small><div class="br-nodes">${g.nodes.join("")}</div></div>`).join("")}
+    </div><div class="br-legend"><span class="br-crit">Direct takeover</span><span class="br-warn">Admin pivot</span>
+    <span class="br-l2">Same-VLAN peer</span><span class="br-blue">WAN entry</span><span class="br-ok">Unreached</span><span class="br-neutral">Reachability unknown</span></div></section>`;
+}
+
+// Reserve space for both hops so a busy first hop cannot hide the cascade.
+let blastDrawEdges = [];
+let blastDrawFrame = 0;
+function scheduleBlastSVG() {
+  cancelAnimationFrame(blastDrawFrame);
+  blastDrawFrame = requestAnimationFrame(drawBlastSVG);
+}
+
+function drawBlastSVG() {
+  if (activeTab !== "blast") return;
+  const svg = document.getElementById("blast-connectors");
+  if (!svg) return;
+  const map = svg.parentElement;
+  const frame = map.getBoundingClientRect();
+  if (!frame.width) return;
+  svg.setAttribute("viewBox", `0 0 ${map.scrollWidth} ${map.scrollHeight}`);
+  const bounds = new Map();
+  map.querySelectorAll("[data-map-node]").forEach(el => bounds.set(el.dataset.mapNode, el.getBoundingClientRect()));
+  const ns = "http://www.w3.org/2000/svg";
+  const element = (tag, attrs) => {
+    const el = document.createElementNS(ns, tag);
+    for (const [name, value] of Object.entries(attrs)) el.setAttribute(name, value);
+    return el;
+  };
+  const colors = {wan: "var(--blue)", takeover: "var(--crit-solid)", pivot: "var(--warn-solid)", l2: "var(--l2)"};
+  const defs = element("defs", {});
+  for (const [tier, fill] of Object.entries(colors)) {
+    const marker = element("marker", {id: "br-tip-" + tier, viewBox: "0 0 8 8", refX: 7, refY: 4, markerWidth: 5, markerHeight: 5, orient: "auto"});
+    marker.append(element("path", {d: "M0 0L8 4L0 8Z", fill}));
+    defs.append(marker);
+  }
+  svg.replaceChildren(defs);
+  for (const edge of blastDrawEdges) {
+    const a = bounds.get(edge.from), b = bounds.get(edge.to);
+    if (!a || !b) continue;
+    const dx = (b.left + b.right - a.left - a.right) / 2;
+    const dy = (b.top + b.bottom - a.top - a.bottom) / 2;
+    const horizontal = Math.abs(dx) > Math.abs(dy);
+    const sx = horizontal ? Math.sign(dx) : 0, sy = horizontal ? 0 : Math.sign(dy);
+    const x1 = a.left - frame.left + a.width * (1 + sx) / 2;
+    const y1 = a.top - frame.top + a.height * (1 + sy) / 2;
+    const x2 = b.left - frame.left + b.width * (1 - sx) / 2;
+    const y2 = b.top - frame.top + b.height * (1 - sy) / 2;
+    const bend = Math.min(84, Math.max(12, Math.hypot(x2-x1, y2-y1) / 3));
+    svg.append(element("path", {d: `M ${x1} ${y1} C ${x1+sx*bend} ${y1+sy*bend}, ${x2-sx*bend} ${y2-sy*bend}, ${x2} ${y2}`,
+      fill: "none", stroke: colors[edge.tier], "stroke-width": 1.7, "stroke-linecap": "round",
+      "stroke-dasharray": edge.tier === "wan" ? "1 4" : edge.tier === "l2" ? "5 4" : "none", "marker-end": "url(#br-tip-" + edge.tier + ")"}));
+  }
+}
+const blastMapObserver = new ResizeObserver(scheduleBlastSVG);
+
+function blastPaths(graph, reach) {
+  const names = new Map(graph.nodes.map(n => [n.id, n.name]));
+  return ["Hop 1 (Direct Reach)", "Hop 2+ (Cascaded Pivot)"].map((heading, group) => {
+    const indices = reach.order.filter(i => (reach.hops[i] > 1) === Boolean(group));
+    return `<div class="br-overline">${esc(heading)} · ${esc(indices.length)}</div>` + (indices.length ? indices.map(i => {
+      const n = graph.nodes[i], edge = reach.via[i], tier = blastTiers[edge.tier];
+      return `<button class="br-path" data-entity-id="${esc(n.entity_id)}"><span class="br-path-title"><strong>${esc(n.name)}</strong>
+        <span class="br-role">${esc(n.role.toUpperCase())}</span>${blastTag(tier.tone, tier.label)}</span>
+        <span class="br-detail">via <b>${esc(names.get(edge.from))}</b> → ${esc(edge.label)}</span>
+        <span class="small">${esc(edge.via)}</span></button>`;
+    }).join("") : '<p class="br-empty">No peers reached.</p>');
+  }).join("");
+}
+
+function blastFixes(actions, cuts) {
+  const lanes = [["all", "All"], ["fix-now", "Fix now"], ["reduce-exposure", "Reduce exposure"]];
+  const filtered = actions.filter(a => blastLaneFilter === "all" || a.lane === blastLaneFilter);
+  const visible = blastAllFixes ? filtered : filtered.slice(0, 8);
+  return `<div class="br-filters">${lanes.map(([id, name]) => blastControl("lane", id, name, blastLaneFilter === id)).join("")}</div>`
+    + (visible.length ? visible.map(a => {
+      const simulated = cuts.has(a.id);
+      const tag = simulated ? "label" : "div";
+      const checked = blastAppliedFixes.has(a.id);
+      const checkbox = simulated ? `<input type="checkbox" id="br-fix-${esc(a.id)}" data-blast-fix="${esc(a.id)}" ${esc(checked ? "checked" : "")}>` : "";
+      return `<${tag} class="br-fix ${esc(checked ? "applied" : "")}">${checkbox}
+        <span><strong>${esc(a.title)}</strong><span class="br-detail">${esc(a.reason)}</span>
+        <span class="aq-meta">${blastPriority(a)}${a.high_profile ? blastTag("warn", "Frequently targeted") : ""}
+        ${simulated ? "" : blastTag("neutral", "Not simulated on map")}
+        ${checked ? blastTag("ok", "Applied in simulation") : ""}</span>
+        ${a.breaks_approved?.length ? `<span class="aq-warn">Would interrupt approved paths: ${esc(a.breaks_approved.join(", "))}</span>` : ""}</span></${tag}>`;
+    }).join("") : '<p class="br-empty">No actions in this lane.</p>')
+    + (filtered.length > 8 ? `<button class="btn sm br-more" data-action="blast-more-fixes" aria-expanded="${esc(blastAllFixes)}">${esc(blastAllFixes ? "Show fewer" : "Show all " + filtered.length)}</button>` : "");
+}
+
+function blastVerify(actions) {
+  return actions.map(a => `<div class="br-verify"><strong>${esc(a.title)}</strong><div class="br-detail">${esc(a.reason)}</div></div>`).join("");
+}
+
+function blastGear(reports) {
+  if (!reports.length) return '<p class="br-empty">No UniFi equipment reported.</p>';
+  const rep = reports.find(r => r.target_id === selectedInfraKey) || reports[0];
+  const buttons = reports.map(r => {
+    const duplicate = reports.some(other => other !== r && other.target === r.target && other.scope === r.scope);
+    const suffix = duplicate ? " (" + r.target_id.slice(-5) + ")" : "";
+    return blastControl("gear", r.target_id, r.scope + " · " + r.target + suffix, r === rep);
+  });
+  const detail = (key, value) => value ? `<p class="whatif-kv"><b>${esc(key)}</b> ${esc(value)}</p>` : "";
+  const legs = rep.legs || [], clients = rep.clients || [];
+  const blind = new Set();
+  function verdict(name, v) {
+    const value = v?.verdict || "unknown";
+    if (value.startsWith("resilient")) {
+      for (const text of v.blind_spots?.length ? v.blind_spots : ["Resilience covers only observed inbound services. Unobserved traffic and client verification remain unknown."]) blind.add(text);
+    }
+    const tone = value.startsWith("resilient") ? "ok" : value === "exposed" ? "crit" : value === "conditional" ? "warn" : "unk";
+    return blastTag(tone, name + " · " + (tone === "ok" ? "resilient (observed)" : value));
+  }
+  const transport = legs.map(l => `<div class="whatif-leg"><strong>${esc(l.from)} → ${esc(l.to)}</strong>
+    <div class="br-detail">${esc([l.protocol, l.address, l.port ? l.transport + "/" + l.port : "", l.class, l.reachability].filter(Boolean).join(" · "))}</div>
+    <div class="aq-meta">${verdict("Privacy", l.confidentiality)}${verdict("Integrity", l.integrity)}${verdict("Availability", l.availability)}</div>
+    <div class="small">${esc([l.path, l.note, l.wireless].filter(Boolean).join(" "))}</div></div>`).join("");
+  return `<div class="br-gear"><div class="br-filters">${buttons.join("")}</div>
+    ${(rep.effects || []).map(effect => `<p class="whatif-kv">${esc(effect)}</p>`).join("")}
+    ${detail("Controller host", rep.hosted_on)}${detail("Manages", rep.manages?.join(", "))}
+    ${detail("Downstream devices", rep.downstream?.join(", "))}
+    ${["AP", "Switch"].includes(rep.scope) ? detail("Uplink VLANs", [...(rep.uplink_vlans || []), ...(rep.uplink_unknown ? ["Unknown coverage"] : [])].join(", ") || "None") : ""}
+    ${detail("Routed VLANs", rep.routed_vlans?.join(", "))}
+    <details data-details-key="clients-${esc(rep.target_id)}"><summary>Affected clients (${esc(clients.length)})</summary>
+      <div class="br-detail">${esc(clients.join(", ") || "No affected clients in inventory.")}</div></details>
+    <details data-details-key="legs-${esc(rep.target_id)}"><summary>Transport survival (${esc(legs.length)} legs)</summary>
+      ${transport || '<p class="br-empty">No observed service legs on these paths.</p>'}</details>
+    ${blind.size ? `<div class="whatif-blind"><strong>Blind spots in resilient verdicts</strong><ul>${Array.from(blind, s => `<li>${esc(s)}</li>`).join("")}</ul></div>` : ""}</div>`;
+}
+
+function blastTable(rows, peers) {
+  const visible = blastAllDevices ? rows : rows.slice(0, 5);
+  return `<section class="br-panel br-table"><div class="br-heading"><h2>Highest-Risk Entry Points</h2>
+    <p class="br-sub">Ranked by remaining entry exposure and the number of peers reached under the selected fixes.</p></div>
+    <div class="br-table-wrap"><table><thead><tr><th>Patient Zero Candidate</th><th>VLAN / Zone</th><th>Entry Exposure</th>
+    <th>Direct Reach</th><th>Total Blast Radius</th><th>Critical Devices Threatened</th><th>Simulate</th></tr></thead><tbody>
+    ${visible.map(({node, reach, weight, exposure}) => `<tr aria-current="${esc(node.id === blastPatient)}">
+      <td><strong>${esc(node.name)}</strong><span class="br-address">${esc(node.ip)}</span></td>
+      <td>${esc(node.vlan)}<span class="br-address">${esc(node.zone)}</span></td>
+      <td>${blastTag(weight > 2 ? "crit" : "neutral", exposure)}</td><td>${esc(reach.direct)}</td>
+      <td><div class="br-radius br-${esc(reach.total ? "crit" : "ok")}"><meter min="0" max="${esc(Math.max(1, peers))}" value="${esc(reach.total)}"></meter>${esc(reach.total)} / ${esc(peers)}</div></td>
+      <td><div class="br-threats">${reach.critical.length ? reach.critical.slice(0, 3).map(n => `<span class="tag warn" title="${esc(n.name)}">${esc(n.name)}</span>`).join("") : blastTag("ok", "None")}
+        ${reach.critical.length > 3 ? blastTag("neutral", "+" + (reach.critical.length - 3) + " more") : ""}</div></td>
+      <td>${blastControl("patient", node.id, node.id === blastPatient ? "Simulating" : "Simulate", node.id === blastPatient, "btn sm")}</td></tr>`).join("")}
+    </tbody></table></div>${rows.length > 5 ? `<button class="btn sm br-more" data-action="blast-more-devices" aria-expanded="${esc(blastAllDevices)}">${esc(blastAllDevices ? "Show top 5" : "Show all " + rows.length + " devices")}</button>` : ""}</section>`;
+}
+
+function renderBlast() {
+  const vm = state.view || {};
+  const actions = vm.blast?.actions || [], reports = vm.infra_blast || [];
+  const sim = vm.blast?.simulation;
+  const cuts = new Set((sim?.edges || []).flatMap(e => e.cut_ids || []));
+  for (const node of sim?.nodes || []) {
+    for (const id of node.egress_cut_ids || []) cuts.add(id);
+  }
+  const fixes = actions.filter(a => a.lane !== "verify" && (a.highest_tier_reduced || cuts.has(a.id)));
+  const verify = actions.filter(a => a.lane === "verify");
+  const fixIDs = new Set(fixes.map(a => a.id));
+  for (const id of blastAppliedFixes) if (!fixIDs.has(id) || !cuts.has(id)) blastAppliedFixes.delete(id);
+  if (blastInspector === "verify" && !verify.length) blastInspector = "paths";
+  const graph = blastGraph(sim);
+  const rows = blastRanking(graph);
+  const row = rows.find(r => r.node.id === blastPatient) || rows[0];
+  blastPatient = row?.node.id || "";
+  const quick = rows.slice(0, 5);
+  if (row && !quick.includes(row)) quick.push(row);
+  const applied = blastAppliedFixes.size;
+  let html = `<section class="br-panel br-banner"><div class="br-intro"><div>
+    <h1>Lateral Blast Radius &amp; Containment Simulator</h1><p class="br-sub">Choose Patient Zero to trace reachable devices and preview how containment changes limit the spread.</p></div>
+    <div class="br-segment" role="group" aria-label="Simulation mode">${blastControl("mode", "strict", "Strict (Confirmed Vulns)", blastMode === "strict")}
+    ${blastControl("mode", "worst", "Worst-Case (Admin + L2 Pivot)", blastMode === "worst")}</div></div>
+    <div class="br-pickers"><span class="br-overline">Patient Zero</span>
+      ${quick.map(r => blastControl("patient", r.node.id, r.node.name, row === r, "br-quick")).join("")}
+      <div class="br-status">${blastTag(applied ? "ok" : "neutral", applied ? applied + " What-If " + (applied === 1 ? "fix" : "fixes") + " active" : "Live baseline")}
+      ${applied ? '<button class="btn sm" data-action="blast-reset">Reset</button>' : ""}</div></div></section>`;
+  let map = '<div class="br-panel br-empty">No inventory devices available to simulate.</div>';
+  const peers = Math.max(0, rows.length - 1);
+  blastDrawEdges = [];
+  if (row) {
+    const {node, reach, exposure, weight} = row;
+    const pct = peers ? Math.round(reach.total * 100 / peers) : 0;
+    const baseline = blastEgress.get(node.internet_state) || blastEgress.get("unknown");
+    const blocked = node.egress_cut_ids?.length && node.egress_cut_ids.every(id => blastAppliedFixes.has(id));
+    const egress = blocked ? blastEgress.get("local-only (policy)") : baseline;
+    html += `<div class="br-kpis">` +
+      blastKPI("Blast Radius", reach.total, `/ ${peers} peers (${pct}%)`, `${reach.direct} direct (Hop 1) · ${reach.total - reach.direct} cascaded (Hop 2+)`, reach.total ? (pct >= 50 ? "crit" : "warn") : "ok") +
+      blastKPI("Critical Devices Threatened", reach.critical.length, "", reach.critical.slice(0, 2).map(n => n.name).join(" · ") || "No high-value peers reached", reach.critical.length ? "crit" : "ok", reach.critical.slice(2).map(n => n.name)) +
+      blastKPI("Internet Egress", egress.short, "", blocked ? "Simulated outbound block · Baseline: " + baseline.short : egress.detail, egress.tone) +
+      blastKPI("Initial Entry Exposure", exposure, "", [node.vlan, node.ip].filter(Boolean).join(" · "), weight > 2 ? "crit" : weight === 2 ? "warn" : "neutral") + "</div>";
+    map = blastMap(graph, row, sim.inventory_count);
+    if (graph.wan.has(reach.root)) blastDrawEdges.push(graph.wan.get(reach.root));
+    for (const group of [1, 2]) {
+      const targets = reach.order.filter(i => (group === 1 ? reach.hops[i] === 1 : reach.hops[i] > 1));
+      blastDrawEdges.push(...targets.slice(0, group === 1 ? 7 : 5).map(i => reach.via[i]));
+    }
+  }
+  const tabs = [["paths", "Blast Paths", row?.reach.total || 0], ["fixes", "What-If Fixes", fixes.length]];
+  if (verify.length) tabs.push(["verify", "Verify", verify.length]);
+  tabs.push(["gear", "UniFi Gear", reports.length]);
+  html += `<div class="br-workspace">${map}<section class="br-panel br-inspector"><div class="br-tabs">
+    ${tabs.map(([id, label, count]) => `<button class="br-control" aria-pressed="${esc(blastInspector === id)}" data-action="blast-inspector" data-value="${esc(id)}">${esc(label)} <span class="br-count">(${esc(count)})</span></button>`).join("")}
+    </div><div class="br-inspect-body" id="blast-inspect-body">${blastInspector === "gear" ? blastGear(reports) : blastInspector === "fixes" ? blastFixes(fixes, cuts) : blastInspector === "verify" ? blastVerify(verify)
+      : row ? blastPaths(graph, row.reach) : '<p class="br-empty">No paths available.</p>'}</div></section></div>`;
+  if (rows.length) html += blastTable(rows, peers);
+  const view = document.getElementById("view-blast");
+  const panel = view.querySelector(".br-inspect-body");
+  const scroll = panel?.dataset.inspector === blastInspector ? panel.scrollTop : 0;
+  if (patchContainerHTML(view, html)) {
+    const inspector = view.querySelector(".br-inspect-body");
+    inspector.dataset.inspector = blastInspector;
+    inspector.scrollTop = scroll;
+    blastMapObserver.disconnect();
+    if (row) blastMapObserver.observe(view.querySelector(".br-map"));
+  }
+  scheduleBlastSVG();
 }
 
 /* ============================================================================
@@ -3755,6 +4395,7 @@ function renderActiveTab(progressOnly = false) {
   document.querySelectorAll("main > section.view:not(#view-initial)").forEach(s => s.classList.toggle("active", s.id === "view-" + activeTab));
   if (activeTab === "checkup") renderCheckup();
   else if (activeTab === "house") renderHouse();
+  else if (activeTab === "blast") renderBlast();
   else if (activeTab === "devices") renderDevices();
   else if (activeTab === "activity") renderActivity();
   if (drawerStack.length) renderDrawer();

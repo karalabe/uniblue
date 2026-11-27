@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	builtinchecks "github.com/karalabe/uniblue/checks"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
@@ -97,7 +98,7 @@ func TestAssumedBreachBoundaryAndApprovedPath(t *testing.T) {
 	nas := client("files", "192.0.2.100", "storage")
 	s := &unifi.Snapshot{Networks: []unifi.Network{network("iot"), network("devices"), network("inside"), network("storage")}, Clients: []unifi.Client{sensor, bridge, second, nas},
 		FirewallPolicies: []unifi.FirewallPolicy{allow("iot", "devices"), allow("inside", "storage")}}
-	in := Input{Snapshot: s, Assets: map[string]classify.AssetProfile{"files": {Tier: classify.TierCrown}}, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{ApprovedPaths: []config.ApprovedPath{{Name: "Bridge updates", SourceZone: "iot", DestIP: bridge.IP, Port: 80, Transport: "tcp"}}}}}
+	in := Input{Snapshot: s, Assets: map[string]classify.AssetProfile{"files": {Tier: classify.TierCrown}}, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot"}, ApprovedPaths: []config.ApprovedPath{{Name: "Bridge updates", SourceZone: "iot", DestIP: bridge.IP, Port: 80, Transport: "tcp"}}}}}
 	observed(&in, bridge, 80, checks.GrantPivot)
 	observed(&in, nas, 443, checks.GrantRead)
 	r := Evaluate(in)
@@ -187,7 +188,7 @@ func TestMissingEnforcementAndVersionEvidence(t *testing.T) {
 	cl := client("storage", "198.51.100.1", "storage")
 	iot := client("plug", "192.0.2.2", "iot")
 	s := &unifi.Snapshot{Networks: []unifi.Network{network("iot"), network("storage")}, Clients: []unifi.Client{iot, cl}, Visibility: &unifi.SiteVisibility{PortForwardsAvailable: true}}
-	in := Input{Snapshot: s}
+	in := Input{Snapshot: s, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot"}}}}
 	for _, kind := range []string{"firewall", "switch", "router"} {
 		switch kind {
 		case "switch":
@@ -200,6 +201,11 @@ func TestMissingEnforcementAndVersionEvidence(t *testing.T) {
 		r := Evaluate(in)
 		if x := exposure(t, r, AssumeBreach, "storage", "network access"); x.State != "unknown" || x.Lane != LaneVerify {
 			t.Fatal(kind, x)
+		}
+		if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+			return e.From == iot.ID && e.To == cl.ID && e.Tier == "unknown" && len(e.CutIDs) == 0
+		}) {
+			t.Fatalf("%s telemetry gap missing from the map: %+v", kind, r.Simulation.Edges)
 		}
 		if !slices.ContainsFunc(r.Actions, func(a Action) bool { return a.Lane == LaneVerify && strings.Contains(a.ID, kind) }) {
 			t.Fatal(kind, r.Actions)
@@ -231,7 +237,7 @@ func TestCloudPolicyAndObservation(t *testing.T) {
 	open := allow("iot", "External")
 	open.Index = 2
 	s := &unifi.Snapshot{Networks: []unifi.Network{network("iot")}, Clients: []unifi.Client{a, b, c}, FirewallPolicies: []unifi.FirewallPolicy{block, open}}
-	in := Input{Snapshot: s, Profiles: []probe.HostProfile{{Client: b, OutboundDependencies: []probe.OutboundDependency{{Category: "firmware-updates", Source: "device-config"}}}, {Client: c, OutboundDependencies: []probe.OutboundDependency{{Category: "vendor-control", Source: "zeek"}}}}}
+	in := Input{Snapshot: s, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot"}}}, Profiles: []probe.HostProfile{{Client: b, OutboundDependencies: []probe.OutboundDependency{{Category: "firmware-updates", Source: "device-config"}}}, {Client: c, OutboundDependencies: []probe.OutboundDependency{{Category: "vendor-control", Source: "zeek"}}}}}
 	r := Evaluate(in)
 	got := map[string]string{}
 	for _, e := range r.Cloud {
@@ -244,6 +250,46 @@ func TestCloudPolicyAndObservation(t *testing.T) {
 	s.Clients[0] = a
 	if e := Evaluate(in).Cloud[0]; e.Asset != "local" || e.State != cloudCapable {
 		t.Fatal("IPv6 exception lost", e)
+	}
+}
+
+// TestSimulationEgressCuts checks which VLAN controls can close a multi-homed client's egress.
+func TestSimulationEgressCuts(t *testing.T) {
+	in := Input{Snapshot: &unifi.Snapshot{
+		Networks:         []unifi.Network{network("iot"), network("sensors")},
+		Clients:          []unifi.Client{client("bridge", "192.0.2.1", "iot"), client("bridge", "198.51.100.1", "sensors")},
+		FirewallPolicies: []unifi.FirewallPolicy{allow("iot", "External")},
+	}, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot", "sensors"}}}}
+	check := func(want ...string) {
+		t.Helper()
+		if got := Evaluate(in).Simulation.Nodes[0].EgressCutIDs; !slices.Equal(got, want) {
+			t.Fatalf("got egress cuts %v, want %v", got, want)
+		}
+	}
+	check() // The missing sensors policy leaves this attachment's egress unknown.
+	in.Snapshot.FirewallPolicies = append(in.Snapshot.FirewallPolicies, allow("sensors", "External"))
+	check("act:vlan-egress:iot->internet", "act:vlan-egress:sensors->internet")
+	in.Snapshot.FirewallPolicies[1].Action = "BLOCK"
+	check("act:vlan-egress:iot->internet")
+}
+
+// TestCloudEgressVelocityTieBreak keeps equally effective outbound controls in their usual order.
+func TestCloudEgressVelocityTieBreak(t *testing.T) {
+	a, b := client("alpha", "192.0.2.1", "a"), client("beta", "198.51.100.1", "b")
+	vendor := []probe.OutboundDependency{{Category: "vendor-control", Source: "zeek"}}
+	in := Input{Snapshot: &unifi.Snapshot{
+		Networks: []unifi.Network{network("a"), network("b")}, Clients: []unifi.Client{a, b},
+		FirewallPolicies: []unifi.FirewallPolicy{allow("a", "External"), allow("b", "External")},
+	}, Profiles: []probe.HostProfile{{Client: a, OutboundDependencies: vendor}, {Client: b, OutboundDependencies: vendor}},
+		TargetSignals: []TargetSignal{{Asset: b.IP, Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}}}}
+	var ranked []Action
+	for _, a := range Evaluate(in).Actions {
+		if strings.HasSuffix(a.ID, "->internet") {
+			ranked = append(ranked, a)
+		}
+	}
+	if len(ranked) != 2 || ranked[0].ID != "act:vlan-egress:a->internet" || !ranked[1].HighProfile || ranked[0].HighestTierReduced != ranked[1].HighestTierReduced {
+		t.Fatalf("unexpected egress ranking: %+v", ranked)
 	}
 }
 
@@ -720,5 +766,674 @@ func TestTransportDisclosure(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestTargetVelocityPriorityAndTieBreak verifies the target velocity rules:
+// +1 step on any-source internet reach (not P1, not version-matched KEV), no
+// cross-port bleed, no boost on source-restricted WAN or KEV, no discount for
+// unknown/opaque IoT velocity, and upward tie-break on equal untrusted-LAN
+// actions.
+func TestTargetVelocityPriorityAndTieBreak(t *testing.T) {
+	web := client("web", "192.0.2.10", "lan")
+	web.MAC = "02:00:00:00:01:10"
+	iot := client("iot", "192.0.2.20", "lan")
+	iot.MAC = "02:00:00:00:01:20"
+	aHost := client("alpha", "192.0.2.30", "lan")
+	aHost.MAC = "02:00:00:00:01:30"
+	bHost := client("beta", "192.0.2.31", "lan")
+	bHost.MAC = "02:00:00:00:01:31"
+
+	snap := &unifi.Snapshot{
+		Networks: []unifi.Network{network("lan"), network("guest")},
+		Clients:  []unifi.Client{web, iot, aHost, bHost},
+		WLANs:    []unifi.WLANConfig{{Enabled: true, Name: "Guest", NetworkID: "guest", Security: "open"}},
+		FirewallPolicies: []unifi.FirewallPolicy{
+			allow("guest", "lan"),
+		},
+		PortForwards: []unifi.PortForward{
+			{ID: "pf-443", Name: "HTTPS", Enabled: true, Proto: "tcp", DstPort: "443", FwdIP: web.IP, FwdPort: "443", Src: "any"},
+			{ID: "pf-8080", Name: "AltHTTP", Enabled: true, Proto: "tcp", DstPort: "8080", FwdIP: web.IP, FwdPort: "8080", Src: "any"},
+			{ID: "pf-restr", Name: "Restricted", Enabled: true, Proto: "tcp", DstPort: "8443", FwdIP: web.IP, FwdPort: "8443", Src: "198.51.100.1"},
+			{ID: "pf-iot", Name: "IoT", Enabled: true, Proto: "tcp", DstPort: "9000", FwdIP: iot.IP, FwdPort: "9000", Src: "any"},
+		},
+	}
+	in := Input{
+		Snapshot: snap,
+		Assets: map[string]classify.AssetProfile{
+			web.MAC:   {Tier: classify.TierMedium},
+			iot.MAC:   {Tier: classify.TierMedium},
+			aHost.MAC: {Tier: classify.TierMedium},
+			bHost.MAC: {Tier: classify.TierMedium},
+		},
+		CVEMatches: []cve.Match{
+			{
+				Confidence: cve.ConfidenceExact,
+				Record: cve.Record{
+					ID:                 "CVE-2025-9999",
+					Severity:           checks.SeverityHigh,
+					AttackVector:       "N",
+					PrivilegesRequired: "L",
+					KEV:                true,
+				},
+				Product: cve.Product{
+					Label:          "WebApp",
+					HostIP:         web.IP,
+					HighConfidence: true,
+					Ports:          []cve.EndpointPort{{Transport: "tcp", Port: 443}},
+				},
+			},
+		},
+		TargetSignals: []TargetSignal{
+			{Asset: web.IP, Proto: "tcp", Port: 443, Product: "Nginx", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+			{Asset: web.IP, Proto: "tcp", Port: 8443, Product: "Nginx", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+			{Asset: iot.IP, Proto: "tcp", Port: 9000, Product: "UnknownIoT", Velocity: cve.TargetVelocity{Class: cve.VelocityUnknown}},
+			{Asset: bHost.IP, Proto: "tcp", Port: 8000, Product: "PopularApp", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+		},
+	}
+	// Attach equal unauthenticated service checks to alpha and beta so untrusted
+	// Wi-Fi reaches both at equal priority; beta's high-profile signal must win
+	// the tie-break despite sorting after alpha by ID.
+	observed(&in, aHost, 8000, checks.GrantControl)
+	observed(&in, bHost, 8000, checks.GrantControl)
+
+	r := Evaluate(in)
+
+	// 1. Public tcp/443 on TierMedium promotes P2 -> P1 with HighProfile=true.
+	pub443 := exposure(t, r, Internet, web.MAC, "public access to tcp/443")
+	if pub443.Priority != P1 || !pub443.HighProfile {
+		t.Fatalf("expected tcp/443 promoted to P1 + HighProfile, got %+v", pub443)
+	}
+	// 2. Unrelated tcp/8080 on the same host does NOT inherit tcp/443 signal.
+	pub8080 := exposure(t, r, Internet, web.MAC, "public access to tcp/8080")
+	if pub8080.Priority != P2 || pub8080.HighProfile {
+		t.Fatalf("expected tcp/8080 to stay P2 without HighProfile bleed, got %+v", pub8080)
+	}
+	// 3. Source-restricted tcp/8443 must NOT receive a priority boost (stays P2, not P1).
+	restr := exposure(t, r, InternetSource, web.MAC, "public access to tcp/8443")
+	if restr.Priority != P2 || !restr.HighProfile {
+		t.Fatalf("expected source-restricted tcp/8443 to stay P2 (no priority boost), got %+v", restr)
+	}
+	// 4. Version-matched KEV (moderate difficulty on TierMedium = P3) must NOT double-stack.
+	kevExp := exposure(t, r, Internet, web.MAC, "CVE-2025-9999")
+	if kevExp.Priority != P3 {
+		t.Fatalf("expected KEV fact not to double-stack target velocity (want P3), got %+v", kevExp)
+	}
+	// 5. VelocityUnknown on opaque IoT must NOT discount below base P2.
+	iotExp := exposure(t, r, Internet, iot.MAC, "public access to tcp/9000")
+	if iotExp.Priority != P2 || iotExp.HighProfile {
+		t.Fatalf("expected VelocityUnknown IoT to stay P2 without discount, got %+v", iotExp)
+	}
+	// 6. On equal untrusted-LAN check actions, beta (HighProfile) must outrank alpha.
+	idxA, idxB := -1, -1
+	for i, a := range r.Actions {
+		if strings.Contains(a.ID, aHost.MAC) {
+			idxA = i
+		}
+		if strings.Contains(a.ID, bHost.MAC) {
+			idxB = i
+		}
+	}
+	if idxA < 0 || idxB < 0 || idxB > idxA {
+		t.Fatalf("expected high-profile beta action before alpha (idxB=%d, idxA=%d): %+v", idxB, idxA, r.Actions)
+	}
+	if !r.Actions[idxB].HighProfile || r.Actions[idxA].HighProfile {
+		t.Fatalf("expected HighProfile flag only on beta action: beta=%+v alpha=%+v", r.Actions[idxB], r.Actions[idxA])
+	}
+
+	// 7. Cross-port consequence bleed check: private high-profile tcp/443 and
+	// public port-forwarded non-high-profile tcp/8080 both grant "control".
+	// Internet "control" must stay P2 (NOT promoted to P1) with HighProfile=false.
+	dual := client("dual", "192.0.2.40", "lan")
+	dual.MAC = "02:00:00:00:01:40"
+	inDual := Input{
+		Snapshot: &unifi.Snapshot{
+			Networks: []unifi.Network{network("lan")},
+			Clients:  []unifi.Client{dual},
+			PortForwards: []unifi.PortForward{
+				{ID: "pf-dual", Name: "Alt8080", Enabled: true, Proto: "tcp", DstPort: "8080", FwdIP: dual.IP, FwdPort: "8080", Src: "any"},
+			},
+		},
+		Assets: map[string]classify.AssetProfile{dual.MAC: {Tier: classify.TierMedium}},
+		Checks: []*checks.Check{
+			{ID: "CHK-443", Grants: []checks.GrantSpec{{Effect: checks.GrantControl, Basis: checks.BasisImplied}}},
+			{ID: "CHK-8080", Grants: []checks.GrantSpec{{Effect: checks.GrantControl, Basis: checks.BasisImplied}}},
+		},
+		Findings: []checks.Finding{
+			{CheckID: "CHK-443", Client: dual, Port: 443, Transport: "tcp", ObservedIPs: []string{dual.IP}},
+			{CheckID: "CHK-8080", Client: dual, Port: 8080, Transport: "tcp", ObservedIPs: []string{dual.IP}},
+		},
+		TargetSignals: []TargetSignal{
+			{Asset: dual.IP, Proto: "tcp", Port: 443, Product: "PrivateHP", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+		},
+	}
+	rDual := Evaluate(inDual)
+	ctrlExp := exposure(t, rDual, Internet, dual.MAC, "control")
+	if ctrlExp.Priority != P2 || ctrlExp.HighProfile {
+		t.Fatalf("private tcp/443 signal must not promote public tcp/8080 control (want P2, HighProfile=false), got %+v", ctrlExp)
+	}
+
+	// 8. Trusted-LAN-only actions must NOT reverse order on target velocity tie-break.
+	tA := client("t-alpha", "192.0.2.50", "lan")
+	tA.MAC = "02:00:00:00:01:50"
+	tB := client("t-beta", "192.0.2.51", "lan")
+	tB.MAC = "02:00:00:00:01:51"
+	inTrust := Input{
+		Snapshot: &unifi.Snapshot{
+			Networks: []unifi.Network{network("lan")},
+			Clients:  []unifi.Client{tA, tB},
+		},
+		Assets: map[string]classify.AssetProfile{
+			tA.MAC: {Tier: classify.TierMedium},
+			tB.MAC: {Tier: classify.TierMedium},
+		},
+		TargetSignals: []TargetSignal{
+			{Asset: tB.IP, Proto: "tcp", Port: 8000, Product: "PopularApp", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+		},
+	}
+	observed(&inTrust, tA, 8000, checks.GrantControl)
+	observed(&inTrust, tB, 8000, checks.GrantControl)
+	rTrust := Evaluate(inTrust)
+	idxTA, idxTB := -1, -1
+	for i, a := range rTrust.Actions {
+		if strings.Contains(a.ID, tA.MAC) {
+			idxTA = i
+		}
+		if strings.Contains(a.ID, tB.MAC) {
+			idxTB = i
+		}
+	}
+	if idxTA < 0 || idxTB < 0 || idxTA > idxTB {
+		t.Fatalf("trusted-LAN-only tie-break must not reverse alpha/beta (idxTA=%d, idxTB=%d): %+v", idxTA, idxTB, rTrust.Actions)
+	}
+
+	// 9. IPv6-only high-profile signal on a dual-stack host must not promote a
+	// forwarded IPv4 listener on the same port.
+	ds := unifi.Client{ID: "ds", MAC: "02:00:00:00:01:60", Name: "dualstack", IP: "192.0.2.60", IPv6: []string{"2001:db8::60"}, NetworkID: "lan", NetworkName: "lan"}
+	inDS := Input{
+		Snapshot: &unifi.Snapshot{
+			Networks: []unifi.Network{network("lan")},
+			Clients:  []unifi.Client{ds},
+			PortForwards: []unifi.PortForward{
+				{ID: "pf-ds-v4", Name: "HTTPSv4", Enabled: true, Proto: "tcp", DstPort: "443", FwdIP: ds.IP, FwdPort: "443", Src: "any"},
+			},
+		},
+		Assets: map[string]classify.AssetProfile{ds.MAC: {Tier: classify.TierMedium}},
+		TargetSignals: []TargetSignal{
+			{Asset: "2001:db8::60", Proto: "tcp", Port: 443, Product: "IPv6OnlyHP", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+		},
+	}
+	rDS := Evaluate(inDS)
+	dsExp := exposure(t, rDS, Internet, ds.MAC, "public access to tcp/443")
+	if dsExp.Priority != P2 || dsExp.HighProfile {
+		t.Fatalf("IPv6-only high-profile signal must not promote IPv4 forward (want P2, HighProfile=false), got %+v", dsExp)
+	}
+
+	// 10. Closing a port forward when UPnP leases are unknown must earn zero
+	// credit even when the exposed service carries a high-profile signal.
+	upnpHost := client("sshbox", "192.0.2.70", "lan")
+	upnpHost.MAC = "02:00:00:00:01:70"
+	inUPnP := Input{
+		Snapshot: &unifi.Snapshot{
+			Visibility:       &unifi.SiteVisibility{GatewayPoliciesAvailable: true, PortForwardsAvailable: true, SettingsAvailable: true},
+			SecuritySettings: &unifi.SiteSecuritySettings{UPnPEnabled: true},
+			Networks:         []unifi.Network{network("lan")},
+			Clients:          []unifi.Client{upnpHost},
+			PortForwards: []unifi.PortForward{
+				{ID: "pf-22", Name: "SSH", Enabled: true, Proto: "tcp", DstPort: "22", FwdIP: upnpHost.IP, FwdPort: "22", Src: "any"},
+			},
+		},
+		Assets: map[string]classify.AssetProfile{upnpHost.MAC: {Tier: classify.TierMedium}},
+		CVEMatches: []cve.Match{
+			{
+				Confidence: cve.ConfidenceExact,
+				Record:     cve.Record{ID: "CVE-2025-1111", Severity: checks.SeverityHigh, AttackVector: "N"},
+				Product:    cve.Product{Label: "OpenSSH", HostIP: upnpHost.IP, HighConfidence: true, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 22}}},
+			},
+		},
+		TargetSignals: []TargetSignal{
+			{Asset: upnpHost.IP, Proto: "tcp", Port: 22, Product: "OpenSSH", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+		},
+	}
+	rUPnP := Evaluate(inUPnP)
+	if pf := action(t, rUPnP, "act:wan-pf:pf-22"); pf.HighestTierReduced != "" {
+		t.Fatalf("closing forward while UPnP leases are unknown must earn zero credit even with high-profile signal, got %+v", pf)
+	}
+
+	// 11. Exact KEV CVE must never rank below an exact non-KEV CVE on the same
+	// high-profile product.
+	kevBox := client("kevbox", "192.0.2.80", "lan")
+	kevBox.MAC = "02:00:00:00:01:80"
+	nonKevBox := client("nonkevbox", "192.0.2.81", "lan")
+	nonKevBox.MAC = "02:00:00:00:01:81"
+	inKEV := Input{
+		Snapshot: &unifi.Snapshot{
+			Networks: []unifi.Network{network("lan")},
+			Clients:  []unifi.Client{kevBox, nonKevBox},
+			PortForwards: []unifi.PortForward{
+				{ID: "pf-kev", Name: "KEVWeb", Enabled: true, Proto: "tcp", DstPort: "443", FwdIP: kevBox.IP, FwdPort: "443", Src: "any"},
+				{ID: "pf-nonkev", Name: "NonKEVWeb", Enabled: true, Proto: "tcp", DstPort: "443", FwdIP: nonKevBox.IP, FwdPort: "443", Src: "any"},
+			},
+		},
+		Assets: map[string]classify.AssetProfile{
+			kevBox.MAC:    {Tier: classify.TierMedium},
+			nonKevBox.MAC: {Tier: classify.TierMedium},
+		},
+		CVEMatches: []cve.Match{
+			{
+				Confidence: cve.ConfidenceExact,
+				Record:     cve.Record{ID: "CVE-2025-2001", Severity: checks.SeverityCritical, AttackVector: "N", KEV: true},
+				Product:    cve.Product{Label: "WebEdge", HostIP: kevBox.IP, HighConfidence: true, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 443}}},
+			},
+			{
+				Confidence: cve.ConfidenceExact,
+				Record:     cve.Record{ID: "CVE-2025-2002", Severity: checks.SeverityHigh, AttackVector: "N"},
+				Product:    cve.Product{Label: "WebEdge", HostIP: nonKevBox.IP, HighConfidence: true, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 443}}},
+			},
+		},
+		TargetSignals: []TargetSignal{
+			{Asset: kevBox.IP, Proto: "tcp", Port: 443, Product: "WebEdge", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+			{Asset: nonKevBox.IP, Proto: "tcp", Port: 443, Product: "WebEdge", Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile}},
+		},
+	}
+	rKEV := Evaluate(inKEV)
+	expKEV := exposure(t, rKEV, Internet, kevBox.MAC, "CVE-2025-2001")
+	expNonKEV := exposure(t, rKEV, Internet, nonKevBox.MAC, "CVE-2025-2002")
+	if expNonKEV.Priority < expKEV.Priority {
+		t.Fatalf("non-KEV CVE must never outrank KEV CVE on same product: kev=%+v nonKev=%+v", expKEV, expNonKEV)
+	}
+}
+
+// TestRelabellingInvariance verifies that renaming VLANs (including an isolated
+// VLAN renamed between "Hall" and "IoT" through risk.Evaluate), SSIDs, and
+// neutral client display labels does not change exposure priorities, cloud
+// states, or action ranking.
+func TestRelabellingInvariance(t *testing.T) {
+	build := func(vlan1Name, vlan2Name, ssidName, camName, nasName string) Report {
+		dev1 := unifi.Client{ID: "c1", MAC: "02:00:00:00:02:01", Name: camName, IP: "192.0.2.11", NetworkID: "n1", NetworkName: vlan1Name}
+		dev2 := unifi.Client{ID: "c2", MAC: "02:00:00:00:02:02", Name: nasName, IP: "198.51.100.11", NetworkID: "n2", NetworkName: vlan2Name}
+		snap := &unifi.Snapshot{
+			Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true, PortForwardsAvailable: true, WLANsAvailable: true},
+			Networks: []unifi.Network{
+				{ID: "n1", Name: vlan1Name, ZoneName: "z1", VLAN: "10", Subnet: "192.0.2.1/24", IsolationEnabled: true},
+				{ID: "n2", Name: vlan2Name, ZoneName: "z2", VLAN: "20", Subnet: "198.51.100.1/24"},
+			},
+			Clients: []unifi.Client{dev1, dev2},
+			WLANs:   []unifi.WLANConfig{{Enabled: true, Name: ssidName, NetworkID: "n1", Security: "open"}},
+			FirewallPolicies: []unifi.FirewallPolicy{
+				allow("z1", "z2"),
+				allow("z1", "External"),
+			},
+			PortForwards: []unifi.PortForward{
+				{ID: "pf1", Name: "Web", Enabled: true, Proto: "tcp", DstPort: "8080", FwdIP: dev2.IP, FwdPort: "8080", Src: "any"},
+			},
+		}
+		findings := []checks.Finding{
+			{CheckID: "UB-TEST-AUTH", Client: dev2, Port: 8080, Transport: "tcp", ObservedIPs: []string{dev2.IP}},
+		}
+		riskRep := risk.Evaluate(snap, findings, config.NetworkConfig{})
+		in := Input{
+			Snapshot:    snap,
+			Isolation:   riskRep.Isolation,
+			SwitchPorts: riskRep.SwitchPorts,
+			Assets: map[string]classify.AssetProfile{
+				dev1.MAC: {Tier: classify.TierLow},
+				dev2.MAC: {Tier: classify.TierHigh},
+			},
+			Checks: []*checks.Check{
+				{ID: "UB-TEST-AUTH", Grants: []checks.GrantSpec{{Effect: checks.GrantControl, Basis: checks.BasisImplied}}},
+			},
+			Findings: findings,
+		}
+		return Evaluate(in)
+	}
+
+	r1 := build("IoT", "Trusted", "GuestWiFi", "Device-A", "Storage-A")
+	r2 := build("Hall", "Segment-B", "Wireless-X", "Device-B", "Storage-B")
+
+	if len(r1.Exposures) != len(r2.Exposures) {
+		t.Fatalf("exposure count changed after relabelling: %d vs %d", len(r1.Exposures), len(r2.Exposures))
+	}
+	for i := range r1.Exposures {
+		e1, e2 := r1.Exposures[i], r2.Exposures[i]
+		if e1.Entry != e2.Entry || e1.Asset != e2.Asset || e1.Consequence != e2.Consequence || e1.State != e2.State || e1.Priority != e2.Priority || e1.Lane != e2.Lane {
+			t.Fatalf("exposure %d changed after relabelling: %+v vs %+v", i, e1, e2)
+		}
+	}
+	if len(r1.Cloud) != len(r2.Cloud) {
+		t.Fatalf("cloud count changed after relabelling: %d vs %d", len(r1.Cloud), len(r2.Cloud))
+	}
+	for i := range r1.Cloud {
+		if r1.Cloud[i].Asset != r2.Cloud[i].Asset || r1.Cloud[i].State != r2.Cloud[i].State {
+			t.Fatalf("cloud %d changed after relabelling: %+v vs %+v", i, r1.Cloud[i], r2.Cloud[i])
+		}
+	}
+	if len(r1.Actions) != len(r2.Actions) {
+		t.Fatalf("action count changed after relabelling: %d vs %d", len(r1.Actions), len(r2.Actions))
+	}
+	for i := range r1.Actions {
+		a1, a2 := r1.Actions[i], r2.Actions[i]
+		if a1.ID != a2.ID || a1.Lane != a2.Lane || a1.HighestTierReduced != a2.HighestTierReduced || a1.PairsByTier != a2.PairsByTier {
+			t.Fatalf("action %d changed after relabelling: %+v vs %+v", i, a1, a2)
+		}
+	}
+}
+
+// TestEvaluateAllInfraKeepsDuplicateNames verifies that multiple UniFi devices
+// sharing a display label (such as two unnamed U6-Lite APs) each keep their own
+// deterministic InfraReport keyed by canonical MAC.
+func TestEvaluateAllInfraKeepsDuplicateNames(t *testing.T) {
+	snap := &unifi.Snapshot{
+		Devices: []unifi.Device{
+			{MAC: "02:00:00:00:aa:01", Type: "udm", Name: "Gateway"},
+			{MAC: "02:00:00:00:aa:03", Type: "uap", Model: "U6-Lite", UplinkMAC: "02:00:00:00:aa:01", UplinkPort: 1},
+			{MAC: "02:00:00:00:aa:02", Type: "uap", Model: "U6-Lite", UplinkMAC: "02:00:00:00:aa:01", UplinkPort: 2},
+		},
+	}
+	reps := EvaluateAllInfra(Input{Snapshot: snap})
+	var aps []InfraReport
+	for _, r := range reps {
+		if r.Scope == "AP" {
+			aps = append(aps, r)
+		}
+	}
+	if len(aps) != 2 {
+		t.Fatalf("expected 2 AP infra reports for duplicate-named APs, got %d: %+v", len(aps), aps)
+	}
+	if aps[0].TargetID != "02:00:00:00:aa:02" || aps[1].TargetID != "02:00:00:00:aa:03" {
+		t.Fatalf("expected deterministic MAC tie-break ordering, got %+v", aps)
+	}
+}
+
+// TestExpectedP2PAndVPNForwardsNotFlaggedAsUrgent verifies that intentionally
+// public P2P peering ports (such as Ethereum DevP2P 30303) and VPN endpoints
+// (such as WireGuard 51820) are not flagged as Fix now actions on their own,
+// while a real unauthenticated grant or CVE on that port still surfaces.
+func TestExpectedP2PAndVPNForwardsNotFlaggedAsUrgent(t *testing.T) {
+	node := client("eth-node", "192.0.2.90", "lan")
+	node.MAC = "02:00:00:00:01:90"
+	snap := &unifi.Snapshot{
+		Networks: []unifi.Network{network("lan")},
+		Clients:  []unifi.Client{node},
+		PortForwards: []unifi.PortForward{
+			{ID: "pf-eth", Name: "Ethereum Execution DevP2P", Enabled: true, Proto: "tcp_udp", DstPort: "30303", FwdIP: node.IP, FwdPort: "30303", Src: "any"},
+			{ID: "pf-consensus", Name: "Ethereum Consensus LibP2P", Enabled: true, Proto: "tcp_udp", DstPort: "9000", FwdIP: node.IP, FwdPort: "9000", Src: "any"},
+			{ID: "pf-wg", Name: "WireGuard VPN", Enabled: true, Proto: "udp", DstPort: "51820", FwdIP: node.IP, FwdPort: "51820", Src: "any"},
+		},
+	}
+	in := Input{
+		Snapshot: snap,
+		Assets:   map[string]classify.AssetProfile{node.MAC: {Tier: classify.TierHigh}},
+	}
+	clean := Evaluate(in)
+	for _, a := range clean.Actions {
+		if a.ID == "act:wan-pf:pf-eth" || a.ID == "act:wan-pf:pf-consensus" || a.ID == "act:wan-pf:pf-wg" {
+			t.Fatalf("clean expected-p2p/vpn forward should not be flagged as an urgent action: %+v", a)
+		}
+	}
+
+	// If an exact remote CVE affects that forwarded port, closing/patching must still surface.
+	in.CVEMatches = []cve.Match{
+		{
+			Confidence: cve.ConfidenceExact,
+			Record:     cve.Record{ID: "CVE-2025-30303", Severity: checks.SeverityCritical, AttackVector: "N", KEV: true},
+			Product:    cve.Product{Label: "Geth", HostIP: node.IP, HighConfidence: true, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 30303}}},
+		},
+	}
+	vuln := Evaluate(in)
+	exp := exposure(t, vuln, Internet, node.MAC, "CVE-2025-30303")
+	if exp.Priority != P1 || exp.Lane != LaneFixNow {
+		t.Fatalf("real CVE on forwarded P2P port must still surface as P1 Fix now, got %+v", exp)
+	}
+	patch := "act:patch:CVE-2025-30303:" + node.MAC
+	if !slices.ContainsFunc(vuln.Simulation.Edges, func(e SimEdge) bool {
+		return e.Tier == "wan" && e.To == node.MAC && slices.Contains(e.CutIDs, patch) && slices.Contains(e.CutIDs, "act:wan-pf:pf-eth")
+	}) {
+		t.Fatal("the vulnerable peering listener must be containable by patching it or closing its forward")
+	}
+}
+
+// TestSimulationParallelCuts ensures each route carries only its own remedies.
+// A second listener or publication must survive a cut to the first.
+func TestSimulationParallelCuts(t *testing.T) {
+	src := client("guest", "192.0.2.10", "guest")
+	dst := client("storage", "198.51.100.10", "storage")
+	in := Input{Snapshot: &unifi.Snapshot{
+		Networks: []unifi.Network{network("guest"), network("storage")},
+		Clients:  []unifi.Client{src, dst}, FirewallPolicies: []unifi.FirewallPolicy{allow("guest", "storage")},
+		PortForwards:     []unifi.PortForward{{ID: "web", Enabled: true, FwdIP: dst.IP, DstPort: "9443", FwdPort: "443", Proto: "tcp"}},
+		PublishedTunnels: []unifi.PublishedTunnel{{Provider: "relay", Hostname: "files.example", BackendIP: dst.IP, BackendPort: 443, AccessPolicy: "public"}},
+	}, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{GuestVLANs: []string{"guest"}}}}
+	observed(&in, dst, 443, checks.GrantControl)
+	observed(&in, dst, 8080, checks.GrantPivot)
+	r := Evaluate(in)
+	sim := r.Simulation
+	if sim == nil || len(sim.Nodes) != 2 {
+		t.Fatalf("missing inventory: %+v", sim)
+	}
+	if n := sim.Nodes[0]; n.ID != "storage" || n.EntityID != "host:ip/"+dst.IP || n.EntryExposure != "WAN TCP/9443" || n.InternetState == "" {
+		t.Fatal(n)
+	}
+	want := map[string]string{
+		"act:wan-pf:web": "act:wan-service:storage:tcp/443",
+		"act:published-tunnel:relay:files.example": "act:wan-service:storage:tcp/443",
+		"act:check:control-storage:storage:443":    "act:vlan-egress:guest->storage",
+		"act:check:pivot-storage:storage:8080":     "act:vlan-egress:guest->storage",
+	}
+	for _, e := range sim.Edges {
+		for _, id := range e.CutIDs {
+			action(t, r, id)
+		}
+		if e.To != dst.ID {
+			continue
+		}
+		for id, boundary := range want {
+			if !slices.Contains(e.CutIDs, id) {
+				continue
+			}
+			if len(e.CutIDs) != 2 || !slices.Contains(e.CutIDs, boundary) {
+				t.Fatalf("wrong route remedies: %+v", e)
+			}
+			if strings.HasPrefix(id, "act:check:") {
+				if e.Tier != "takeover" || e.From != src.ID {
+					t.Fatal(e)
+				}
+			} else if e.Tier != "wan" || e.From != "internet" {
+				t.Fatal(e)
+			}
+			delete(want, id)
+		}
+	}
+	if len(want) > 0 {
+		t.Fatalf("missing independently cuttable paths: %+v", want)
+	}
+	slices.Reverse(in.Snapshot.Clients)
+	slices.Reverse(in.Findings)
+	if !reflect.DeepEqual(sim, Evaluate(in).Simulation) {
+		t.Fatal("inventory order changed the simulation")
+	}
+}
+
+// TestSystemWireGuardGatewayRule distinguishes UniFi's VPN listener from a
+// user rule with the same name and preserves confirmed findings on its port.
+func TestSystemWireGuardGatewayRule(t *testing.T) {
+	d := unifi.Device{MAC: "02:00:00:00:00:01", Name: "Router", Type: "udm", IP: "192.0.2.1"}
+	p := allow("External", "Gateway")
+	p.ID, p.Name, p.Origin, p.Protocol = "vpn", "Allow WireGuard VPN", "SYSTEM_DEFINED", "udp"
+	p.Destination.AnyPort = false
+	p.Destination.Ports = []int{51820}
+	in := Input{Snapshot: &unifi.Snapshot{Devices: []unifi.Device{d}, FirewallPolicies: []unifi.FirewallPolicy{p}}}
+	// A configuration review on this port is not proof of anonymous access.
+	gw := risk.NewOracle(in.Snapshot, in.NetCfg).DeviceClient(d)
+	gw.ID = "gateway"
+	in.Findings = []checks.Finding{{CheckID: "config-review", Client: gw, Port: 51820, Transport: "udp", ObservedIPs: []string{d.IP}}}
+	r := Evaluate(in)
+	for _, a := range r.Actions {
+		if a.ID == "act:gateway-local:vpn" {
+			t.Fatal(a)
+		}
+	}
+	for _, e := range r.Simulation.Edges {
+		if e.Tier == "wan" {
+			t.Fatal(e)
+		}
+	}
+	user := p
+	user.ID, user.Origin = "custom", "USER_DEFINED"
+	in.Snapshot.FirewallPolicies = append(in.Snapshot.FirewallPolicies, user)
+	action(t, Evaluate(in), "act:gateway-local:custom")
+	in.Snapshot.FirewallPolicies = in.Snapshot.FirewallPolicies[:1]
+	observed(&in, gw, 51820, checks.GrantControl)
+	in.Findings[len(in.Findings)-1].Transport = "udp"
+	r = Evaluate(in)
+	if x := exposure(t, r, Internet, d.MAC, "control"); x.State != "exposed" {
+		t.Fatal(x)
+	}
+	routeID := "act:gateway-local:vpn"
+	action(t, r, routeID)
+	if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+		return e.Tier == "wan" && e.To == d.MAC && slices.Contains(e.CutIDs, routeID) && slices.Contains(e.CutIDs, "act:check:control-gateway:"+d.MAC+":51820:udp")
+	}) {
+		t.Fatalf("missing confirmed WAN path: %+v", r.Simulation.Edges)
+	}
+}
+
+// TestGatewayControlTraffic keeps built-in gateway services out of the action
+// queue while preserving an independent user publication on the same gateway.
+func TestGatewayControlTraffic(t *testing.T) {
+	gw := unifi.Device{Type: "udm", MAC: "02:00:00:00:00:01", IP: "2001:db8::1"}
+	s := &unifi.Snapshot{Devices: []unifi.Device{gw}}
+	rule := func(name, origin, proto string, port int) unifi.FirewallPolicy {
+		p := allow("External", "Gateway")
+		p.ID, p.Name, p.Origin, p.IPVersion, p.Protocol = name, name, origin, "ipv6", proto
+		if port != 0 {
+			p.Destination.AnyPort, p.Destination.Ports = false, []int{port}
+		}
+		return p
+	}
+	s.FirewallPolicies = []unifi.FirewallPolicy{
+		rule("Allow DHCPv6", "SYSTEM_DEFINED", "udp", 547),
+		rule("Allow Neighbor Solicitations", "SYSTEM_DEFINED", "icmpv6", 0),
+		rule("Allow Return Traffic", "SYSTEM_DEFINED", "all", 0),
+		rule("Secure Shell", "USER_DEFINED", "tcp", 22),
+	}
+	in := Input{Snapshot: s, Assets: map[string]classify.AssetProfile{gw.MAC: {Tier: classify.TierCrown}}}
+	r := Evaluate(in)
+	for _, a := range r.Actions {
+		if strings.HasPrefix(a.ID, "act:gateway-local:Allow ") {
+			t.Errorf("system gateway control traffic produced an action: %+v", a)
+		}
+	}
+	if a := action(t, r, "act:gateway-local:Secure Shell"); a.Lane != LaneFixNow || a.HighestTierReduced != P1 {
+		t.Fatal(a)
+	}
+	in.CVEMatches = []cve.Match{{
+		Confidence: cve.ConfidenceExact, Record: cve.Record{ID: "CVE-example", AttackVector: "N", KEV: true},
+		Product: cve.Product{HostIP: gw.IP, Ports: []cve.EndpointPort{{Transport: "udp", Port: 547}}},
+	}}
+	r = Evaluate(in)
+	if x := exposure(t, r, Internet, gw.MAC, "CVE-example"); x.State != "exposed" {
+		t.Fatal(x)
+	}
+	if !slices.ContainsFunc(r.Simulation.Edges, func(e SimEdge) bool {
+		return e.Tier == "wan" && e.To == gw.MAC && slices.Contains(e.CutIDs, "act:gateway-local:Allow DHCPv6") && slices.Contains(e.CutIDs, "act:patch:CVE-example:"+gw.MAC)
+	}) {
+		t.Fatalf("missing confirmed DHCPv6 finding: %+v", r.Simulation.Edges)
+	}
+}
+
+// TestSimulationCVEImpact distinguishes availability findings from takeover paths on the same socket.
+func TestSimulationCVEImpact(t *testing.T) {
+	src, dst := client("source", "192.0.2.1", "guest"), client("service", "198.51.100.1", "lan")
+	in := Input{Snapshot: &unifi.Snapshot{Networks: []unifi.Network{network("guest"), network("lan")},
+		Clients: []unifi.Client{src, dst}, FirewallPolicies: []unifi.FirewallPolicy{allow("guest", "lan")}}}
+	for id, vector := range map[string]string{
+		"CVE-dos":          "CVSS:3.1/AV:N/C:N/I:N/A:H",
+		"CVE-dos-trailing": "CVSS:3.1/AV:N/A:H/C:N/I:N",
+		"CVE-dos-v4":       "CVSS:4.0/AV:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+		"CVE-control":      "CVSS:3.1/AV:N/C:N/I:H/A:H",
+	} {
+		in.CVEMatches = append(in.CVEMatches, cve.Match{
+			Confidence: cve.ConfidenceExact, Record: cve.Record{ID: id, Severity: checks.SeverityHigh, AttackVector: "N", CVSSVector: vector},
+			Product: cve.Product{HostIP: dst.IP, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 8000}}},
+		})
+	}
+	r := Evaluate(in)
+	var takeover []string
+	for _, e := range r.Simulation.Edges {
+		if e.From == src.ID && e.To == dst.ID && e.Tier == "takeover" {
+			takeover = append(takeover, e.Label)
+		}
+	}
+	if !slices.Equal(takeover, []string{"CVE-control · tcp/8000"}) {
+		t.Fatalf("unexpected takeover paths: %v", takeover)
+	}
+}
+
+// TestInventoryGrants checks that discovery can leave a conditional question
+// without turning an ordinary time reply into a read-access consequence.
+func TestInventoryGrants(t *testing.T) {
+	catalog, err := checks.LoadFromFS(builtinchecks.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := client("server", "192.0.2.2", "lan")
+	r := Evaluate(Input{Snapshot: &unifi.Snapshot{Clients: []unifi.Client{cl}}, Checks: catalog, Findings: []checks.Finding{
+		{Client: cl, CheckID: "UB-0011", ClaimKind: checks.ClaimServiceObserved, BaseSeverity: checks.SeverityInfo, Category: "service-inventory", Transport: "udp", Port: 123},
+		{Client: cl, CheckID: "UB-0014", Transport: "udp", Port: 5351},
+	}})
+	for _, a := range r.Actions {
+		if strings.Contains(a.ID, "UB-0011") || (strings.Contains(a.ID, "UB-0014") && a.Lane != LaneVerify) {
+			t.Fatal(a)
+		}
+	}
+	for _, x := range r.Exposures {
+		if x.Asset == cl.ID && x.Consequence == "read" {
+			t.Fatal(x)
+		}
+	}
+	action(t, r, "act:verify:UB-0014:server:udp/5351")
+}
+
+// TestSimulationInfrastructurePaths distinguishes control of adopted equipment
+// from the VLANs and client attachments each device actually serves.
+func TestSimulationInfrastructurePaths(t *testing.T) {
+	const gw, sw, ap, leaf = "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03", "02:00:00:00:00:04"
+	camera := client("camera", "192.0.2.2", "cameras")
+	camera.IsWired, camera.SwitchMAC = true, leaf
+	phone := client("phone", "198.51.100.2", "staff")
+	phone.APMAC = ap
+	s := &unifi.Snapshot{
+		Devices:  []unifi.Device{{MAC: gw, Type: "udm"}, {MAC: sw, Type: "usw", UplinkMAC: gw}, {MAC: ap, Type: "uap", UplinkMAC: sw}, {MAC: leaf, Type: "usw", UplinkMAC: sw}},
+		Networks: []unifi.Network{{ID: "cameras", Name: "Cameras", VLAN: "3", IsolationEnabled: true}, {ID: "staff", Name: "Staff", RouterDeviceMAC: sw}},
+		Clients:  []unifi.Client{camera, phone},
+	}
+	edges := Evaluate(Input{Snapshot: s}).Simulation.Edges
+	for _, want := range []SimEdge{
+		{From: gw, To: sw, Tier: "takeover", Label: "Managed UniFi gear", Via: "Controller owns device config"},
+		{From: gw, To: ap, Tier: "takeover", Label: "Managed UniFi gear", Via: "Controller owns device config"},
+		{From: gw, To: camera.ID, Tier: "pivot", Label: "Routed VLAN gateway", Via: "Routes Cameras"},
+		{From: sw, To: phone.ID, Tier: "pivot", Label: "Routed VLAN gateway", Via: "Routes Staff"},
+		{From: sw, To: ap, Tier: "pivot", Label: "Downstream UniFi gear", Via: "Switch uplink"},
+		{From: sw, To: leaf, Tier: "pivot", Label: "Downstream UniFi gear", Via: "Switch uplink"},
+		{From: leaf, To: camera.ID, Tier: "pivot", Label: "Wired client", Via: "Direct switch port"},
+		{From: ap, To: phone.ID, Tier: "pivot", Label: "Wireless client", Via: "Associated with AP"},
+	} {
+		if !slices.ContainsFunc(edges, func(e SimEdge) bool { return reflect.DeepEqual(e, want) }) {
+			t.Errorf("missing infrastructure path: %+v", want)
+		}
+	}
+	for _, e := range edges {
+		if (e.From == gw && e.To == phone.ID) || (e.From == sw && e.To == camera.ID) {
+			t.Errorf("indirect route reported as a direct attachment: %+v", e)
+		}
+	}
+	const cloudKey = "02:00:00:00:00:05"
+	s.Devices[0].Type = "uxg"
+	s.Devices = append(s.Devices, unifi.Device{MAC: cloudKey, Type: "uck"})
+	edges = Evaluate(Input{Snapshot: s}).Simulation.Edges
+	if !slices.ContainsFunc(edges, func(e SimEdge) bool { return e.From == cloudKey && e.To == gw && e.Tier == "takeover" }) ||
+		slices.ContainsFunc(edges, func(e SimEdge) bool { return e.From == gw && e.Tier == "takeover" }) {
+		t.Error("a standalone gateway must be managed by its Cloud Key")
 	}
 }

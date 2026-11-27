@@ -48,6 +48,7 @@ type builder struct {
 	sockets         map[socket]bool
 	positions       map[risk.Position]fact
 	cloud           []ClientEgress
+	wanEdges        []SimEdge
 	unknownPhysical bool
 }
 
@@ -174,6 +175,51 @@ func (b *builder) inventory() {
 	}
 }
 
+// indexTargetSignals records high-profile target velocity hints on matching
+// assets, exact IP/transport/port listeners, or host-wide ports. Unknown or
+// low-confidence velocity never discounts opaque IoT devices.
+func (b *builder) indexTargetSignals() {
+	for _, sig := range b.TargetSignals {
+		if sig.Velocity.Class != cve.VelocityHighProfile {
+			continue
+		}
+		key := canonicalMAC(sig.Asset)
+		sigIP := ""
+		if _, ok := b.assets[key]; !ok {
+			if ip := address(sig.Asset); ip != "" && len(b.byIP[ip]) == 1 {
+				key = b.byIP[ip][0]
+				sigIP = ip
+			} else if _, ok := b.assets[sig.Asset]; ok {
+				key = sig.Asset
+			}
+		}
+		if key == "" {
+			continue
+		}
+		if sig.Port > 0 {
+			proto := strings.ToLower(cmp.Or(sig.Proto, "tcp"))
+			svc := serviceName(proto, sig.Port)
+			if sigIP != "" {
+				b.highProfileSockets[key+"|"+sigIP+"|"+svc] = true
+				b.highProfileFamily[key+"|"+family(sigIP)] = true
+			} else {
+				b.highProfilePorts[key+"|"+svc] = true
+				b.highProfileFamily[key+"|ipv4"] = true
+				b.highProfileFamily[key+"|ipv6"] = true
+			}
+		} else {
+			b.highProfileHost[key] = true
+		}
+	}
+}
+
+// isHighProfileSocket reports whether listener s matches a port-scoped or
+// exact-IP high-profile target signal.
+func (b *builder) isHighProfileSocket(s socket) bool {
+	svc := serviceName(s.proto, s.port)
+	return b.highProfileSockets[s.host+"|"+s.ip+"|"+svc] || b.highProfilePorts[s.host+"|"+svc]
+}
+
 // resolvePublishedIP returns the unique host owning raw. When multiple inventory
 // entries share raw, it records an explicit verification item and marks every
 // candidate unknown from Internet so none falsely reports "contained".
@@ -220,7 +266,11 @@ func grantLevel(g checks.GrantSpec) uint8 {
 // grant attaches a service consequence to its specific listener and remedy so
 // independent findings supporting the same consequence survive a single cut.
 func (b *builder) grant(s socket, g checks.GrantSpec, id int) {
-	b.link(s.fact(), fact{consequence, s.host, string(g.Effect)}, grantLevel(g), id, 0)
+	cf := fact{consequence, s.host, string(g.Effect)}
+	if b.isHighProfileSocket(s) {
+		b.addHighProfileSource(b.node(cf), b.node(s.fact()), id)
+	}
+	b.link(s.fact(), cf, grantLevel(g), id, 0)
 }
 
 // services wires check grants, protocol traits, CVEs, management ownership, and
@@ -232,12 +282,22 @@ func (b *builder) services() {
 	}
 	for _, f := range b.Findings {
 		c := byID[f.CheckID]
-		if f.Port == 0 || (c == nil && f.IsInventoryOnly()) {
+		if f.Port == 0 {
 			continue
+		}
+		var grants []checks.GrantSpec
+		if c != nil {
+			grants = checks.EffectiveGrants(c, f.Observation)
+		}
+		inventoryOnly := f.IsInventoryOnly() || (c != nil && c.IsInventoryOnly())
+		if inventoryOnly {
+			// A discovery response identifies a listener. Only a separate
+			// prerequisite in its grant gives the operator something to verify.
+			grants = slices.DeleteFunc(grants, func(g checks.GrantSpec) bool { return grantLevel(g) != moderate })
 		}
 		host := hostKey(f.Client)
 		ips := f.EndpointIPs()
-		if len(ips) == 0 {
+		if len(ips) == 0 && (!inventoryOnly || len(grants) != 0) {
 			b.verify(root(TrustedLAN), "service-address", host+":"+serviceName(f.EffectiveTransport(), f.Port), "Check which IP serves "+b.assets[host].name, "This finding does not include an IP address, so it cannot be tied to a specific network path.")
 		}
 		for _, ip := range ips {
@@ -246,14 +306,14 @@ func (b *builder) services() {
 				continue
 			}
 			b.link(root(TrustedLAN), s.fact(), trivial, 0, 0)
-			var grants []checks.GrantSpec
-			if c != nil {
-				grants = checks.EffectiveGrants(c, f.Observation)
-			}
-			if len(grants) == 0 && !f.IsInventoryOnly() && (c == nil || len(c.Grants) == 0) {
+			if !inventoryOnly && len(grants) == 0 && (c == nil || len(c.Grants) == 0) {
 				title := fmt.Sprintf("Review %s on port %d", b.assets[host].name, s.port)
 				a := b.action("act:check:"+f.CheckID+":"+host+":"+serviceName(s.proto, s.port), title, cmp.Or(f.Title, "A service check found a setting that needs attention."), LaneReduceExposure, 1)
-				b.link(s.fact(), fact{consequence, host, "service setting: " + f.CheckID}, low, a, 0)
+				cf := fact{consequence, host, "service setting: " + f.CheckID}
+				if b.isHighProfileSocket(s) {
+					b.addHighProfileSource(b.node(cf), b.node(s.fact()), a)
+				}
+				b.link(s.fact(), cf, low, a, 0)
 			}
 			for _, g := range grants {
 				name := b.assets[host].name
@@ -411,7 +471,11 @@ func (b *builder) cve(m cve.Match) {
 			d = moderate
 		}
 		a := b.action("act:patch:"+r.ID+":"+host, "Update "+b.assets[host].name+" to fix "+r.ID, "The running service version matches a known remote vulnerability.", LaneFixNow, 2)
-		b.link(s.fact(), fact{consequence, host, r.ID}, d, a, 0)
+		cf := fact{consequence, host, r.ID}
+		if b.isHighProfileSocket(s) {
+			b.addHighProfileSource(b.node(cf), b.node(s.fact()), a)
+		}
+		b.link(s.fact(), cf, d, a, 0)
 	}
 }
 

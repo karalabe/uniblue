@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/risk"
@@ -62,18 +63,29 @@ type asset struct {
 	name    string
 	profile classify.AssetProfile
 }
+type highProfileEdge struct {
+	src int
+	cut int
+}
+
 type graph struct {
-	ids       map[fact]int
-	facts     []fact
-	edges     [][]edge
-	assets    map[string]asset
-	actionIDs map[string]int
-	actions   []candidate
-	roots     [len(starts)]int
+	ids                map[fact]int
+	facts              []fact
+	edges              [][]edge
+	assets             map[string]asset
+	actionIDs          map[string]int
+	actions            []candidate
+	roots              [len(starts)]int
+	highProfileHost    map[string]bool
+	highProfileFamily  map[string]bool
+	highProfilePorts   map[string]bool
+	highProfileSockets map[string]bool
+	highProfileSources map[int][]highProfileEdge
 }
 type candidate struct {
 	Action
-	effort int
+	effort     int
+	tieBreakHP bool
 }
 
 // Evaluate computes reachable consequences and ranks hypothetical changes without
@@ -88,12 +100,23 @@ func Evaluate(in Input) Report {
 	if in.Assets == nil {
 		in.Assets, _ = classify.ResolveAssets(in.Snapshot, in.Profiles, in.NetCfg.Assets)
 	}
-	g := graph{ids: make(map[fact]int), assets: make(map[string]asset), actionIDs: make(map[string]int), actions: []candidate{{}}}
+	g := graph{
+		ids:                make(map[fact]int),
+		assets:             make(map[string]asset),
+		actionIDs:          make(map[string]int),
+		actions:            []candidate{{}},
+		highProfileHost:    make(map[string]bool),
+		highProfileFamily:  make(map[string]bool),
+		highProfilePorts:   make(map[string]bool),
+		highProfileSockets: make(map[string]bool),
+		highProfileSources: make(map[int][]highProfileEdge),
+	}
 	for i, s := range starts {
 		g.roots[i] = g.node(root(s.entry))
 	}
 	b := builder{Input: in, graph: &g}
 	b.inventory()
+	b.indexTargetSignals()
 	b.services()
 	b.entries()
 	b.routes()
@@ -101,6 +124,7 @@ func Evaluate(in Input) Report {
 	states := g.solve(nil)
 	result.Exposures = g.exposures(states)
 	result.Actions = g.rank(states)
+	result.Simulation = b.buildSimulation(result)
 	return result
 }
 
@@ -139,7 +163,7 @@ func (g *graph) action(id, title, reason string, lane Lane, effort int) int {
 	}
 	i := len(g.actions)
 	g.actionIDs[id] = i
-	g.actions = append(g.actions, candidate{Action{ID: id, Title: title, Reason: reason, Lane: lane}, effort})
+	g.actions = append(g.actions, candidate{Action: Action{ID: id, Title: title, Reason: reason, Lane: lane}, effort: effort})
 	return i
 }
 
@@ -188,10 +212,57 @@ func (g *graph) solveRoot(r int, cuts []bool, dist []uint8, queue []int) {
 	}
 }
 
+// addHighProfileSource records that consequence node cf is backed by high-profile
+// listener or entry node src gated by action cut so target velocity applies only
+// when that exact edge survives and src is reachable in the same entry state.
+func (g *graph) addHighProfileSource(cf, src, cut int) {
+	he := highProfileEdge{src: src, cut: cut}
+	if !slices.Contains(g.highProfileSources[cf], he) {
+		g.highProfileSources[cf] = append(g.highProfileSources[cf], he)
+	}
+}
+
+// isHighProfileIn reports whether fact n/f is backed by a high-profile target
+// signal reachable in state dist (falling back to base when a listener degraded
+// to unknown under a counterfactual cut) along an uncut edge.
+func (g *graph) isHighProfileIn(n int, f fact, dist, base []uint8, cuts []bool) bool {
+	if g.highProfileHost[f.asset] {
+		return true
+	}
+	for _, he := range g.highProfileSources[n] {
+		if cuts != nil && he.cut != 0 && cuts[he.cut] {
+			continue
+		}
+		if he.src >= len(dist) {
+			continue
+		}
+		sd := dist[he.src]
+		if base != nil && sd == unknown && he.src < len(base) && base[he.src] < unknown {
+			sd = base[he.src]
+		}
+		if sd < unknown {
+			return true
+		}
+	}
+	return false
+}
+
+// factPriority applies the base priority matrix and the additive high-profile
+// target velocity rule (+1 step on any-source external reach not already P1).
+// Version-matched CVE facts are excluded so product-history velocity never
+// outranks or inverts an exact KEV match on the same product.
+func (g *graph) factPriority(s start, n int, f fact, d uint8, dist, base []uint8, cuts []bool) Priority {
+	p := PriorityFor(s.audience, difficulties[d], g.assets[f.asset].profile.Tier)
+	if s.audience == AudienceInternetAny && d < unknown && p > P1 && !strings.HasPrefix(f.detail, "CVE-") && g.isHighProfileIn(n, f, dist, base, cuts) {
+		return PromotePriority(p)
+	}
+	return p
+}
+
 // exposure translates a reachable fact into an owner-facing assessment.
-func (g *graph) exposure(s start, f fact, level uint8) Exposure {
+func (g *graph) exposure(s start, n int, f fact, level uint8, dist []uint8) Exposure {
 	a := g.assets[f.asset]
-	e := Exposure{Entry: s.entry, Asset: f.asset, Name: cmp.Or(a.name, f.asset), Consequence: f.detail, State: "exposed", Difficulty: difficulties[level]}
+	e := Exposure{Entry: s.entry, Asset: f.asset, Name: cmp.Or(a.name, f.asset), Consequence: f.detail, State: "exposed", Difficulty: difficulties[level], HighProfile: g.isHighProfileIn(n, f, dist, nil, nil)}
 	if f.kind == blocked {
 		e.State = "contained"
 		e.Difficulty = ""
@@ -202,7 +273,7 @@ func (g *graph) exposure(s start, f fact, level uint8) Exposure {
 		level = max(level, moderate)
 		e.Difficulty = difficulties[level]
 	}
-	e.Priority = PriorityFor(s.audience, e.Difficulty, a.profile.Tier)
+	e.Priority = g.factPriority(s, n, f, level, dist, nil, nil)
 	switch {
 	case level == unknown:
 		e.State = "unknown"
@@ -232,7 +303,7 @@ func (g *graph) exposures(states [][]uint8) []Exposure {
 			if d == unreachable || (f.kind != consequence && f.kind != permission && f.kind != blocked) {
 				continue
 			}
-			e := g.exposure(starts[i], f, d)
+			e := g.exposure(starts[i], n, f, d, dist)
 			order := stateOrder(e.State)
 			best[f.asset] = max(best[f.asset], order)
 			rows = append(rows, e)

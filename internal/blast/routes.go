@@ -10,11 +10,90 @@ import (
 	"cmp"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/karalabe/uniblue/internal/risk"
 	"github.com/karalabe/uniblue/internal/unifi"
+	builtinrules "github.com/karalabe/uniblue/rules"
 )
+
+var (
+	wanClassifierOnce sync.Once
+	wanClassifier     *risk.ExposureClassifier
+)
+
+func exposureClassifier() *risk.ExposureClassifier {
+	wanClassifierOnce.Do(func() {
+		wanClassifier, _ = risk.LoadExposureClassifier(builtinrules.BuiltinFS)
+	})
+	return wanClassifier
+}
+
+// gatewayControlTraffic identifies built-in rules for IPv6 configuration and
+// established flows. These rules do not publish application listeners.
+func gatewayControlTraffic(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "allow neighbor solicitations", "allow neighbor advertisements", "allow router advertisements",
+		"allow router solicitations", "allow dhcpv6", "allow icmpv6", "allow return traffic":
+		return true
+	}
+	return false
+}
+
+// isExpectedGatewayRule recognizes UniFi's own control traffic and VPN listeners.
+// A user-defined policy with the same name still needs its own assessment.
+func (b *builder) isExpectedGatewayRule(c risk.IsolationCell) bool {
+	if c.PathKind != "gateway-local" {
+		return false
+	}
+	var name string
+	for _, p := range b.Snapshot.FirewallPolicies {
+		if !p.Enabled {
+			continue
+		}
+		if c.DecisiveRuleID != "" && c.DecisiveRuleID != p.ID ||
+			c.DecisiveRuleID == "" && (c.DecisiveRuleName == "" || c.DecisiveRuleName != p.Name) {
+			continue
+		}
+		// When only the name is known, every matching rule must be system-defined.
+		if !strings.EqualFold(p.Origin, "SYSTEM_DEFINED") {
+			return false
+		}
+		name = strings.ToLower(p.Name)
+		if c.DecisiveRuleID != "" {
+			break
+		}
+	}
+	return gatewayControlTraffic(name) || strings.Contains(name, "wireguard") || strings.Contains(name, "openvpn") ||
+		strings.Contains(name, "teleport") || strings.Contains(name, "l2tp") || strings.Contains(name, "vpn server") || strings.Contains(name, "ipsec")
+}
+
+// portForward resolves the exact publication so its public port and intended
+// service class come from the same rule that authorized this socket.
+func (b *builder) portForward(c risk.IsolationCell, s socket) (unifi.PortForward, bool) {
+	for _, pf := range b.Snapshot.PortForwards {
+		pf.FwdPort = cmp.Or(pf.FwdPort, pf.DstPort)
+		if address(pf.FwdIP) != s.ip || !pf.ExposesEndpoint(s.port, s.proto) {
+			continue
+		}
+		if (c.DecisiveRuleID != "" && pf.ID != c.DecisiveRuleID) ||
+			(c.DecisiveRuleID == "" && pf.Name != c.DecisiveRuleName) {
+			continue
+		}
+		return pf, true
+	}
+	return unifi.PortForward{}, false
+}
+
+// expectedForward classifies a single socket so one intended VPN or peering
+// listener cannot exempt the other ports and transports in a mixed rule.
+func expectedForward(pf unifi.PortForward, s socket, cl unifi.Client) bool {
+	pf.FwdPort, pf.Proto = strconv.Itoa(s.port), s.proto
+	ea := exposureClassifier().Classify(pf, cl)
+	return ea.Class == "expected-p2p" || ea.Class == "vpn-entrypoint"
+}
 
 type egressLink struct {
 	from, to fact
@@ -390,6 +469,9 @@ func (b *builder) routes() {
 					b.link(root(Internet), fact{permission, a.host, "network access"}, unknown, 0, 0)
 				}
 				if c.Effective == "allow" {
+					if b.isExpectedGatewayRule(c) {
+						continue
+					}
 					if _, ok := b.socket(a.host, c.DestIP, c.Transport, c.Port); !ok {
 						entry, _ := b.scope(socket{}, c)
 						lane := LaneFixNow
@@ -397,7 +479,16 @@ func (b *builder) routes() {
 							lane = LaneReduceExposure
 						}
 						cut := b.action("act:"+cmp.Or(c.PathKind, "gateway-routed")+":"+cmp.Or(c.DecisiveRuleID, c.DecisiveRuleName), "Limit inbound internet rule "+cmp.Or(c.DecisiveRuleName, "on the gateway"), "This firewall rule allows inbound connections from the internet to reach inside the network.", lane, 1)
-						b.link(root(entry), fact{permission, a.host, "network access"}, trivial, cut, 0)
+						pf := fact{permission, a.host, "network access"}
+						if b.highProfileFamily[a.host+"|"+fam] {
+							b.addHighProfileSource(b.node(pf), b.node(root(entry)), cut)
+						}
+						b.link(root(entry), pf, trivial, cut, 0)
+						label := "WAN inbound rule"
+						if entry == InternetSource {
+							label += " (restricted)"
+						}
+						b.wanEdges = append(b.wanEdges, SimEdge{From: "internet", To: a.host, Tier: "wan", Label: label, Via: c.DecisiveRuleName, CutIDs: []string{b.actions[cut].ID}})
 					}
 				}
 			}
@@ -415,11 +506,11 @@ func (b *builder) routes() {
 
 	scopeIdx := b.buildRuleScopeIndex()
 	type crossKey struct {
-		srcNet, srcZone      string
-		srcHasIP, srcHasMAC  bool
-		dstNet               string
-		dstHasIP, dstHasMAC  bool
-		fam                  string
+		srcNet, srcZone     string
+		srcHasIP, srcHasMAC bool
+		dstNet              string
+		dstHasIP, dstHasMAC bool
+		fam                 string
 	}
 	type wifiKey struct {
 		net, ap, ssid, fam string
@@ -618,17 +709,29 @@ func owns(cl unifi.Client, ip string) bool {
 // boundary returns the action controlling a permitted lateral path. For routed
 // inter-VLAN rules it also returns the source display name and destination key/name.
 func (b *builder) boundary(pos risk.Position, c risk.IsolationCell) (cut int, srcName, dstKey, dstName string) {
+	id, from, dk, to := b.boundaryID(pos, c)
+	switch c.PathKind {
+	case "same-ap-wifi":
+		return b.action(id, "Turn on client isolation for "+pos.SSID, "This prevents wireless devices on the same access point from talking directly to each other.", LaneReduceExposure, 1), "", "", ""
+	case "wired-same-vlan", "mixed-same-vlan", "cross-ap-wifi":
+		return b.action(id, "Isolate devices on "+from, "Turn on port or client isolation so devices on "+from+" cannot reach each other directly.", LaneReduceExposure, 2), "", "", ""
+	}
+	return b.action(id, "Block unnecessary traffic from "+from+" to "+to, "Adding a firewall rule between these networks limits what a compromised device on "+from+" can reach.", LaneReduceExposure, 2), from, dk, to
+}
+
+// boundaryID identifies the same control in the ranked report and in hypothetical client paths.
+func (b *builder) boundaryID(pos risk.Position, c risk.IsolationCell) (id, from, dk, to string) {
 	src, dst := b.network(pos.NetworkID, cmp.Or(c.SourceNetwork, pos.NetworkName)), b.network("", c.DestNetwork)
-	from, to := cmp.Or(src.Name, c.SourceNetwork, "the source network"), cmp.Or(dst.Name, c.DestNetwork, "the destination network")
+	from, to = cmp.Or(src.Name, c.SourceNetwork, "the source network"), cmp.Or(dst.Name, c.DestNetwork, "the destination network")
 	key := cmp.Or(networkKey(src), from)
 	switch c.PathKind {
 	case "same-ap-wifi":
-		return b.action("act:l2-peers:"+key+":wifi:"+pos.SSID, "Turn on client isolation for "+pos.SSID, "This prevents wireless devices on the same access point from talking directly to each other.", LaneReduceExposure, 1), "", "", ""
+		return "act:l2-peers:" + key + ":wifi:" + pos.SSID, from, "", to
 	case "wired-same-vlan", "mixed-same-vlan", "cross-ap-wifi":
-		return b.action("act:l2-peers:"+key, "Isolate devices on "+from, "Turn on port or client isolation so devices on "+from+" cannot reach each other directly.", LaneReduceExposure, 2), "", "", ""
+		return "act:l2-peers:" + key, from, "", to
 	}
-	dk := cmp.Or(networkKey(dst), to)
-	return b.action("act:vlan-egress:"+key+"->"+dk, "Block unnecessary traffic from "+from+" to "+to, "Adding a firewall rule between these networks limits what a compromised device on "+from+" can reach.", LaneReduceExposure, 2), from, dk, to
+	dk = cmp.Or(networkKey(dst), to)
+	return "act:vlan-egress:" + key + "->" + dk, from, dk, to
 }
 
 func (b *builder) approved(id int, name string) {
@@ -640,13 +743,15 @@ func (b *builder) approved(id int, name string) {
 
 // missing records a verification item for incomplete controller telemetry.
 func (b *builder) missing(from fact, c risk.IsolationCell) {
-	key := cmp.Or(c.DestNetwork, c.SourceNetwork, "site")
+	label := cmp.Or(c.DestNetwork, c.SourceNetwork, "site")
+	n := b.network("", cmp.Or(c.DestNetwork, c.SourceNetwork))
+	key := cmp.Or(networkKey(n), label)
 	why := strings.ToLower(c.MissingInput)
-	code, title, reason := "route", "Check how traffic reaches "+key, "The controller did not provide enough information to verify this path."
+	code, title, reason := "route", "Check how traffic reaches "+label, "The controller did not provide enough information to verify this path."
 	switch {
 	case strings.Contains(why, "switch acl"):
 		code = "switch-acls"
-		title = "Check switch ACL rules for " + key
+		title = "Check switch ACL rules for " + label
 		reason = "Switch ACL data is missing, so UniBlue cannot verify which traffic this switch blocks."
 	case strings.Contains(why, "polic") || strings.Contains(why, "firewall"):
 		code = "firewall"
@@ -655,7 +760,7 @@ func (b *builder) missing(from fact, c risk.IsolationCell) {
 		reason = "Firewall policy data is missing, so UniBlue cannot confirm which connections the gateway blocks."
 	case strings.Contains(why, "router") || strings.Contains(why, "routing owner"):
 		code = "router"
-		title = "Identify which device routes " + key
+		title = "Identify which device routes " + label
 	case strings.Contains(why, "port-forward"):
 		code = "wan-forwards"
 		key = "site"
@@ -683,10 +788,12 @@ func (b *builder) lateral(pos risk.Position, from, to fact, c risk.IsolationCell
 }
 
 type publication struct {
-	s      socket
-	entry  Entry
-	level  uint8
-	action int
+	label    string
+	s        socket
+	entry    Entry
+	level    uint8
+	action   int
+	expected bool
 }
 
 // internet adds every independent WAN route for a host's sockets, peeling away
@@ -733,6 +840,10 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 			if c.DestIP != "" && address(c.DestIP) != s.ip {
 				continue
 			}
+			expected := b.isExpectedGatewayRule(c)
+			if c.Effective == "allow" && expected && gatewayControlTraffic(c.DecisiveRuleName) && len(b.listenerRemedies(s)) == 0 {
+				continue
+			}
 			anyIngress = true
 			entry, level := b.scope(s, c)
 			if level == unknown && c.Effective == "allow" {
@@ -747,19 +858,31 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 			}
 			id := cmp.Or(c.DecisiveRuleID, c.DecisiveRuleName)
 			kind := c.PathKind
+			entryLabel := "WAN " + strings.ToUpper(serviceName(s.proto, s.port))
 			label := b.assets[s.host].name
 			title := "Limit inbound internet rule " + cmp.Or(c.DecisiveRuleName, "for "+label)
 			why := "This rule lets connections from the internet reach a service inside your network."
 			switch kind {
 			case "port-forward":
 				kind = "wan-pf"
+				if pf, ok := b.portForward(c, s); ok {
+					expected = expectedForward(pf, s, a.client)
+					if pf.DstPort != "" {
+						entryLabel = "WAN " + strings.ToUpper(s.proto) + "/" + pf.DstPort
+					}
+				}
 				title = "Close port forward " + cmp.Or(c.DecisiveRuleName, "to "+label)
 				why = "This port forward exposes a local service directly to the internet."
 			case "proxy-route", "published-tunnel":
+				entryLabel = "Public proxy"
+				if kind == "published-tunnel" {
+					entryLabel = "Published tunnel"
+				}
 				title = "Restrict public access through " + cmp.Or(c.DecisiveRuleName, label)
 				why = "This public route forwards internet traffic to an internal service."
 				id = c.Enforcer + ":" + id
 			case "dynamic-mapping":
+				entryLabel = "WAN automatic mapping"
 				title = "Remove automatic port mapping to " + label
 				why = "An automatic UPnP or NAT-PMP lease exposes this port to the internet."
 			}
@@ -768,6 +891,9 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 			if entry == InternetSource || level >= moderate {
 				lane = LaneReduceExposure
 			}
+			if expected && len(b.listenerRemedies(s)) == 0 {
+				continue
+			}
 			act := b.action("act:"+kind+":"+id, title, why, lane, 1)
 			for _, ap := range b.Oracle.ApprovedServices(risk.Position{Zone: "External"}, dst, b.Findings, fam) {
 				if (ap.Port == 0 || ap.Port == s.port) && (ap.Transport == "" || strings.EqualFold(ap.Transport, s.proto)) {
@@ -775,7 +901,10 @@ func (b *builder) internet(a attachment, sockets []socket, groups map[fact][]pub
 				}
 			}
 			k := fact{consequence, a.host, "public access to " + serviceName(s.proto, s.port)}
-			groups[k] = append(groups[k], publication{s, entry, level, act})
+			if !expected && b.isHighProfileSocket(s) {
+				b.addHighProfileSource(b.node(k), b.node(s.fact()), act)
+			}
+			groups[k] = append(groups[k], publication{label: entryLabel, s: s, entry: entry, level: level, action: act, expected: expected})
 		}
 	}
 	if !anyIngress && !upnpUnknown && len(sockets) > 0 && b.Snapshot.Visibility != nil && b.Snapshot.Visibility.GatewayPoliciesAvailable && b.Snapshot.Visibility.PortForwardsAvailable {
@@ -799,8 +928,33 @@ func (b *builder) linkPublications(groups map[fact][]publication) {
 			}
 		}
 		for _, r := range routes {
+			label := r.label
+			if r.entry == InternetSource {
+				label += " (restricted)"
+			} else if r.level == moderate {
+				label += " (authenticated)"
+			} else if r.level == unknown {
+				label += " (login unverified)"
+			}
+			wan := SimEdge{From: "internet", To: host, Tier: "wan", Label: label, Via: b.actions[r.action].Title}
+			wan.CutIDs = []string{b.actions[r.action].ID}
+			if bundle != 0 {
+				wan.CutIDs = append(wan.CutIDs, b.actions[bundle].ID)
+			}
+			if r.expected {
+				// An intentional listener becomes a risky entry only while a finding on it survives.
+				for _, e := range b.listenerRemedies(r.s) {
+					route := wan
+					route.CutIDs = append(slices.Clone(wan.CutIDs), b.actions[e.cut].ID)
+					b.wanEdges = append(b.wanEdges, route)
+				}
+			} else {
+				b.wanEdges = append(b.wanEdges, wan)
+			}
 			b.link(root(r.entry), r.s.fact(), r.level, r.action, bundle)
-			b.link(root(r.entry), outcome, trivial, r.action, bundle)
+			if !r.expected {
+				b.link(root(r.entry), outcome, trivial, r.action, bundle)
+			}
 		}
 	}
 }

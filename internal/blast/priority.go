@@ -70,6 +70,23 @@ var priorities = map[EntryAudience][4][5]Priority{
 var difficulties = [...]ChainDifficulty{DifficultyTrivial, DifficultyLow, DifficultyModerate, DifficultyUnknown}
 var tiers = map[classify.AssetTier]int{classify.TierCrown: 0, classify.TierHigh: 1, classify.TierMedium: 2, classify.TierLow: 3, classify.TierDisposable: 4}
 
+// PromotePriority steps a priority one level more urgent (e.g. P2 -> P1),
+// capped at P1. Used only for additive high-profile target velocity boosts.
+func PromotePriority(p Priority) Priority {
+	switch p {
+	case P2:
+		return P1
+	case P3:
+		return P2
+	case P4:
+		return P3
+	case P5:
+		return P4
+	default:
+		return p
+	}
+}
+
 // PriorityFor looks up urgency from audience, evidence and asset value.
 func PriorityFor(audience EntryAudience, difficulty ChainDifficulty, assetValue classify.AssetTier) Priority {
 	row, ok := priorities[audience]

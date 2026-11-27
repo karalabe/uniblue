@@ -45,23 +45,22 @@ func namesNetwork(names []string, n unifi.Network) bool {
 // entry point for empty guest/IoT/camera networks, and adds open/guest Wi-Fi
 // and outdoor physical port entry points.
 func (b *builder) entries() {
+	// Derive network roles strictly from structural UniFi properties (Purpose,
+	// IsolationEnabled) and explicit owner intent so renaming a VLAN never alters
+	// priority tiers, cloud classification, or action ranking.
 	roles := map[string]string{}
-	if b.Isolation != nil {
-		for _, c := range b.Isolation.Containment {
-			n := b.network(c.NetworkID, c.NetworkName)
-			roles[networkKey(n)] = c.Archetype
-		}
-	}
 	policy := b.NetCfg.IsolationPolicy
 	for _, n := range b.Snapshot.Networks {
 		k := networkKey(n)
 		switch {
-		case namesNetwork(policy.GuestVLANs, n) || strings.EqualFold(n.Purpose, "guest") || strings.EqualFold(n.Name, "guest"):
+		case namesNetwork(policy.GuestVLANs, n) || strings.EqualFold(n.Purpose, "guest"):
 			roles[k] = "guest"
-		case namesNetwork(policy.IoTVLANs, n) || strings.EqualFold(n.Name, "iot"):
+		case namesNetwork(policy.IoTVLANs, n):
 			roles[k] = "iot"
 		case namesNetwork(policy.CameraVLANs, n):
 			roles[k] = "camera"
+		case n.IsolationEnabled:
+			roles[k] = "isolated"
 		}
 	}
 	occupied := map[string]bool{}
@@ -89,7 +88,7 @@ func (b *builder) entries() {
 		k := networkKey(n)
 		role := roles[k]
 		isAppliance := appliance(b.roles[a.host].Category) || role == "camera" || role == "iot"
-		if role == "guest" || isAppliance || guestSSID[cl.ESSID] || namesNetwork(b.NetCfg.IsolatedVLANs, n) {
+		if role == "guest" || role == "isolated" || isAppliance || guestSSID[cl.ESSID] || namesNetwork(b.NetCfg.IsolatedVLANs, n) {
 			occupied[k] = true
 			compromised[a.host] = true
 		}
@@ -121,7 +120,7 @@ func (b *builder) entries() {
 	for _, n := range b.Snapshot.Networks {
 		k := networkKey(n)
 		role := roles[k]
-		if !occupied[k] && (role == "iot" || role == "guest" || role == "camera") {
+		if !occupied[k] && (role == "iot" || role == "guest" || role == "camera" || role == "isolated") {
 			b.link(root(AssumeBreach), b.position(risk.Position{NetworkID: n.ID, NetworkName: n.Name}), trivial, 0, 0)
 		}
 	}
@@ -193,6 +192,26 @@ func observedVendor(deps []probe.OutboundDependency) bool {
 // egress evaluates outbound internet reachability for one client attachment.
 // Observed vendor traffic takes precedence over firewall policy alone.
 func (b *builder) egress(a attachment, deps []probe.OutboundDependency, isAppliance bool) ClientEgress {
+	e, allowed, missing := b.assessEgress(a, deps, isAppliance)
+	n := b.network(a.client.NetworkID, a.client.NetworkName)
+	netName := cmp.Or(n.Name, "this network")
+	if allowed && (isAppliance || e.State == cloudConnected) {
+		id := b.action("act:vlan-egress:"+networkKey(n)+"->internet", "Limit internet access from "+netName, "Blocking outbound internet traffic stops these devices from contacting external servers. Confirm they do not need cloud access or updates first.", LaneReduceExposure, 2)
+		b.link(root(CloudEgress), fact{consequence, a.host, "internet access"}, low, id, 0)
+		for _, ap := range b.NetCfg.IsolationPolicy.ApprovedPaths {
+			if (strings.EqualFold(ap.DestZone, "External") || strings.EqualFold(ap.DestZone, "Internet")) && (strings.EqualFold(ap.SourceZone, n.Name) || strings.EqualFold(ap.SourceZone, n.ZoneName)) {
+				b.approved(id, ap.Name)
+			}
+		}
+	}
+	if !allowed && missing {
+		b.verify(root(CloudEgress), "egress", cmp.Or(networkKey(n), a.host), "Check outbound internet rules for "+netName, "Not enough firewall or address data was available to verify whether devices on "+netName+" can reach the internet.")
+	}
+	return e
+}
+
+// assessEgress keeps the observed and policy-only states consistent for clients and infrastructure.
+func (b *builder) assessEgress(a attachment, deps []probe.OutboundDependency, isAppliance bool) (ClientEgress, bool, bool) {
 	e := ClientEgress{Asset: a.host, Name: b.assets[a.host].name, State: localOnly, Reason: "Firewall policy blocks outbound internet access on every address family checked."}
 	allowed, missing := false, false
 	for _, fam := range b.Oracle.Families(a.client) {
@@ -219,21 +238,7 @@ func (b *builder) egress(a attachment, deps []probe.OutboundDependency, isApplia
 		e.State = "unknown"
 		e.Reason = "Not enough firewall or address data to confirm whether this device can reach the internet."
 	}
-	n := b.network(a.client.NetworkID, a.client.NetworkName)
-	netName := cmp.Or(n.Name, "this network")
-	if allowed && (isAppliance || e.State == cloudConnected) {
-		id := b.action("act:vlan-egress:"+networkKey(n)+"->internet", "Limit internet access from "+netName, "Blocking outbound internet traffic stops these devices from contacting external servers. Confirm they do not need cloud access or updates first.", LaneReduceExposure, 2)
-		b.link(root(CloudEgress), fact{consequence, a.host, "internet access"}, low, id, 0)
-		for _, ap := range b.NetCfg.IsolationPolicy.ApprovedPaths {
-			if (strings.EqualFold(ap.DestZone, "External") || strings.EqualFold(ap.DestZone, "Internet")) && (strings.EqualFold(ap.SourceZone, n.Name) || strings.EqualFold(ap.SourceZone, n.ZoneName)) {
-				b.approved(id, ap.Name)
-			}
-		}
-	}
-	if !allowed && missing {
-		b.verify(root(CloudEgress), "egress", cmp.Or(networkKey(n), a.host), "Check outbound internet rules for "+netName, "Not enough firewall or address data was available to verify whether devices on "+netName+" can reach the internet.")
-	}
-	return e
+	return e, allowed, missing
 }
 
 // outdoor models untagged and tagged VLAN access on outdoor sockets separately

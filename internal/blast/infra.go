@@ -19,6 +19,8 @@ import (
 
 // InfraReport describes the consequences of losing one infrastructure device or the site controller.
 type InfraReport struct {
+	// TargetID is the stable identifier (canonical MAC or "controller") for UI selection and deduplication.
+	TargetID string `json:"target_id,omitempty"`
 	// Target names the selected device or controller.
 	Target string `json:"target"`
 	// Scope identifies the role under review.
@@ -165,6 +167,12 @@ func wanNetwork(n unifi.Network) bool {
 	return strings.HasPrefix(strings.ToLower(n.Purpose), "wan") || strings.EqualFold(n.ZoneName, "External")
 }
 
+// vlanRouter returns the MAC of the device routing a local network. An empty
+// MAC selects the site gateway only when the controller resolved the network.
+func vlanRouter(n unifi.Network) (string, bool) {
+	return canonicalMAC(n.RouterDeviceMAC), networkKey(n) != "" && !wanNetwork(n) && !n.RouterUnresolved
+}
+
 // switchSubtree follows LLDP toward the leaves and visits each MAC once, even in a stale loop.
 func switchSubtree(s *unifi.Snapshot, root string) map[string]bool {
 	children := make(map[string][]string)
@@ -187,6 +195,57 @@ func switchSubtree(s *unifi.Snapshot, root string) map[string]bool {
 	return seen
 }
 
+// EvaluateAllInfra computes deterministic compromise reports for the site's
+// controller and every adopted UniFi gateway, switch, and access point so
+// interactive UIs and offline HTML exports can inspect each device immediately.
+func EvaluateAllInfra(in Input) []InfraReport {
+	if in.Snapshot == nil || len(in.Snapshot.Devices) == 0 {
+		return nil
+	}
+	if in.Oracle == nil {
+		in.Oracle = risk.NewOracle(in.Snapshot, in.NetCfg)
+	}
+	var out []InfraReport
+	seen := make(map[string]bool)
+	add := func(target string) {
+		rep, err := EvaluateInfraCompromise(in, target)
+		if err != nil {
+			return
+		}
+		key := rep.Scope + "|" + cmp.Or(rep.TargetID, rep.Target)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, rep)
+	}
+	add("controller")
+	for _, d := range in.Snapshot.Devices {
+		if infraRole(d) == "" {
+			continue
+		}
+		add(cmp.Or(d.MAC, d.Name))
+	}
+	scopeOrder := func(s string) int {
+		switch s {
+		case "Controller":
+			return 0
+		case "Gateway":
+			return 1
+		case "Switch":
+			return 2
+		case "AP":
+			return 3
+		default:
+			return 4
+		}
+	}
+	slices.SortFunc(out, func(a, b InfraReport) int {
+		return cmp.Or(cmp.Compare(scopeOrder(a.Scope), scopeOrder(b.Scope)), cmp.Compare(a.Target, b.Target), cmp.Compare(a.TargetID, b.TargetID))
+	})
+	return out
+}
+
 // EvaluateInfraCompromise estimates the effects of losing a device identified by name or MAC.
 // The reserved name "controller" selects the Network application independently of its host.
 func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
@@ -199,7 +258,13 @@ func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
 	if err != nil {
 		return InfraReport{}, err
 	}
-	r := InfraReport{Target: deviceLabel(d), Scope: role}
+	targetID := canonicalMAC(d.MAC)
+	if role == "Controller" {
+		targetID = "controller"
+	} else if targetID == "" {
+		targetID = cmp.Or(d.ID, deviceLabel(d))
+	}
+	r := InfraReport{TargetID: targetID, Target: deviceLabel(d), Scope: role}
 	mac := canonicalMAC(d.MAC)
 	control := role == "Controller" || integratedGateway(d) && mac != "" && mac == canonicalMAC(host.MAC)
 	owned := map[string]bool{}
@@ -267,10 +332,7 @@ func EvaluateInfraCompromise(in Input, targetMAC string) (InfraReport, error) {
 	byName := make(map[string]unifi.Network)
 	for _, n := range s.Networks {
 		byName[strings.ToLower(n.Name)] = n
-		if wanNetwork(n) || n.RouterUnresolved {
-			continue
-		}
-		if (gwOwned && n.RouterDeviceMAC == "") || (n.RouterDeviceMAC != "" && owned[canonicalMAC(n.RouterDeviceMAC)]) {
+		if router, ok := vlanRouter(n); ok && ((router == "" && gwOwned) || owned[router]) {
 			r.RoutedVLANs = append(r.RoutedVLANs, cmp.Or(n.Name, n.ID))
 			routed[networkKey(n)] = true
 		}

@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	builtinchecks "github.com/karalabe/uniblue/checks"
 	classifydata "github.com/karalabe/uniblue/classify"
+	"github.com/karalabe/uniblue/internal/blast"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
@@ -41,7 +43,15 @@ func NewDemoEngine(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("load demo classifier: %w", err)
 	}
 
-	snap, netCfg, profiles, rawFindings, exactCVEs, potentialCVEs, events := buildDemoDataset(now)
+	snap, netCfg, profiles, rawFindings, demoCVEMatches, events := buildDemoDataset(now)
+	var exactCVEs, potentialCVEs []cve.ProductSummary
+	for _, s := range cve.RollupMatches(demoCVEMatches) {
+		if s.Confidence == cve.ConfidenceExact {
+			exactCVEs = append(exactCVEs, s)
+		} else {
+			potentialCVEs = append(potentialCVEs, s)
+		}
+	}
 
 	// Merge synthetic Nerva protocol findings using the real deduplication path.
 	nervaFindings := checks.FindingsFromProfiles(profiles, rawFindings)
@@ -106,6 +116,29 @@ func NewDemoEngine(opts Options) (*Engine, error) {
 	})
 
 	view := BuildPresentationModel(snap, report, topo, clientViews, exactCVEs, potentialCVEs, profiles)
+	demoChecks, _ := checks.LoadFromFS(builtinchecks.BuiltinFS)
+	var demoSignals []blast.TargetSignal
+	for _, cl := range snap.Clients {
+		low := strings.ToLower(cl.Name + " " + cl.Hostname)
+		switch {
+		case strings.Contains(low, "caddy") || strings.Contains(low, "nginx"):
+			demoSignals = append(demoSignals, blast.TargetSignal{
+				Asset:    config.CanonicalMAC(cl.MAC),
+				Proto:    "tcp",
+				Port:     443,
+				Product:  cl.DisplayName(),
+				Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile, KEVCount: 2, LatestKEV: "2025-11-10"},
+			})
+		case strings.Contains(low, "homeassistant") || strings.Contains(low, "home assistant") || strings.Contains(low, "plex"):
+			demoSignals = append(demoSignals, blast.TargetSignal{
+				Asset:    config.CanonicalMAC(cl.MAC),
+				Product:  cl.DisplayName(),
+				Velocity: cve.TargetVelocity{Class: cve.VelocityHighProfile, KEVCount: 2, LatestKEV: "2025-11-10"},
+			})
+		}
+	}
+	blastRep, infraReps := EvaluateSiteBlast(snap, profiles, allRaw, report, netCfg, demoChecks, demoCVEMatches, demoSignals, "192.168.1.1")
+	AttachBlast(view, blastRep, infraReps)
 
 	eng := &Engine{
 		cfg:           &config.Config{Network: netCfg},
@@ -155,8 +188,7 @@ func buildDemoDataset(now time.Time) (
 	config.NetworkConfig,
 	[]probe.HostProfile,
 	[]checks.Finding,
-	[]cve.ProductSummary,
-	[]cve.ProductSummary,
+	[]cve.Match,
 	[]LiveEvent,
 ) {
 	const (
@@ -504,6 +536,7 @@ func buildDemoDataset(now time.Time) (
 			ControllerVersion:        "9.1.120",
 			APIMode:                  "integration-v1",
 			GatewayPoliciesAvailable: true,
+			PortForwardsAvailable:    true,
 			SwitchACLsAvailable:      true,
 			WLANsAvailable:           true,
 			SettingsAvailable:        true,
@@ -871,36 +904,51 @@ func buildDemoDataset(now time.Time) (
 		},
 	}
 
-	exactCVEs := []cve.ProductSummary{
+	for i := range rawFindings {
+		if len(rawFindings[i].ObservedIPs) == 0 {
+			rawFindings[i].ObservedIPs = rawFindings[i].Client.AllIPs()
+		}
+	}
+
+	// Build realistic endpoint-bound CVE matches so both the rolled-up CVE cards
+	// and the counterfactual action queue derive from the exact same matches.
+	prodBMCSSH := cve.Product{
+		Label: "OpenSSH", Vendors: []string{"openbsd"}, Products: []string{"openssh"},
+		Version: "7.4p1", Source: "ssh-banner", HighConfidence: true,
+		Ports:    []cve.EndpointPort{{Transport: "tcp", Port: 22}},
+		HostName: clBMC.Name, HostIP: clBMC.IP, VLAN: clBMC.NetworkName,
+	}
+	prodLabSSH := cve.Product{
+		Label: "OpenSSH", Vendors: []string{"openbsd"}, Products: []string{"openssh"},
+		Version: "8.9p1", Source: "ssh-banner", HighConfidence: true,
+		Ports:    []cve.EndpointPort{{Transport: "tcp", Port: 22}},
+		HostName: clLab.Name, HostIP: clLab.IP, VLAN: clLab.NetworkName,
+	}
+	demoCVEMatches := []cve.Match{
 		{
-			Product: cve.Product{
-				Label: "OpenSSH", Vendors: []string{"openbsd"}, Products: []string{"openssh"},
-				Version: "7.4p1", Source: "ssh-banner",
-				HostName: clBMC.Name, HostIP: clBMC.IP, VLAN: clBMC.NetworkName,
-			},
-			Confidence:      cve.ConfidenceExact,
-			TotalCVEs:       4,
-			CriticalCount:   1,
-			HighCount:       2,
-			KEVCount:        1,
-			MaxSeverity:     checks.SeverityCritical,
-			MaxCVSS:         9.8,
-			TopCVEs:         []string{"CVE-2024-6387", "CVE-2023-38408", "CVE-2021-41617"},
-			MinFixedVersion: "9.8p1",
+			Confidence: cve.ConfidenceExact, Product: prodBMCSSH,
+			MatchedCPE: cve.CPEMatch{Vendor: "openbsd", Product: "openssh", EndExcl: "9.8p1"},
+			Record:     cve.Record{ID: "CVE-2024-6387", Severity: checks.SeverityCritical, CVSS: 9.8, AttackVector: "N", KEV: true, Description: "OpenSSH regreSSHion signal handler race condition"},
 		},
 		{
-			Product: cve.Product{
-				Label: "OpenSSH", Vendors: []string{"openbsd"}, Products: []string{"openssh"},
-				Version: "8.9p1", Source: "ssh-banner",
-				HostName: clLab.Name, HostIP: clLab.IP, VLAN: clLab.NetworkName,
-			},
-			Confidence:      cve.ConfidenceExact,
-			TotalCVEs:       2,
-			HighCount:       2,
-			MaxSeverity:     checks.SeverityHigh,
-			MaxCVSS:         8.1,
-			TopCVEs:         []string{"CVE-2024-6387", "CVE-2023-48795"},
-			MinFixedVersion: "9.8p1",
+			Confidence: cve.ConfidenceExact, Product: prodBMCSSH,
+			MatchedCPE: cve.CPEMatch{Vendor: "openbsd", Product: "openssh", EndExcl: "9.3p2"},
+			Record:     cve.Record{ID: "CVE-2023-38408", Severity: checks.SeverityHigh, CVSS: 8.8, AttackVector: "N", Description: "OpenSSH forwarded ssh-agent PKCS#11 remote code execution"},
+		},
+		{
+			Confidence: cve.ConfidenceExact, Product: prodBMCSSH,
+			MatchedCPE: cve.CPEMatch{Vendor: "openbsd", Product: "openssh", EndExcl: "8.8p1"},
+			Record:     cve.Record{ID: "CVE-2021-41617", Severity: checks.SeverityHigh, CVSS: 7.0, AttackVector: "N", PrivilegesRequired: "L", Description: "OpenSSH AuthorizedKeysCommand supplemental groups privilege escalation"},
+		},
+		{
+			Confidence: cve.ConfidenceExact, Product: prodLabSSH,
+			MatchedCPE: cve.CPEMatch{Vendor: "openbsd", Product: "openssh", EndExcl: "9.8p1"},
+			Record:     cve.Record{ID: "CVE-2024-6387", Severity: checks.SeverityCritical, CVSS: 9.8, AttackVector: "N", KEV: true, Description: "OpenSSH regreSSHion signal handler race condition"},
+		},
+		{
+			Confidence: cve.ConfidenceExact, Product: prodLabSSH,
+			MatchedCPE: cve.CPEMatch{Vendor: "openbsd", Product: "openssh", EndExcl: "9.6p1"},
+			Record:     cve.Record{ID: "CVE-2023-48795", Severity: checks.SeverityHigh, CVSS: 7.4, AttackVector: "N", Description: "SSH Terrapin prefix truncation attack"},
 		},
 	}
 
@@ -913,5 +961,5 @@ func buildDemoDataset(now time.Time) (
 		{ID: 1, Time: now.Add(-4 * time.Minute), Type: "startup", Severity: "info", Summary: "UniBlue demo mode started (simulated UniFi home network, zero packets sent)"},
 	}
 
-	return snap, netCfg, profiles, rawFindings, exactCVEs, nil, events
+	return snap, netCfg, profiles, rawFindings, demoCVEMatches, events
 }

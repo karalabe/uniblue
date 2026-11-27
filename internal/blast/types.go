@@ -17,6 +17,21 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TargetSignal binds a high-confidence historical CVE velocity signal to one
+// asset (and optional service port) without changing finding severities.
+type TargetSignal struct {
+	// Asset is the canonical MAC, controller ID, or IP matching hostKey.
+	Asset string
+	// Proto is the optional transport ("tcp" or "udp"). Empty matches any service on Asset.
+	Proto string
+	// Port is the optional service port. Zero matches any service on Asset.
+	Port int
+	// Product is an optional human-readable software label (e.g. "nginx").
+	Product string
+	// Velocity is the historical CISA KEV / network-CVE signal from the local cache.
+	Velocity cve.TargetVelocity
+}
+
 // Input holds the inventory and evidence from one scan. Evaluate borrows all fields.
 type Input struct {
 	// ControllerHost is the configured controller address without credentials or a port.
@@ -32,7 +47,10 @@ type Input struct {
 	Checks []*checks.Check
 	// CVEMatches binds vulnerable product versions to observed services.
 	CVEMatches []cve.Match
-	// Isolation supplies network roles and previously evaluated boundaries.
+	// TargetSignals supplies high-confidence historical CVE velocity per asset/service.
+	TargetSignals []TargetSignal
+	// Isolation holds optional precomputed isolation results; blast computes
+	// reachability and network roles directly from Snapshot, NetCfg, and Oracle.
 	Isolation *risk.IsolationMatrix
 	// SwitchPorts supplies the physical perimeter and effective port settings.
 	SwitchPorts []risk.SwitchDeviceView
@@ -94,6 +112,8 @@ type Exposure struct {
 	Priority Priority `json:"priority,omitempty"`
 	// Lane groups the response when there is work to do.
 	Lane Lane `json:"lane,omitempty"`
+	// HighProfile marks high-confidence targets with recent KEV or sustained remote CVE history.
+	HighProfile bool `json:"high_profile,omitempty"`
 }
 
 // Action describes a single proposed change and its marginal value in queue order.
@@ -110,8 +130,13 @@ type Action struct {
 	HighestTierReduced Priority `json:"highest_tier_reduced,omitempty"`
 	// PairsByTier counts distinct device and consequence pairs improved at P1 through P5, capped at three each.
 	PairsByTier [5]int `json:"pairs_by_tier"`
-	// Benefits names up to three devices helped at the highest improved priority.
+	// Benefits names up to three devices helped most by this change, ordered by
+	// highest priority reduced first.
 	Benefits []string `json:"benefits,omitempty"`
+	// AffectedAssets holds stable asset keys (MAC or ID) for devices helped by this change.
+	AffectedAssets []string `json:"affected_assets,omitempty"`
+	// HighProfile marks actions that help protect a frequently targeted software stack.
+	HighProfile bool `json:"high_profile,omitempty"`
 	// BreaksApproved names approved workflows affected by this change.
 	BreaksApproved []string `json:"breaks_approved,omitempty"`
 }
@@ -136,4 +161,6 @@ type Report struct {
 	Actions []Action `json:"actions"`
 	// Cloud lists per-client egress assessments.
 	Cloud []ClientEgress `json:"cloud"`
+	// Simulation provides the real topology graph and candidate cuts for interactive UI exploration.
+	Simulation *Simulation `json:"simulation,omitempty"`
 }

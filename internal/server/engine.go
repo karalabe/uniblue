@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,6 +29,7 @@ import (
 
 	classifydata "github.com/karalabe/uniblue/classify"
 	"github.com/karalabe/uniblue/fingerprints"
+	"github.com/karalabe/uniblue/internal/blast"
 	"github.com/karalabe/uniblue/internal/checks"
 	"github.com/karalabe/uniblue/internal/classify"
 	"github.com/karalabe/uniblue/internal/config"
@@ -341,18 +343,21 @@ const (
 // Engine coordinates UniFi event ingestion, targeted single-host live checks,
 // periodic full reconciliation, webhook alerting, and SSE broadcasting.
 type Engine struct {
-	cfg        *config.Config
-	opts       Options
-	demoMode   bool
-	ctrl       *unifi.Controller
-	checkList  []*checks.Check
-	scanPorts  []int
-	classifier *classify.Classifier
-	cveCache   *cve.Cache
-	cveIdent   *cve.Fingerprinter
-	notifier   *notify.Notifier
-	minNotify  checks.Severity
-	logger     *slog.Logger
+	cfg            *config.Config
+	opts           Options
+	demoMode       bool
+	ctrl           *unifi.Controller
+	checkList      []*checks.Check
+	scanPorts      []int
+	classifier     *classify.Classifier
+	cveCache       *cve.Cache
+	cveIdent       *cve.Fingerprinter
+	velocityMemo   map[string]cve.TargetVelocity
+	velocityMemoAt time.Time
+	velocityGen    uint64
+	notifier       *notify.Notifier
+	minNotify      checks.Severity
+	logger         *slog.Logger
 
 	startedAt time.Time
 	eventMode string
@@ -655,6 +660,9 @@ func (e *Engine) cveSyncLoop(ctx context.Context) {
 		e.mu.Lock()
 		e.cveCache = cache
 		e.cveIdent = ident
+		e.velocityMemo = nil
+		e.velocityMemoAt = time.Time{}
+		e.velocityGen++
 		e.mu.Unlock()
 
 		var totalCVEs, vendors, kevs int
@@ -1948,6 +1956,13 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	baselineReady := e.baselineComplete || isFullScan
 	cveCache := e.cveCache
 	cveIdent := e.cveIdent
+	velGen := e.velocityGen
+	velMemo := make(map[string]cve.TargetVelocity)
+	if !e.velocityMemoAt.IsZero() && time.Since(e.velocityMemoAt) <= time.Hour {
+		for k, v := range e.velocityMemo {
+			velMemo[k] = v
+		}
+	}
 	e.mu.RUnlock()
 
 	sort.Slice(profiles, func(i, j int) bool {
@@ -1963,11 +1978,23 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 
 	var exactCVEs, potentialCVEs []cve.ProductSummary
 	var rawExactMatches []cve.Match
+	var allCVEMatches []cve.Match
+	var targetSignals []blast.TargetSignal
 	cveLoaded := false
 	cveMatched := false
 	if cveCache != nil && cveIdent != nil {
 		cveLoaded = true
+		nowVel := time.Now().UTC()
 		products := cveIdent.Identify(snap, profiles)
+		targetSignals = CollectTargetSignalsCached(cveCache, products, nowVel, velMemo)
+		e.mu.Lock()
+		if e.velocityGen == velGen && e.cveCache == cveCache {
+			e.velocityMemo = velMemo
+			if e.velocityMemoAt.IsZero() || nowVel.Sub(e.velocityMemoAt) > time.Hour {
+				e.velocityMemoAt = nowVel
+			}
+		}
+		e.mu.Unlock()
 		matches, err := cveCache.MatchProducts(products, cve.MatchOptions{
 			MinSeverity:          checks.SeverityHigh,
 			PotentialMaxAgeYears: 2,
@@ -1976,6 +2003,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 			e.logger.Warn("failed to match products against local CVE cache; preserving CVE baseline", "err", err)
 		} else {
 			cveMatched = true
+			allCVEMatches = matches
 			for _, m := range matches {
 				if m.Confidence == cve.ConfidenceExact {
 					rawExactMatches = append(rawExactMatches, m)
@@ -2114,6 +2142,15 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	}
 	viewModel := BuildPresentationModel(snap, report, topoModel, clientViews, exactCVEs, potentialCVEs, profiles)
 	AttachDeviceChildren(viewModel, devChildren)
+	ctrlHost := ""
+	if e.cfg != nil && e.cfg.UniFi.URL != "" {
+		if u, err := url.Parse(e.cfg.UniFi.URL); err == nil {
+			ctrlHost = u.Hostname()
+		}
+	}
+	blastProfiles := AppendDeviceChildProfiles(snap, profiles, devChildren)
+	blastRep, infraReps := EvaluateSiteBlast(snap, blastProfiles, rawFindings, report, e.cfg.Network, e.checkList, allCVEMatches, targetSignals, ctrlHost)
+	AttachBlast(viewModel, blastRep, infraReps)
 
 	now := time.Now().UTC()
 	e.mu.Lock()

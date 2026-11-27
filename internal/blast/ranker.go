@@ -13,20 +13,30 @@ import (
 )
 
 // prioritiesByFact computes the highest urgency for each distinct (asset,
-// consequence) pair. When baseline is non-nil (counterfactual evaluation), any
-// confirmed path that only degrades to unknown retains its prior difficulty so
-// leaving an unresolved route behind never earns mitigation credit.
-func (g *graph) prioritiesByFact(baseline, states [][]uint8, pairs []int) []Priority {
+// consequence) pair along with whether a high-profile target signal backs that
+// winning pair and whether that signal applies on an untrusted-LAN entry point.
+// When baseline is non-nil (counterfactual evaluation), any confirmed path that
+// only degrades to unknown retains its prior difficulty so leaving an
+// unresolved route behind never earns mitigation credit.
+func (g *graph) prioritiesByFact(baseline, states [][]uint8, cuts []bool, pairs []int) ([]Priority, []bool, []bool) {
 	out := make([]Priority, len(g.facts))
+	hp := make([]bool, len(g.facts))
+	untrustedHP := make([]bool, len(g.facts))
 	for n, f := range g.facts {
 		if f.kind != consequence && f.kind != permission {
 			continue
 		}
 		for i, dist := range states {
+			var base []uint8
+			if baseline != nil {
+				base = baseline[i]
+			}
 			d := dist[n]
+			hpDist := dist
+			hpCuts := cuts
 			if d >= unknown {
-				if baseline != nil && d == unknown && baseline[i][n] < unknown {
-					d = baseline[i][n]
+				if base != nil && d == unknown && base[n] < unknown {
+					d, hpDist, hpCuts = base[n], base, nil
 				} else {
 					continue
 				}
@@ -34,13 +44,26 @@ func (g *graph) prioritiesByFact(baseline, states [][]uint8, pairs []int) []Prio
 			if f.kind == permission {
 				d = max(d, moderate)
 			}
-			p := PriorityFor(starts[i].audience, difficulties[d], g.assets[f.asset].profile.Tier)
-			if key := pairs[n]; out[key] == "" || p < out[key] {
+			s := starts[i]
+			p := g.factPriority(s, n, f, d, hpDist, base, hpCuts)
+			isHP := g.isHighProfileIn(n, f, hpDist, base, hpCuts)
+			isUntrusted := isHP && s.entry != CloudEgress && (s.audience == AudienceGuestOrUntrusted || s.audience == AudienceAssumeBreach || s.audience == AudiencePhysical)
+			key := pairs[n]
+			if out[key] == "" || p < out[key] {
 				out[key] = p
+				hp[key] = isHP
+				untrustedHP[key] = isUntrusted
+			} else if p == out[key] {
+				if isHP {
+					hp[key] = true
+				}
+				if isUntrusted {
+					untrustedHP[key] = true
+				}
 			}
 		}
 	}
-	return out
+	return out, hp, untrustedHP
 }
 
 // pairIndexes collapses multiple CVEs or generic service settings on the same
@@ -100,6 +123,9 @@ func precedes(a, b candidate) bool {
 		if n != b.PairsByTier[i] {
 			return n > b.PairsByTier[i]
 		}
+	}
+	if a.tieBreakHP != b.tieBreakHP {
+		return a.tieBreakHP
 	}
 	return cmp.Or(cmp.Compare(laneOrder(a.Lane), laneOrder(b.Lane)), cmp.Compare(a.effort, b.effort), cmp.Compare(a.ID, b.ID)) < 0
 }
@@ -169,7 +195,7 @@ func (g *graph) rank(states [][]uint8) []Action {
 	pairs := g.pairIndexes()
 	initialStates := states
 	currentStates := states
-	before := g.prioritiesByFact(nil, currentStates, pairs)
+	before, beforeHP, beforeUntrustedHP := g.prioritiesByFact(nil, currentStates, cuts, pairs)
 	out := make([]Action, 0, len(remaining)+len(verify))
 
 	// Reuse scratch buffers across candidate evaluations to avoid heap churn.
@@ -205,9 +231,23 @@ func (g *graph) rank(states [][]uint8) []Action {
 					trial[i] = currentStates[i]
 				}
 			}
+			after, _, _ := g.prioritiesByFact(initialStates, trial, cuts, pairs)
 			cuts[id] = false
-			after := g.prioritiesByFact(initialStates, trial, pairs)
 			c.HighestTierReduced, c.PairsByTier = impact(before, after)
+			c.HighProfile = false
+			c.tieBreakHP = false
+			if c.HighestTierReduced != "" {
+				for n, p := range before {
+					if p != "" && (after[n] == "" || after[n] > p) {
+						if beforeHP[n] {
+							c.HighProfile = true
+						}
+						if beforeUntrustedHP[n] {
+							c.tieBreakHP = true
+						}
+					}
+				}
+			}
 			if c.HighestTierReduced != "" && (best < 0 || precedes(*c, g.actions[remaining[best]])) {
 				best = j
 				winning = after
@@ -223,20 +263,46 @@ func (g *graph) rank(states [][]uint8) []Action {
 				g.actions[id].HighestTierReduced = ""
 				g.actions[id].PairsByTier = [5]int{}
 				g.actions[id].Benefits = nil
+				g.actions[id].AffectedAssets = nil
+				g.actions[id].HighProfile = false
+				g.actions[id].tieBreakHP = false
 				out = append(out, g.actions[id].Action)
 			}
 			break
 		}
 		winner := remaining[best]
-		var names []string
+		type protectedAsset struct {
+			key  string
+			name string
+			pri  Priority
+		}
+		bestByAsset := map[string]Priority{}
 		for n, p := range before {
-			if p != "" && p == g.actions[winner].HighestTierReduced && (winning[n] == "" || winning[n] > p) {
-				names = append(names, g.assets[g.facts[n].asset].name)
+			if p != "" && (winning[n] == "" || winning[n] > p) {
+				ak := g.facts[n].asset
+				if prev, ok := bestByAsset[ak]; !ok || p < prev {
+					bestByAsset[ak] = p
+				}
 			}
 		}
-		slices.Sort(names)
-		names = slices.Compact(names)
-		g.actions[winner].Benefits = names[:min(3, len(names))]
+		protected := make([]protectedAsset, 0, len(bestByAsset))
+		for ak, p := range bestByAsset {
+			protected = append(protected, protectedAsset{key: ak, name: cmp.Or(g.assets[ak].name, ak), pri: p})
+		}
+		slices.SortFunc(protected, func(a, b protectedAsset) int {
+			return cmp.Or(cmp.Compare(a.pri, b.pri), cmp.Compare(a.name, b.name), cmp.Compare(a.key, b.key))
+		})
+		limit := min(6, len(protected))
+		assets := make([]string, 0, limit)
+		names := make([]string, 0, min(3, limit))
+		for i, pa := range protected[:limit] {
+			assets = append(assets, pa.key)
+			if i < 3 {
+				names = append(names, pa.name)
+			}
+		}
+		g.actions[winner].Benefits = names
+		g.actions[winner].AffectedAssets = assets
 		out = append(out, g.actions[winner].Action)
 
 		cuts[winner] = true
@@ -251,7 +317,7 @@ func (g *graph) rank(states [][]uint8) []Action {
 			}
 		}
 		currentStates = nextStates
-		before = g.prioritiesByFact(initialStates, currentStates, pairs)
+		before, beforeHP, beforeUntrustedHP = g.prioritiesByFact(initialStates, currentStates, cuts, pairs)
 		byRoot, _ = g.activeByRoot(currentStates, cuts)
 		remaining = slices.Delete(remaining, best, best+1)
 	}
