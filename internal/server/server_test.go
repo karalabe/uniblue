@@ -1351,11 +1351,36 @@ assert.match(html("view-activity"), /Blocked threat/);
 assert.doesNotMatch(html("view-activity"), /Firewall block|Security notice/);
 renderDrawer();
 assert.match(html("drawer-hd-content"), /Router alert \(2\)/);
-assert.match(html("drawer-body"), /Blocked outbound threat/);`
+assert.match(html("drawer-body"), /Blocked outbound threat/);
+
+const scan = {...last, id: "lan", kind: "ids_threat", severity: "high", dst_ip: "10.0.0.2", message: "Signature matched"};
+state.scanner_ips = [host.ip];
+assert.equal(siteLogKind({...scan, src_ip: "::ffff:" + host.ip}), "scanner_ips_blocked");
+assert.equal(siteLogKind({...scan, src_ip: "::ffff:" + host.ip, dst_ip: ""}), "ids_threat");
+assert.equal(siteLogKind({...scan, dst_ip: "10.bad"}), "ids_threat");
+assert.equal(siteLogKind({...scan, kind: "honeypot_hit"}), "honeypot_hit");
+state.events = [{type: "scanner_ips_blocked", ip: host.ip, dst_ip: scan.dst_ip, time: scan.timestamp, summary: "Live scan notice", severity: "info"}];
+state.report.unifi_posture.recent_logs = [scan];
+assert.deepEqual(humanEventType("scanner_ips_blocked"), {label: "Scan blocked by IPS", tone: "neutral"});
+assert.deepEqual(activityRows().map(r => [r.type, r.severity, r.count]), [["scanner_ips_blocked", "info", 1]]);
+showToast(state.events[0]);
+renderDrawer();
+assert.match(html("drawer-body"), /fix-card neutral"[\s\S]*UniBlue scan probe flagged by router IDS\/IPS/);
+assert.match(html("drawer-body"), /10\.0\.0\.2/);
+assert.doesNotMatch(html("drawer-hd-content") + html("drawer-body"), /Router alert|Blocked outbound threat|Inspect running apps|fix-card crit/);
+const wan = {...scan, id: "wan", dst_ip: "198.51.100.5"};
+state.report.unifi_posture.recent_logs.push(wan);
+renderDrawer();
+assert.match(html("drawer-hd-content"), /Router alert \(1\)/);
+assert.match(html("drawer-body"), /Blocked outbound threat[^<]*198\.51\.100\.5/);
+assert.match(html("drawer-body"), /Inspect running apps/);
+renderActivity();
+assert.match(html("view-activity"), /Blocked threat/);
+assert.doesNotMatch(html("view-activity"), /Scan blocked by IPS|Live scan notice/);`
 	cmd := exec.Command(node)
 	cmd.Stdin = strings.NewReader(dom + "\n" + script + "\n" + run)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("render firewall activity: %v\n%s", err, out)
+		t.Fatalf("render router activity: %v\n%s", err, out)
 	}
 }
 

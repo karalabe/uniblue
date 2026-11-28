@@ -21,6 +21,7 @@ metadata:
 
 preconditions:
   ports_any: [80, 8080]
+  http_server_regex: "(?i)RomPager"
 
 probe:
   type: http

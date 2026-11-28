@@ -151,10 +151,13 @@ type LiveEvent struct {
 	// IP is the host IP address, if applicable.
 	IP string `json:"ip,omitempty"`
 
+	// DstIP identifies the LAN destination when grouping scanner notices.
+	DstIP string `json:"dst_ip,omitempty"`
+
 	// Policy names the firewall policy responsible for a logged block.
 	Policy string `json:"policy,omitempty"`
 
-	// Count is the number of firewall hits represented by a grouped event.
+	// Count is the number of controller hits represented by a grouped event.
 	Count int `json:"count,omitempty"`
 
 	// FirstHit records the earliest hit in a group so Activity can include earlier controller history.
@@ -231,6 +234,9 @@ type StateSnapshot struct {
 
 	// ControllerType is the detected UniFi API flavor.
 	ControllerType string `json:"controller_type"`
+
+	// ScannerIPs lists the local addresses used to identify scanner notices in controller history.
+	ScannerIPs []string `json:"scanner_ips,omitempty"`
 
 	// CVELoaded reports whether local NVD+KEV correlation is active.
 	CVELoaded bool `json:"cve_loaded"`
@@ -1441,7 +1447,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 			pendingEvents = append(pendingEvents, aev)
 		}
 		for _, aev := range e.anomalies.EvaluateSiteTelemetry(snap, snap.RecentLogs) {
-			if aev.Type != "firewall_block" {
+			if aev.Type != "firewall_block" && aev.Type != "scanner_ips_blocked" {
 				changed = true
 			}
 			pendingEvents = append(pendingEvents, aev)
@@ -1449,8 +1455,9 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 	}
 	// A busy firewall can push an older intrusion out of the controller's log window.
 	// Refresh the assessment if the totals it reports have changed.
+	logs := snap.SiteLogs()
 	if !changed && prevSnap != nil {
-		changed = risk.CountPostureLogs(prevSnap.RecentLogs) != risk.CountPostureLogs(snap.RecentLogs)
+		changed = risk.CountPostureLogs(prevSnap.SiteLogs()) != risk.CountPostureLogs(logs)
 	}
 	e.snap = snap
 	e.deltaGen++
@@ -1464,10 +1471,11 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 	}
 	e.lastPorts = currPorts
 	if !changed {
+		e.current.ScannerIPs = snap.ScannerIPs
 		// Replace only the posture header so existing readers keep their log window.
 		if p := e.current.Report.UniFiPosture; p != nil {
 			posture := *p
-			posture.RecentLogs = snap.RecentLogs
+			posture.RecentLogs = logs
 			e.current.Report.UniFiPosture = &posture
 		}
 		for _, ev := range pendingEvents {
@@ -2449,8 +2457,13 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	e.mu.Lock()
 	// A concurrent poll may have published newer logs during this assessment.
 	// Keep the newer window when its counts agree with the findings and notes.
-	if e.snap != snapPtr && risk.CountPostureLogs(snap.RecentLogs) == risk.CountPostureLogs(e.snap.RecentLogs) {
-		report.UniFiPosture.RecentLogs = e.snap.RecentLogs
+	scannerIPs := snap.ScannerIPs
+	if e.snap != snapPtr {
+		logs := e.snap.SiteLogs()
+		if risk.CountPostureLogs(report.UniFiPosture.RecentLogs) == risk.CountPostureLogs(logs) {
+			report.UniFiPosture.RecentLogs = logs
+			scannerIPs = e.snap.ScannerIPs
+		}
 	}
 	if nextState != nil {
 		e.prevRiskState = nextState
@@ -2473,6 +2486,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 		EventMode:      e.eventMode,
 		Site:           snap.Site,
 		ControllerType: snap.ControllerType,
+		ScannerIPs:     scannerIPs,
 		CVELoaded:      cveLoaded,
 		Report:         report,
 		ExactCVEs:      exactCVEs,
@@ -3450,24 +3464,34 @@ func (e *Engine) emit(ev LiveEvent) {
 	e.mu.Unlock()
 }
 
-// firewallGroup identifies one source and policy pair. Without both
-// identifiers, only matching descriptions can safely be treated as repetitions.
-type firewallGroup struct {
-	source, policy, summary string
+// logGroup groups policy hits by rule and scanner hits by LAN destination.
+type logGroup struct {
+	kind, source, detail, summary string
 }
 
-// firewallGroup collapses repeated hits for the same source and policy so
-// chatty logged rules cannot evict unrelated alerts from the shared history.
-func (ev LiveEvent) firewallGroup() firewallGroup {
-	key := firewallGroup{source: firstStr(ev.IP, ev.Host), policy: ev.Policy}
-	if key.source == "" || key.policy == "" {
+// logGroup identifies repetitions without merging unrelated router events.
+func (ev LiveEvent) logGroup() logGroup {
+	normIP := func(raw string) string {
+		if a, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil {
+			return a.Unmap().String()
+		}
+		return strings.TrimSpace(raw)
+	}
+	source := normIP(ev.IP)
+	if source == "" {
+		source = strings.TrimSpace(ev.Host)
+	}
+	key := logGroup{kind: ev.Type, source: source, detail: ev.Policy}
+	if ev.Type == "scanner_ips_blocked" {
+		key.detail = normIP(ev.DstIP)
+	} else if key.source == "" || key.detail == "" {
 		key.summary = ev.Summary
 	}
 	return key
 }
 
-// mergeFirewallHits retains the latest description even when a poll delivers hits newest first.
-func mergeFirewallHits(a, b LiveEvent) LiveEvent {
+// mergeLogHits retains the latest description even when a poll delivers hits newest first.
+func mergeLogHits(a, b LiveEvent) LiveEvent {
 	if b.Time.After(a.Time) {
 		a, b = b, a
 	}
@@ -3483,17 +3507,17 @@ func mergeFirewallHits(a, b LiveEvent) LiveEvent {
 }
 
 // emitLocked publishes a new immutable history before broadcasting its sequence number.
-// Moving an updated firewall row to the front keeps SSE replay in sequence order.
+// Moving an updated log group to the front keeps SSE replay in sequence order.
 func (e *Engine) emitLocked(ev LiveEvent) {
 	if ev.Time.IsZero() {
 		ev.Time = time.Now().UTC()
 	}
 	history := e.events
-	if ev.Type == "firewall_block" {
-		key := ev.firewallGroup()
+	if ev.Type == "firewall_block" || ev.Type == "scanner_ips_blocked" {
+		key := ev.logGroup()
 		for i, prev := range history {
-			if prev.Type == ev.Type && prev.firewallGroup() == key {
-				ev = mergeFirewallHits(ev, prev)
+			if prev.logGroup() == key {
+				ev = mergeLogHits(ev, prev)
 				history = slices.Concat(history[:i], history[i+1:])
 				break
 			}

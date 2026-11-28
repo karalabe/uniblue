@@ -301,6 +301,62 @@ func TestFirewallBlockPolls(t *testing.T) {
 	}
 }
 
+// TestScannerIPSPolls keeps scanner notices and external threats distinct across overlapping polls.
+func TestScannerIPSPolls(t *testing.T) {
+	cfg := config.Default()
+	cfg.UniFi.URL, cfg.UniFi.APIKey = "https://192.0.2.1", "test"
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	e, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const scanner = "192.0.2.20"
+	snap := unifi.Snapshot{ScannerIPs: []string{scanner}}
+	e.snap = &snap
+	e.recomputeAndPublish(t.Context(), true, nil)
+	now := time.Now().UTC()
+	hit := unifi.ControllerLogEvent{
+		ID: "lan", Timestamp: now, Category: "THREATS", Severity: "high",
+		SrcIP: scanner, DstIP: "10.0.0.12", Message: "Signature matched",
+	}
+	first := snap
+	first.RecentLogs = []unifi.ControllerLogEvent{hit}
+	e.applySnapshotDelta(t.Context(), &first, now)
+	state := e.Snapshot()
+	if !slices.Equal(state.ScannerIPs, []string{scanner}) || len(state.Events) == 0 ||
+		state.Events[0].Type != "scanner_ips_blocked" || state.Events[0].Severity != "info" ||
+		!strings.Contains(state.Events[0].Summary, hit.DstIP) {
+		t.Fatalf("missing scanner notice: %+v", state.Events)
+	}
+	repeat, external := hit, hit
+	repeat.ID, repeat.Timestamp = "repeat", now.Add(time.Second)
+	external.ID, external.DstIP = "external", "198.51.100.5"
+	next := snap
+	next.RecentLogs = []unifi.ControllerLogEvent{hit, repeat, external}
+	e.applySnapshotDelta(t.Context(), &next, repeat.Timestamp)
+	state = e.Snapshot()
+	var notices, threats int
+	for _, event := range state.Events {
+		switch event.Type {
+		case "scanner_ips_blocked":
+			notices++
+			if event.Count != 2 || event.Severity != "info" {
+				t.Errorf("scanner group = %+v", event)
+			}
+		case "ids_threat":
+			threats++
+			if event.Severity != "high" {
+				t.Errorf("external alert = %+v", event)
+			}
+		}
+	}
+	if notices != 1 || threats != 1 || !slices.ContainsFunc(state.Report.PostureNotes, func(n risk.PostureNote) bool {
+		return n.Title == "Gateway IDS/IPS blocked 1 intrusion attempt(s) in the last 24h"
+	}) {
+		t.Fatalf("notices=%d threats=%d posture=%+v", notices, threats, state.Report.PostureNotes)
+	}
+}
+
 // TestEngineBaselinePreservationFirstForwardDetectionAndConcurrency verifies
 // that startup recompute before baseline does not wipe persisted host findings,
 // adding the first port forward on an empty site fires policy_changed,

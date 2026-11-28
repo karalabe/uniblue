@@ -331,7 +331,7 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 	var events []LiveEvent
 
 	// Group a burst before broadcasting so a single poll prompts one dashboard refresh per group.
-	blocks := make(map[firewallGroup]int)
+	groups := make(map[logGroup]int)
 	for _, ev := range freshLogs {
 		if ev.ID == "" {
 			continue
@@ -340,6 +340,7 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			continue
 		}
 		a.seenLogIDs[ev.ID] = struct{}{}
+		ev = snap.SiteLog(ev)
 		live := LiveEvent{
 			Time:     ev.Timestamp,
 			Type:     ev.LogKind(),
@@ -349,18 +350,19 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			Summary:  firstStr(ev.Message, ev.Title, ev.Event),
 		}
 		switch live.Type {
+		case "ids_threat":
+			live.Severity = firstStr(ev.Severity, "high")
+		case "scanner_ips_blocked":
+			live.Host = firstStr(ev.SrcHost, ev.SrcIP)
+			live.DstIP = ev.DstIP
+			live.Summary = fmt.Sprintf("Router IPS blocked a UniBlue scan probe from %s to %s: %s",
+				ev.SrcIP, firstStr(ev.DstIP, "an unreported destination"), live.Summary)
 		case "firewall_block":
 			live.Severity = "info"
 			live.Policy = ev.Policy
 			// Device often names the gateway that enforced the policy. Only a
 			// source address or client name can identify repeated hits by one host.
 			live.Host = ev.SrcHost
-			key := live.firewallGroup()
-			if i, ok := blocks[key]; ok {
-				events[i] = mergeFirewallHits(events[i], live)
-				continue
-			}
-			blocks[key] = len(events)
 		case "controller_security":
 			live.Type = "controller_log"
 		case "":
@@ -368,6 +370,14 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			if strings.Contains(ev.Event, "DHCP") || strings.Contains(ev.Event, "LOOP") {
 				live.Type = "network_alert"
 			}
+		}
+		if live.Type == "firewall_block" || live.Type == "scanner_ips_blocked" {
+			key := live.logGroup()
+			if i, ok := groups[key]; ok {
+				events[i] = mergeLogHits(events[i], live)
+				continue
+			}
+			groups[key] = len(events)
 		}
 		events = append(events, live)
 	}

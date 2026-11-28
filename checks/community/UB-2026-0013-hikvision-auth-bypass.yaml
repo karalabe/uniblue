@@ -24,15 +24,22 @@ preconditions:
 
 probe:
   type: http
-  method: GET
-  path: /Security/users?auth=YWRtaW46MTEK
   timeout: 3s
-  match:
-    status: [200]
-    body_contains_all:
-      - "<UserList"
-      - "<userName>"
-    redact_body: true
+  steps:
+    - method: GET
+      paths: ["/", "/doc/page/login.asp"]
+      match:
+        status: [200]
+        body_regex: '(?i)(?:href|location(?:\.href)?)\s*=\s*["'']/?doc/page/login\.asp|hikvision|webComponents\.exe|g_szCacheTime|DNVRS-Webs'
+        evidence_summary: "Camera login page identified"
+    - method: GET
+      path: /Security/users?auth=YWRtaW46MTEK
+      match:
+        status: [200]
+        body_contains_all:
+          - "<UserList"
+          - "<userName>"
+        redact_body: true
 
 grants:
   - effect: read

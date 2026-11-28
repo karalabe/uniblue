@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -350,7 +352,7 @@ func (entry rawSystemLogEntry) controllerEvent() (ControllerLogEvent, bool) {
 		Title:       title,
 		Message:     msg,
 		SrcIP:       firstNonEmpty(params["SRC_IP"], params["SOURCE_IP"], params["IP"]),
-		DstIP:       params["DST_IP"],
+		DstIP:       firstNonEmpty(params["DST_IP"], params["DEST_IP"], params["DESTINATION_IP"]),
 		Device:      firstNonEmpty(params["DEVICE"], params["CONSOLE_NAME"]),
 	}
 	if entry.Type != "" && !strings.EqualFold(entry.Type, ev.Event) {
@@ -374,7 +376,7 @@ func (entry rawSystemLogEntry) controllerEvent() (ControllerLogEvent, bool) {
 	}
 	if ev.ID == "" {
 		identity := fmt.Sprintf("%d|%s|%s|%s", entry.Timestamp, entry.Key, entry.Event, msg)
-		if ev.Kind == "firewall_block" {
+		if ev.Kind == "firewall_block" || ev.Kind == "ids_threat" {
 			// Controllers can log different clients, destinations, or rules with the same summary in one millisecond.
 			identity += "|" + ev.SrcIP + "|" + ev.DstIP + "|" + ev.SrcHost + "|" + ev.Policy
 		}
@@ -802,6 +804,54 @@ func (e ControllerLogEvent) LogKind() string {
 		return "controller_security"
 	}
 	return ""
+}
+
+// SiteLog applies scanner attribution to a copy so consumers retain the original controller record.
+func (s *Snapshot) SiteLog(ev ControllerLogEvent) ControllerLogEvent {
+	if len(s.ScannerIPs) == 0 || ev.LogKind() != "ids_threat" {
+		return ev
+	}
+	src, err := netip.ParseAddr(ev.SrcIP)
+	if err == nil && slices.Contains(s.ScannerIPs, src.Unmap().String()) && s.internalLogIP(ev.DstIP) {
+		ev.Kind = "scanner_ips_blocked"
+		ev.Severity = "info"
+	}
+	return ev
+}
+
+// SiteLogs returns the log window used for both display and posture totals.
+func (s *Snapshot) SiteLogs() []ControllerLogEvent {
+	if len(s.ScannerIPs) == 0 {
+		return s.RecentLogs
+	}
+	logs := slices.Clone(s.RecentLogs)
+	for i, ev := range logs {
+		logs[i] = s.SiteLog(ev)
+	}
+	return logs
+}
+
+// internalLogIP requires an exact inventory match for publicly routed addresses.
+// A site's IPv6 prefix or WAN subnet alone cannot identify a LAN destination.
+func (s *Snapshot) internalLogIP(raw string) bool {
+	ip, err := netip.ParseAddr(raw)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || netip.MustParsePrefix("100.64.0.0/10").Contains(ip) {
+		return true
+	}
+	matches := func(raw string) bool {
+		addr, err := netip.ParseAddr(raw)
+		return err == nil && addr.Unmap() == ip
+	}
+	for _, cl := range s.Clients {
+		if matches(cl.IP) || slices.ContainsFunc(cl.IPv6, matches) {
+			return true
+		}
+	}
+	return slices.ContainsFunc(s.Devices, func(d Device) bool { return matches(d.IP) })
 }
 
 // normalizeLogSeverity reserves the controller's intrusion escalation for actual detections.

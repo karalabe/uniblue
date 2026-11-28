@@ -2624,6 +2624,7 @@ func runTopology(ctx context.Context, args []string, stdout, stderr io.Writer) e
 			EventMode:      "static-export",
 			Site:           snap.Site,
 			ControllerType: snap.ControllerType,
+			ScannerIPs:     snap.ScannerIPs,
 			CVELoaded:      cveLoaded,
 			Report:         report,
 			ExactCVEs:      exactCVEs,

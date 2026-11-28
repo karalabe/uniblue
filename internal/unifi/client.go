@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/netip"
@@ -627,10 +628,37 @@ func (c *Controller) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
 			return nil, err
 		}
 	}
+	var snap *Snapshot
+	var err error
 	if c.currentControllerType() == controllerIntegrationV1 {
-		return c.fetchIntegrationSnapshot(ctx)
+		snap, err = c.fetchIntegrationSnapshot(ctx)
+	} else {
+		snap, err = c.fetchLegacySnapshot(ctx)
 	}
-	return c.fetchLegacySnapshot(ctx)
+	if err == nil {
+		// Refresh local addresses alongside inventory so DHCP changes reach every report consumer.
+		addrs, _ := net.InterfaceAddrs()
+		snap.ScannerIPs = localScannerIPs(addrs)
+	}
+	return snap, err
+}
+
+// localScannerIPs keeps addresses that could identify the scanner in routed IPS logs.
+// An incomplete interface inventory leaves unmatched sources at their controller severity.
+func localScannerIPs(addrs []net.Addr) []string {
+	var ips []string
+	for _, addr := range addrs {
+		prefix, err := netip.ParsePrefix(addr.String())
+		if err != nil {
+			continue
+		}
+		ip := prefix.Addr().Unmap()
+		if ip.IsGlobalUnicast() {
+			ips = append(ips, ip.String())
+		}
+	}
+	slices.Sort(ips)
+	return slices.Compact(ips)
 }
 
 // fetchIntegrationSnapshot queries UniFi's official Network Integration API v1

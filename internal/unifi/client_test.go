@@ -10,8 +10,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1367,5 +1369,65 @@ func TestIntegrationNetworkTagConflict(t *testing.T) {
 	ids := networkAliases([]Network{{ID: "current", Name: "Office", VLAN: "20"}}, legacy)
 	if id := ids["retired"]; id != "" {
 		t.Fatalf("legacy ID resolved to conflicting VLAN %q", id)
+	}
+}
+
+// TestLocalScannerIPs keeps routed source addresses stable across duplicate interface entries.
+func TestLocalScannerIPs(t *testing.T) {
+	var addrs []net.Addr
+	for _, raw := range []string{"fd00::20/64", "192.0.2.4/24", "::ffff:192.0.2.4/128", "127.0.0.1/8",
+		"::1/128", "fe80::1/64", "169.254.1.1/16", "::/128", "0.0.0.0/32", "ff02::1/128"} {
+		ip, network, err := net.ParseCIDR(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		network.IP = ip
+		addrs = append(addrs, network)
+	}
+	if got := localScannerIPs(addrs); !slices.Equal(got, []string{"192.0.2.4", "fd00::20"}) {
+		t.Errorf("local scanner IPs = %v", got)
+	}
+}
+
+// TestIDSLogIdentity preserves concurrent LAN and WAN hits when the controller omits event IDs.
+func TestIDSLogIdentity(t *testing.T) {
+	entry := rawSystemLogEntry{Category: "THREATS", MessageRaw: "Signature matched"}
+	entry.Parameters = map[string]json.RawMessage{"DST_IP": json.RawMessage(`"10.0.0.1"`)}
+	lan, _ := entry.controllerEvent()
+	entry.Parameters = map[string]json.RawMessage{"DESTINATION_IP": json.RawMessage(`"198.51.100.5"`)}
+	wan, _ := entry.controllerEvent()
+	if lan.ID == wan.ID || wan.DstIP != "198.51.100.5" {
+		t.Fatalf("distinct IPS destinations collapsed: LAN=%+v WAN=%+v", lan, wan)
+	}
+}
+
+// TestScannerLogDestinations limits attribution to the scanner and a confirmed local destination.
+func TestScannerLogDestinations(t *testing.T) {
+	snap := Snapshot{
+		ScannerIPs: []string{"192.0.2.4"},
+		Clients:    []Client{{IPv6: []string{"2001:db8::123"}}},
+		Devices:    []Device{{IP: "198.51.100.17"}},
+	}
+	for _, tc := range []struct {
+		dst  string
+		scan bool
+	}{
+		{"", false}, {"100.127.255.255", true}, {"100.128.0.1", false},
+		{"fd18::10", true}, {"2001:0DB8::0123", true}, {"2001:db8::124", false},
+		{"198.51.100.17", true}, {"198.51.100.18", false}, {"10.invalid", false},
+	} {
+		ev := ControllerLogEvent{Kind: "ids_threat", SrcIP: "::ffff:192.0.2.4", DstIP: tc.dst, Severity: "high"}
+		got := snap.SiteLog(ev)
+		if (got.Kind == "scanner_ips_blocked") != tc.scan || (got.Severity == "info") != tc.scan {
+			t.Errorf("destination %q: kind=%s severity=%s", tc.dst, got.Kind, got.Severity)
+		}
+	}
+	for _, ev := range []ControllerLogEvent{
+		{Kind: "ids_threat", SrcIP: "192.0.2.5", DstIP: "10.0.0.1"},
+		{Kind: "honeypot_hit", SrcIP: "192.0.2.4", DstIP: "10.0.0.1"},
+	} {
+		if snap.SiteLog(ev) != ev {
+			t.Errorf("reclassified unrelated event %+v", ev)
+		}
 	}
 }

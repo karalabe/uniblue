@@ -1972,6 +1972,7 @@ function humanReason(r, ent) {
 
 function humanEventType(t) {
   const l = (t || "").toLowerCase();
+  if (l === "scanner_ips_blocked") return { label: "Scan blocked by IPS", tone: "neutral" };
   if (l === "firewall_block") return { label: "Firewall block", tone: "neutral" };
   if (l === "controller_log") return { label: "Controller log", tone: "neutral" };
   if (l.includes("threat")) return { label: "Blocked threat", tone: "crit" };
@@ -3998,6 +3999,14 @@ function controllerLogKind(lg) {
   return category === "SECURITY" ? "controller_security" : "";
 }
 
+// Saved controller rows can predate server-side scanner attribution.
+function siteLogKind(lg) {
+  const kind = controllerLogKind(lg);
+  if (kind !== "ids_threat" || !state?.scanner_ips?.length) return kind;
+  const src = canonicalLogIP(lg.src_ip);
+  return src && state.scanner_ips.includes(src) && lg.dst_ip && isInternalIP(lg.dst_ip) ? "scanner_ips_blocked" : kind;
+}
+
 // Reconcile live counts with the overlapping controller history before rendering either Activity count.
 function activityRows() {
   const logs = [];
@@ -4005,9 +4014,11 @@ function activityRows() {
   const blocks = new Map();
 
   function addBlock(row, feed) {
-    const source = row.ip || row.host || row.summary?.match(/^(.+?) was blocked from accessing /i)?.[1] || "";
+    const source = (row.ip ? (canonicalLogIP(row.ip) || row.ip) : "") || row.host || row.summary?.match(/^(.+?) was blocked from accessing /i)?.[1] || "";
     const policy = row.policy || row.summary?.match(/\bby the (.+?) firewall policy\b/i)?.[1] || "";
-    const key = JSON.stringify([source, policy, source && policy ? "" : row.summary]);
+    const key = row.type === "scanner_ips_blocked"
+      ? JSON.stringify([row.type, source, row.dst_ip ? (canonicalLogIP(row.dst_ip) || row.dst_ip) : ""])
+      : JSON.stringify([row.type, source, policy, source && policy ? "" : row.summary]);
     if (!blocks.has(key)) blocks.set(key, { latest: row, count: 0, live: [] });
     const group = blocks.get(key);
     if (Date.parse(row.time) > Date.parse(group.latest.time)) group.latest = row;
@@ -4026,7 +4037,7 @@ function activityRows() {
 
   for (const ev of (state.events || [])) {
     const row = { ...ev, type: ev.type || "event", subject: ev.subject_id || "" };
-    if (ev.type === "firewall_block") {
+    if (ev.type === "firewall_block" || ev.type === "scanner_ips_blocked") {
       addBlock(row, "live");
       continue;
     }
@@ -4037,13 +4048,16 @@ function activityRows() {
   for (const lg of (state.report?.unifi_posture?.recent_logs || [])) {
     if (lg.id && logIDs.has(lg.id)) continue;
     if (lg.id) logIDs.add(lg.id);
-    const kind = controllerLogKind(lg);
+    const kind = siteLogKind(lg);
     let type = kind;
     if (kind === "controller_security") type = "controller_log";
     if (!kind) type = /vpn/i.test(lg.event) ? "vpn_connected" : "controller_log";
     const row = { time: lg.timestamp, severity: lg.severity || "info", type, summary: lg.message || lg.title || lg.event,
       host: lg.src_host, ip: lg.src_ip, dst_ip: lg.dst_ip, policy: lg.policy };
-    if (kind === "firewall_block") addBlock(row, "controller");
+    if (kind === "scanner_ips_blocked") {
+      row.summary = `Router IPS blocked a UniBlue scan probe from ${lg.src_ip} to ${lg.dst_ip || "an unreported destination"}: ${row.summary}`;
+    }
+    if (kind === "firewall_block" || kind === "scanner_ips_blocked") addBlock(row, "controller");
     else if (!seen.has(row.summary)) logs.push(row);
   }
   for (const { latest, count } of blocks.values()) {
@@ -4157,12 +4171,30 @@ function plainSummaryForEntity(vm, ent) {
   return `Review this security rule below to make sure it matches what you want allowed on your network.`;
 }
 
+// Normalize log and inventory addresses before matching alternate IPv6 spellings or mapped IPv4.
+function canonicalLogIP(ip) {
+  if (!ip) return "";
+  if (!ip.includes(":")) {
+    const octets = ip.split(".");
+    return octets.length === 4 && octets.every(n => /^(?:0|[1-9]\d{0,2})$/.test(n) && Number(n) <= 255) ? ip : "";
+  }
+  if (!/^[\da-f:.]+$/i.test(ip)) return "";
+  try {
+    const addr = new URL("http://[" + ip + "]/").hostname.slice(1, -1);
+    const mapped = /^::ffff:([a-f\d]+):([a-f\d]+)$/.exec(addr);
+    if (!mapped) return addr;
+    const hi = parseInt(mapped[1], 16), lo = parseInt(mapped[2], 16);
+    return [hi >> 8, hi & 255, lo >> 8, lo & 255].join(".");
+  } catch {
+    return "";
+  }
+}
+
 // Classify an IP as internal if it falls in private, CGNAT, loopback, or
 // link-local IPv4/IPv6 ranges, or matches an individual entity IP in the live
 // site snapshot (covering public LAN entity IPs and IPv6 GUAs, not subnet matching).
 function isInternalIP(ip) {
-  if (!ip) return false;
-  const s = String(ip).trim().toLowerCase();
+  const s = canonicalLogIP(ip);
   if (!s) return false;
   if (s.startsWith("10.") || s.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(s) || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(s) || s.startsWith("127.") || s.startsWith("169.254.")) {
     return true;
@@ -4172,10 +4204,10 @@ function isInternalIP(ip) {
   }
   const entities = state?.view?.entities || {};
   for (const ent of Object.values(entities)) {
-    if (!ent) continue;
-    if (ent.ip && String(ent.ip).toLowerCase() === s) return true;
+    if (ent?.kind !== "host" && ent?.kind !== "device") continue;
+    if (canonicalLogIP(ent.ip) === s) return true;
     for (const ip6 of (ent.ipv6 || [])) {
-      if (ip6 && String(ip6).toLowerCase() === s) return true;
+      if (canonicalLogIP(ip6) === s) return true;
     }
   }
   return false;
@@ -4183,28 +4215,22 @@ function isInternalIP(ip) {
 
 function hostSecurityLogs(ent) {
   if (!ent || ent.kind !== "host") return [];
-  const ips = new Set();
-  if (ent.ip) ips.add(ent.ip.toLowerCase());
-  for (const ip6 of (ent.ipv6 || [])) {
-    if (ip6) ips.add(ip6.toLowerCase());
-  }
+  const ips = new Set([ent.ip, ...(ent.ipv6 || [])].map(canonicalLogIP).filter(Boolean));
   if (ips.size === 0) return [];
   const out = [];
   const seen = new Set();
   for (const lg of (state?.report?.unifi_posture?.recent_logs || [])) {
-    const kind = controllerLogKind(lg);
-    if (kind !== "ids_threat" && kind !== "honeypot_hit") continue;
-    const srcLow = (lg.src_ip || "").toLowerCase();
-    const dstLow = (lg.dst_ip || "").toLowerCase();
-    const isSrc = srcLow !== "" && ips.has(srcLow);
-    const isDst = dstLow !== "" && ips.has(dstLow);
+    const kind = siteLogKind(lg);
+    if (kind !== "ids_threat" && kind !== "honeypot_hit" && kind !== "scanner_ips_blocked") continue;
+    const isSrc = ips.has(canonicalLogIP(lg.src_ip));
+    const isDst = ips.has(canonicalLogIP(lg.dst_ip));
     if (!isSrc && !isDst) continue;
-    const key = (lg.timestamp || "") + "|" + (lg.message || lg.event || "");
+    const key = lg.id || JSON.stringify([kind, lg.timestamp, lg.src_ip, lg.dst_ip, lg.message || lg.event]);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({
       time: lg.timestamp,
-      severity: lg.severity || "high",
+      severity: kind === "scanner_ips_blocked" ? "info" : lg.severity || "high",
       type: kind,
       message: lg.message || lg.event,
       src_ip: lg.src_ip || "",
@@ -4231,7 +4257,8 @@ function renderDrawer() {
   if (!vm.entities[id]) return;
   const ent = vm.entities[id];
   const tone = humanStateTone(ent);
-  const hostAlerts = hostSecurityLogs(ent);
+  const routerLogs = hostSecurityLogs(ent);
+  const hostAlerts = routerLogs.filter(al => al.type !== "scanner_ips_blocked");
   const hasOutboundAlert = hostAlerts.some(a => a.direction === "outbound" || a.type === "honeypot_hit");
   const alertOnlyHost = ent.kind === "host" && ent.state === "ok" && hostAlerts.length > 0;
   const summaryTone = alertOnlyHost ? (hasOutboundAlert ? "crit" : "warn") : (tone === "unk" ? "blue" : tone);
@@ -4284,6 +4311,15 @@ function renderDrawer() {
       </div>`;
     }
     b += `</div>`;
+  }
+
+  for (const al of routerLogs.filter(al => al.type === "scanner_ips_blocked")) {
+    b += `<div class="fix-card neutral">
+      <strong>UniBlue scan probe flagged by router IDS/IPS</strong>
+      <span class="small">${esc(fmtTime(al.time))}</span>
+      <div class="small">Your gateway's IDS/IPS flagged UniBlue's LAN probe from ${esc(al.src_ip)}${al.dst_ip ? " to " + esc(al.dst_ip) : ""}.</div>
+      <div class="small">${esc(al.message)}</div>
+    </div>`;
   }
 
   // 1. Known Software Security Bugs (Exact CVEs, always prominently at the top)
@@ -4856,7 +4892,7 @@ function resolveEventSubject(ev) {
 function showToast(ev) {
   if (!ev || !ev.summary) return;
   const t = (ev.type || "").toLowerCase();
-  if (t === "startup" || t === "scan_progress" || t === "client_multi_ip" || t === "firewall_block") return;
+  if (t === "startup" || t === "scan_progress" || t === "client_multi_ip" || t === "firewall_block" || t === "scanner_ips_blocked") return;
   const stack = document.getElementById("toast-stack");
   if (!stack) return;
 

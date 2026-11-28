@@ -94,7 +94,7 @@ func AnalyzeUniFiPosture(
 		Health:      snap.Health,
 		WLANs:       snap.WLANs,
 		NeighborAPs: len(snap.RogueAPs),
-		RecentLogs:  snap.RecentLogs,
+		RecentLogs:  snap.SiteLogs(),
 	}
 
 	var findings []checks.Finding
@@ -385,7 +385,7 @@ func AnalyzeUniFiPosture(
 	}
 
 	// 4. Summarize recent 24h IDS/IPS threat & admin highlights cleanly in Posture Notes.
-	counts := CountPostureLogs(snap.RecentLogs)
+	counts := CountPostureLogs(summary.RecentLogs)
 	if counts.HoneypotHits > 0 {
 		findings = append(findings, checks.Finding{
 			CheckID:           "UB-UNIFI-HONEYPOT-HIT",

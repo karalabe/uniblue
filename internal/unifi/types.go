@@ -67,6 +67,9 @@ type Snapshot struct {
 	// wakeup and wired/wireless medium-swap anomaly detection.
 	KnownClients []HistoricalClient `json:"known_clients,omitempty"`
 
+	// ScannerIPs lists the canonical addresses assigned to the scanner when this snapshot was collected.
+	ScannerIPs []string `json:"scanner_ips,omitempty"`
+
 	// RecentLogs holds recent security and admin activity events from the console.
 	RecentLogs []ControllerLogEvent `json:"recent_logs,omitempty"`
 

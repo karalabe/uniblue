@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -782,25 +783,59 @@ func TestIoTBuiltinHTTPChecksAuthVsUnauth(t *testing.T) {
 		}
 	})
 
-	// Verify Brother CVE-2024-51977 (UB-2026-0053) CSV disclosure.
-	t.Run("brother_cve_2024_51977", func(t *testing.T) {
-		chk := byID["UB-2026-0053"]
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/etc/mnt_info.csv" {
-				_, _ = io.WriteString(w, "\"Node Name\",\"Model Name\",\"Serial No.\"\n\"BRN001122\",\"MFC-L2750DW\",\"E12345678\"\n")
-				return
+	// The same service response must be unreachable until this port identifies the product.
+	for _, tc := range []struct {
+		name, id                 string
+		port                     int
+		banner                   probe.HTTPBanner
+		identityPath, identity   string
+		servicePath, serviceBody string
+	}{
+		{"hikvision", "UB-2026-0013", 80, probe.HTTPBanner{}, "/doc/page/login.asp", "webComponents.exe", "/Security/users", "<UserList><userName>fixture</userName></UserList>"},
+		{"rompager", "UB-2026-0004", 80, probe.HTTPBanner{Server: "RomPager"}, "", "", "/rom-0", "spt.dat"},
+		{"brother_cve_2024_51977", "UB-2026-0053", 80, probe.HTTPBanner{}, "/general/status.html", "MFC-L2750DW", "/etc/mnt_info.csv", "Node Name,Model Name,Serial No."},
+		{"zoneminder", "UB-2026-0016", 80, probe.HTTPBanner{}, "/zm/", "ZoneMinder", "/zm/api/host/getVersion.json", `{"version":"fixture","apiversion":"fixture"}`},
+		{"tasmota", "UB-2026-0033", 80, probe.HTTPBanner{}, "/", "<title>Kitchen Plug Main Menu</title><a href='https://github.com/arendst/Tasmota'>Tasmota 15.1.0 by Theo Arends</a>", "/cm", `{"StatusFWR":{},"StatusNET":{}}`},
+		{"kodi", "UB-2026-0068", 8080, probe.HTTPBanner{}, "/", "<title>Chorus</title>", "/jsonrpc", `{"jsonrpc":"2.0","name":"Kodi"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, identified := range []bool{false, true} {
+				banner := probe.HTTPBanner{Title: "Smart plug", Server: "GoAhead-Webs"}
+				wantFindings := 0
+				if identified {
+					banner = tc.banner
+					wantFindings = 1
+				}
+				hp := probe.HostProfile{
+					Client: unifi.Client{IP: "127.0.0.1"}, OpenPorts: []int{tc.port},
+					HTTP: map[int]probe.HTTPBanner{tc.port: banner},
+				}
+				if identified && tc.identityPath != "" {
+					hp.HTTP = nil
+				}
+				var requested atomic.Bool
+				handler := func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case tc.servicePath:
+						requested.Store(true)
+						_, _ = io.WriteString(w, tc.serviceBody)
+					case tc.identityPath:
+						if identified {
+							_, _ = io.WriteString(w, tc.identity)
+							return
+						}
+						fallthrough
+					default:
+						_, _ = fmt.Fprintf(w, "Unknown page %s", r.URL.Path)
+					}
+				}
+				got := runProfileHTTP(t, hp, handler, byID[tc.id])
+				if requested.Load() != identified || len(got) != wantFindings {
+					t.Fatalf("identified=%t: requested %s=%t, findings=%v", identified, tc.servicePath, requested.Load(), got)
+				}
 			}
-			http.NotFound(w, r)
-		}))
-		defer srv.Close()
-		_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
-		port, _ := strconv.Atoi(portStr)
-		r := NewRunner(nil, 1)
-
-		if _, ok := r.executeProbe(context.Background(), chk, "127.0.0.1", port); !ok {
-			t.Fatal("expected vulnerable Brother /etc/mnt_info.csv to match UB-2026-0053")
-		}
-	})
+		})
+	}
 
 	// Verify ports_all precondition (UB-2026-0073 Jailbroken iOS SSH):
 	// requires BOTH 62078 and 22, so neither stock iOS (62078 only) nor Mac/Linux (22 only) triggers.
@@ -1007,16 +1042,22 @@ func TestHTTPStepExecutionAndLegacyFraming(t *testing.T) {
 // runBuiltinHTTP redirects connections for port to an ephemeral httptest.Server.
 func runBuiltinHTTP(t *testing.T, port int, handler http.HandlerFunc, checks ...*Check) []Finding {
 	t.Helper()
+	return runProfileHTTP(t, probe.HostProfile{
+		Client:    unifi.Client{IP: "127.0.0.1"},
+		OpenPorts: []int{port},
+	}, handler, checks...)
+}
+
+// runProfileHTTP keeps the production port and fingerprint while all requests go to the fixture.
+func runProfileHTTP(t *testing.T, hp probe.HostProfile, handler http.HandlerFunc, checks ...*Check) []Finding {
+	t.Helper()
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
 	r := NewRunner(checks, 1)
 	r.httpClient.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
 	}
-	return r.RunHost(t.Context(), probe.HostProfile{
-		Client:    unifi.Client{IP: "127.0.0.1"},
-		OpenPorts: []int{port},
-	})
+	return r.RunHost(t.Context(), hp)
 }
 
 // TestCommunityCheckPrecision verifies Node-RED auth modes, Shelly Gen1 json_match,
