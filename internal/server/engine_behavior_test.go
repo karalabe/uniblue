@@ -38,6 +38,30 @@ import (
 	"github.com/karalabe/uniblue/internal/unifi"
 )
 
+// TestPollDeltaTimeout checks the local deadline and the budget for paced
+// snapshots, including large durations that could overflow when scaled.
+func TestPollDeltaTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		delay, timeout, interval, want time.Duration
+	}{
+		{"local", 0, 10 * time.Second, 5 * time.Second, 15 * time.Second},
+		{"unpaced slow poll", 0, 10 * time.Second, time.Minute, time.Minute},
+		{"paced", 500 * time.Millisecond, 10 * time.Second, 5 * time.Second, 30 * time.Second},
+		{"slow HTTP", 0, 25 * time.Second, 5 * time.Second, 25 * time.Second},
+		{"long interval", time.Second, 10 * time.Second, time.Minute, time.Minute},
+		{"capped", time.Duration(1<<63 - 1), time.Minute, time.Hour, 2 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &Engine{cfg: config.Default(), opts: Options{PollInterval: tc.interval}}
+			e.cfg.UniFi.RequestDelay, e.cfg.UniFi.Timeout = tc.delay, tc.timeout
+			if got := e.pollDeltaTimeout(); got != tc.want {
+				t.Errorf("pollDeltaTimeout = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestHTTPProtectionHostOriginTokenAndRescanResponses verifies DNS-rebinding
 // Host protection on both loopback and non-loopback listeners, reverse-proxy
 // AllowedHosts support, cross-origin POST CSRF blocking, Bearer token and

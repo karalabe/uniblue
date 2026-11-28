@@ -1121,6 +1121,17 @@ func (e *Engine) websocketLoop(ctx context.Context) {
 	}
 }
 
+// pollDeltaTimeout budgets up to forty paced requests and a network round trip.
+// A slower poll cadence can absorb additional controller backoff even without
+// explicit request pacing. Bound the inputs before multiplying so even very
+// large configured delays stay capped.
+func (e *Engine) pollDeltaTimeout() time.Duration {
+	const floor, ceiling = 15 * time.Second, 2 * time.Minute
+	u := e.cfg.UniFi
+	budget := min(u.Timeout, ceiling) + 40*min(u.RequestDelay, ceiling/40)
+	return min(ceiling, max(floor, budget, e.opts.PollInterval))
+}
+
 // pollDelta fetches a fresh UniFi topology snapshot (no LAN probing) and reacts
 // immediately to newly appearing clients, IP/VLAN changes, departures, physical
 // switch port link transitions, or firewall/port-forward changes. Serialized by
@@ -1129,7 +1140,7 @@ func (e *Engine) pollDelta(ctx context.Context) {
 	e.pollMu.Lock()
 	defer e.pollMu.Unlock()
 
-	pollCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	pollCtx, cancel := context.WithTimeout(ctx, e.pollDeltaTimeout())
 	defer cancel()
 
 	snap, err := e.ctrl.FetchSnapshot(pollCtx)

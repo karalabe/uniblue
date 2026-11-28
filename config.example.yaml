@@ -24,6 +24,16 @@ unifi:
   # username: ""
   # password: ""   # or UNIBLUE_UNIFI_PASSWORD
 
+  # Optional pacing between controller requests (useful for Site Manager API
+  # rate limits on https://api.ui.com/v1/connector/consoles/<console-id>,
+  # or set UNIBLUE_UNIFI_REQUEST_DELAY):
+  # request_delay: 750ms
+
+  # Skip TLS certificate verification. Defaults to true for local consoles
+  # (private IPs and LAN hostnames) and false for public hosts like api.ui.com
+  # (or set UNIBLUE_UNIFI_INSECURE_SKIP_VERIFY):
+  # insecure_skip_verify: false
+
 # --- Optional Overrides (derived from UniFi topology when omitted) ---
 
 # network:

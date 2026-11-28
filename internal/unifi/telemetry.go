@@ -391,102 +391,13 @@ func stableHashID(s string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// postJSON performs a read-only query POST (used by UniFi v2 system-log endpoints)
-// and decodes its JSON response into dst, transparently re-logging in once if
-// the cookie session expired and retrying once on transient 429/5xx bursts.
+// postJSON encodes a read-only telemetry query once so retries replay the same payload.
 func (c *Controller) postJSON(ctx context.Context, fullPath string, payload any, dst any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	var lastErr error
-	relogged := false
-	for attempt := 0; attempt < 2; attempt++ {
-		if attempt > 0 {
-			timer := time.NewTimer(250 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-		epoch := c.currentAuthEpoch()
-		err := c.postJSONOnce(ctx, fullPath, raw, dst)
-		if err == nil {
-			c.clearPathUnauthorized(fullPath)
-			return nil
-		}
-		lastErr = err
-		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorized(fullPath) {
-			relogged = true
-			if loginErr := c.relogin(ctx, epoch); loginErr != nil {
-				return fmt.Errorf("re-authentication failed: %w (after %w)", loginErr, err)
-			}
-			// Retry immediately with the fresh session without consuming the transient retry slot.
-			retryErr := c.postJSONOnce(ctx, fullPath, raw, dst)
-			if retryErr == nil {
-				c.clearPathUnauthorized(fullPath)
-				return nil
-			}
-			if isSessionExpiredError(retryErr) {
-				c.markPathUnauthorized(fullPath)
-			}
-			lastErr = retryErr
-		}
-		var apiErr *apiEnvelopeError
-		if errors.As(lastErr, &apiErr) {
-			return lastErr
-		}
-		var httpErr *httpStatusError
-		if errors.As(lastErr, &httpErr) && httpErr.status != http.StatusTooManyRequests && httpErr.status < 500 {
-			return lastErr
-		}
-	}
-	return lastErr
-}
-
-// postJSONOnce performs a single read-only POST request to fullPath with API
-// key and CSRF headers, enforces maxControllerBodyBytes, checks HTTP status
-// and UniFi meta.rc envelope errors, and decodes the JSON response into dst.
-func (c *Controller) postJSONOnce(ctx context.Context, fullPath string, raw []byte, dst any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+fullPath, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
-	}
-	if tok := c.currentCSRFToken(); tok != "" {
-		req.Header.Set("X-CSRF-Token", tok)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("POST %s: %w", fullPath, err)
-	}
-	defer resp.Body.Close()
-
-	if tok := resp.Header.Get("X-CSRF-Token"); tok != "" {
-		c.setCSRFToken(tok)
-	}
-
-	body, err := readControllerBody(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", fullPath, err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &httpStatusError{method: http.MethodPost, path: fullPath, status: resp.StatusCode, apiMsg: extractAPIErrorMsg(body)}
-	}
-	if err := checkAPIEnvelopeError(fullPath, body); err != nil {
-		return err
-	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		return fmt.Errorf("decode %s: %w", fullPath, err)
-	}
-	return nil
+	return c.queryJSON(ctx, http.MethodPost, fullPath, raw, dst)
 }
 
 // parseSecuritySettings extracts strictly non-secret security posture flags from

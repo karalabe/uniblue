@@ -184,6 +184,8 @@ UniBlue can run with a `config.yaml` or purely from environment variables. In Do
 | `UNIBLUE_UNIFI_USERNAME` | Fallback | Local view-only UniFi username (when not using an API key) |
 | `UNIBLUE_UNIFI_PASSWORD` | Fallback | Local view-only UniFi password (when not using an API key) |
 | `UNIBLUE_UNIFI_SITE` | Optional | UniFi site name or ID (default: `default`) |
+| `UNIBLUE_UNIFI_REQUEST_DELAY` | Optional | Delay between UniFi API requests (e.g., `750ms` for Site Manager rate limits; default: `0`) |
+| `UNIBLUE_UNIFI_INSECURE_SKIP_VERIFY` | Optional | Skip TLS certificate verification (`true` by default for local consoles with private IPs or LAN hostnames; `false` for public hosts like `api.ui.com`) |
 | `UNIBLUE_API_TOKEN` | Recommended | Protects `/api/v1/*` with Bearer auth for agents and a login cookie for browsers |
 | `UNIBLUE_ALLOWED_HOSTS` | Optional | Comma-separated reverse-proxy hostnames allowed past DNS-rebinding checks |
 | `UNIBLUE_WEBHOOK_URL` | Optional | Outbound alert webhook URL (Hermes, ntfy, Discord, Slack, or custom) |
@@ -273,6 +275,7 @@ UniBlue automatically detects how to talk to your UniFi console:
 - **UniFi Network Integration API v1** (`X-API-Key`, recommended with 2FA): `/proxy/network/integration/v1/...`
 - **UniFi OS** (UDM Pro, UDM SE, Cloud Gateways, modern Cloud Keys): `/api/auth/login` + `/proxy/network/...`
 - **Classic Network Controller** (older Cloud Key / standalone Network App): `/api/login` + `/api/s/<site>/...`
+- **UniFi Site Manager API** (cloud bridge for consoles without local API keys, such as UDR7): set `unifi.url` to `https://api.ui.com/v1/connector/consoles/<console-id>` (find `<console-id>` via `GET https://api.ui.com/v1/hosts` with header `X-API-Key: <cloud-key>`, created at `https://unifi.ui.com/settings/api-keys`) and pass that key via `UNIBLUE_UNIFI_API_KEY`. TLS certificate verification is enforced automatically for public hosts; set `unifi.request_delay` (e.g., `750ms`) and a slower `-poll` interval (e.g., `-poll 60s`) to stay within Site Manager rate limits.
 
 Wired and wirelessly meshed UniFi APs are supported. Ubiquiti's separate **AmpliFi** consumer line (HD, Instant, Alien) is not supported, as it does not run the UniFi Network API.
 

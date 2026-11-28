@@ -13,12 +13,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"golang.org/x/net/idna"
 	"gopkg.in/yaml.v3"
 )
 
@@ -82,12 +86,15 @@ type UniFiConfig struct {
 	// When set, session login with username/password is skipped.
 	APIKey string `yaml:"api_key"`
 
-	// InsecureSkipVerify disables TLS certificate verification, which is typically
-	// required for local gateways serving self-signed certificates.
+	// InsecureSkipVerify disables TLS certificate verification. Load enables
+	// it by default only for local consoles, which commonly use self-signed certificates.
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
 
 	// Timeout bounds each HTTP request made to the UniFi controller.
 	Timeout time.Duration `yaml:"timeout"`
+
+	// RequestDelay spaces controller requests to stay within a shared API quota.
+	RequestDelay time.Duration `yaml:"request_delay"`
 }
 
 // PhysicalPortRule assigns an explicit physical-security zone and optional MAC
@@ -377,6 +384,13 @@ func Default() *Config {
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
+	// Keep the public bool field while distinguishing an omitted YAML setting
+	// from an explicit false, including settings inherited through YAML merges.
+	var overrides struct {
+		UniFi struct {
+			InsecureSkipVerify *bool `yaml:"insecure_skip_verify"`
+		} `yaml:"unifi"`
+	}
 	loadedFromFile := false
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -395,6 +409,9 @@ func Load(path string) (*Config, error) {
 		if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("parse config %q: %w", path, err)
 		}
+		if err := yaml.Unmarshal(raw, &overrides); err != nil {
+			return nil, fmt.Errorf("parse config %q: %w", path, err)
+		}
 		cfg.State.ExplicitPath = cfg.State.Path != ""
 	}
 
@@ -402,6 +419,21 @@ func Load(path string) (*Config, error) {
 	// run with a minimal (or even absent) config.yaml.
 	if v := os.Getenv("UNIBLUE_UNIFI_URL"); v != "" {
 		cfg.UniFi.URL = v
+	}
+	if v := os.Getenv("UNIBLUE_UNIFI_INSECURE_SKIP_VERIFY"); v != "" {
+		cfg.UniFi.InsecureSkipVerify, err = strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("config: UNIBLUE_UNIFI_INSECURE_SKIP_VERIFY: %w", err)
+		}
+	} else if overrides.UniFi.InsecureSkipVerify == nil {
+		controller, err := url.Parse(cfg.UniFi.URL)
+		cfg.UniFi.InsecureSkipVerify = err == nil && localConsoleHost(controller.Hostname())
+	}
+	if v := os.Getenv("UNIBLUE_UNIFI_REQUEST_DELAY"); v != "" {
+		cfg.UniFi.RequestDelay, err = time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("config: UNIBLUE_UNIFI_REQUEST_DELAY: %w", err)
+		}
 	}
 	if v := os.Getenv("UNIBLUE_UNIFI_SITE"); v != "" {
 		cfg.UniFi.Site = v
@@ -503,6 +535,36 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// localConsoleHost recognizes LAN addresses and names without relying on DNS
+// answers to decide whether a controller's certificate should be trusted.
+func localConsoleHost(host string) bool {
+	// Use the HTTP transport's IDNA lookup rules so a Unicode label separator
+	// in a public hostname cannot be mistaken for part of a single LAN label.
+	if strings.ContainsFunc(host, func(r rune) bool { return r >= utf8.RuneSelf }) {
+		ascii, err := idna.Lookup.ToASCII(host)
+		if err != nil {
+			return false
+		}
+		host = ascii
+	}
+	host, absolute := strings.CutSuffix(strings.ToLower(host), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		ip = ip.Unmap()
+		return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || netip.MustParsePrefix("100.64.0.0/10").Contains(ip)
+	}
+	for _, suffix := range []string{".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain", ".localhost"} {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	// Some resolvers accept an integer as an IPv4 address.
+	if _, err := strconv.ParseUint(host, 0, 32); err == nil {
+		return false
+	}
+	// A rooted single label can address a public top-level domain directly.
+	return host == "localhost" || (!absolute && host != "" && strings.Trim(host, "abcdefghijklmnopqrstuvwxyz0123456789-_") == "")
+}
+
 // ParseCanonicalMAC parses a 48-bit MAC address in colon, dash, Cisco dot, or
 // bare 12-hex-digit form and returns lowercase colon-separated aa:bb:cc:dd:ee:ff.
 func ParseCanonicalMAC(raw string) (string, bool) {
@@ -569,6 +631,9 @@ func (c *Config) Validate() error {
 	parsed, err := url.Parse(c.UniFi.URL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return fmt.Errorf("config: unifi.url %q must be a valid http(s) URL", c.UniFi.URL)
+	}
+	if c.UniFi.RequestDelay < 0 {
+		return errors.New("config: unifi.request_delay must be non-negative")
 	}
 	if c.UniFi.APIKey == "" && (c.UniFi.Username == "" || c.UniFi.Password == "") {
 		return errors.New("config: either unifi.api_key or unifi.username + unifi.password is required")

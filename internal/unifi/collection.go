@@ -75,7 +75,7 @@ func (env *apiEnvelope[T]) UnmarshalJSON(raw []byte) error {
 }
 
 // finishSessionLogin resolves the site's internal routing reference via
-// /api/self/sites using getJSONOnce (avoiding recursive loginMu acquisition),
+// /api/self/sites using a single GET (avoiding recursive loginMu acquisition),
 // tolerates permission/404 denials on restricted accounts, and commits the
 // active session state and authEpoch under authMu.
 func (c *Controller) finishSessionLogin(ctx context.Context, prefix, kind string) error {
@@ -87,7 +87,7 @@ func (c *Controller) finishSessionLogin(ctx context.Context, prefix, kind string
 		Description string `json:"desc"`
 	}]
 	ref := wanted
-	err := c.getJSONOnce(ctx, prefix+"/api/self/sites", &env)
+	err := c.queryJSONOnce(ctx, http.MethodGet, prefix+"/api/self/sites", nil, &env)
 	if err == nil && len(env.Data) > 0 {
 		var sites []integrationSite
 		for _, r := range env.Data {

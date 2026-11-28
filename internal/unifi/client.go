@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -56,6 +57,16 @@ const (
 	// maxControllerBodyBytes caps JSON payloads read from the controller so a
 	// misconfigured URL cannot exhaust memory.
 	maxControllerBodyBytes = 16 << 20
+
+	// Bound HTTP 429 retries so one throttled feed cannot hold a poll indefinitely.
+	defaultRateLimitBase = time.Second
+	defaultRateLimitMax  = time.Minute
+	maxRateLimitAttempts = 5
+
+	// maxControllerConns bounds concurrent in-flight controller requests to
+	// match the HTTP transport's per-host connection limit so extra callers wait
+	// before pacing instead of queueing past a shared 429 cooldown.
+	maxControllerConns = 4
 
 	// defaultAuthFailCooldown prevents concurrent or repeated 401 responses from
 	// hammering the controller login endpoint when credentials were revoked or
@@ -101,8 +112,22 @@ type Controller struct {
 	// httpClient carries TLS configuration, timeouts, and the session cookie jar.
 	httpClient *http.Client
 
+	// paceMu protects both deadlines so a new 429 also delays queued requests.
+	paceMu         sync.Mutex
+	nextRequestAt  time.Time
+	rateLimitUntil time.Time
+	requestDelay   time.Duration
+	rateLimitBase  time.Duration
+	rateLimitMax   time.Duration
+	// paceSlot gives one paced caller at a time the next slot. Cancelled polls
+	// can leave the queue without reserving slots that nobody will use.
+	paceSlot chan struct{}
+	// inFlight caps concurrent requests before waitTurn so no caller queues
+	// inside http.Transport and slips past a shared 429 cooldown.
+	inFlight chan struct{}
+
 	// authMu guards apiPrefix, controllerType, site, displaySite, siteID, csrfToken,
-	// authEpoch, wsReloginSuppressedUntil, and unauthPaths.
+	// authEpoch, wsReloginSuppressedUntil, unauthPaths, and unsupportedPaths.
 	authMu sync.RWMutex
 
 	// loginMu serializes Login/relogin calls so concurrent 401s re-authenticate once
@@ -133,6 +158,11 @@ type Controller struct {
 	// re-logins on every poll while automatically recovering after a restart.
 	unauthPaths map[string]time.Time
 
+	// unsupportedPaths caches denials of optional legacy feeds for this API-key
+	// session until their TTL expires so snapshots keep reporting the original
+	// status without hammering unsupported endpoints on every poll.
+	unsupportedPaths map[string]cachedDenial
+
 	// apiPrefix is "/proxy/network" for UniFi OS consoles or "" for classic
 	// controllers, discovered automatically during Login.
 	apiPrefix string
@@ -159,8 +189,8 @@ func New(cfg config.UniFiConfig) (*Controller, error) {
 	}
 
 	transport := &http.Transport{
-		MaxIdleConnsPerHost: 4,
-		MaxConnsPerHost:     4,
+		MaxIdleConnsPerHost: maxControllerConns,
+		MaxConnsPerHost:     maxControllerConns,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec // local gateways typically serve self-signed certs
 		},
@@ -173,6 +203,11 @@ func New(cfg config.UniFiConfig) (*Controller, error) {
 		username:           cfg.Username,
 		password:           cfg.Password,
 		apiKey:             cfg.APIKey,
+		requestDelay:       cfg.RequestDelay,
+		paceSlot:           make(chan struct{}, 1),
+		inFlight:           make(chan struct{}, maxControllerConns),
+		rateLimitBase:      defaultRateLimitBase,
+		rateLimitMax:       defaultRateLimitMax,
 		insecureSkipVerify: cfg.InsecureSkipVerify,
 		httpClient: &http.Client{
 			Timeout:   cfg.Timeout,
@@ -224,9 +259,23 @@ func (c *Controller) currentCSRFToken() string {
 	return c.csrfToken
 }
 
+func (c *Controller) currentCSRFTokenAndEpoch() (string, uint64) {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.csrfToken, c.authEpoch
+}
+
 func (c *Controller) setCSRFToken(tok string) {
 	c.authMu.Lock()
 	c.csrfToken = tok
+	c.authMu.Unlock()
+}
+
+func (c *Controller) setCSRFTokenIfEpoch(epoch uint64, tok string) {
+	c.authMu.Lock()
+	if c.authEpoch == epoch {
+		c.csrfToken = tok
+	}
 	c.authMu.Unlock()
 }
 
@@ -415,6 +464,10 @@ func (c *Controller) Login(ctx context.Context) error {
 	c.loginMu.Lock()
 	defer c.loginMu.Unlock()
 	if err := c.loginLocked(ctx); err != nil {
+		var certErr *tls.CertificateVerificationError
+		if errors.As(err, &certErr) {
+			err = fmt.Errorf("%w (set unifi.insecure_skip_verify: true if this console uses a self-signed certificate)", err)
+		}
 		return err
 	}
 	c.lastLoginErr = nil
@@ -488,6 +541,7 @@ func (c *Controller) loginWithAPIKey(ctx context.Context) error {
 		}
 		c.controllerType = controllerIntegrationV1
 		c.apiPrefix = "/proxy/network"
+		c.unsupportedPaths = make(map[string]cachedDenial)
 		c.authEpoch++
 		c.authMu.Unlock()
 		return nil
@@ -500,6 +554,11 @@ func (c *Controller) loginWithAPIKey(ctx context.Context) error {
 		return fmt.Errorf("unifi integration api login failed: %w", err)
 	}
 
+	// These probes select the primary API for the new session. A denial from
+	// an earlier Integration v1 enrichment attempt must not skip discovery.
+	c.authMu.Lock()
+	c.unsupportedPaths = nil
+	c.authMu.Unlock()
 	probes := []struct {
 		prefix string
 		kind   string
@@ -581,23 +640,12 @@ func (c *Controller) postLogin(ctx context.Context, path string) (int, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
+	resp, body, err := c.readResponse(req, path, false)
+	if resp == nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
-	body, err := readControllerBody(resp.Body)
 	if err != nil {
 		return resp.StatusCode, err
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, &httpStatusError{
-			method: http.MethodPost,
-			path:   path,
-			status: resp.StatusCode,
-			apiMsg: extractAPIErrorMsg(body),
-		}
 	}
 	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 {
 		if !json.Valid(trimmed) || trimmed[0] != '{' {
@@ -634,6 +682,10 @@ func (c *Controller) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
 		snap, err = c.fetchIntegrationSnapshot(ctx)
 	} else {
 		snap, err = c.fetchLegacySnapshot(ctx)
+	}
+	if err == nil && ctx.Err() != nil {
+		// Feeds read after the deadline degrade to empty, so the snapshot is incomplete.
+		return nil, ctx.Err()
 	}
 	if err == nil {
 		// Refresh local addresses alongside inventory so DHCP changes reach every report consumer.
@@ -2875,6 +2927,12 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 	return <-errs
 }
 
+// cachedDenial remembers an optional feed's denial until it is worth re-probing.
+type cachedDenial struct {
+	err   *httpStatusError
+	until time.Time
+}
+
 // httpStatusError preserves the HTTP status code and optional controller error
 // message on failed requests so callers can distinguish missing endpoints (404),
 // session expiry (401), and explicit permission errors (NoPermission).
@@ -2977,91 +3035,245 @@ func isSessionExpiredError(err error) bool {
 	return false
 }
 
-// getJSON performs a read-only GET request against a full controller path and
-// decodes its JSON response into dst, transparently re-logging in once if a
-// cookie session expired (HTTP 401 or api.err.LoginRequired) and retrying once
-// on transient 429/5xx bursts.
-func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) error {
-	var lastErr error
-	relogged := false
-	for attempt := 0; attempt < 2; attempt++ {
-		if attempt > 0 {
-			timer := time.NewTimer(250 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
+// waitTurn admits requests before the HTTP timeout starts. Only the caller at
+// the head of a paced queue needs a timer. It rechecks the shared deadline
+// after waking because an in-flight request may have received another 429.
+func (c *Controller) waitTurn(ctx context.Context) error {
+	if c.requestDelay > 0 {
+		select {
+		case c.paceSlot <- struct{}{}:
+			defer func() { <-c.paceSlot }()
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		epoch := c.currentAuthEpoch()
-		err := c.getJSONOnce(ctx, fullPath, dst)
-		if err == nil {
-			c.clearPathUnauthorized(fullPath)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.paceMu.Lock()
+		start := c.rateLimitUntil
+		if c.nextRequestAt.After(start) {
+			start = c.nextRequestAt
+		}
+		now := time.Now()
+		if !start.After(now) {
+			if c.requestDelay > 0 {
+				c.nextRequestAt = now.Add(c.requestDelay)
+			}
+			c.paceMu.Unlock()
 			return nil
 		}
-		lastErr = err
-		if !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorized(fullPath) {
+		c.paceMu.Unlock()
+		if err := waitForRetry(ctx, start.Sub(now)); err != nil {
+			return err
+		}
+	}
+}
+
+// cooldownEndsBefore reports whether the shared 429 cooldown ends before the
+// caller's deadline, so a retry never consumes the rest of a bounded poll.
+func (c *Controller) cooldownEndsBefore(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	c.paceMu.Lock()
+	defer c.paceMu.Unlock()
+	return c.rateLimitUntil.Before(deadline)
+}
+
+// waitForRetry lets cancellation interrupt either a pacing slot or a transient retry.
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// parseRetryAfter bounds both forms of the HTTP header before converting seconds
+// to a Duration so even an overflowing integer cannot bypass the cooldown.
+func parseRetryAfter(header string, now time.Time) time.Duration {
+	header = strings.TrimSpace(header)
+	if secs, err := strconv.ParseUint(header, 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+		return time.Duration(min(secs, uint64(defaultRateLimitMax/time.Second))) * time.Second
+	}
+	if when, err := http.ParseTime(header); err == nil {
+		return min(max(0, when.Sub(now)), defaultRateLimitMax)
+	}
+	return 0
+}
+
+// readResponse applies the controller concurrency limit and quota to HTTP
+// requests, including login. A 429 delays other callers as soon as its headers
+// arrive. When attachCSRF is true, the current CSRF token is read after pacing
+// so an intervening relogin cannot pair an old token with a refreshed cookie.
+func (c *Controller) readResponse(req *http.Request, path string, attachCSRF bool) (*http.Response, []byte, error) {
+	select {
+	case c.inFlight <- struct{}{}:
+		defer func() { <-c.inFlight }()
+	case <-req.Context().Done():
+		return nil, nil, req.Context().Err()
+	}
+	if err := c.waitTurn(req.Context()); err != nil {
+		return nil, nil, err
+	}
+	var epoch uint64
+	if attachCSRF {
+		var tok string
+		tok, epoch = c.currentCSRFTokenAndEpoch()
+		if tok != "" {
+			req.Header.Set("X-CSRF-Token", tok)
+		} else {
+			req.Header.Del("X-CSRF-Token")
+		}
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s %s: %w", req.Method, path, err)
+	}
+	defer resp.Body.Close()
+
+	if attachCSRF {
+		if tok := resp.Header.Get("X-CSRF-Token"); tok != "" {
+			c.setCSRFTokenIfEpoch(epoch, tok)
+		}
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		now := time.Now()
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), now)
+		// Share the server's cooldown, or one base interval, across all callers;
+		// exponential backoff stays local to the caller that keeps being refused.
+		delay := min(c.rateLimitMax, max(retryAfter, c.rateLimitBase+rand.N(c.rateLimitBase/8+1)))
+		until := now.Add(delay)
+		c.paceMu.Lock()
+		if until.After(c.rateLimitUntil) {
+			c.rateLimitUntil = until
+		}
+		c.paceMu.Unlock()
+	}
+
+	body, err := readControllerBody(resp.Body)
+	if err != nil && resp.StatusCode != http.StatusTooManyRequests {
+		return resp, nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp, nil, &httpStatusError{
+			method: req.Method, path: path, status: resp.StatusCode,
+			apiMsg: extractAPIErrorMsg(body),
+		}
+	}
+	return resp, body, nil
+}
+
+// getJSON reads a controller feed using the retry policy shared with telemetry queries.
+func (c *Controller) getJSON(ctx context.Context, fullPath string, dst any) error {
+	return c.queryJSON(ctx, http.MethodGet, fullPath, nil, dst)
+}
+
+// queryJSON retries read-only queries after throttling, a transient failure, or
+// cookie expiry. An explicit login starts a new session and clears cached denials.
+func (c *Controller) queryJSON(ctx context.Context, method, fullPath string, raw []byte, dst any) error {
+	var cacheKey string
+	var unsupported map[string]cachedDenial
+	path := strings.TrimPrefix(fullPath, "/proxy/network")
+	if c.apiKey != "" && (strings.HasPrefix(path, "/api/s/") || strings.HasPrefix(path, "/v2/api/")) {
+		cacheKey = method + " " + fullPath
+		c.authMu.RLock()
+		// Only Integration v1 sessions have a cache. Keep this session's map
+		// so a late response cannot suppress a feed after a new login.
+		unsupported = c.unsupportedPaths
+		cached, hit := unsupported[cacheKey]
+		c.authMu.RUnlock()
+		if hit && time.Now().Before(cached.until) {
+			return cached.err
+		}
+	}
+
+	relogged, retriedTransient := false, false
+	for attempt := 0; ; attempt++ {
+		epoch := c.currentAuthEpoch()
+		err := c.queryJSONOnce(ctx, method, fullPath, raw, dst)
+		if err != nil && !relogged && c.canRelogin() && isSessionExpiredError(err) && !c.isPathUnauthorized(fullPath) {
 			relogged = true
 			if loginErr := c.relogin(ctx, epoch); loginErr != nil {
 				return fmt.Errorf("re-authentication failed: %w (after %w)", loginErr, err)
 			}
-			// Retry immediately with the fresh session without consuming the transient retry slot.
-			retryErr := c.getJSONOnce(ctx, fullPath, dst)
-			if retryErr == nil {
-				c.clearPathUnauthorized(fullPath)
-				return nil
-			}
-			if isSessionExpiredError(retryErr) {
+			// Replaying with the new cookie does not consume a transient retry.
+			err = c.queryJSONOnce(ctx, method, fullPath, raw, dst)
+			if isSessionExpiredError(err) {
 				c.markPathUnauthorized(fullPath)
 			}
-			lastErr = retryErr
+		}
+		if err == nil {
+			c.clearPathUnauthorized(fullPath)
+			return nil
 		}
 		var apiErr *apiEnvelopeError
-		if errors.As(lastErr, &apiErr) {
-			return lastErr
+		if errors.As(err, &apiErr) {
+			return err
 		}
 		var httpErr *httpStatusError
-		if errors.As(lastErr, &httpErr) && httpErr.status != http.StatusTooManyRequests && httpErr.status < 500 {
-			return lastErr
+		if errors.As(err, &httpErr) {
+			switch httpErr.status {
+			case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+				if unsupported != nil {
+					c.authMu.Lock()
+					unsupported[cacheKey] = cachedDenial{err: httpErr, until: time.Now().Add(c.reloginSuppressTTLDuration())}
+					c.authMu.Unlock()
+				}
+				return err
+			case http.StatusTooManyRequests:
+				if attempt+1 >= maxRateLimitAttempts || !c.cooldownEndsBefore(ctx) {
+					return err
+				}
+				backoff := c.rateLimitBase << attempt
+				backoff = min(c.rateLimitMax, backoff+rand.N(backoff/8+1))
+				if deadline, ok := ctx.Deadline(); ok && !time.Now().Add(backoff).Before(deadline) {
+					return err
+				}
+				if err := waitForRetry(ctx, backoff); err != nil {
+					return err
+				}
+				continue
+			}
+			if httpErr.status < 500 {
+				return err
+			}
+		}
+		if retriedTransient || attempt+1 == maxRateLimitAttempts {
+			return err
+		}
+		retriedTransient = true
+		if err := waitForRetry(ctx, 250*time.Millisecond); err != nil {
+			return err
 		}
 	}
-	return lastErr
 }
 
-// getJSONOnce performs a single read-only GET request to fullPath with API key
-// and CSRF headers, enforces maxControllerBodyBytes, checks HTTP status and
-// UniFi meta.rc envelope errors, and decodes the JSON body into dst.
-func (c *Controller) getJSONOnce(ctx context.Context, fullPath string, dst any) error {
-	fullURL := c.baseURL + fullPath
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+// queryJSONOnce sends one read-only query. Rebuilding the request on each
+// attempt replays the POST payload and picks up any refreshed session token.
+func (c *Controller) queryJSONOnce(ctx context.Context, method, fullPath string, raw []byte, dst any) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+fullPath, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	if tok := c.currentCSRFToken(); tok != "" {
-		req.Header.Set("X-CSRF-Token", tok)
-	}
 
-	resp, err := c.httpClient.Do(req)
+	_, body, err := c.readResponse(req, fullPath, true)
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", fullPath, err)
-	}
-	defer resp.Body.Close()
-
-	if tok := resp.Header.Get("X-CSRF-Token"); tok != "" {
-		c.setCSRFToken(tok)
-	}
-
-	body, err := readControllerBody(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", fullPath, err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &httpStatusError{path: fullPath, status: resp.StatusCode, apiMsg: extractAPIErrorMsg(body)}
+		return err
 	}
 	if err := checkAPIEnvelopeError(fullPath, body); err != nil {
 		return err

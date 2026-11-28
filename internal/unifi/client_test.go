@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/karalabe/uniblue/internal/config"
@@ -231,6 +233,391 @@ func TestFetchSnapshotIntegrationV1(t *testing.T) {
 	if len(snap.Devices) != 1 || !snap.Devices[0].Upgradable {
 		t.Fatalf("unexpected devices: %+v", snap.Devices)
 	}
+}
+
+// TestSnapshotCachesUnsupportedLegacyFeeds checks that repeated snapshots
+// preserve visibility while spending quota only on feeds that can recover.
+func TestSnapshotCachesUnsupportedLegacyFeeds(t *testing.T) {
+	var deniedLegacy, deniedV1 atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == integrationV1Prefix+"/sites":
+			io.WriteString(w, `{"offset":0,"count":1,"totalCount":1,"data":[{"id":"s","internalReference":"default"}]}`)
+		case r.URL.Path == integrationV1Prefix+"/sites/s/firewall/zones":
+			deniedV1.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+		case strings.HasPrefix(r.URL.Path, integrationV1Prefix+"/"):
+			io.WriteString(w, `{"offset":0,"count":0,"totalCount":0,"data":[]}`)
+		default:
+			deniedLegacy.Add(1)
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/stat/sta"):
+				w.WriteHeader(http.StatusUnauthorized)
+			case strings.HasSuffix(r.URL.Path, "/rest/portconf"):
+				w.WriteHeader(http.StatusNotFound)
+			default:
+				w.WriteHeader(http.StatusForbidden)
+			}
+		}
+	}))
+	defer srv.Close()
+	c, err := New(config.UniFiConfig{URL: srv.URL, APIKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := c.FetchSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, feed := range []string{"client-enrichment (HTTP 401)", "port-profiles (HTTP 404)", "port-forwards (HTTP 403)", "system-logs (HTTP 403)", "vpn-connections (HTTP 403)"} {
+		if !slices.Contains(first.Visibility.MissingFeeds, feed) {
+			t.Errorf("missing %q in %v", feed, first.Visibility.MissingFeeds)
+		}
+	}
+	before := deniedLegacy.Load()
+	second, err := c.FetchSnapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == 0 || deniedLegacy.Load() != before || deniedV1.Load() != 2 {
+		t.Errorf("legacy requests %d then %d, integration zone requests %d", before, deniedLegacy.Load(), deniedV1.Load())
+	}
+	if !slices.Equal(first.Visibility.MissingFeeds, second.Visibility.MissingFeeds) {
+		t.Errorf("missing feeds changed from %v to %v", first.Visibility.MissingFeeds, second.Visibility.MissingFeeds)
+	}
+	if err := c.Login(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.FetchSnapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := deniedLegacy.Load(); got != 2*before {
+		t.Errorf("new session made %d legacy requests, want %d", got-before, before)
+	}
+}
+
+// TestControllerDenialCacheExpires verifies that cached legacy feed denials
+// recover automatically once their TTL expires without requiring a restart.
+func TestControllerDenialCacheExpires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, err := New(config.UniFiConfig{URL: "https://unifi", APIKey: "test-key"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.unsupportedPaths = make(map[string]cachedDenial)
+		c.reloginSuppressTTL = time.Minute
+		var calls atomic.Int32
+		code := http.StatusForbidden
+		c.httpClient.Transport = controllerTransport(func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			w.WriteHeader(code)
+			io.WriteString(w, "{}")
+		})
+		const path = "/proxy/network/v2/api/site/default/vpn/connections"
+		var dst struct{}
+		if err := c.getJSON(t.Context(), path, &dst); err == nil {
+			t.Fatal("expected HTTP 403 on first call")
+		}
+		if err := c.getJSON(t.Context(), path, &dst); err == nil {
+			t.Fatal("expected cached HTTP 403 before TTL expiry")
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("calls before TTL = %d, want 1", calls.Load())
+		}
+		code = http.StatusOK
+		time.Sleep(time.Minute)
+		if err := c.getJSON(t.Context(), path, &dst); err != nil {
+			t.Fatalf("expected recovery after TTL expiry, got %v", err)
+		}
+		if calls.Load() != 2 {
+			t.Fatalf("calls after TTL = %d, want 2", calls.Load())
+		}
+	})
+}
+
+// TestControllerBoundedPollAndInFlightCooldown verifies that 429 retries abort
+// before consuming a bounded poll deadline and that callers queued behind
+// maxControllerConns honor a shared Retry-After raised by in-flight requests.
+func TestControllerBoundedPollAndInFlightCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, err := New(config.UniFiConfig{URL: "https://unifi"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.httpClient.Transport = controllerTransport(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusTooManyRequests)
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+		start := time.Now()
+		var he *httpStatusError
+		if err := c.getJSON(ctx, "/sites", &struct{}{}); !errors.As(err, &he) || he.status != http.StatusTooManyRequests {
+			t.Fatalf("wanted HTTP 429, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("bounded poll waited %s for a 30s Retry-After, want immediate abort", elapsed)
+		}
+	})
+
+	synctest.Test(t, func(t *testing.T) {
+		c, err := New(config.UniFiConfig{URL: "https://unifi"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		arrived := make(chan struct{}, maxControllerConns)
+		release := make(chan struct{})
+		fifthAt := make(chan time.Time, 1)
+		c.httpClient.Transport = controllerTransport(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/fifth" {
+				fifthAt <- time.Now()
+				io.WriteString(w, "{}")
+				return
+			}
+			if r.URL.Path == "/slot0" && time.Now().Equal(start) {
+				arrived <- struct{}{}
+				<-release
+				w.Header().Set("Retry-After", "5")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			if time.Now().Equal(start) {
+				arrived <- struct{}{}
+				<-release
+			}
+			io.WriteString(w, "{}")
+		})
+		done := make(chan error, maxControllerConns+1)
+		for i := range maxControllerConns {
+			path := "/slot" + string(rune('0'+i))
+			go func() { done <- c.getJSON(t.Context(), path, &struct{}{}) }()
+		}
+		for range maxControllerConns {
+			<-arrived
+		}
+		go func() { done <- c.getJSON(t.Context(), "/fifth", &struct{}{}) }()
+		synctest.Wait()
+		close(release)
+		for range maxControllerConns + 1 {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if gap := (<-fifthAt).Sub(start); gap < 5*time.Second {
+			t.Errorf("queued 5th request fired after %s, want >= 5s", gap)
+		}
+	})
+}
+
+// TestControllerPacedCSRFFreshness verifies that a request waiting in pacing
+// reads the latest CSRF token after an intervening relogin and cannot overwrite
+// the newer epoch's token with an older response header.
+func TestControllerPacedCSRFFreshness(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, err := New(config.UniFiConfig{URL: "https://unifi", RequestDelay: 100 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.setCSRFToken("old-token")
+		var gotToken string
+		c.httpClient.Transport = controllerTransport(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/second" {
+				gotToken = r.Header.Get("X-CSRF-Token")
+			}
+			io.WriteString(w, "{}")
+		})
+		if err := c.getJSON(t.Context(), "/first", &struct{}{}); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- c.postJSON(t.Context(), "/second", struct{}{}, &struct{}{}) }()
+		synctest.Wait()
+		// Simulate a concurrent relogin updating the token and authEpoch while /second waits.
+		c.authMu.Lock()
+		c.authEpoch++
+		c.csrfToken = "fresh-token"
+		c.authMu.Unlock()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if gotToken != "fresh-token" {
+			t.Errorf("paced POST sent CSRF %q, want %q", gotToken, "fresh-token")
+		}
+	})
+}
+
+// controllerTransport runs the HTTP exchange on the test clock so pacing and
+// cooldown assertions do not depend on socket or scheduler latency.
+type controllerTransport http.HandlerFunc
+
+// RoundTrip records a complete HTTP response for the controller client.
+func (h controllerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	h(rec, req)
+	return rec.Result(), nil
+}
+
+// TestControllerSharedRetryAfter holds a response until a second caller is
+// queued, then checks that both the queued caller and the retry honor the header.
+func TestControllerSharedRetryAfter(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const spacing = 50 * time.Millisecond
+				c, err := New(config.UniFiConfig{URL: "https://unifi", RequestDelay: spacing, Timeout: 10 * time.Millisecond})
+				if err != nil {
+					t.Fatal(err)
+				}
+				start := time.Now()
+				arrived, release := make(chan struct{}), make(chan struct{})
+				times := make(chan time.Time, 3)
+				c.httpClient.Transport = controllerTransport(func(w http.ResponseWriter, r *http.Request) {
+					times <- time.Now()
+					if r.Method == method && time.Now().Equal(start) {
+						close(arrived)
+						<-release
+						header := "5"
+						if method == http.MethodPost {
+							header = start.Add(5 * time.Second).UTC().Format(http.TimeFormat)
+						}
+						w.Header().Set("Retry-After", header)
+						w.WriteHeader(http.StatusTooManyRequests)
+						return
+					}
+					io.WriteString(w, "{}")
+				})
+				request := func(verb string) error {
+					var dst struct{}
+					if verb == http.MethodPost {
+						return c.postJSON(t.Context(), "/logs", struct{}{}, &dst)
+					}
+					return c.getJSON(t.Context(), "/sites", &dst)
+				}
+				done := make(chan error, 2)
+				go func() { done <- request(method) }()
+				<-arrived
+				other := http.MethodPost
+				if method == http.MethodPost {
+					other = http.MethodGet
+				}
+				go func() { done <- request(other) }()
+				synctest.Wait()
+				close(release)
+				for range 2 {
+					if err := <-done; err != nil {
+						t.Fatal(err)
+					}
+				}
+				first, next, last := <-times, <-times, <-times
+				if next.Sub(first) != 5*time.Second || last.Sub(next) != spacing {
+					t.Errorf("request gaps %s, %s; want 5s, %s", next.Sub(first), last.Sub(next), spacing)
+				}
+			})
+		})
+	}
+}
+
+// TestControllerRetryBudget verifies that 429s back off exponentially, 5xx
+// retries stay short, and neither status disables a legacy feed on later polls.
+func TestControllerRetryBudget(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		synctest.Test(t, func(t *testing.T) {
+			c, err := New(config.UniFiConfig{URL: "https://unifi", APIKey: "test-key"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.unsupportedPaths = make(map[string]cachedDenial)
+			c.rateLimitBase, c.rateLimitMax = time.Millisecond, 6*time.Millisecond
+			var starts []time.Time
+			code := status
+			c.httpClient.Transport = controllerTransport(func(w http.ResponseWriter, _ *http.Request) {
+				starts = append(starts, time.Now())
+				w.WriteHeader(code)
+				io.WriteString(w, "{}")
+			})
+			const path = "/proxy/network/v2/api/site/default/vpn/connections"
+			var dst struct{}
+			var he *httpStatusError
+			if err := c.getJSON(t.Context(), path, &dst); !errors.As(err, &he) || he.status != status {
+				t.Fatalf("wanted HTTP %d, got %v", status, err)
+			}
+			delays := []time.Duration{250 * time.Millisecond}
+			if status == http.StatusTooManyRequests {
+				delays = []time.Duration{time.Millisecond, 2 * time.Millisecond, 4 * time.Millisecond, 6 * time.Millisecond}
+			}
+			if len(starts) != 1+len(delays) {
+				t.Fatalf("HTTP %d: %d attempts, want %d", status, len(starts), 1+len(delays))
+			}
+			for i, delay := range delays {
+				maxDelay := delay
+				if status == http.StatusTooManyRequests {
+					maxDelay = min(c.rateLimitMax, delay+delay/8)
+				}
+				if gap := starts[i+1].Sub(starts[i]); gap < delay || gap > maxDelay {
+					t.Errorf("HTTP %d retry %d waited %s, want [%s, %s]", status, i+1, gap, delay, maxDelay)
+				}
+			}
+			code = http.StatusOK
+			if err := c.getJSON(t.Context(), path, &dst); err != nil {
+				t.Fatalf("recovered feed: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseRetryAfter checks that malformed or extreme headers cannot stall a poll.
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Unix(0, 0).UTC()
+	for header, want := range map[string]time.Duration{
+		"": 0, "invalid": 0, "-1": 0, "5": 5 * time.Second, "999999999999999999999": time.Minute,
+		now.Add(-time.Hour).Format(http.TimeFormat): 0, now.Add(time.Hour).Format(http.TimeFormat): time.Minute,
+	} {
+		if got := parseRetryAfter(header, now); got != want {
+			t.Errorf("parseRetryAfter(%q) = %s, want %s", header, got, want)
+		}
+	}
+}
+
+// TestControllerPacing checks that concurrent reads get distinct slots and a
+// cancelled waiter neither reaches the transport nor delays the remaining reads.
+func TestControllerPacing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const delay = 100 * time.Millisecond
+		c, err := New(config.UniFiConfig{URL: "https://unifi", RequestDelay: delay})
+		if err != nil {
+			t.Fatal(err)
+		}
+		starts := make(chan time.Time, 4)
+		c.httpClient.Transport = controllerTransport(func(w http.ResponseWriter, _ *http.Request) {
+			starts <- time.Now()
+			io.WriteString(w, "{}")
+		})
+		read := func(ctx context.Context) error { return c.getJSON(ctx, "/sites", &struct{}{}) }
+		if err := read(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		first := <-starts
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 3)
+		go func() { done <- read(ctx) }()
+		synctest.Wait()
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) || !time.Now().Equal(first) {
+			t.Fatalf("cancelled after %s: %v", time.Since(first), err)
+		}
+		for range 3 {
+			go func() { done <- read(t.Context()) }()
+		}
+		for i := 1; i <= 3; i++ {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if gap := (<-starts).Sub(first); gap != time.Duration(i)*delay {
+				t.Errorf("request %d started after %s", i, gap)
+			}
+		}
+	})
 }
 
 // TestPortMatchesSpec verifies single-port, range, and comma-separated UniFi port specs.

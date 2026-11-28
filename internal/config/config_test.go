@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestLoadZeroConfigFromEnv verifies that Load builds a valid configuration
@@ -29,6 +30,117 @@ func TestLoadZeroConfigFromEnv(t *testing.T) {
 	}
 	if len(cfg.Scan.Ports) != len(DefaultPorts) {
 		t.Fatalf("got %d default ports, want %d", len(cfg.Scan.Ports), len(DefaultPorts))
+	}
+}
+
+// TestControllerTLSDefaults checks the certificate policy for the effective
+// controller URL, including an environment override of a local YAML URL.
+func TestControllerTLSDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.yaml")
+	t.Setenv("UNIBLUE_UNIFI_API_KEY", "test-key")
+	for _, tc := range []struct {
+		host  string
+		local bool
+	}{
+		{"api.ui.com/v1/connector/consoles/abc", false}, {"unifi.local.example", false},
+		{"192.0.2.1", false}, {"[2001:db8::1]", false}, {"100.128.0.1", false},
+		{"api。ui。com", false}, {"ai.", false}, {"134744072", false},
+		{"192.168.1.1", true}, {"10.0.0.1", true}, {"172.16.0.1", true},
+		{"localhost.", true}, {"127.0.0.1", true}, {"100.127.255.254", true}, {"169.254.1.1", true},
+		{"[fc00::1]", true}, {"[::1]", true}, {"[fe80::1%25en0]", true},
+		{"unifi", true}, {"konzolám", true}, {"unifi.local", true}, {"UNIFI.LAN.:8443", true},
+		{"unifi.home", true}, {"unifi.home.arpa", true}, {"unifi.internal", true},
+		{"unifi.localdomain", true}, {"unifi.localhost", true},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
+			t.Setenv("UNIBLUE_UNIFI_URL", "https://"+tc.host)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.UniFi.InsecureSkipVerify != tc.local {
+				t.Errorf("InsecureSkipVerify = %t, want %t", cfg.UniFi.InsecureSkipVerify, tc.local)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		host, yamlSetting, envSetting string
+		setEnv                        bool
+		want                          bool
+	}{
+		{"api.ui.com", "", "", false, false}, {"api.ui.com", "true", "", false, true}, {"unifi", "false", "", false, false},
+		{"api.ui.com", "false", "true", true, true}, {"unifi", "true", "false", true, false},
+		{"unifi", "false", "", true, false}, {"api.ui.com", "", "", true, false},
+	} {
+		t.Run(tc.host+"/"+tc.yamlSetting+"/"+tc.envSetting, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			raw := "unifi:\n  url: https://unifi.lan\n"
+			if tc.yamlSetting != "" {
+				raw += "  insecure_skip_verify: " + tc.yamlSetting + "\n"
+			}
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("UNIBLUE_UNIFI_URL", "https://"+tc.host)
+			if tc.setEnv {
+				t.Setenv("UNIBLUE_UNIFI_INSECURE_SKIP_VERIFY", tc.envSetting)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.UniFi.InsecureSkipVerify != tc.want {
+				t.Errorf("InsecureSkipVerify = %t, want %t", cfg.UniFi.InsecureSkipVerify, tc.want)
+			}
+		})
+	}
+	t.Setenv("UNIBLUE_UNIFI_URL", "https://unifi")
+	t.Setenv("UNIBLUE_UNIFI_INSECURE_SKIP_VERIFY", "sometimes")
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "UNIBLUE_UNIFI_INSECURE_SKIP_VERIFY") {
+		t.Errorf("invalid TLS override: %v", err)
+	}
+}
+
+// TestControllerRequestDelay checks pacing defaults, precedence, and rejection
+// of invalid settings before the controller client is constructed.
+func TestControllerRequestDelay(t *testing.T) {
+	t.Setenv("UNIBLUE_UNIFI_URL", "https://unifi")
+	t.Setenv("UNIBLUE_UNIFI_API_KEY", "test-key")
+	for _, tc := range []struct {
+		yaml, env, wantErr string
+		setEnv             bool
+		want               time.Duration
+	}{
+		{"", "", "", false, 0}, {"500ms", "", "", false, 500 * time.Millisecond},
+		{"500ms", "", "", true, 500 * time.Millisecond},
+		{"500ms", "2s", "", true, 2 * time.Second}, {"500ms", "0", "", true, 0},
+		{"-1s", "", "unifi.request_delay", false, 0}, {"", "-1ms", "unifi.request_delay", true, 0},
+		{"", "later", "UNIBLUE_UNIFI_REQUEST_DELAY", true, 0},
+	} {
+		t.Run(tc.yaml+"/"+tc.env, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if tc.yaml != "" {
+				if err := os.WriteFile(path, []byte("unifi:\n  request_delay: "+tc.yaml+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.setEnv {
+				t.Setenv("UNIBLUE_UNIFI_REQUEST_DELAY", tc.env)
+			}
+			cfg, err := Load(path)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.UniFi.RequestDelay != tc.want {
+				t.Errorf("RequestDelay = %s, want %s", cfg.UniFi.RequestDelay, tc.want)
+			}
+		})
 	}
 }
 
