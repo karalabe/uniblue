@@ -51,6 +51,32 @@ type UniFiPostureSummary struct {
 	RecentLogs []unifi.ControllerLogEvent `json:"recent_logs,omitempty"`
 }
 
+// PostureLogCounts holds the controller event totals used in posture notes and findings.
+type PostureLogCounts struct {
+	// Threats counts IDS/IPS detections in the controller's reporting window.
+	Threats int
+	// HoneypotHits counts attempts to access the gateway's internal honeypot.
+	HoneypotHits int
+	// AdminActivity counts administrator access and configuration events.
+	AdminActivity int
+}
+
+// CountPostureLogs lets polling detect changes to posture even when an alert ages out.
+func CountPostureLogs(logs []unifi.ControllerLogEvent) PostureLogCounts {
+	var counts PostureLogCounts
+	for _, ev := range logs {
+		switch ev.LogKind() {
+		case "honeypot_hit":
+			counts.HoneypotHits++
+		case "ids_threat":
+			counts.Threats++
+		case "admin_activity":
+			counts.AdminActivity++
+		}
+	}
+	return counts
+}
+
 // AnalyzeUniFiPosture audits Wi-Fi security (WLAN configs + Evil-Twin/Rogue APs),
 // UniFi device SSH, UPnP, IDS/IPS, Honeypot, DNS Shield, and recent controller
 // security logs, emitting high-signal findings and clean posture notes.
@@ -359,21 +385,11 @@ func AnalyzeUniFiPosture(
 	}
 
 	// 4. Summarize recent 24h IDS/IPS threat & admin highlights cleanly in Posture Notes.
-	var threatCount, honeypotCount, adminCount int
-	for _, ev := range snap.RecentLogs {
-		switch {
-		case strings.Contains(ev.Event, "HONEYPOT"):
-			honeypotCount++
-		case ev.Category == "SECURITY" || strings.Contains(ev.Event, "THREAT"):
-			threatCount++
-		case ev.Category == "ADMIN":
-			adminCount++
-		}
-	}
-	if honeypotCount > 0 {
+	counts := CountPostureLogs(snap.RecentLogs)
+	if counts.HoneypotHits > 0 {
 		findings = append(findings, checks.Finding{
 			CheckID:           "UB-UNIFI-HONEYPOT-HIT",
-			Title:             fmt.Sprintf("UniFi Internal Honeypot Triggered (%d hit(s) in 24h)", honeypotCount),
+			Title:             fmt.Sprintf("UniFi Internal Honeypot Triggered (%d hit(s) in 24h)", counts.HoneypotHits),
 			Category:          "intrusion",
 			BaseSeverity:      checks.SeverityCritical,
 			EffectiveSeverity: checks.SeverityCritical,
@@ -382,7 +398,7 @@ func AnalyzeUniFiPosture(
 				IP:   gw.IP,
 				Name: gw.Name,
 			},
-			Evidence: fmt.Sprintf("Gateway reported %d internal honeypot hit(s) in the last 24 hours (indicates active horizontal LAN scanning)", honeypotCount),
+			Evidence: fmt.Sprintf("Gateway reported %d internal honeypot hit(s) in the last 24 hours (indicates active horizontal LAN scanning)", counts.HoneypotHits),
 			Remediation: checks.Remediation{
 				Summary: "Investigate the source IP in UniFi System Log immediately. Internal honeypot hits indicate an unexpected host scanning private LAN addresses.",
 				UniFiActions: []string{
@@ -391,17 +407,17 @@ func AnalyzeUniFiPosture(
 			},
 		})
 	}
-	if threatCount > 0 {
+	if counts.Threats > 0 {
 		notes = append(notes, PostureNote{
 			Severity: checks.SeverityInfo,
-			Title:    fmt.Sprintf("Gateway IDS/IPS blocked %d intrusion attempt(s) in the last 24h", threatCount),
+			Title:    fmt.Sprintf("Gateway IDS/IPS blocked %d intrusion attempt(s) in the last 24h", counts.Threats),
 			Detail:   "Inspect individual source/destination IPs in the live event stream (`uniblue serve`) or UniFi Security Detections.",
 		})
 	}
-	if adminCount > 0 {
+	if counts.AdminActivity > 0 {
 		notes = append(notes, PostureNote{
 			Severity: checks.SeverityInfo,
-			Title:    fmt.Sprintf("%d UniFi admin console access event(s) in the last 24h", adminCount),
+			Title:    fmt.Sprintf("%d UniFi admin console access event(s) in the last 24h", counts.AdminActivity),
 			Detail:   "Live admin logins and configuration edits are streamed in real time by `uniblue serve`.",
 		})
 	}

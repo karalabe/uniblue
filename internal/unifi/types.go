@@ -887,8 +887,20 @@ type ControllerLogEvent struct {
 	// Category is the uppercase log category ("SECURITY", "ADMIN", "NETWORK", "CLIENT_DEVICES", etc.).
 	Category string `json:"category"`
 
+	// SubCategory identifies the controller subsystem that produced the event.
+	SubCategory string `json:"subcategory,omitempty"`
+
+	// Policy names the firewall policy or traffic rule reported by the controller.
+	Policy string `json:"policy,omitempty"`
+
+	// Kind records the classification returned by LogKind for dashboard consumers.
+	Kind string `json:"kind,omitempty"`
+
 	// Event is the uppercase event type or activity key (e.g., "THREAT_BLOCKED", "ADMIN_ACCESS").
 	Event string `json:"event"`
+
+	// Type is an additional controller event identifier when it differs from Event.
+	Type string `json:"type,omitempty"`
 
 	// Key is the raw controller event key string, if present.
 	Key string `json:"key,omitempty"`
@@ -904,6 +916,9 @@ type ControllerLogEvent struct {
 
 	// SrcIP is the source IP address associated with the event, if reported.
 	SrcIP string `json:"src_ip,omitempty"`
+
+	// SrcHost names the source client when a firewall log identifies it by name.
+	SrcHost string `json:"src_host,omitempty"`
 
 	// DstIP is the destination IP address associated with the event, if reported.
 	DstIP string `json:"dst_ip,omitempty"`

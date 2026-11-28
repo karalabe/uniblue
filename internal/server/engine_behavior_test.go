@@ -247,6 +247,60 @@ func NewDemoEngineForTest(t *testing.T) *Engine {
 	return eng
 }
 
+// TestFirewallBlockPolls preserves alert history and the last assessment through a burst of drops.
+func TestFirewallBlockPolls(t *testing.T) {
+	cfg := config.Default()
+	cfg.UniFi.URL, cfg.UniFi.APIKey = "https://192.0.2.1", "test"
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	e, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.snap = &unifi.Snapshot{}
+	e.recomputeAndPublish(t.Context(), true, nil)
+	for range maxEventHistory - 1 {
+		e.emit(LiveEvent{Type: "finding_new"})
+	}
+	before := e.Snapshot()
+	hour := time.Now().UTC().Truncate(time.Hour)
+	var logs []unifi.ControllerLogEvent
+	for i := range maxEventHistory + 5 {
+		logs = append(logs, unifi.ControllerLogEvent{ID: strconv.Itoa(i), Timestamp: hour.Add(time.Duration(i) * time.Second),
+			Category: "SECURITY", Policy: "Guest rules", SrcIP: "192.0.2.10", Message: fmt.Sprintf("Denied connection %d", i)})
+	}
+	e.applySnapshotDelta(t.Context(), &unifi.Snapshot{RecentLogs: logs[:1]}, hour)
+	first := e.Snapshot()
+	e.applySnapshotDelta(t.Context(), &unifi.Snapshot{RecentLogs: logs}, logs[len(logs)-1].Timestamp)
+	got := e.Snapshot()
+	if got.View != before.View || got.Topology != before.Topology {
+		t.Fatal("firewall-only poll replaced the risk assessment")
+	}
+	if len(before.Report.UniFiPosture.RecentLogs) != 0 || len(first.Report.UniFiPosture.RecentLogs) != 1 ||
+		len(got.Report.UniFiPosture.RecentLogs) != len(logs) {
+		t.Fatal("published snapshots lost their controller log windows")
+	}
+	if len(got.Events) != maxEventHistory || got.Events[maxEventHistory-1].ID != before.Events[maxEventHistory-2].ID {
+		t.Fatal("repeated hits displaced an unrelated event")
+	}
+	replay, _, unsubscribe := e.SubscribeWithReplay(first.Events[0].ID)
+	defer unsubscribe()
+	if len(replay) != 1 || replay[0] != got.Events[0] || replay[0].Count != len(logs) ||
+		replay[0].FirstHit != hour || replay[0].Time != logs[len(logs)-1].Timestamp || replay[0].Summary != logs[len(logs)-1].Message {
+		t.Fatalf("unexpected coalesced event: %+v", replay)
+	}
+	// A threat arriving or leaving the controller window still changes posture.
+	mixed := append(slices.Clone(logs), unifi.ControllerLogEvent{ID: "ids", Event: "THREAT_BLOCKED"})
+	e.applySnapshotDelta(t.Context(), &unifi.Snapshot{RecentLogs: mixed}, hour)
+	withThreat := e.Snapshot()
+	e.applySnapshotDelta(t.Context(), &unifi.Snapshot{RecentLogs: logs}, hour)
+	after := e.Snapshot()
+	if withThreat.View == got.View || after.View == withThreat.View || slices.ContainsFunc(after.Report.PostureNotes, func(n risk.PostureNote) bool {
+		return strings.Contains(n.Title, "intrusion attempt")
+	}) {
+		t.Fatal("posture did not follow the intrusion into and out of the log window")
+	}
+}
+
 // TestEngineBaselinePreservationFirstForwardDetectionAndConcurrency verifies
 // that startup recompute before baseline does not wipe persisted host findings,
 // adding the first port forward on an empty site fires policy_changed,
@@ -2154,6 +2208,7 @@ func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing
 	// 1. First recompute seeds ExactCVEs silently; noisy events must NOT push.
 	eng.recomputeAndPublish(ctx, false, []LiveEvent{
 		{Type: "ids_threat", Severity: "high", Summary: "Blocked WAN scan"},
+		{Type: "firewall_block", Severity: "high", Summary: "Guest rules blocked a connection"},
 		{Type: "port_stp_blocked", Severity: "high", Summary: "STP blocked Switch Port 3"},
 		{Type: "client_dormant_wakeup", Severity: "medium", Summary: "Old tablet woke up"},
 		{Type: "port_link_up", Severity: "info", Summary: "Physical link UP on Main Switch Port 2 (zone=internal, VLAN=Main)"},

@@ -1972,6 +1972,8 @@ function humanReason(r, ent) {
 
 function humanEventType(t) {
   const l = (t || "").toLowerCase();
+  if (l === "firewall_block") return { label: "Firewall block", tone: "neutral" };
+  if (l === "controller_log") return { label: "Controller log", tone: "neutral" };
   if (l.includes("threat")) return { label: "Blocked threat", tone: "crit" };
   if (l.includes("honeypot")) return { label: "Intruder trap", tone: "crit" };
   if (l.includes("evil")) return { label: "Fake Wi-Fi", tone: "crit" };
@@ -2494,8 +2496,7 @@ function renderHeader() {
     dvB.className = "nav-cnt" + (hosts.some(e => e.state === "exposed" && e.max_severity === "critical") ? " crit" : expHosts ? " warn" : "");
   }
 
-  const actCount = (state.events || []).length + (state.report?.unifi_posture?.recent_logs || []).length;
-  document.getElementById("nb-ac").textContent = actCount;
+  document.getElementById("nb-ac").textContent = activityRows().length;
 
   if (vm.copyright) {
     const authorURL = vm.author_url || "https://x.com/peter_szilagyi";
@@ -3977,27 +3978,83 @@ function renderDeviceRow(vm, ent) {
 /* ============================================================================
    TAB 5: ACTIVITY (Friendly Chronological Timeline)
    ========================================================================== */
-function renderActivity() {
-  const vm = state.view || { entities: {} };
+// Older saved dashboards lack kind. Apply the same precedence as ControllerLogEvent.LogKind.
+function controllerLogKind(lg) {
+  if (lg.kind) return lg.kind;
+  const category = (lg.category || "").toUpperCase();
+  const event = [lg.event, lg.key, lg.type].join(" ").toUpperCase();
+  const sub = (lg.subcategory || lg.sub_category || "").toUpperCase();
+  const ids = event + " " + sub;
+  const threat = category === "THREATS" || /THREAT|(?:^|[^A-Z0-9])(?:IPS|IDS)(?:$|[^A-Z0-9])|INTRUSION|MALWARE|ATTACK/.test(ids);
+  if (ids.includes("HONEYPOT")) return "honeypot_hit";
+  if (category === "ADMIN") return "admin_activity";
+  if (/FIREWALL|TRAFFIC_RULE|POLICY_BLOCK|FW_/.test(event)) return "firewall_block";
+  if (threat) return "ids_threat";
+  if (/FIREWALL|TRAFFIC_RULE/.test(sub)) return "firewall_block";
+  const description = [lg.title, lg.message].join("\n");
+  const cleanDesc = description.replace(/\bby the (.+?) firewall policy\b/gi, "by the firewall policy");
+  if (lg.policy || (/firewall policy|blocked by firewall|traffic rule/i.test(description) &&
+      !/\b(?:IDS|IPS)\b|THREAT|INTRUSION|MALWARE|HONEYPOT/i.test(cleanDesc))) return "firewall_block";
+  return category === "SECURITY" ? "controller_security" : "";
+}
+
+// Reconcile live counts with the overlapping controller history before rendering either Activity count.
+function activityRows() {
   const logs = [];
   const seen = new Set();
+  const blocks = new Map();
+
+  function addBlock(row, feed) {
+    const source = row.ip || row.host || row.summary?.match(/^(.+?) was blocked from accessing /i)?.[1] || "";
+    const policy = row.policy || row.summary?.match(/\bby the (.+?) firewall policy\b/i)?.[1] || "";
+    const key = JSON.stringify([source, policy, source && policy ? "" : row.summary]);
+    if (!blocks.has(key)) blocks.set(key, { latest: row, count: 0, live: [] });
+    const group = blocks.get(key);
+    if (Date.parse(row.time) > Date.parse(group.latest.time)) group.latest = row;
+    const time = Date.parse(row.time);
+    if (feed === "live") {
+      group.count += row.count || 1;
+      group.live.push({ first: Date.parse(row.first_hit || row.time), last: time, remaining: row.count || 1 });
+    } else {
+      // Each live hit accounts for one controller row in its time interval.
+      // Rows before startup or outside the retained history still count in full.
+      const overlap = group.live.find(batch => batch.remaining && time >= batch.first && time <= batch.last);
+      if (overlap) overlap.remaining--;
+      else group.count++;
+    }
+  }
 
   for (const ev of (state.events || [])) {
-    logs.push({ time: ev.time, severity: ev.severity || "info", type: ev.type || "event", summary: ev.summary, subject: ev.subject_id || "", ip: ev.ip || "" });
+    const row = { ...ev, type: ev.type || "event", subject: ev.subject_id || "" };
+    if (ev.type === "firewall_block") {
+      addBlock(row, "live");
+      continue;
+    }
+    logs.push(row);
     seen.add(ev.summary);
   }
+  const logIDs = new Set();
   for (const lg of (state.report?.unifi_posture?.recent_logs || [])) {
-    if (seen.has(lg.message)) continue;
-    let t = "controller";
-    const evName = (lg.event || "").toUpperCase();
-    if (lg.category === "ADMIN") t = "admin_activity";
-    else if (evName.includes("HONEYPOT")) t = "honeypot_hit";
-    else if (lg.category === "SECURITY" || evName.includes("THREAT")) t = "ids_threat";
-    else if (evName.includes("VPN")) t = "vpn_connected";
-    logs.push({ time: lg.timestamp, severity: lg.severity || "info", type: t, summary: lg.message || lg.event, subject: "", ip: lg.src_ip || "", dst_ip: lg.dst_ip || "" });
+    if (lg.id && logIDs.has(lg.id)) continue;
+    if (lg.id) logIDs.add(lg.id);
+    const kind = controllerLogKind(lg);
+    let type = kind;
+    if (kind === "controller_security") type = "controller_log";
+    if (!kind) type = /vpn/i.test(lg.event) ? "vpn_connected" : "controller_log";
+    const row = { time: lg.timestamp, severity: lg.severity || "info", type, summary: lg.message || lg.title || lg.event,
+      host: lg.src_host, ip: lg.src_ip, dst_ip: lg.dst_ip, policy: lg.policy };
+    if (kind === "firewall_block") addBlock(row, "controller");
+    else if (!seen.has(row.summary)) logs.push(row);
   }
-  logs.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+  for (const { latest, count } of blocks.values()) {
+    logs.push({ ...latest, count, severity: "info" });
+  }
+  return logs.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+}
 
+function renderActivity() {
+  const vm = state.view || { entities: {} };
+  const logs = activityRows();
   const filtered = logs.filter(ev => {
     const t = ev.type.toLowerCase();
     if (activityFilter === "threats") return t.includes("threat") || t.includes("honeypot") || t.includes("evil") || t.includes("tamper") || t.includes("surge") || t.includes("spike") || t.includes("finding");
@@ -4038,6 +4095,7 @@ function renderActivity() {
           <div class="act-l">
             <span class="act-time mono">${fmtTime(ev.time)}</span>
             <span class="tag ${ht.tone}">${esc(ht.label)}</span>
+            ${ev.count > 1 ? `<span class="tag neutral">${esc(ev.count)}x</span>` : ""}
             <span style="font-weight:500">${esc(ev.summary)}</span>
           </div>
           ${target ? `<span class="go-arrow">Inspect →</span>` : (isOfflineHost ? `<span class="small" style="color:var(--muted)">Offline</span>` : "")}
@@ -4134,9 +4192,8 @@ function hostSecurityLogs(ent) {
   const out = [];
   const seen = new Set();
   for (const lg of (state?.report?.unifi_posture?.recent_logs || [])) {
-    const evName = (lg.event || "").toUpperCase();
-    const isThreat = evName.includes("HONEYPOT") || lg.category === "SECURITY" || evName.includes("THREAT");
-    if (!isThreat) continue;
+    const kind = controllerLogKind(lg);
+    if (kind !== "ids_threat" && kind !== "honeypot_hit") continue;
     const srcLow = (lg.src_ip || "").toLowerCase();
     const dstLow = (lg.dst_ip || "").toLowerCase();
     const isSrc = srcLow !== "" && ips.has(srcLow);
@@ -4148,7 +4205,7 @@ function hostSecurityLogs(ent) {
     out.push({
       time: lg.timestamp,
       severity: lg.severity || "high",
-      type: evName.includes("HONEYPOT") ? "honeypot_hit" : "ids_threat",
+      type: kind,
       message: lg.message || lg.event,
       src_ip: lg.src_ip || "",
       dst_ip: lg.dst_ip || "",
@@ -4799,7 +4856,7 @@ function resolveEventSubject(ev) {
 function showToast(ev) {
   if (!ev || !ev.summary) return;
   const t = (ev.type || "").toLowerCase();
-  if (t === "startup" || t === "scan_progress" || t === "client_multi_ip") return;
+  if (t === "startup" || t === "scan_progress" || t === "client_multi_ip" || t === "firewall_block") return;
   const stack = document.getElementById("toast-stack");
   if (!stack) return;
 

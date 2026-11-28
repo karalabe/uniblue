@@ -1298,6 +1298,67 @@ func TestDashboardSimulationControls(t *testing.T) {
 	}
 }
 
+// TestDashboardFirewallLogs exercises the Activity and host drawer with overlapping live and saved logs.
+func TestDashboardFirewallLogs(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is required to render the dashboard JavaScript")
+	}
+	_, script, ok := strings.Cut(string(dashboardHTML), "<script>")
+	script, _, hasBootstrap := strings.Cut(script, "const staticEl =")
+	if !ok || !hasBootstrap {
+		t.Fatal("missing dashboard script")
+	}
+	const dom = `const assert = require("node:assert/strict");
+const elements = new Map();
+const document = {addEventListener() {}, querySelectorAll: () => [], getElementById(id) {
+  if (!elements.has(id)) elements.set(id, {id, addEventListener() {}, querySelectorAll: () => []});
+  return elements.get(id);
+}};
+const window = document, ResizeObserver = class {};`
+	const run = `
+const host = {id: "host:plug", kind: "host", ip: "192.0.2.10", label: "Plug", state: "ok"};
+const log = {category: "SECURITY", src_ip: host.ip, message: "Plug was blocked from accessing Gateway by the Guest rules Firewall Policy."};
+const recent = Array.from({length: 50}, (_, i) => ({...log, id: String(i), timestamp: new Date(Date.UTC(2026, 0, 1, 12, 0, i)).toISOString()}));
+const last = recent.at(-1);
+state = {events: [{type: "firewall_block", count: 14, first_hit: recent[36].timestamp, time: last.timestamp, summary: "Latest policy hit", ip: host.ip, policy: "Guest rules"}],
+  report: {unifi_posture: {recent_logs: recent}}, view: {entities: {[host.id]: host}}};
+const html = id => document.getElementById(id).innerHTML;
+assert.deepEqual(humanEventType("controller_log"), {label: "Controller log", tone: "neutral"});
+assert.equal(controllerLogKind({category: "ADMIN", event: "FIREWALL_EDIT"}), "admin_activity");
+assert.equal(controllerLogKind({category: "THREATS", policy: "Suricata rule"}), "ids_threat");
+assert.equal(controllerLogKind({category: "SECURITY", title: "IPS inspected a firewall policy"}), "controller_security");
+assert.deepEqual(activityRows().map(r => [r.time, r.count, r.severity]), [[last.timestamp, 50, "info"]]);
+state.report.unifi_posture.recent_logs = recent.slice(0, 40);
+assert.equal(activityRows()[0].count, 50);
+state.report.unifi_posture.recent_logs = recent;
+renderActivity();
+assert.match(html("view-activity"), /tag neutral">Firewall block</);
+assert.match(html("view-activity"), />50x</);
+drawerStack = [host.id];
+renderDrawer();
+assert.doesNotMatch(html("drawer-hd-content") + html("drawer-body"), /Router alert|Blocked outbound threat/);
+showToast(state.events[0]);
+const different = [{...last, id: "second-host", src_ip: "192.0.2.11"}, {...last, id: "second-policy", policy: "Other rule"}];
+recent.push(...different);
+assert.deepEqual(activityRows().map(r => r.count).sort((a, b) => a - b), [1, 1, 50]);
+recent.push({...log, kind: "controller_security", message: "Security notice"}, {...log, kind: "ids_threat", message: "Intrusion"},
+  {...log, event: "HONEYPOT_TRIGGERED", message: "Trap"});
+assert.deepEqual(hostSecurityLogs(host).map(r => r.type).sort(), ["honeypot_hit", "ids_threat"]);
+activityFilter = "threats";
+renderActivity();
+assert.match(html("view-activity"), /Blocked threat/);
+assert.doesNotMatch(html("view-activity"), /Firewall block|Security notice/);
+renderDrawer();
+assert.match(html("drawer-hd-content"), /Router alert \(2\)/);
+assert.match(html("drawer-body"), /Blocked outbound threat/);`
+	cmd := exec.Command(node)
+	cmd.Stdin = strings.NewReader(dom + "\n" + script + "\n" + run)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("render firewall activity: %v\n%s", err, out)
+	}
+}
+
 // TestDashboardPatchAdvisories renders the drawer fragment with each kind of
 // advisory so known versions and client-specific guidance stay visible.
 func TestDashboardPatchAdvisories(t *testing.T) {

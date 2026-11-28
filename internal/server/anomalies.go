@@ -330,7 +330,8 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 	}
 	var events []LiveEvent
 
-	// 1. Stream newly arrived UniFi System Log events (IDS/IPS, Honeypot, Admin logins, DHCP/Loops).
+	// Group a burst before broadcasting so a single poll prompts one dashboard refresh per group.
+	blocks := make(map[firewallGroup]int)
 	for _, ev := range freshLogs {
 		if ev.ID == "" {
 			continue
@@ -339,24 +340,36 @@ func (a *anomalyTracker) EvaluateSiteTelemetry(snap *unifi.Snapshot, freshLogs [
 			continue
 		}
 		a.seenLogIDs[ev.ID] = struct{}{}
-		evType := "controller_security"
-		switch {
-		case ev.Category == "ADMIN":
-			evType = "admin_activity"
-		case strings.Contains(ev.Event, "HONEYPOT"):
-			evType = "honeypot_hit"
-		case ev.Category == "SECURITY" || strings.Contains(ev.Event, "THREAT"):
-			evType = "ids_threat"
-		case strings.Contains(ev.Event, "DHCP") || strings.Contains(ev.Event, "LOOP"):
-			evType = "network_alert"
-		}
-		events = append(events, LiveEvent{
-			Type:     evType,
-			Severity: ev.Severity,
+		live := LiveEvent{
+			Time:     ev.Timestamp,
+			Type:     ev.LogKind(),
+			Severity: firstStr(ev.Severity, "info"),
 			Host:     firstStr(ev.Device, ev.Admin, ev.SrcIP),
 			IP:       ev.SrcIP,
-			Summary:  ev.Message,
-		})
+			Summary:  firstStr(ev.Message, ev.Title, ev.Event),
+		}
+		switch live.Type {
+		case "firewall_block":
+			live.Severity = "info"
+			live.Policy = ev.Policy
+			// Device often names the gateway that enforced the policy. Only a
+			// source address or client name can identify repeated hits by one host.
+			live.Host = ev.SrcHost
+			key := live.firewallGroup()
+			if i, ok := blocks[key]; ok {
+				events[i] = mergeFirewallHits(events[i], live)
+				continue
+			}
+			blocks[key] = len(events)
+		case "controller_security":
+			live.Type = "controller_log"
+		case "":
+			live.Type = "controller_log"
+			if strings.Contains(ev.Event, "DHCP") || strings.Contains(ev.Event, "LOOP") {
+				live.Type = "network_alert"
+			}
+		}
+		events = append(events, live)
 	}
 	// Once seenLogIDs grows past 2000 entries, reset it to the current poll's
 	// freshLogs IDs to bound memory while keeping the active poll window deduplicated.

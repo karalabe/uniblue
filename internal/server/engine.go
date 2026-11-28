@@ -151,6 +151,15 @@ type LiveEvent struct {
 	// IP is the host IP address, if applicable.
 	IP string `json:"ip,omitempty"`
 
+	// Policy names the firewall policy responsible for a logged block.
+	Policy string `json:"policy,omitempty"`
+
+	// Count is the number of firewall hits represented by a grouped event.
+	Count int `json:"count,omitempty"`
+
+	// FirstHit records the earliest hit in a group so Activity can include earlier controller history.
+	FirstHit time.Time `json:"first_hit,omitzero"`
+
 	// SubjectID links this event directly to a typed PresentationModel entity
 	// (e.g., "host:<mac>", "port:<mac>/<idx>", "dev:<mac>") for one-click drilldown.
 	SubjectID string `json:"subject_id,omitempty"`
@@ -1432,11 +1441,17 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 			pendingEvents = append(pendingEvents, aev)
 		}
 		for _, aev := range e.anomalies.EvaluateSiteTelemetry(snap, snap.RecentLogs) {
-			changed = true
+			if aev.Type != "firewall_block" {
+				changed = true
+			}
 			pendingEvents = append(pendingEvents, aev)
 		}
 	}
-
+	// A busy firewall can push an older intrusion out of the controller's log window.
+	// Refresh the assessment if the totals it reports have changed.
+	if !changed && prevSnap != nil {
+		changed = risk.CountPostureLogs(prevSnap.RecentLogs) != risk.CountPostureLogs(snap.RecentLogs)
+	}
 	e.snap = snap
 	e.deltaGen++
 	if fwdOK {
@@ -1448,16 +1463,20 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 		e.policySigInit = true
 	}
 	e.lastPorts = currPorts
-	e.mu.Unlock()
-
-	if changed {
-		e.recomputeAndPublish(ctx, false, pendingEvents)
-	} else if len(pendingEvents) > 0 {
-		e.mu.Lock()
+	if !changed {
+		// Replace only the posture header so existing readers keep their log window.
+		if p := e.current.Report.UniFiPosture; p != nil {
+			posture := *p
+			posture.RecentLogs = snap.RecentLogs
+			e.current.Report.UniFiPosture = &posture
+		}
 		for _, ev := range pendingEvents {
 			e.emitLocked(ev)
 		}
-		e.mu.Unlock()
+	}
+	e.mu.Unlock()
+	if changed {
+		e.recomputeAndPublish(ctx, false, pendingEvents)
 	}
 
 	return toScan
@@ -2428,6 +2447,11 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 
 	now := time.Now().UTC()
 	e.mu.Lock()
+	// A concurrent poll may have published newer logs during this assessment.
+	// Keep the newer window when its counts agree with the findings and notes.
+	if e.snap != snapPtr && risk.CountPostureLogs(snap.RecentLogs) == risk.CountPostureLogs(e.snap.RecentLogs) {
+		report.UniFiPosture.RecentLogs = e.snap.RecentLogs
+	}
 	if nextState != nil {
 		e.prevRiskState = nextState
 	}
@@ -3326,6 +3350,16 @@ func preserveUnavailableTelemetry(prevSnap, nextSnap *unifi.Snapshot) {
 	if !nextSnap.Visibility.WLANsAvailable && len(nextSnap.WLANs) == 0 && len(prevSnap.WLANs) > 0 {
 		nextSnap.WLANs = append([]unifi.WLANConfig(nil), prevSnap.WLANs...)
 	}
+	// A failed or partial log fetch is not evidence that older alerts left the
+	// controller window, so keep the last complete window until it ages out.
+	if len(prevSnap.RecentLogs) > 0 && slices.ContainsFunc(nextSnap.Visibility.MissingFeeds, func(f string) bool {
+		return strings.HasPrefix(f, "system-logs")
+	}) {
+		cutoff := time.Now().UTC().Add(-24 * time.Hour)
+		nextSnap.RecentLogs = slices.DeleteFunc(slices.Clone(prevSnap.RecentLogs), func(ev unifi.ControllerLogEvent) bool {
+			return ev.Timestamp.Before(cutoff)
+		})
+	}
 	if !nextSnap.Visibility.PortProfilesAvailable && len(prevSnap.Devices) > 0 && len(nextSnap.Devices) > 0 {
 		prevPorts := make(map[string]unifi.SwitchPort)
 		for _, d := range prevSnap.Devices {
@@ -3416,17 +3450,61 @@ func (e *Engine) emit(ev LiveEvent) {
 	e.mu.Unlock()
 }
 
-// emitLocked appends ev (caller must hold e.mu) and broadcasts non-blockingly.
+// firewallGroup identifies one source and policy pair. Without both
+// identifiers, only matching descriptions can safely be treated as repetitions.
+type firewallGroup struct {
+	source, policy, summary string
+}
+
+// firewallGroup collapses repeated hits for the same source and policy so
+// chatty logged rules cannot evict unrelated alerts from the shared history.
+func (ev LiveEvent) firewallGroup() firewallGroup {
+	key := firewallGroup{source: firstStr(ev.IP, ev.Host), policy: ev.Policy}
+	if key.source == "" || key.policy == "" {
+		key.summary = ev.Summary
+	}
+	return key
+}
+
+// mergeFirewallHits retains the latest description even when a poll delivers hits newest first.
+func mergeFirewallHits(a, b LiveEvent) LiveEvent {
+	if b.Time.After(a.Time) {
+		a, b = b, a
+	}
+	first := b.FirstHit
+	if first.IsZero() {
+		first = b.Time
+	}
+	if a.FirstHit.IsZero() || first.Before(a.FirstHit) {
+		a.FirstHit = first
+	}
+	a.Count = max(1, a.Count) + max(1, b.Count)
+	return a
+}
+
+// emitLocked publishes a new immutable history before broadcasting its sequence number.
+// Moving an updated firewall row to the front keeps SSE replay in sequence order.
 func (e *Engine) emitLocked(ev LiveEvent) {
-	ev.ID = e.eventSeq.Add(1)
 	if ev.Time.IsZero() {
 		ev.Time = time.Now().UTC()
 	}
-	e.events = append([]LiveEvent{ev}, e.events...)
+	history := e.events
+	if ev.Type == "firewall_block" {
+		key := ev.firewallGroup()
+		for i, prev := range history {
+			if prev.Type == ev.Type && prev.firewallGroup() == key {
+				ev = mergeFirewallHits(ev, prev)
+				history = slices.Concat(history[:i], history[i+1:])
+				break
+			}
+		}
+	}
+	ev.ID = e.eventSeq.Add(1)
+	e.events = append([]LiveEvent{ev}, history...)
 	if len(e.events) > maxEventHistory {
 		e.events = e.events[:maxEventHistory]
 	}
-	e.current.Events = append([]LiveEvent(nil), e.events...)
+	e.current.Events = e.events
 
 	e.subMu.Lock()
 	for ch := range e.subscribers {

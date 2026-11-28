@@ -96,9 +96,15 @@ type rawVPNConnectionsResponse struct {
 
 // rawSystemLogEntry maps one item from POST /v2/api/site/<site>/system-log/all.
 type rawSystemLogEntry struct {
-	ID         string                     `json:"id"`
-	Timestamp  int64                      `json:"timestamp"`
-	Category   string                     `json:"category"`
+	ID        string `json:"id"`
+	Timestamp int64  `json:"timestamp"`
+	Category  string `json:"category"`
+	// SubCategory identifies the subsystem within the broad SECURITY feed.
+	SubCategory string `json:"subcategory"`
+	// SubCategoryAlt accepts the subsystem spelling used by other controller versions.
+	SubCategoryAlt string `json:"sub_category"`
+	// Type carries an event identifier on controllers that report it separately.
+	Type       string                     `json:"type"`
 	Event      string                     `json:"event"`
 	Key        string                     `json:"key"`
 	Severity   string                     `json:"severity"`
@@ -239,31 +245,9 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 
 	var events []ControllerLogEvent
 	for _, entry := range ar.items {
-		if !isSecurityRelevantLog(entry) {
-			continue
+		if ev, ok := entry.controllerEvent(); ok {
+			events = append(events, ev)
 		}
-		params := extractLogParams(entry.Parameters)
-		msg := interpolateLogTemplate(entry.MessageRaw, params)
-		if msg == "" {
-			msg = interpolateLogTemplate(entry.TitleRaw, params)
-		}
-		logID := strings.TrimSpace(entry.ID)
-		if logID == "" {
-			logID = "syslog:" + stableHashID(fmt.Sprintf("%d|%s|%s|%s", entry.Timestamp, entry.Key, entry.Event, msg))
-		}
-		events = append(events, ControllerLogEvent{
-			ID:        logID,
-			Timestamp: time.UnixMilli(entry.Timestamp).UTC(),
-			Category:  strings.ToUpper(entry.Category),
-			Event:     strings.ToUpper(entry.Event),
-			Key:       entry.Key,
-			Severity:  normalizeLogSeverity(entry.Severity, entry.Category, entry.Event),
-			Title:     interpolateLogTemplate(entry.TitleRaw, params),
-			Message:   msg,
-			SrcIP:     firstNonEmpty(params["SRC_IP"], params["IP"]),
-			DstIP:     params["DST_IP"],
-			Device:    firstNonEmpty(params["DEVICE"], params["CONSOLE_NAME"]),
-		})
 	}
 	for _, entry := range admr.items {
 		adminName := "admin"
@@ -326,7 +310,7 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 		if adminID == "" {
 			adminID = stableHashID(fmt.Sprintf("%d|%s|%s|%s|%s", entry.Timestamp, entry.Key, adminName, entry.IP, msg))
 		}
-		events = append(events, ControllerLogEvent{
+		ev := ControllerLogEvent{
 			ID:        "admin:" + adminID,
 			Timestamp: time.UnixMilli(entry.Timestamp).UTC(),
 			Category:  "ADMIN",
@@ -336,13 +320,68 @@ func (c *Controller) FetchRecentLogs(ctx context.Context, since time.Time) ([]Co
 			Message:   msg,
 			SrcIP:     entry.IP,
 			Admin:     adminName,
-		})
+		}
+		ev.Kind = ev.LogKind()
+		events = append(events, ev)
 	}
 
 	sort.Slice(events, func(i, j int) bool {
 		return events[i].Timestamp.After(events[j].Timestamp)
 	})
 	return events, errors.Join(ar.err, admr.err)
+}
+
+// controllerEvent resolves the controller's template and structured fields before
+// classifying the log, since some gateways identify policy hits only in prose.
+func (entry rawSystemLogEntry) controllerEvent() (ControllerLogEvent, bool) {
+	params := extractLogParams(entry.Parameters)
+	title := interpolateLogTemplate(entry.TitleRaw, params)
+	msg := interpolateLogTemplate(entry.MessageRaw, params)
+	if msg == "" {
+		msg = title
+	}
+	ev := ControllerLogEvent{
+		ID:          strings.TrimSpace(entry.ID),
+		Timestamp:   time.UnixMilli(entry.Timestamp).UTC(),
+		Category:    strings.ToUpper(entry.Category),
+		SubCategory: strings.ToUpper(firstNonEmpty(entry.SubCategory, entry.SubCategoryAlt)),
+		Event:       strings.ToUpper(firstNonEmpty(entry.Event, entry.Type)),
+		Key:         entry.Key,
+		Title:       title,
+		Message:     msg,
+		SrcIP:       firstNonEmpty(params["SRC_IP"], params["SOURCE_IP"], params["IP"]),
+		DstIP:       params["DST_IP"],
+		Device:      firstNonEmpty(params["DEVICE"], params["CONSOLE_NAME"]),
+	}
+	if entry.Type != "" && !strings.EqualFold(entry.Type, ev.Event) {
+		ev.Type = strings.ToUpper(entry.Type)
+	}
+	ev.Policy = firstNonEmpty(params["FIREWALL_POLICY"], params["POLICY"], params["POLICY_NAME"], params["RULE"], params["RULE_NAME"], params["TRAFFIC_RULE"])
+	ev.Kind = ev.LogKind()
+	if ev.Kind == "firewall_block" {
+		ev.SrcHost = firstNonEmpty(params["SRC_HOST"], params["SRC_NAME"], params["CLIENT_NAME"])
+		if host, _, ok := strings.Cut(ev.Message, " was blocked from accessing "); ok && ev.SrcHost == "" {
+			ev.SrcHost = host
+		}
+		if ev.Policy == "" {
+			if match := firewallPolicyName.FindStringSubmatch(ev.Message + "\n" + ev.Title); match != nil {
+				ev.Policy = strings.TrimSpace(match[1])
+			}
+		}
+	}
+	if ev.Kind == "" && !isSecurityRelevantLog(ev, entry.Severity) {
+		return ControllerLogEvent{}, false
+	}
+	if ev.ID == "" {
+		identity := fmt.Sprintf("%d|%s|%s|%s", entry.Timestamp, entry.Key, entry.Event, msg)
+		if ev.Kind == "firewall_block" {
+			// Controllers can log different clients, destinations, or rules with the same summary in one millisecond.
+			identity += "|" + ev.SrcIP + "|" + ev.DstIP + "|" + ev.SrcHost + "|" + ev.Policy
+		}
+		ev.ID = "syslog:" + stableHashID(identity)
+	}
+	ev.Severity = normalizeLogSeverity(entry.Severity, ev)
+	return ev, true
 }
 
 func stableHashID(s string) string {
@@ -576,22 +615,16 @@ func convertHistoricalClients(raw []rawHistoricalUser, netByID map[string]Networ
 	return out
 }
 
-// isSecurityRelevantLog filters noisy routine Wi-Fi roaming/connect messages out
-// of /system-log/all so only genuine security, intrusion, honeypot, DHCP/loop,
-// failover, rogue-AP, and VPN events are surfaced.
-func isSecurityRelevantLog(e rawSystemLogEntry) bool {
-	cat := strings.ToUpper(e.Category)
-	ev := strings.ToUpper(e.Event)
+// isSecurityRelevantLog retains operational alerts from outside the security and admin feeds.
+func isSecurityRelevantLog(e ControllerLogEvent, rawSeverity string) bool {
+	ev := e.Event
 	key := strings.ToUpper(e.Key)
-	sev := strings.ToUpper(e.Severity)
+	sev := strings.ToUpper(rawSeverity)
 
-	if cat == "SECURITY" || cat == "THREATS" || cat == "ADMIN" {
-		return true
-	}
 	for _, kw := range []string{
-		"THREAT", "HONEYPOT", "IPS", "IDS", "ROGUE", "DHCP", "LOOP",
+		"ROGUE", "DHCP", "LOOP",
 		"STP", "SPOOF", "CONFLICT", "FAILOVER", "WAN_", "VPN", "TELEPORT",
-		"BLOCKED", "ATTACK", "MALWARE", "BRUTE", "UNAUTHORIZED", "TAMPER",
+		"BLOCKED", "BRUTE", "UNAUTHORIZED", "TAMPER",
 	} {
 		if strings.Contains(ev, kw) || strings.Contains(key, kw) {
 			return true
@@ -727,12 +760,56 @@ func interpolateLogTemplate(tmpl string, params map[string]string) string {
 	return strings.TrimSpace(out)
 }
 
-// normalizeLogSeverity maps controller severity labels, categories, and
-// high-signal event keywords (such as honeypot or rogue AP detections) onto
-// normalized "critical", "high", "medium", "low", or "info" levels.
-func normalizeLogSeverity(rawSev, category, event string) string {
-	ev := strings.ToUpper(event)
-	if strings.Contains(ev, "HONEYPOT") || strings.Contains(ev, "ROGUE") {
+var (
+	firewallPolicyName = regexp.MustCompile(`(?i)\bby the (.+?) firewall policy\b`)
+	threatIdentifier   = regexp.MustCompile(`THREAT|(?:^|[^A-Z0-9])(?:IPS|IDS)(?:$|[^A-Z0-9])|INTRUSION|MALWARE|ATTACK`)
+	firewallIdentifier = regexp.MustCompile(`FIREWALL|TRAFFIC_RULE|POLICY_BLOCK|FW_`)
+	firewallPhrase     = regexp.MustCompile(`FIREWALL POLICY|BLOCKED BY FIREWALL|TRAFFIC RULE`)
+	threatPhrase       = regexp.MustCompile(`\b(?:IDS|IPS)\b|THREAT|INTRUSION|MALWARE|HONEYPOT`)
+)
+
+// LogKind identifies security and admin events even in snapshots saved before Kind
+// was recorded. An empty result leaves unrelated operational logs to their consumers.
+func (e ControllerLogEvent) LogKind() string {
+	if e.Kind != "" {
+		return e.Kind
+	}
+	event := strings.ToUpper(e.Event + " " + e.Key + " " + e.Type)
+	sub := strings.ToUpper(e.SubCategory)
+	identifiers := event + " " + sub
+	threat := strings.EqualFold(e.Category, "THREATS") || threatIdentifier.MatchString(identifiers)
+	switch {
+	case strings.Contains(identifiers, "HONEYPOT"):
+		return "honeypot_hit"
+	case strings.EqualFold(e.Category, "ADMIN"):
+		return "admin_activity"
+	case firewallIdentifier.MatchString(event):
+		return "firewall_block"
+	case threat:
+		return "ids_threat"
+	case strings.Contains(sub, "FIREWALL"), strings.Contains(sub, "TRAFFIC_RULE"):
+		return "firewall_block"
+	}
+	// The broad SECURITY category also includes user policies. Strip any user-named
+	// policy before scanning for threat words so a name like "Block Malware" stays
+	// classified as a firewall policy hit.
+	description := strings.ToUpper(e.Title + "\n" + e.Message)
+	cleanDesc := firewallPolicyName.ReplaceAllString(description, "by the firewall policy")
+	if e.Policy != "" || (firewallPhrase.MatchString(description) && !threatPhrase.MatchString(cleanDesc)) {
+		return "firewall_block"
+	}
+	if strings.EqualFold(e.Category, "SECURITY") {
+		return "controller_security"
+	}
+	return ""
+}
+
+// normalizeLogSeverity reserves the controller's intrusion escalation for actual detections.
+func normalizeLogSeverity(rawSev string, ev ControllerLogEvent) string {
+	if ev.Kind == "firewall_block" {
+		return "info"
+	}
+	if ev.Kind == "honeypot_hit" || strings.Contains(ev.Event, "ROGUE") {
 		return "critical"
 	}
 	switch strings.ToUpper(strings.TrimSpace(rawSev)) {
@@ -743,12 +820,12 @@ func normalizeLogSeverity(rawSev, category, event string) string {
 	case "MEDIUM":
 		return "medium"
 	case "LOW":
-		if strings.EqualFold(category, "SECURITY") {
+		if ev.Kind == "ids_threat" {
 			return "medium"
 		}
 		return "low"
 	default:
-		if strings.EqualFold(category, "SECURITY") {
+		if ev.Kind == "ids_threat" {
 			return "high"
 		}
 		return "info"

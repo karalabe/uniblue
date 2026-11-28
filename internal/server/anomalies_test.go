@@ -181,14 +181,22 @@ func TestAnomalyTrackerPortTamperAndBehavioralSignals(t *testing.T) {
 	freshLogs := []unifi.ControllerLogEvent{
 		{ID: "old-1", Category: "SECURITY", Event: "THREAT_BLOCKED", Severity: "high", Message: "old"},
 		{ID: "new-ids-2", Category: "SECURITY", Event: "THREAT_BLOCKED", Severity: "high", Message: "IDS blocked 198.51.100.99"},
+		{ID: "block", Category: "SECURITY", SubCategory: "FIREWALL", Policy: "Guest rules", Severity: "high"},
+		{ID: "other", Category: "SECURITY", Event: "OTHER", Severity: "low"},
 		{ID: "admin:new-3", Category: "ADMIN", Event: "ADMIN_ACCESS", Severity: "medium", Admin: "ops", Message: "ops accessed UniFi"},
 	}
 	siteEvs := tr.EvaluateSiteTelemetry(nextSnap, freshLogs)
 	siteTypes := map[string]bool{}
 	for _, ev := range siteEvs {
 		siteTypes[ev.Type] = true
+		if ev.Type == "firewall_block" && (ev.Severity != "info" || ev.Policy != "Guest rules") {
+			t.Errorf("unexpected firewall event: %+v", ev)
+		}
+		if ev.Type == "controller_log" && ev.Severity != "low" {
+			t.Errorf("unexpected controller log severity: %+v", ev)
+		}
 	}
-	for _, wantType := range []string{"ids_threat", "admin_activity", "wifi_evil_twin", "wan_ip_changed", "vpn_connected", "config_drift"} {
+	for _, wantType := range []string{"ids_threat", "firewall_block", "controller_log", "admin_activity", "wifi_evil_twin", "wan_ip_changed", "vpn_connected", "config_drift"} {
 		if !siteTypes[wantType] {
 			t.Errorf("missing expected live event %q; got %+v", wantType, siteEvs)
 		}

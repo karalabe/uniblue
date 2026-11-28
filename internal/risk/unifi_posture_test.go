@@ -144,6 +144,9 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 			DoHState:             "off",
 		},
 		RecentLogs: []unifi.ControllerLogEvent{
+			{Category: "SECURITY", SubCategory: "FIREWALL"},
+			{Category: "SECURITY", Event: "THREAT_BLOCKED"},
+			{Category: "SECURITY", Event: "OTHER"},
 			{
 				ID:        "hp-1",
 				Timestamp: time.Now().UTC(),
@@ -160,6 +163,11 @@ func TestAnalyzeUniFiPostureAndPhysicalTamper(t *testing.T) {
 
 	_, portFindings, _ := AnalyzeSwitchPorts(snap, config.NetworkConfig{}, trusted, isolated)
 	summary, postureFindings, notes := AnalyzeUniFiPosture(snap, trusted, isolated)
+	if !slices.ContainsFunc(notes, func(n PostureNote) bool {
+		return n.Title == "Gateway IDS/IPS blocked 1 intrusion attempt(s) in the last 24h"
+	}) {
+		t.Errorf("expected exactly one intrusion in posture notes: %v", notes)
+	}
 
 	if summary == nil || summary.EvilTwinCount != 2 {
 		t.Fatalf("expected EvilTwinCount=2 (foreign + near-cloned BSSID), got %+v", summary)

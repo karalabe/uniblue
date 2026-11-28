@@ -1154,16 +1154,21 @@ func TestSnapshotSitePreservesConfiguredDisplayName(t *testing.T) {
 	}
 }
 
-// TestFetchRecentLogsInterpolatesAdminTemplateParameters verifies that UniFi
-// admin-activity log messages interpolate numeric, string, and object parameter
-// values and strip any remaining unpopulated {PLACEHOLDER} tokens cleanly.
-func TestFetchRecentLogsInterpolatesAdminTemplateParameters(t *testing.T) {
+// TestFetchRecentLogs verifies classification and template interpolation on both log feeds.
+func TestFetchRecentLogs(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/proxy/network/v2/api/site/default/system-log/all", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":[]}`))
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"zbf","category":"SECURITY","severity":"LOW","message_raw":"Smart plug A was blocked from accessing Gateway by the DenyIoTToGateway Firewall Policy."},
+			{"id":"legacy","category":"SECURITY","subcategory":"FIREWALL","severity":"HIGH","parameters":{"rule_name":{"name":"Block guests"}}},
+			{"id":"ids","category":"SECURITY","event":"THREAT_BLOCKED","severity":"INFO","parameters":{"RULE":"Suricata signature"}},
+			{"id":"trap","event":"HONEYPOT_TRIGGERED","sub_category":"firewall"},
+			{"id":"type","category":"SECURITY","event":"BLOCKED","type":"IPS_DETECTION"},
+			{"id":"generic","category":"SECURITY","severity":"LOW"}
+		]}`))
 	})
 	mux.HandleFunc("/proxy/network/v2/api/site/default/system-log/admin-activity", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"data":[
@@ -1208,14 +1213,33 @@ func TestFetchRecentLogsInterpolatesAdminTemplateParameters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchRecentLogs: %v", err)
 	}
-	if len(logs) != 2 {
-		t.Fatalf("expected 2 admin log events, got %d (%+v)", len(logs), logs)
+	if len(logs) != 8 {
+		t.Fatalf("expected 8 controller log events, got %d (%+v)", len(logs), logs)
 	}
 	if logs[0].Message != "Alice made 3 changes to UDM Pro Firewall settings" {
 		t.Fatalf("unexpected interpolated admin message: %q", logs[0].Message)
 	}
 	if logs[1].Message != "Bob made changes to Network settings" || strings.Contains(logs[1].Message, "{") {
 		t.Fatalf("unexpected fallback admin message with missing params: %q", logs[1].Message)
+	}
+	want := map[string][4]string{
+		"admin:adm-1": {"admin_activity", "medium", "", ""},
+		"admin:adm-2": {"admin_activity", "medium", "", ""},
+		"zbf":         {"firewall_block", "info", "DenyIoTToGateway", ""},
+		"legacy":      {"firewall_block", "info", "Block guests", "FIREWALL"},
+		"ids":         {"ids_threat", "high", "Suricata signature", ""},
+		"trap":        {"honeypot_hit", "critical", "", "FIREWALL"},
+		"type":        {"ids_threat", "high", "", ""},
+		"generic":     {"controller_security", "low", "", ""},
+	}
+	for _, ev := range logs {
+		if got := [4]string{ev.Kind, ev.Severity, ev.Policy, ev.SubCategory}; got != want[ev.ID] {
+			t.Errorf("%s: got %q, want %q", ev.ID, got, want[ev.ID])
+		}
+		ev.Kind = ""
+		if ev.LogKind() != want[ev.ID][0] {
+			t.Errorf("%s: classification with no saved kind = %q", ev.ID, ev.LogKind())
+		}
 	}
 }
 
