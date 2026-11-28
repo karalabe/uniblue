@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -976,6 +977,36 @@ func TestHTTPAuthBruteForceLockout(t *testing.T) {
 	}
 }
 
+// writeTestCVEShard seeds a local nginx feed so tests exercise matching without a sync.
+func writeTestCVEShard(cacheDir string, recs []cve.Record, stats *cve.CacheStats) error {
+	vendorsDir := filepath.Join(cacheDir, "vendors")
+	if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(filepath.Join(vendorsDir, "f5.json.gz"))
+	if err != nil {
+		return err
+	}
+	gz := gzip.NewWriter(f)
+	if err := json.NewEncoder(gz).Encode(recs); err != nil {
+		_ = gz.Close()
+		_ = f.Close()
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	rawStats, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(cacheDir, "stats.json"), rawStats, 0o644)
+}
+
 // TestBackgroundCVESyncAutoLoadsAndSkipsUnchanged verifies that cveSyncLoop
 // populates an initially empty CVE cache, publishes exact CVE matches without
 // restart, stays quiet when feeds are unchanged, and re-correlates when new
@@ -1000,35 +1031,6 @@ func TestBackgroundCVESyncAutoLoadsAndSkipsUnchanged(t *testing.T) {
 		ScannedAt: time.Now().UTC(),
 	}
 	eng.mu.Unlock()
-
-	writeShard := func(recs []cve.Record, stats *cve.CacheStats) error {
-		vendorsDir := filepath.Join(cacheDir, "vendors")
-		if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
-			return err
-		}
-		f, err := os.Create(filepath.Join(vendorsDir, "f5.json.gz"))
-		if err != nil {
-			return err
-		}
-		gz := gzip.NewWriter(f)
-		if err := json.NewEncoder(gz).Encode(recs); err != nil {
-			_ = gz.Close()
-			_ = f.Close()
-			return err
-		}
-		if err := gz.Close(); err != nil {
-			_ = f.Close()
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-		rawStats, err := json.Marshal(stats)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(filepath.Join(cacheDir, "stats.json"), rawStats, 0o644)
-	}
 
 	t1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
 	t2 := time.Date(2026, 6, 1, 11, 0, 0, 0, time.UTC)
@@ -1065,7 +1067,7 @@ func TestBackgroundCVESyncAutoLoadsAndSkipsUnchanged(t *testing.T) {
 	eng.cveSyncFn = func(_ context.Context, _ *cve.Cache) (*cve.CacheStats, error) {
 		switch calls.Add(1) {
 		case 1:
-			if err := writeShard([]cve.Record{rec1}, stats1); err != nil {
+			if err := writeTestCVEShard(cacheDir, []cve.Record{rec1}, stats1); err != nil {
 				return nil, err
 			}
 			return stats1, nil
@@ -1073,7 +1075,7 @@ func TestBackgroundCVESyncAutoLoadsAndSkipsUnchanged(t *testing.T) {
 			close(step2Done)
 			return stats1, nil
 		case 3:
-			if err := writeShard([]cve.Record{rec1, rec2}, stats2); err != nil {
+			if err := writeTestCVEShard(cacheDir, []cve.Record{rec1, rec2}, stats2); err != nil {
 				return nil, err
 			}
 			close(step3Done)
@@ -1289,6 +1291,402 @@ func TestIPv6OnlyClientJoinTriggersImmediateScan(t *testing.T) {
 	toScanMove := eng.applySnapshotDelta(context.Background(), moveSnap, time.Now().UTC().Add(time.Second))
 	if len(toScanMove) != 1 || toScanMove[0].client.PrimaryIP() != "fd00:20::99" {
 		t.Fatalf("expected IPv6 address change to re-queue scan, got %+v", toScanMove)
+	}
+}
+
+// TestClientIPv4Flapping follows a lease change through the first bounce,
+// subsequent quiet polls, and a move to another VLAN.
+func TestClientIPv4Flapping(t *testing.T) {
+	const a, b, c = "192.0.2.10", "192.0.2.11", "192.0.2.12"
+	cfg := config.Default()
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	e, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := unifi.Client{MAC: "02:00:00:00:ab:01", Name: "bridge", NetworkName: "Default", IP: a}
+	now := time.Now()
+	e.snap = &unifi.Snapshot{Clients: []unifi.Client{cl}}
+	e.baselineComplete = true
+	poll := func(ip string) []hostScanTask {
+		cl.IP = ip
+		now = now.Add(5 * time.Second)
+		return e.applySnapshotDelta(t.Context(), &unifi.Snapshot{Clients: []unifi.Client{cl}}, now)
+	}
+	cache := func() {
+		e.profilesByMAC[cl.MAC] = probe.HostProfile{Client: cl, ProbeIP: cl.IP, ScannedAt: now}
+		e.findingsByMAC[cl.MAC] = []checks.Finding{{Client: cl, CheckID: "bridge-service"}}
+	}
+	wantMove := func(ip string) {
+		t.Helper()
+		tasks := poll(ip)
+		if len(tasks) != 1 || tasks[0].client.IP != ip || tasks[0].client.NetworkName != cl.NetworkName || !tasks[0].retryOnEmpty {
+			t.Fatalf("move to %s/%s queued %+v", ip, cl.NetworkName, tasks)
+		}
+		if _, ok := e.profilesByMAC[cl.MAC]; ok || len(e.findingsByMAC[cl.MAC]) != 0 {
+			t.Fatal("move retained stale scan results")
+		}
+		ev := e.events[0]
+		if ev.Type != "client_moved" || ev.Severity != "medium" || ev.IP != ip {
+			t.Fatalf("move event = %+v", ev)
+		}
+	}
+
+	cache()
+	wantMove(b)
+	cache()
+	updated := e.current.UpdatedAt
+	state, err := os.Stat(cfg.State.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ip := range []string{b, a, b, a} {
+		if tasks := poll(ip); len(tasks) != 0 {
+			t.Fatalf("poll of %s queued %+v", ip, tasks)
+		}
+		if e.snap.Clients[0].IP != ip || !e.current.UpdatedAt.Equal(updated) {
+			t.Fatalf("poll of %s lost the current address or republished the dashboard", ip)
+		}
+		hp := e.profilesByMAC[cl.MAC]
+		fl := e.findingsByMAC[cl.MAC]
+		if hp.Client.IP != ip || hp.ProbeIP != b || len(fl) != 1 || fl[0].Client.IP != b {
+			t.Fatalf("poll of %s lost the probe of %s: profile %+v, findings %+v", ip, b, hp, fl)
+		}
+	}
+	after, err := os.Stat(cfg.State.Path)
+	if err != nil || !os.SameFile(state, after) {
+		t.Fatalf("quiet polls replaced the saved state: %v", err)
+	}
+	if len(e.events) != 2 {
+		t.Fatalf("expected one move and one notice, got %+v", e.events)
+	}
+	ev := e.events[0]
+	if ev.Type != "client_multi_ip" || ev.Severity != "info" || ev.SubjectID != hostEntityID(cl) ||
+		!strings.Contains(ev.Summary, cl.NetworkName) || !strings.Contains(ev.Summary, a) || !strings.Contains(ev.Summary, b) {
+		t.Fatalf("multi-address notice = %+v", ev)
+	}
+
+	target, status := e.triggerHostRescanStatus(strings.ToUpper(cl.MAC))
+	if status != hostRescanQueued || target.IP != a {
+		t.Fatalf("recheck after quiet bounce resolved %q, status %v", target.IP, status)
+	}
+	if task := <-e.hostScanCh; task.client.IP != a || task.client.MAC != cl.MAC {
+		t.Fatalf("recheck queued %+v", task)
+	}
+
+	wantMove(c)
+	eventCount := len(e.events)
+	for _, ip := range []string{a, b, c} {
+		if tasks := poll(ip); len(tasks) != 0 || len(e.events) != eventCount {
+			t.Fatalf("known address %s queued %+v, events %+v", ip, tasks, e.events)
+		}
+	}
+
+	cl.NetworkName = "IoT"
+	wantMove(b)
+	if e.ipv4ByMAC[cl.MAC] != nil {
+		t.Fatal("VLAN move retained the old address set")
+	}
+	wantMove(a)
+	if tasks := poll(b); len(tasks) != 0 {
+		t.Fatalf("return on IoT queued %+v", tasks)
+	}
+	// A brief Wi-Fi absence keeps the host in leave grace, but a returning
+	// client must establish its address history again.
+	e.applySnapshotDelta(t.Context(), &unifi.Snapshot{}, now)
+	if e.ipv4ByMAC[cl.MAC] != nil {
+		t.Fatal("missing Wi-Fi client retained its address history")
+	}
+	wantMove(a)
+	wantMove(b)
+}
+
+// TestClientIPv4FlapLimits verifies that old leases and long runs of new
+// addresses cannot keep a client exempt from normal move handling.
+func TestClientIPv4FlapLimits(t *testing.T) {
+	e := new(Engine)
+	cl := unifi.Client{MAC: "02:00:00:00:ab:01", NetworkName: "Default", IP: "192.0.2.1"}
+	now := time.Now()
+	change := func(ip string, wantSuppress bool) {
+		t.Helper()
+		prev := cl
+		cl.IP = ip
+		suppressed, _ := e.recordIPv4Change(cl.MAC, prev, cl, now)
+		if got := len(e.ipv4ByMAC[cl.MAC].seen); suppressed != wantSuppress || got > maxClientIPv4s {
+			t.Fatalf("%s -> %s: suppressed=%t, tracked=%d", prev.IP, ip, suppressed, got)
+		}
+	}
+	change("192.0.2.2", false)
+	change("192.0.2.1", true)
+	now = now.Add(ipv4FlapWindow + time.Second)
+	change("192.0.2.2", false)
+	change("192.0.2.1", true)
+	for i := 3; i <= maxClientIPv4s+1; i++ {
+		change(fmt.Sprintf("192.0.2.%d", i), false)
+	}
+	change("192.0.2.1", false)
+}
+
+// TestClientIPv4FlapAttachmentMove checks that a return to a familiar IP on a
+// different attachment gets a fresh scan, even when the network name stays the same.
+func TestClientIPv4FlapAttachmentMove(t *testing.T) {
+	const a, b = "192.0.2.10", "192.0.2.11"
+	for _, tc := range []struct {
+		name  string
+		wired bool
+		move  func(*unifi.Client)
+	}{
+		{"AP roam", false, func(c *unifi.Client) { c.APMAC = "02:00:00:00:00:02" }},
+		{"switch port", true, func(c *unifi.Client) { c.SwitchPort++ }},
+		{"switch MAC", true, func(c *unifi.Client) { c.SwitchMAC = "02:00:00:00:00:02" }},
+		{"medium", false, func(c *unifi.Client) { c.IsWired = true }},
+		{"network ID", true, func(c *unifi.Client) { c.NetworkID = "second" }},
+		{"VLAN", true, func(c *unifi.Client) { c.VLAN = "20" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+			e, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cl := unifi.Client{MAC: "02:00:00:00:ab:01", IP: a, IsWired: tc.wired, NetworkID: "first", VLAN: "10"}
+			if cl.IsWired {
+				cl.SwitchMAC, cl.SwitchPort = "02:00:00:00:ab:cd", 1
+			} else {
+				cl.APMAC = "02:00:00:00:ab:cd"
+			}
+			e.snap = &unifi.Snapshot{Clients: []unifi.Client{cl}}
+			poll := func() []hostScanTask {
+				return e.applySnapshotDelta(t.Context(), &unifi.Snapshot{Clients: []unifi.Client{cl}}, time.Now())
+			}
+			cl.IP = b
+			poll()
+			cl.APMAC, cl.SwitchMAC = strings.ToUpper(cl.APMAC), strings.ToUpper(cl.SwitchMAC)
+			cl.IP = a
+			if tasks := poll(); len(tasks) != 0 {
+				t.Fatalf("return to same attachment queued %+v", tasks)
+			}
+			scanned := probe.HostProfile{Client: cl, ProbeIP: a}
+			tc.move(&cl)
+			cl.IP = b
+			if tasks := poll(); len(tasks) != 1 || attachmentOf(tasks[0].client) != attachmentOf(cl) ||
+				e.events[0].Type != "client_moved" || e.ipv4ByMAC[cl.MAC] != nil {
+				t.Fatalf("move queued %+v, events %+v, tracker %+v", tasks, e.events, e.ipv4ByMAC)
+			}
+			if e.storeHostScan(cl.MAC, cl, scanned, nil, time.Now()) {
+				t.Fatal("accepted sibling scan from previous attachment")
+			}
+		})
+	}
+}
+
+// TestClientRoamKeepsScan checks that a Wi-Fi roam or a switch port report
+// that keeps the address and network is not a move and keeps the last scan.
+func TestClientRoamKeepsScan(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		wired bool
+		roam  func(*unifi.Client)
+	}{
+		{"AP roam", false, func(c *unifi.Client) { c.APMAC = "02:00:00:00:00:02" }},
+		{"switch port", true, func(c *unifi.Client) { c.SwitchPort = 0 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+			e, err := NewEngine(cfg, nil, nil, Options{SkipCVE: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cl := unifi.Client{MAC: "02:00:00:00:ab:01", IP: "192.0.2.10", IsWired: tc.wired, NetworkID: "first", NetworkName: "Default"}
+			if cl.IsWired {
+				cl.SwitchMAC, cl.SwitchPort = "02:00:00:00:ab:cd", 1
+			} else {
+				cl.APMAC = "02:00:00:00:ab:cd"
+			}
+			e.snap = &unifi.Snapshot{Clients: []unifi.Client{cl}}
+			scanned := probe.HostProfile{Client: cl, ProbeIP: cl.IP, ScannedAt: time.Now()}
+			e.profilesByMAC[cl.MAC] = scanned
+			e.findingsByMAC[cl.MAC] = []checks.Finding{{Client: cl, CheckID: "bridge-service"}}
+			tc.roam(&cl)
+			if tasks := e.applySnapshotDelta(t.Context(), &unifi.Snapshot{Clients: []unifi.Client{cl}}, time.Now()); len(tasks) != 0 || len(e.events) != 0 {
+				t.Fatalf("roam queued %+v, events %+v", tasks, e.events)
+			}
+			if hp := e.profilesByMAC[cl.MAC]; attachmentOf(hp.Client) != attachmentOf(cl) || len(e.findingsByMAC[cl.MAC]) != 1 {
+				t.Fatalf("roam lost the scan: profile %+v, findings %+v", hp, e.findingsByMAC[cl.MAC])
+			}
+			scanned.ScannedAt = time.Now()
+			if !e.storeHostScan(cl.MAC, cl, scanned, nil, time.Now()) {
+				t.Fatal("rejected a scan that started before the roam")
+			}
+		})
+	}
+}
+
+// TestClientIPv4FlapKeepsCVEs follows a sibling's scan through dashboard
+// publication, webhook diffing and reassignment of the observed address.
+func TestClientIPv4FlapKeepsCVEs(t *testing.T) {
+	cfg := config.Default()
+	cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+	cfg.CVE.CacheDir = t.TempDir()
+	rec := cve.Record{ID: "CVE-2026-99991", Severity: checks.SeverityHigh, CVSS: 8.1, AttackVector: "N",
+		Matches: []cve.CPEMatch{{Part: "a", Vendor: "f5", Product: "nginx", StartIncl: "1.26.0", EndExcl: "1.26.4"}}}
+	if err := writeTestCVEShard(cfg.CVE.CacheDir, []cve.Record{rec}, &cve.CacheStats{VendorCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewEngine(cfg, nil, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := unifi.Client{MAC: "02:00:00:00:ab:01", IP: "192.0.2.10", Name: "bridge"}
+	b := a
+	b.IP = "192.0.2.11"
+	poll := func(clients ...unifi.Client) {
+		e.applySnapshotDelta(t.Context(), &unifi.Snapshot{Clients: clients}, time.Now())
+	}
+	e.snap = &unifi.Snapshot{Clients: []unifi.Client{a}}
+	poll(b)
+	hp := probe.HostProfile{Client: b, ProbeIP: b.IP, ScannedAt: time.Now(), OpenPorts: []int{80},
+		HTTP:     map[int]probe.HTTPBanner{80: {Server: "nginx/1.26.3"}},
+		Services: []probe.Service{{Port: 80, Protocol: "http", Findings: []probe.ServiceFinding{{ID: "http-version", Severity: "low"}}}}}
+	f := checks.Finding{Client: b, CheckID: "bridge-service", ObservedIPs: []string{b.IP}}
+	if !e.storeHostScan(b.MAC, b, hp, []checks.Finding{f}, time.Now()) {
+		t.Fatal("could not seed the probe at the current address")
+	}
+	e.recomputeAndPublish(t.Context(), true, nil)
+	poll(a)
+	older := hp
+	hp.ScannedAt = time.Now()
+	if !e.storeHostScan(a.MAC, a, hp, []checks.Finding{f}, time.Now()) || e.storeHostScan(a.MAC, a, older, nil, time.Now()) {
+		t.Fatal("expected only the newer probe of the sibling to be accepted")
+	}
+	empty := probe.HostProfile{Client: a, ProbeIP: a.IP, ScannedAt: time.Now()}
+	if e.storeHostScan(a.MAC, a, empty, nil, time.Now()) {
+		t.Fatal("a clean scan at a different address cleared confirmed findings")
+	}
+	e.recomputeAndPublish(t.Context(), false, nil)
+	published := e.Snapshot()
+	ent := published.View.Entities[hostEntityID(a)]
+	if ent == nil || ent.IP != b.IP || ent.ExactCVECount != 1 || e.snap.Clients[0].IP != a.IP {
+		t.Fatalf("sibling publication: host %+v, inventory %+v", ent, e.snap.Clients)
+	}
+	keys := e.prevRiskState.ExactCVEs
+	cveKey := a.MAC + "|nginx|1.26.3|" + rec.ID
+	if len(keys) != 1 || keys[cveKey] == "" || e.webhookSeq != 0 {
+		t.Fatalf("CVE alert keys %v, queued webhooks %d", keys, e.webhookSeq)
+	}
+	if !slices.ContainsFunc(published.View.Blast.Actions, func(action blast.Action) bool {
+		return action.ID == "act:patch:"+rec.ID+":"+a.MAC
+	}) {
+		t.Fatalf("missing patch action for the bridge in %+v", published.View.Blast.Actions)
+	}
+	for _, id := range []string{f.CheckID, "NERVA-HTTP-VERSION"} {
+		if !slices.ContainsFunc(published.Report.Findings, func(f checks.Finding) bool {
+			return f.CheckID == id && f.Client.IP == b.IP && slices.Equal(f.ObservedIPs, []string{b.IP})
+		}) {
+			t.Fatalf("missing %s at %s in %+v", id, b.IP, published.Report.Findings)
+		}
+	}
+
+	other := unifi.Client{MAC: "02:00:00:00:ab:02", IP: b.IP, Name: "new owner"}
+	poll(a, other)
+	view := e.Snapshot().View
+	bridge, owner := view.Entities[hostEntityID(a)], view.Entities[hostEntityID(other)]
+	if bridge == nil || bridge.IP != a.IP || owner == nil || owner.IP != b.IP || owner.ExactCVECount != 0 || len(owner.Services) != 0 {
+		t.Fatalf("reassigned probe address: bridge %+v, new owner %+v", bridge, owner)
+	}
+	if len(e.prevRiskState.ExactCVEs) != 1 || e.prevRiskState.ExactCVEs[cveKey] == "" ||
+		len(e.findingsByMAC[a.MAC]) != 1 || e.webhookSeq != 0 {
+		t.Fatalf("reassignment changed attribution: keys %v, findings %+v, queued webhooks %d", e.prevRiskState.ExactCVEs, e.findingsByMAC, e.webhookSeq)
+	}
+	if e.storeHostScan(a.MAC, a, hp, []checks.Finding{f}, time.Now()) || !e.storeHostScan(a.MAC, a, empty, nil, time.Now()) {
+		t.Fatal("reassignment must reject the old sibling and accept a scan of the current address")
+	}
+}
+
+// TestClientIPv4FlapDuringProbe changes the live address inside a loopback
+// HTTP check so both scan paths finish with a newer poll reporting a sibling.
+func TestClientIPv4FlapDuringProbe(t *testing.T) {
+	for _, mode := range []string{"single host", "full scan", "duplicate MAC"} {
+		t.Run(mode, func(t *testing.T) {
+			cl := unifi.Client{MAC: "02:00:00:00:ab:01", Name: "bridge", NetworkName: "Default", IP: "192.0.2.10"}
+			sibling := &unifi.Snapshot{Clients: []unifi.Client{cl}}
+			cl.IP = "127.0.0.1"
+			mux := http.NewServeMux()
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+			port := srv.Listener.Addr().(*net.TCPAddr).Port
+			check := &checks.Check{
+				ID: "bridge-service", Title: "Bridge service", Severity: checks.SeverityLow,
+				Preconditions: checks.Preconditions{PortsAny: []int{port}},
+				Probe: checks.ProbeSpec{Type: "http", Port: port, Scheme: "http", Timeout: 5 * time.Second, HTTPStepSpec: checks.HTTPStepSpec{
+					Method: "GET", Path: "/bridge-check", Match: checks.MatchSpec{Status: []int{http.StatusOK}},
+				}},
+			}
+			cfg := config.Default()
+			cfg.State.Path = filepath.Join(t.TempDir(), "state.json")
+			cfg.UniFi.URL, cfg.UniFi.Username, cfg.UniFi.Password = srv.URL, "test", "test"
+			e, err := NewEngine(cfg, []*checks.Check{check}, []int{port}, Options{SkipCVE: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.snap = sibling
+			tasks := e.applySnapshotDelta(t.Context(), &unifi.Snapshot{Clients: []unifi.Client{cl}}, time.Now())
+			if len(tasks) != 1 {
+				t.Fatalf("first move queued %+v", tasks)
+			}
+			mux.HandleFunc("/bridge-check", func(w http.ResponseWriter, r *http.Request) {
+				if mode == "duplicate MAC" {
+					wrong := cl
+					wrong.NetworkID = "other"
+					e.applySnapshotDelta(r.Context(), &unifi.Snapshot{Clients: []unifi.Client{wrong, cl}}, time.Now())
+				} else {
+					e.applySnapshotDelta(r.Context(), sibling, time.Now())
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			var departed atomic.Bool
+			mux.HandleFunc("/proxy/network/api/s/default/stat/sta", func(w http.ResponseWriter, r *http.Request) {
+				if departed.Load() {
+					io.WriteString(w, `{"data":[]}`)
+					return
+				}
+				fmt.Fprintf(w, `{"data":[{"mac":%q,"ip":%q,"network":%q}]}`, cl.MAC, cl.IP, cl.NetworkName)
+			})
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, `{"data":[]}`)
+			})
+			if mode != "full scan" {
+				e.scanSingleHost(t.Context(), tasks[0])
+			} else if err := e.runFullScan(t.Context(), "reconcile"); err != nil {
+				t.Fatal(err)
+			}
+			hp := e.profilesByMAC[cl.MAC]
+			fl := e.findingsByMAC[cl.MAC]
+			wantIP := sibling.Clients[0].IP
+			if mode == "duplicate MAC" {
+				wantIP = cl.IP
+			}
+			if hp.Client.IP != wantIP || hp.Client.NetworkID != cl.NetworkID || hp.ProbeIP != cl.IP || !hp.HasPort(port) ||
+				len(fl) != 1 || fl[0].CheckID != check.ID || !slices.Equal(fl[0].ObservedIPs, []string{cl.IP}) {
+				t.Fatalf("completed probe of %s: profile %+v, findings %+v", cl.IP, hp, fl)
+			}
+			cv := e.Snapshot().Clients[0]
+			if cv.Client.IP != cl.IP || cv.LastScannedAt == nil || !slices.Contains(cv.OpenPorts, port) || cv.FindingCount == 0 {
+				t.Fatalf("published client lost the sibling probe: %+v", cv)
+			}
+			if mode == "full scan" {
+				departed.Store(true)
+				if err := e.runFullScan(t.Context(), "reconcile"); err != nil {
+					t.Fatal(err)
+				}
+				if e.ipv4ByMAC[cl.MAC] != nil {
+					t.Fatal("adopted full scan retained the departed client's address history")
+				}
+			}
+		})
 	}
 }
 
@@ -1692,32 +2090,6 @@ func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing
 	defer whSrv.Close()
 
 	cacheDir := t.TempDir()
-	writeShard := func(recs []cve.Record, stats *cve.CacheStats) {
-		t.Helper()
-		vendorsDir := filepath.Join(cacheDir, "vendors")
-		if err := os.MkdirAll(vendorsDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		f, err := os.Create(filepath.Join(vendorsDir, "f5.json.gz"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		gz := gzip.NewWriter(f)
-		if err := json.NewEncoder(gz).Encode(recs); err != nil {
-			t.Fatal(err)
-		}
-		if err := gz.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := f.Close(); err != nil {
-			t.Fatal(err)
-		}
-		raw, _ := json.Marshal(stats)
-		if err := os.WriteFile(filepath.Join(cacheDir, "stats.json"), raw, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	rec1 := cve.Record{
 		ID: "CVE-2026-88001", Severity: checks.SeverityHigh, CVSS: 7.5,
 		Matches: []cve.CPEMatch{{Part: "a", Vendor: "f5", Product: "nginx", StartIncl: "1.26.0", EndExcl: "1.26.4"}},
@@ -1726,7 +2098,9 @@ func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing
 		ID: "CVE-2026-88002", Severity: checks.SeverityCritical, CVSS: 9.8, KEV: true,
 		Matches: []cve.CPEMatch{{Part: "a", Vendor: "f5", Product: "nginx", StartIncl: "1.26.0", EndExcl: "1.26.5"}},
 	}
-	writeShard([]cve.Record{rec1}, &cve.CacheStats{SyncedAt: time.Now().UTC(), TotalCVEs: 1, IndexedCPECVEs: 1, VendorCount: 1})
+	if err := writeTestCVEShard(cacheDir, []cve.Record{rec1}, &cve.CacheStats{SyncedAt: time.Now().UTC(), TotalCVEs: 1, IndexedCPECVEs: 1, VendorCount: 1}); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := config.Default()
 	cfg.UniFi.URL = "https://192.0.2.1"
@@ -1825,7 +2199,9 @@ func TestWebhookPushesNewCVEsCoalescesHighSignalEventsAndFiltersNoise(t *testing
 	mu.Unlock()
 
 	// 3. New KEV CVE lands in cache -> pushes immediately with CVE + MinFixedVersion.
-	writeShard([]cve.Record{rec1, rec2}, &cve.CacheStats{SyncedAt: time.Now().UTC().Add(time.Second), TotalCVEs: 2, IndexedCPECVEs: 2, VendorCount: 1, KEVCount: 1})
+	if err := writeTestCVEShard(cacheDir, []cve.Record{rec1, rec2}, &cve.CacheStats{SyncedAt: time.Now().UTC().Add(time.Second), TotalCVEs: 2, IndexedCPECVEs: 2, VendorCount: 1, KEVCount: 1}); err != nil {
+		t.Fatal(err)
+	}
 	eng.recomputeAndPublish(ctx, false, nil)
 
 	select {

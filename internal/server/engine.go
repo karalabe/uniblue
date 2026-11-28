@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,6 +59,12 @@ const (
 	// briefly sleep or roam between APs. Wired clients evict immediately on leave
 	// or physical switch port link-down.
 	defaultLeaveGrace = 60 * time.Second
+
+	// ipv4FlapWindow limits how long a previous address can identify a bridge.
+	ipv4FlapWindow = 15 * time.Minute
+
+	// maxClientIPv4s separates small bridges from clients cycling through leases.
+	maxClientIPv4s = 8
 
 	// maxWebhookCVEsPerBatch caps how many CVEAlert entries are packed into a
 	// single webhook delivery (~40 KB JSON, well below typical 1 MB proxy body
@@ -279,6 +286,50 @@ type missingClient struct {
 	since  time.Time
 }
 
+// clientAttachment identifies the network and physical connection on which a
+// scan or address change was observed. Network names alone need not be unique.
+type clientAttachment struct {
+	networkID, vlan, networkName string
+	wired                        bool
+	apMAC, switchMAC             string
+	switchPort                   int
+}
+
+// attachmentOf normalizes controller MAC formats so a spelling change cannot
+// turn a return to a known address into a move.
+func attachmentOf(cl unifi.Client) clientAttachment {
+	return clientAttachment{
+		networkID: cl.NetworkID, vlan: cl.VLAN, networkName: cl.NetworkName,
+		wired: cl.IsWired, apMAC: config.CanonicalMAC(cl.APMAC),
+		switchMAC: config.CanonicalMAC(cl.SwitchMAC), switchPort: cl.SwitchPort,
+	}
+}
+
+// sameNetwork reports whether two observations place a client on the same
+// network. AP, switch port and medium change on every Wi-Fi roam, so they only
+// qualify an address change and never make a move on their own.
+func sameNetwork(a, b unifi.Client) bool {
+	return a.NetworkID == b.NetworkID && a.VLAN == b.VLAN && a.NetworkName == b.NetworkName
+}
+
+// clientIPv4History records address changes on one attachment. A return to a recent
+// address distinguishes an oscillating bridge from a single DHCP renewal.
+type clientIPv4History struct {
+	attachment clientAttachment
+	seen       map[string]time.Time
+	lastReturn time.Time
+}
+
+// expire forgets old leases so an address reused later starts a new episode.
+func (h *clientIPv4History) expire(now time.Time) {
+	if !h.lastReturn.IsZero() && now.Sub(h.lastReturn) > ipv4FlapWindow {
+		clear(h.seen)
+		h.lastReturn = time.Time{}
+		return
+	}
+	maps.DeleteFunc(h.seen, func(_ string, seen time.Time) bool { return now.Sub(seen) > ipv4FlapWindow })
+}
+
 // hostScanTask describes a targeted single-host probe queued on client join,
 // physical port link-up, policy change, or manual UI rescan.
 type hostScanTask struct {
@@ -413,6 +464,7 @@ type Engine struct {
 	deltaGen         uint64
 	profilesByMAC    map[string]probe.HostProfile
 	findingsByMAC    map[string][]checks.Finding
+	ipv4ByMAC        map[string]*clientIPv4History
 	missingClients   map[string]missingClient
 	lastPorts        map[string]portLiveState
 	anomalies        *anomalyTracker
@@ -840,7 +892,7 @@ func clientMatchesIdentifier(cl unifi.Client, query string) bool {
 	if strings.EqualFold(hostEntityID(cl), q) {
 		return true
 	}
-	if cl.MAC != "" && strings.EqualFold(cl.MAC, q) {
+	if cl.MAC != "" && config.CanonicalMAC(cl.MAC) == config.CanonicalMAC(q) {
 		return true
 	}
 	if cl.IP != "" && strings.EqualFold(cl.IP, q) {
@@ -1152,10 +1204,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 				existed = true
 			}
 		}
-		delete(e.missingClients, k)
-
-		switch {
-		case !existed:
+		if !existed {
 			changed = true
 			clIP := cl.PrimaryIP()
 			summary := fmt.Sprintf("%s joined %s (waiting for IP)", cl.DisplayName(), fallbackVLAN(cl.NetworkName))
@@ -1174,32 +1223,17 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 				pendingEvents = append(pendingEvents, e.anomalies.EvaluateClientJoinAnomalies(cl, now)...)
 			}
 			queueScan(cl, true)
-		case !sameClientStableIP(prev, cl) || prev.NetworkName != cl.NetworkName:
-			changed = true
-			delete(e.profilesByMAC, k)
-			delete(e.findingsByMAC, k)
-			prevIP := prev.PrimaryIP()
-			clIP := cl.PrimaryIP()
-			summary := fmt.Sprintf("%s changed (%s/%s -> %s/%s)", cl.DisplayName(), prevIP, fallbackVLAN(prev.NetworkName), clIP, fallbackVLAN(cl.NetworkName))
-			if clIP != "" {
-				summary += "; queuing security scan"
+		} else if ev := e.updateClientAddress(k, prev, cl, now); ev != nil {
+			if ev.Type == "client_moved" {
+				changed = true
+				if ev.IP != "" {
+					ev.Summary += "; queuing security scan"
+				}
+				queueScan(cl, true)
 			}
-			pendingEvents = append(pendingEvents, LiveEvent{
-				Type:      "client_moved",
-				Severity:  "medium",
-				Host:      cl.DisplayName(),
-				IP:        clIP,
-				SubjectID: hostEntityID(cl),
-				Summary:   summary,
-			})
-			queueScan(cl, true)
-		default:
-			// Update stored profile client metadata in case alias changed.
-			if hp, ok := e.profilesByMAC[k]; ok {
-				hp.Client = cl
-				e.profilesByMAC[k] = hp
-			}
+			pendingEvents = append(pendingEvents, *ev)
 		}
+		delete(e.missingClients, k)
 	}
 
 	// Evict wired clients immediately on disconnect (they do not Wi-Fi sleep);
@@ -1208,6 +1242,7 @@ func (e *Engine) applySnapshotDelta(ctx context.Context, snap *unifi.Snapshot, n
 		if _, active := seenNow[k]; active {
 			continue
 		}
+		delete(e.ipv4ByMAC, k)
 		if prev.IsWired {
 			delete(e.missingClients, k)
 			delete(e.profilesByMAC, k)
@@ -1513,25 +1548,21 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 		return
 	}
 	k := clientKey(cl)
-	// Verify the client is still active on the same IP and VLAN before caching
-	// probe results so a concurrent disconnect or VLAN move cannot leave stale data.
 	e.mu.Lock()
-	stillMatches := false
+	stored := false
 	if e.snap != nil {
+		now := time.Now()
 		for _, cur := range e.snap.Clients {
-			if clientKey(cur) == k && cur.PrimaryIP() == cl.PrimaryIP() && cur.NetworkName == cl.NetworkName {
-				stillMatches = true
+			if clientKey(cur) == k && e.storeHostScan(k, cur, hp, hostCheckFindings, now) {
+				stored = true
 				break
 			}
 		}
 	}
-	if !stillMatches {
-		e.mu.Unlock()
+	e.mu.Unlock()
+	if !stored {
 		return
 	}
-	e.profilesByMAC[k] = hp
-	e.findingsByMAC[k] = hostCheckFindings
-	e.mu.Unlock()
 
 	e.recomputeAndPublish(ctx, false, nil)
 
@@ -1601,6 +1632,126 @@ func (e *Engine) scanSingleHost(ctx context.Context, task hostScanTask) {
 			}
 		}(cl)
 	}
+}
+
+// updateClientAddress refreshes inventory metadata and invalidates probe evidence
+// on a move. Both polling and full scans can supply the next observation of a
+// client. The caller must hold e.mu and supply records for the same client key.
+func (e *Engine) updateClientAddress(k string, prev, cl unifi.Client, now time.Time) *LiveEvent {
+	var notice *LiveEvent
+	if !sameNetwork(prev, cl) || !sameClientStableIP(prev, cl) {
+		suppress, first := e.recordIPv4Change(k, prev, cl, now)
+		if !suppress {
+			delete(e.profilesByMAC, k)
+			delete(e.findingsByMAC, k)
+			return &LiveEvent{
+				Type:      "client_moved",
+				Severity:  "medium",
+				Host:      cl.DisplayName(),
+				IP:        cl.PrimaryIP(),
+				SubjectID: hostEntityID(cl),
+				Summary:   fmt.Sprintf("%s changed (%s/%s -> %s/%s)", cl.DisplayName(), prev.PrimaryIP(), fallbackVLAN(prev.NetworkName), cl.PrimaryIP(), fallbackVLAN(cl.NetworkName)),
+			}
+		}
+		if first {
+			ips := slices.Sorted(maps.Keys(e.ipv4ByMAC[k].seen))
+			notice = &LiveEvent{
+				Type:      "client_multi_ip",
+				Severity:  "info",
+				Host:      cl.DisplayName(),
+				IP:        cl.PrimaryIP(),
+				SubjectID: hostEntityID(cl),
+				Summary:   fmt.Sprintf("%s is sharing multiple IPv4 addresses on %s (%s). Repeated move alerts and rescans are suppressed.", cl.DisplayName(), fallbackVLAN(cl.NetworkName), strings.Join(ips, ", ")),
+			}
+		}
+	}
+	if hp, ok := e.profilesByMAC[k]; ok {
+		hp.Client = cl
+		e.profilesByMAC[k] = hp
+	}
+	return notice
+}
+
+// recordIPv4Change recognizes a bridge only after its MAC returns to a recent
+// IPv4 address on the same attachment. Each new address still needs a scan.
+// The caller must hold e.mu.
+func (e *Engine) recordIPv4Change(k string, prev, cl unifi.Client, now time.Time) (suppress, first bool) {
+	prevIP, ip := strings.TrimSpace(prev.IP), strings.TrimSpace(cl.IP)
+	prevAddr, _ := netip.ParseAddr(prevIP)
+	addr, _ := netip.ParseAddr(ip)
+	// Leave grace preserves the old inventory record, but its address predates
+	// the disconnect and cannot establish a return on the new connection.
+	_, wasMissing := e.missingClients[k]
+	attachment := attachmentOf(cl)
+	if wasMissing || attachmentOf(prev) != attachment || cl.MAC == "" || !prevAddr.Is4() || !addr.Is4() {
+		delete(e.ipv4ByMAC, k)
+		return false, false
+	}
+	h := e.ipv4ByMAC[k]
+	if h == nil || h.attachment != attachment {
+		h = &clientIPv4History{attachment: attachment, seen: make(map[string]time.Time)}
+		if e.ipv4ByMAC == nil {
+			e.ipv4ByMAC = make(map[string]*clientIPv4History)
+		}
+		e.ipv4ByMAC[k] = h
+	}
+	h.expire(now)
+	_, known := h.seen[ip]
+	h.seen[prevIP], h.seen[ip] = now, now
+	if len(h.seen) > maxClientIPv4s {
+		// Resume normal move handling when address churn outgrows a small bridge.
+		h.seen = map[string]time.Time{prevIP: now, ip: now}
+		h.lastReturn = time.Time{}
+	} else if known {
+		first = h.lastReturn.IsZero()
+		h.lastReturn = now
+		return true, first
+	}
+	return false, false
+}
+
+// hasSibling reports whether the observed address is still a known sibling
+// and the live inventory has not assigned it to another client.
+func (e *Engine) hasSibling(k string, attachment clientAttachment, ip, sibling string, now time.Time) bool {
+	h := e.ipv4ByMAC[k]
+	if h == nil || h.attachment != attachment {
+		return false
+	}
+	h.expire(now)
+	_, current := h.seen[ip]
+	_, observed := h.seen[sibling]
+	return current && observed && !h.lastReturn.IsZero() && !slices.ContainsFunc(e.snap.Clients, func(cl unifi.Client) bool {
+		return strings.TrimSpace(cl.IP) == sibling && clientKey(cl) != k
+	})
+}
+
+// storeHostScan accepts results for the current address or a confirmed sibling
+// on the same attachment. ScannedAt prevents an older scan from replacing one
+// that started more recently. An empty scan of a different sibling cannot
+// clear findings on the observed endpoint. The caller must hold e.mu and look
+// up cur by k in the active snapshot.
+func (e *Engine) storeHostScan(k string, cur unifi.Client, hp probe.HostProfile, findings []checks.Finding, now time.Time) bool {
+	attachment := attachmentOf(cur)
+	if currentIP, scannedIP := cur.PrimaryIP(), hp.Client.PrimaryIP(); currentIP == scannedIP {
+		if !sameNetwork(cur, hp.Client) {
+			return false
+		}
+	} else if attachment != attachmentOf(hp.Client) || !e.hasSibling(k, attachment, currentIP, scannedIP, now) {
+		return false
+	}
+	if existing, ok := e.profilesByMAC[k]; ok {
+		if existing.ScannedAt.After(hp.ScannedAt) {
+			return false
+		}
+		if len(findings) == 0 && len(e.findingsByMAC[k]) > 0 && existing.ProbeIP != hp.ProbeIP &&
+			e.hasSibling(k, attachment, hp.ProbeIP, existing.ProbeIP, now) {
+			return false
+		}
+	}
+	hp.Client = cur
+	e.profilesByMAC[k] = hp
+	e.findingsByMAC[k] = findings
+	return true
 }
 
 // sameClientStableIP reports whether a and b have the same primary routing
@@ -1695,6 +1846,7 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		e.setScanProgress(nil)
 		return err
 	}
+	observedAt := time.Now().UTC()
 	preserveUnavailableTelemetry(prevSnapHint, snap)
 	currPorts := snapshotPortStates(snap, e.cfg.Network)
 	snap.Clients = filterOfflineWiredClients(snap.Clients, currPorts)
@@ -1807,10 +1959,19 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		e.setScanProgress(nil)
 		return ctx.Err()
 	}
-	byMAC := make(map[string][]checks.Finding, len(profiles))
+	// A controller can report several rows for one MAC. Keep each scan's
+	// findings with the endpoint that produced them when choosing a profile.
+	type scanEndpoint struct {
+		key, ip    string
+		attachment clientAttachment
+	}
+	endpoint := func(cl unifi.Client) scanEndpoint {
+		return scanEndpoint{clientKey(cl), cl.PrimaryIP(), attachmentOf(cl)}
+	}
+	findingsByEndpoint := make(map[scanEndpoint][]checks.Finding)
 	for _, f := range freshFindings {
-		k := clientKey(f.Client)
-		byMAC[k] = append(byMAC[k], f)
+		id := endpoint(f.Client)
+		findingsByEndpoint[id] = append(findingsByEndpoint[id], f)
 	}
 
 	e.setScanProgress(&ScanProgress{
@@ -1840,24 +2001,36 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 		}
 		e.lastPorts = currPorts
 	}
-	// Merge scanned host profiles/findings carefully: keep only hosts still active
-	// at the same IP/network, and never overwrite a fresher per-host rescan that
-	// completed while this full scan was running.
 	activeByKey := make(map[string]unifi.Client, len(e.snap.Clients))
 	for _, cl := range e.snap.Clients {
 		activeByKey[clientKey(cl)] = cl
 	}
+	now := time.Now().UTC()
 	if adopted {
+		// An adopted snapshot may be the only observation of a move or bounce
+		// between polls. Its host probes have already run for these addresses.
+		if prevSnapHint != nil {
+			for _, prev := range prevSnapHint.Clients {
+				k := clientKey(prev)
+				if cur, active := activeByKey[k]; active {
+					if ev := e.updateClientAddress(k, prev, cur, observedAt); ev != nil {
+						scanExtraEvents = append(scanExtraEvents, *ev)
+					}
+				}
+			}
+		}
 		// Evict absent wired clients immediately and wireless clients whose
 		// leave-grace window has elapsed, while keeping briefly dozing/roaming
 		// Wi-Fi clients intact across full-scan adoption.
-		adoptNow := time.Now().UTC()
 		for k, mc := range e.missingClients {
-			if _, stillActive := activeByKey[k]; stillActive {
+			if cur, stillActive := activeByKey[k]; stillActive {
+				if ev := e.updateClientAddress(k, mc.client, cur, observedAt); ev != nil {
+					scanExtraEvents = append(scanExtraEvents, *ev)
+				}
 				delete(e.missingClients, k)
 				continue
 			}
-			if !mc.client.IsWired && adoptNow.Sub(mc.since) < defaultLeaveGrace {
+			if !mc.client.IsWired && now.Sub(mc.since) < defaultLeaveGrace {
 				continue
 			}
 			delete(e.missingClients, k)
@@ -1891,18 +2064,18 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 			}
 		}
 	}
+	// Use the live inventory for pruning even when a poll superseded this scan.
+	for k, h := range e.ipv4ByMAC {
+		h.expire(now)
+		if cur, active := activeByKey[k]; !active || attachmentOf(cur) != h.attachment || len(h.seen) == 0 {
+			delete(e.ipv4ByMAC, k)
+		}
+	}
 	for _, hp := range profiles {
 		k := clientKey(hp.Client)
-		cur, ok := activeByKey[k]
-		if !ok || cur.PrimaryIP() != hp.Client.PrimaryIP() || cur.NetworkName != hp.Client.NetworkName {
-			continue
+		if cur, active := activeByKey[k]; active {
+			e.storeHostScan(k, cur, hp, findingsByEndpoint[endpoint(hp.Client)], now)
 		}
-		if existing, has := e.profilesByMAC[k]; has && existing.ScannedAt.After(hp.ScannedAt) {
-			continue
-		}
-		hp.Client = cur
-		e.profilesByMAC[k] = hp
-		e.findingsByMAC[k] = byMAC[k]
 	}
 	e.baselineComplete = true
 	e.lastScanError = ""
@@ -1926,6 +2099,53 @@ func (e *Engine) runFullScan(ctx context.Context, reason string) error {
 	return nil
 }
 
+// projectSiblingProbeIPs updates the evaluation copy of the inventory and
+// returns the corresponding IPv4 addresses for profiles and findings. An empty
+// entry withholds an ambiguous scan so another host cannot inherit its CVEs.
+func projectSiblingProbeIPs(clients []unifi.Client, profiles map[string]probe.HostProfile) map[string]string {
+	siblings := make(map[string]string)
+	owners := make(map[string]string)
+	claim := func(ip, key string) {
+		if owner, ok := owners[ip]; ok && owner != key {
+			owners[ip] = ""
+		} else {
+			owners[ip] = key
+		}
+	}
+	for _, cl := range clients {
+		k := clientKey(cl)
+		current := strings.TrimSpace(cl.IP)
+		if current == "" {
+			continue
+		}
+		claim(current, k)
+		hp := profiles[k]
+		ip := hp.ProbeIP
+		if cl.MAC == "" || ip == "" || ip == current || attachmentOf(cl) != attachmentOf(hp.Client) {
+			continue
+		}
+		observed, _ := netip.ParseAddr(ip)
+		inventory, _ := netip.ParseAddr(current)
+		if observed.Is4() && inventory.Is4() {
+			siblings[k] = ip
+			claim(ip, k)
+		}
+	}
+	for i, cl := range clients {
+		k := clientKey(cl)
+		ip := siblings[k]
+		if ip == "" {
+			continue
+		}
+		if owners[ip] != k {
+			siblings[k] = ""
+		} else if attachmentOf(cl) == attachmentOf(profiles[k].Client) {
+			clients[i].IP = ip
+		}
+	}
+	return siblings
+}
+
 // recomputeAndPublish merges cached check findings with profile-derived
 // findings without issuing any host network I/O, then runs blast-radius risk
 // evaluation, CVE rollup, topology construction, and webhook diffing against
@@ -1947,6 +2167,7 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	}
 	// Shallow-copy Snapshot header so site-supplement enrichment never mutates shared pointers.
 	snapCopy := *snapPtr
+	snapCopy.Clients = slices.Clone(snapPtr.Clients)
 	if snapPtr.Visibility != nil {
 		visCopy := *snapPtr.Visibility
 		visCopy.MissingFeeds = append([]string(nil), snapPtr.Visibility.MissingFeeds...)
@@ -1956,30 +2177,40 @@ func (e *Engine) recomputeAndPublish(ctx context.Context, isFullScan bool, extra
 	// defaultLeaveGrace window so /api/v1/hosts/{id} and the dashboard do not
 	// flap them out of existence with transient 404s mid-scan.
 	if len(e.missingClients) > 0 {
-		clients := make([]unifi.Client, 0, len(snapPtr.Clients)+len(e.missingClients))
 		seenCl := make(map[string]struct{}, len(snapPtr.Clients))
 		for _, cl := range snapPtr.Clients {
-			clients = append(clients, cl)
 			seenCl[clientKey(cl)] = struct{}{}
 		}
 		for k, mc := range e.missingClients {
 			if _, ok := seenCl[k]; !ok {
-				clients = append(clients, mc.client)
+				snapCopy.Clients = append(snapCopy.Clients, mc.client)
 			}
 		}
-		snapCopy.Clients = clients
 	}
 	snap := &snapCopy
 
+	// IP-based consumers must resolve the observed endpoint to the same MAC in
+	// the inventory, profile and findings. Live rescans still use e.snap.
+	siblings := projectSiblingProbeIPs(snap.Clients, e.profilesByMAC)
 	profiles := make([]probe.HostProfile, 0, len(e.profilesByMAC))
 	probedHostKeys := make(map[string]struct{}, len(e.profilesByMAC)*2)
 	var cachedFindings []checks.Finding
 	for k, hp := range e.profilesByMAC {
+		ip, sibling := siblings[k]
+		if sibling {
+			if ip == "" {
+				continue
+			}
+			hp.Client.IP = ip
+		}
 		profiles = append(profiles, hp.Clone())
 		probedHostKeys[k] = struct{}{}
 		risk.AddClientHostKeys(probedHostKeys, hp.Client)
-		if fl := e.findingsByMAC[k]; len(fl) > 0 {
-			cachedFindings = append(cachedFindings, fl...)
+		for _, f := range e.findingsByMAC[k] {
+			if sibling {
+				f.Client.IP = ip
+			}
+			cachedFindings = append(cachedFindings, f)
 		}
 	}
 	prevRisk := e.prevRiskState
@@ -3207,9 +3438,11 @@ func (e *Engine) emitLocked(ev LiveEvent) {
 	e.subMu.Unlock()
 }
 
+// clientKey keeps host evidence attached across address changes and falls back
+// to the reported IP for inventory records without a MAC.
 func clientKey(cl unifi.Client) string {
 	if cl.MAC != "" {
-		return strings.ToLower(cl.MAC)
+		return config.CanonicalMAC(cl.MAC)
 	}
 	return cl.IP
 }
