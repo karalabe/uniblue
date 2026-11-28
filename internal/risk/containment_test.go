@@ -459,14 +459,15 @@ func TestFlatInternalNetworkWithExplicitContainment(t *testing.T) {
 // does not certify dual-stack wired peers as isolated when IPv6 remains allowed.
 func TestDualStackPeersWithIPv4OnlyDeny(t *testing.T) {
 	s, c := dualStackContainmentSite()
+	s.Networks[2].IPv6Subnet = ""
 	s.Devices = []unifi.Device{{
 		Type:  "usw",
 		MAC:   "00:00:5e:00:53:01",
 		Ports: []unifi.SwitchPort{{PortIdx: 1, Up: true}, {PortIdx: 2, Up: true}},
 	}}
 	s.Clients = []unifi.Client{
-		{MAC: "00:00:5e:00:53:02", IP: "198.51.100.11", IPv6: []string{"2001:db8:1::11"}, NetworkName: "Sensors", IsWired: true, SwitchMAC: s.Devices[0].MAC, SwitchPort: 1},
-		{MAC: "00:00:5e:00:53:03", IP: "198.51.100.12", IPv6: []string{"2001:db8:1::12"}, NetworkName: "Sensors", IsWired: true, SwitchMAC: s.Devices[0].MAC, SwitchPort: 2},
+		{MAC: "00:00:5e:00:53:02", IP: "198.51.100.11", IPv6: []string{"fe80::11"}, NetworkName: "Sensors", IsWired: true, SwitchMAC: s.Devices[0].MAC, SwitchPort: 1},
+		{MAC: "00:00:5e:00:53:03", IP: "198.51.100.12", IPv6: []string{"fe80::12"}, NetworkName: "Sensors", IsWired: true, SwitchMAC: s.Devices[0].MAC, SwitchPort: 2},
 	}
 	s.SwitchACLs = []unifi.SwitchACL{{
 		ID:          "v4",

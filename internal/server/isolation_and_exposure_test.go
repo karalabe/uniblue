@@ -232,7 +232,7 @@ func TestBMCRedfishGuestIPv4DeniedIPv6Allowed(t *testing.T) {
 			{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "10.0.50.1/24", IPv6Subnet: "2001:db8:50::/64", Purpose: "guest", ZoneName: "Hotspot", IsolationEnabled: true},
 		},
 		Clients: []unifi.Client{
-			{MAC: "11:22:33:44:55:02", IP: host, IPv6: []string{"2001:db8:90::10"}, Name: "Server-01 BMC", NetworkName: "OOB Management", VLAN: "90", IsWired: true},
+			{MAC: "11:22:33:44:55:02", IP: host, IPv6: []string{"fd00:90::10", "2001:db8:90::10"}, Name: "Server-01 BMC", NetworkName: "OOB Management", VLAN: "90", IsWired: true},
 		},
 		FirewallPolicies: []unifi.FirewallPolicy{
 			{
@@ -609,8 +609,8 @@ func TestGuestPrinterIPv6IsolationCustomApprovedPathAndDeviceChildren(t *testing
 			{ID: "net-guest", Name: "Guest", VLAN: "50", Subnet: "198.51.100.1/24", IPv6Subnet: "2001:db8:50::/64", Purpose: "guest", ZoneName: "Hotspot", IsolationEnabled: true},
 		},
 		Clients: []unifi.Client{
-			{MAC: "02:aa:bb:00:00:10", IP: "192.0.2.10", IPv6: []string{"2001:db8:1::10"}, Name: "Office Printer", NetworkName: "Main", VLAN: "1", IsWired: true},
-			{MAC: "02:aa:bb:00:00:11", IP: "192.0.2.11", Name: "Rack UPS", NetworkName: "Main", VLAN: "1", IsWired: true},
+			{MAC: "02:aa:bb:00:00:10", IP: "192.0.2.10", IPv6: []string{"2001:db8:1::10", "fd00:1::10"}, Name: "Office Printer", NetworkName: "Main", VLAN: "1", IsWired: true},
+			{MAC: "02:aa:bb:00:00:11", IP: "192.0.2.11", IPv6: []string{"2001:db8:1::11", "fd00:1::11"}, Name: "Rack UPS", NetworkName: "Main", VLAN: "1", IsWired: true},
 		},
 		FirewallPolicies: []unifi.FirewallPolicy{
 			{
@@ -623,7 +623,7 @@ func TestGuestPrinterIPv6IsolationCustomApprovedPathAndDeviceChildren(t *testing
 				ID: "p-v6-allow", Name: "Legacy Guest IPv6 Allow", Enabled: true, Action: "ALLOW",
 				Origin: "USER_DEFINED", Index: 110, IPVersion: "ipv6", Protocol: "all",
 				Source:      unifi.PolicyEndpoint{ZoneName: "Hotspot", AnyTarget: true, AnyPort: true},
-				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", AnyTarget: true, AnyPort: true},
+				Destination: unifi.PolicyEndpoint{ZoneName: "Internal", IPs: []string{"fd00:1::10", "2001:db8:1::11"}, AnyPort: true},
 			},
 		},
 		Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
@@ -636,11 +636,11 @@ func TestGuestPrinterIPv6IsolationCustomApprovedPathAndDeviceChildren(t *testing
 				{
 					Name:       "UPS Telemetry Check",
 					SourceZone: "Hotspot",
-					DestIP:     "192.0.2.11",
+					DestIP:     "fd00:1::11",
 					Function:   "ups-monitoring",
 					Transport:  "tcp",
 					Port:       3493,
-					IPVersion:  "ipv4",
+					IPVersion:  "ipv6",
 				},
 			},
 		},
@@ -661,10 +661,10 @@ func TestGuestPrinterIPv6IsolationCustomApprovedPathAndDeviceChildren(t *testing
 	foundIPv6PrinterViolation := false
 	foundBlockedUPSWorkflow := false
 	for _, cell := range rep.Isolation.Cells {
-		if cell.DestFunction == "printer-admin" && cell.IPFamily == "ipv6" && cell.Verdict == risk.IsolationViolation {
+		if cell.DestFunction == "printer-admin" && cell.DestIP == "fd00:1::10" && cell.Verdict == risk.IsolationViolation {
 			foundIPv6PrinterViolation = true
 		}
-		if cell.DestFunction == "ups-monitoring" && cell.Port == 3493 && cell.Verdict == risk.IsolationBrokenDependency {
+		if cell.DestFunction == "ups-monitoring" && cell.Port == 3493 && cell.DestIP == "fd00:1::11" && cell.Verdict == risk.IsolationBrokenDependency {
 			foundBlockedUPSWorkflow = true
 		}
 	}

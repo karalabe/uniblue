@@ -139,7 +139,7 @@ func classifyIsolatedArchetype(
 	}
 
 	for _, cl := range snap.Clients {
-		if !strings.EqualFold(cl.NetworkName, n.Name) {
+		if !n.MatchesIdentity(cl.NetworkID, cl.NetworkName) {
 			continue
 		}
 		if m := strings.ToLower(strings.TrimSpace(cl.MAC)); m != "" {
@@ -669,7 +669,7 @@ func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, 
 	wifiClients, unresolvedMedium := false, false
 	apMACs := make(map[string][]string)
 	for _, cl := range snap.Clients {
-		if !(n.ID != "" && cl.NetworkID == n.ID) && !strings.EqualFold(cl.NetworkName, n.Name) {
+		if !n.MatchesIdentity(cl.NetworkID, cl.NetworkName) {
 			continue
 		}
 		if cl.IsWired {
@@ -790,7 +790,7 @@ func (o *Oracle) evaluatePeerContainmentAxis(n unifi.Network) (ContainmentAxis, 
 	}
 
 	families := []string{"ipv4"}
-	if siteHasIPv6Context(snap, n, n, unifi.Client{}) {
+	if siteHasIPv6Context(snap, n, n, unifi.Client{}, true) {
 		families = append(families, "ipv6")
 	}
 	// Evaluate switch port isolation and directional ACLs for a pair of
@@ -1074,7 +1074,7 @@ func (e containmentEvaluator) evaluateInternetEgress(
 	strict bool,
 ) (ContainmentAxis, []IsolationCell, []checks.Finding, []PostureNote) {
 	fams := []string{"ipv4"}
-	if siteHasIPv6Context(e.snap, n, n, unifi.Client{}) {
+	if siteHasIPv6Context(e.snap, n, n, unifi.Client{}, false) {
 		fams = append(fams, "ipv6")
 	}
 
@@ -1146,7 +1146,7 @@ func (e containmentEvaluator) evaluateLANInbound(
 			continue
 		}
 		paths = append(paths, containmentBoundary{src: src, dst: n, fam: "ipv4"})
-		if siteHasIPv6Context(e.snap, src, n, unifi.Client{}) {
+		if siteHasIPv6Context(e.snap, src, n, unifi.Client{}, false) {
 			paths = append(paths, containmentBoundary{src: src, dst: n, fam: "ipv6"})
 		}
 	}

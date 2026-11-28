@@ -1358,10 +1358,7 @@ func siteSubnets(snap *unifi.Snapshot) []netip.Prefix {
 	}
 	var out []netip.Prefix
 	for _, n := range snap.Networks {
-		if p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil {
-			out = append(out, p.Masked())
-		}
-		if p, err := netip.ParsePrefix(strings.TrimSpace(n.IPv6Subnet)); err == nil {
+		for _, p := range n.Prefixes() {
 			out = append(out, p.Masked())
 		}
 	}

@@ -172,10 +172,12 @@ func signalDBM(signal, rssi int) int {
 // name/VLAN matches only when external_id is absent and the hints agree.
 func networkAliases(networks []Network, legacy []rawNetwork) aliases {
 	a, names, vlans := make(aliases), make(aliases), make(aliases)
+	tags := make(map[string]string, len(networks))
 	for _, n := range networks {
 		a.add(n.ID, n.ID)
 		names.add(n.ID, strings.ToLower(n.Name))
 		vlans.add(n.ID, n.VLAN)
+		tags[n.ID] = n.VLAN
 	}
 	for _, r := range legacy {
 		id := firstNonEmpty(a[r.ExternalID], a[r.ID])
@@ -187,7 +189,7 @@ func networkAliases(networks []Network, legacy []rawNetwork) aliases {
 			switch {
 			case byName && byVLAN && name == vlan:
 				id = name
-			case byName && !byVLAN:
+			case byName && !byVLAN && (r.VLAN == "" || tags[name] == "" || string(r.VLAN) == tags[name]):
 				id = name
 			case byVLAN && !byName:
 				id = vlan
@@ -241,8 +243,9 @@ func fixedAliases(users []rawHistoricalUser) aliases {
 	return active
 }
 
-// assignClientNetwork prefers a controller attachment, then an unambiguous name,
-// then the unique longest local prefix containing one of the client's addresses.
+// assignClientNetwork resolves a controller ID first. A unique name can identify
+// the network when either side lacks an ID. Clients without an attachment ID
+// can also match the unique longest prefix containing one of their addresses.
 func assignClientNetwork(c *Client, id, name string, ids aliases, nets []Network) {
 	set := func(n Network) { c.NetworkID, c.NetworkName, c.VLAN = n.ID, n.Name, n.VLAN }
 	ref := ids[id]
@@ -252,12 +255,17 @@ func assignClientNetwork(c *Client, id, name string, ids aliases, nets []Network
 			set(n)
 			return
 		}
-		if name != "" && strings.EqualFold(n.Name, name) {
+		if (id == "" || n.ID == "") && name != "" && strings.EqualFold(n.Name, name) {
 			names = append(names, n)
 		}
 	}
 	if len(names) == 1 {
 		set(names[0])
+		return
+	}
+	if id != "" {
+		// A reused name or overlapping subnet cannot override a known attachment ID.
+		c.NetworkID, c.NetworkName = id, name
 		return
 	}
 	for _, v := range c.AllIPs() {
@@ -267,9 +275,8 @@ func assignClientNetwork(c *Client, id, name string, ids aliases, nets []Network
 		}
 		best, bits, tied := -1, -1, false
 		for i, n := range nets {
-			for _, s := range []string{n.Subnet, n.IPv6Subnet} {
-				p, err := parseNetworkPrefix(s)
-				if err != nil || !p.Contains(addr) {
+			for _, p := range n.Prefixes() {
+				if !p.Contains(addr) {
 					continue
 				}
 				if p.Bits() > bits {

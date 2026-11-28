@@ -66,14 +66,18 @@ func address(s string) string {
 
 func networkKey(n unifi.Network) string { return cmp.Or(n.ID, n.Name) }
 
+// network resolves inventory by ID before considering a compatible display name.
 func (b *builder) network(id, name string) unifi.Network {
 	if id == risk.GatewayNetworkID {
 		return unifi.Network{ID: id, Name: "Gateway", ZoneName: "Gateway"}
 	}
-	if n, ok := b.nets[id]; ok {
+	if n, ok := b.nets[id]; ok && id != "" && n.ID == id {
 		return n
 	}
-	return b.nets[strings.ToLower(name)]
+	if n := b.nets[strings.ToLower(name)]; n.MatchesIdentity(id, name) {
+		return n
+	}
+	return unifi.Network{}
 }
 
 // inventory indexes every device attachment independently while preserving all

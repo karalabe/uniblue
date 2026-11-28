@@ -409,7 +409,7 @@ func TestTransitProbeUnrestrictedNegatedAndExcludedCases(t *testing.T) {
 		})
 		mat, _, _ := EvaluateIsolation(snap, nil, netCfg)
 		cell := findTransitCell(t, mat, "ipv4")
-		if cell.Verdict != IsolationViolation || cell.DestIP == "" || ipMatchesSelectorTri(cell.DestIP, "192.168.1.0/28") == matchYes {
+		if cell.Verdict != IsolationViolation || cell.DestIP == "" || ipMatchesSelectorTri(cell.DestIP, "192.168.1.0/28", "ipv4") == matchYes {
 			t.Fatalf("expected violation on dstNet IP outside 192.168.1.0/28, got %+v", cell)
 		}
 	})

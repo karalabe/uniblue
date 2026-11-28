@@ -1991,14 +1991,9 @@ func (o *Oracle) isolatedZones() map[string]bool {
 		pinholeIntent := config.IsolationIntent{
 			ApprovedPaths: narrowPinholePathsForZone(o.sortedPolicies, srcRaw),
 		}
-		var pinholeIPsV4, pinholeIPsV6 []string
+		var pinholeIPs []string
 		for _, ap := range pinholeIntent.ApprovedPaths {
-			switch selectorFamilyTri(ap.DestIP) {
-			case "ipv4":
-				pinholeIPsV4 = append(pinholeIPsV4, ap.DestIP)
-			case "ipv6":
-				pinholeIPsV6 = append(pinholeIPsV6, ap.DestIP)
-			}
+			pinholeIPs = append(pinholeIPs, ap.DestIP)
 		}
 
 		hasV6Ctx := zoneHasIPv6Context(snap, srcLow)
@@ -2018,44 +2013,13 @@ func (o *Oracle) isolatedZones() map[string]bool {
 					// default alone) on IPv4, and on IPv6 whenever the zone or
 					// Internal has IPv6 context.
 					if fam == "ipv4" || hasV6Ctx {
-						if cell.DecisiveRuleID == "" {
+						explicitBlock := cell.DecisiveRuleID != ""
+						if srcNet.RouterDeviceMAC == "" && dstNet.RouterDeviceMAC == "" {
+							explicitBlock = o.explicitTransitBlocks(srcNet, dstNet, fam, pinholeIPs)
+						}
+						if !explicitBlock {
 							fullyIsolated = false
 							break
-						}
-						// Re-probe UDP/53 against a non-pinhole Internal host on
-						// gateway-routed pairs to confirm an explicit BLOCK/REJECT
-						// rule (ruleID != "") blocks general UDP/53 transit rather
-						// than relying on implicit zone defaults or a broad DNS allow.
-						if srcNet.RouterDeviceMAC == "" && dstNet.RouterDeviceMAC == "" {
-							avoid := pinholeIPsV4
-							if fam == "ipv6" {
-								avoid = pinholeIPsV6
-							}
-							dstIP := sampleNetworkIPForFamily(dstNet, snap, fam)
-							if len(avoid) > 0 {
-								if out := sampleIPOutsideSelectors(dstNet, snap, fam, avoid); out != "" {
-									dstIP = out
-								}
-							}
-							srcIP := sampleNetworkIPForFamily(srcNet, snap, fam)
-							udpDec := evaluateGatewayPolicies(o.sortedPolicies, pathQuery{
-								srcZone:    srcRaw,
-								srcNetID:   srcNet.ID,
-								srcNetName: srcNet.Name,
-								srcIP:      srcIP,
-								dstZone:    "Internal",
-								dstNetID:   dstNet.ID,
-								dstNetName: dstNet.Name,
-								dstIP:      dstIP,
-								proto:      "udp",
-								port:       53,
-								ipFamily:   fam,
-								state:      "new",
-							})
-							if udpDec.action != "deny" || udpDec.ruleID == "" {
-								fullyIsolated = false
-								break
-							}
 						}
 					}
 				}
@@ -2072,6 +2036,61 @@ func (o *Oracle) isolatedZones() map[string]bool {
 		}
 	}
 	return zones
+}
+
+// explicitTransitBlocks requires a block rule for both baseline probes on every
+// routed prefix pair. An implicit zone deny alone does not establish isolation.
+func (o *Oracle) explicitTransitBlocks(src, dst unifi.Network, fam string, pinholes []string) bool {
+	// Rules see an address only through their IP selectors, so one sample per
+	// selector match pattern decides every observed address on the VLAN.
+	var selectors []string
+	for _, pol := range o.sortedPolicies {
+		selectors = append(selectors, pol.Source.IPs...)
+		selectors = append(selectors, pol.Destination.IPs...)
+	}
+	samples := func(n unifi.Network, excluded []string) []string {
+		prefixes := networkPrefixesForFamily(n, fam)
+		// Preserve nested prefix boundaries as well as exceptions for approved hosts.
+		var borders []string
+		for _, p := range prefixes {
+			borders = append(borders, p.String())
+		}
+		var ips []string
+		seen := make(map[string]bool)
+		for _, iv := range partitionIPIntervals(n, o.snap, fam, borders, excluded, nil) {
+			ip := representativeIPInInterval(iv, prefixes, netip.Addr{})
+			if !ipMatchesNoSelector(ip, excluded) {
+				continue
+			}
+			sig := make([]byte, len(selectors))
+			for i, sel := range selectors {
+				sig[i] = byte(ipMatchesSelectorTri(ip, sel, fam))
+			}
+			if !seen[string(sig)] {
+				seen[string(sig)] = true
+				ips = append(ips, ip)
+			}
+		}
+		if len(ips) == 0 {
+			return []string{""}
+		}
+		return ips
+	}
+	q := pathQuery{srcZone: src.ZoneName, srcNetID: src.ID, srcNetName: src.Name,
+		dstZone: dst.ZoneName, dstNetID: dst.ID, dstNetName: dst.Name, ipFamily: fam, state: "new"}
+	dstIPs := samples(dst, pinholes)
+	for _, srcIP := range samples(src, nil) {
+		for _, dstIP := range dstIPs {
+			q.srcIP, q.dstIP = srcIP, dstIP
+			for _, probe := range []pathQuery{{proto: "tcp", port: 443, srcPort: 49152}, {proto: "udp", port: 53}} {
+				q.proto, q.port, q.srcPort = probe.proto, probe.port, probe.srcPort
+				if dec := evaluateGatewayPolicies(o.sortedPolicies, q); dec.action != "deny" || dec.ruleID == "" {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // lookupNetworkByIP resolves an IPv4/IPv6 address to its most specific
@@ -2092,14 +2111,7 @@ func lookupNetworkByIP(snap *unifi.Snapshot, rawIP string) (unifi.Network, bool)
 		if p == "wan" || p == "wan2" {
 			continue
 		}
-		for _, cidr := range []string{n.Subnet, n.IPv6Subnet} {
-			if cidr == "" {
-				continue
-			}
-			pfx, err := netip.ParsePrefix(strings.TrimSpace(cidr))
-			if err != nil {
-				continue
-			}
+		for _, pfx := range n.Prefixes() {
 			if pfx.Contains(addr) && pfx.Bits() > bestBits {
 				best = n
 				bestBits = pfx.Bits()

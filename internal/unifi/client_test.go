@@ -10,11 +10,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,6 +183,15 @@ func TestFetchSnapshotIntegrationV1(t *testing.T) {
 	mux.HandleFunc("/proxy/network/api/s/default/rest/portforward", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	})
+	mux.HandleFunc("/proxy/network/api/s/default/rest/networkconf", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/proxy/network/api/s/default/stat/sta", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[
+			{"mac":"AA:BB:CC:DD:EE:01","network_id":"legacy-iot"},
+			{"mac":"02:00:00:00:00:03","ip":"192.0.2.3","network_id":"legacy-default","network":"Default"}
+		]}`)
+	})
 
 	srv := httptest.NewTLSServer(mux)
 	defer srv.Close()
@@ -203,14 +214,17 @@ func TestFetchSnapshotIntegrationV1(t *testing.T) {
 	if snap.ControllerType != controllerIntegrationV1 {
 		t.Fatalf("controller type = %q, want %q", snap.ControllerType, controllerIntegrationV1)
 	}
-	if len(snap.Clients) != 2 {
-		t.Fatalf("clients = %d, want 2 (paginated)", len(snap.Clients))
+	if len(snap.Clients) != 3 {
+		t.Fatalf("clients = %d, want two paginated clients and one legacy client", len(snap.Clients))
 	}
-	if snap.Clients[0].NetworkName != "IoT" || snap.Clients[0].VLAN != "20" || !snap.Clients[0].IsWired {
+	if snap.Clients[0].NetworkID != "n2" || snap.Clients[0].NetworkName != "IoT" || snap.Clients[0].VLAN != "20" || !snap.Clients[0].IsWired {
 		t.Fatalf("expected subnet-resolved IoT VLAN for client 0, got %+v", snap.Clients[0])
 	}
 	if snap.Clients[1].NetworkName != "Default" || snap.Clients[1].VLAN != "1" || snap.Clients[1].IsWired {
 		t.Fatalf("expected subnet-resolved Default VLAN for client 1, got %+v", snap.Clients[1])
+	}
+	if cl := snap.Clients[2]; cl.NetworkID != "n1" || cl.VLAN != "1" {
+		t.Fatalf("legacy-only client with a network name: %+v", cl)
 	}
 	if len(snap.Devices) != 1 || !snap.Devices[0].Upgradable {
 		t.Fatalf("unexpected devices: %+v", snap.Devices)
@@ -1219,5 +1233,115 @@ func TestAdoptedSSHPasswordSetting(t *testing.T) {
 		if s.SSHPasswordAuth != tc.enabled || s.SSHPasswordAuthKnown != tc.known {
 			t.Fatal(tc, s)
 		}
+	}
+}
+
+// TestSnapshotIPv6Prefixes exercises both network ID namespaces against the
+// same gateway inventory, including a delegated VLAN with no active clients.
+func TestSnapshotIPv6Prefixes(t *testing.T) {
+	mux := http.NewServeMux()
+	serve := func(path, body string) {
+		mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, body) })
+	}
+	const legacy = "/proxy/network/api/s/default/"
+	serve("/api/auth/login", "{}")
+	serve(legacy+"stat/sta", `{"data":[{"mac":"02:00:00:00:00:01","network_id":"stale","network":"Static","ipv6_addresses":["fd00:1::5"]}]}`)
+	serve(legacy+"rest/networkconf", `{"data":[
+		{"_id":"l1","external_id":"v1","name":"Static","ipv6_subnet":"malformed","ipv6_static_subnet":"fd00:1::7/64","ipv6_subnets":["fd00:1::/64","2001:db8:10::/64"]},
+		{"_id":"l2","external_id":"v2","name":"Delegated"},
+		{"_id":"l3","external_id":"v3","name":"Shared","ipv6_subnet":"fd00:3::/64","ipv6_static_subnet":"2001:db8:3::1/64"},
+		{"_id":"l4","external_id":"v4","name":"Shared"}
+	]}`)
+	serve(legacy+"stat/device", `{"data":[
+		{"type":"udm","network_table":[
+			{"_id":"l2","name":"Static","ipv6_subnets":["invalid","::/128","::1/128","ff02::/16","fe80::/64","fe00::/8","8000::/1","192.0.2.0/24","2001:db8:2::/64","fd00:2::/64"],"ipv6_subnet":"fd00:2::1/64"},
+			{"external_id":"v3","ipv6_static_subnet":"fd00:3::/64"},
+			{"name":"sTaTic","ipv6_subnet":"2001:db8:1::/64"},
+			{"_id":"stale","name":"Static","ipv6_subnet":"fd00:bad::/64"},
+			{"external_id":"stale","name":"Static","ipv6_subnet":"fd00:bad::/64"},
+			{"name":"Shared","ipv6_subnet":"fd00:bad::/64"}]},
+		{"type":"usw","network_table":[{"_id":"l2","ipv6_subnet":"fd00:bad::/64"}]}
+	]}`)
+	serve(legacy+"rest/firewallgroup", `{"data":[{"_id":"group","external_id":"group-alias","group_type":"ipv6-address-group",
+		"group_members":["2001:db8:2::/64","fc00::/7"]}]}`)
+	const v2 = "/proxy/network/v2/api/site/default/"
+	serve(v2+"firewall/zone", `[{"_id":"i","name":"Internal"},{"_id":"g","name":"Gateway"}]`)
+	serve(v2+"firewall-policies", `[{"_id":"block","index":1,"enabled":true,"action":"BLOCK","ip_version":"IPV6","protocol":"all",
+		"connection_state_type":"ALL","source":{"zone_id":"i","matching_target":"IP","matching_target_type":"OBJECT","ip_group_id":"group-alias","port_matching_type":"ANY"},
+		"destination":{"zone_id":"g","matching_target":"ANY","port_matching_type":"ANY"}}]`)
+	serve(integrationV1Prefix+"/sites", `{"offset":0,"count":1,"totalCount":1,"data":[{"id":"site","internalReference":"default"}]}`)
+	const site = integrationV1Prefix + "/sites/site/"
+	serve(site+"devices", `{"offset":0,"count":0,"totalCount":0,"data":[]}`)
+	serve(site+"clients", `{"offset":0,"count":0,"totalCount":0,"data":[]}`)
+	serve(site+"networks", `{"offset":0,"count":4,"totalCount":4,"data":[
+		{"id":"v1","name":"Static"},{"id":"v2","name":"Delegated"},{"id":"v3","name":"Shared"},{"id":"v4","name":"Shared"}
+	]}`)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	for _, mode := range []string{"session", "integration"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.UniFiConfig{URL: server.URL, Site: "default", Username: "reader", Password: "fixture"}
+			idPrefix := "l"
+			if mode == "integration" {
+				cfg.APIKey = "fixture"
+				idPrefix = "v"
+			}
+			ctrl, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap, err := ctrl.FetchSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snap.Clients) != 1 || snap.Clients[0].NetworkID != "stale" {
+				t.Fatalf("client with a stale network ID: %+v", snap.Clients)
+			}
+			if mode == "session" {
+				if len(snap.FirewallPolicies) != 1 {
+					t.Fatalf("got %d session policies, want one IPv6 block", len(snap.FirewallPolicies))
+				}
+				p := snap.FirewallPolicies[0]
+				if p.UnsupportedReason != "" || p.Source.UnsupportedSelector != "" ||
+					!slices.Equal(p.Source.IPs, []string{"2001:db8:2::/64", "fc00::/7"}) {
+					t.Fatalf("session IPv6 address group: %+v", p)
+				}
+			}
+			want := map[string][]string{
+				idPrefix + "1": {"fd00:1::7/64", "2001:db8:10::/64", "2001:db8:1::/64"},
+				idPrefix + "2": {"2001:db8:2::/64", "fd00:2::1/64"},
+				idPrefix + "3": {"fd00:3::/64", "2001:db8:3::1/64"},
+				idPrefix + "4": nil,
+			}
+			if len(snap.Networks) != len(want) {
+				t.Fatalf("got %d networks, want %d", len(snap.Networks), len(want))
+			}
+			for _, n := range snap.Networks {
+				expected, ok := want[n.ID]
+				primary := ""
+				if len(expected) > 0 {
+					primary = expected[0]
+				}
+				if !ok || n.IPv6Subnet != primary || !slices.Equal(n.IPv6Subnets, expected) {
+					t.Errorf("%s: got primary %q and prefixes %v, want %q and %v", n.ID, n.IPv6Subnet, n.IPv6Subnets, primary, expected)
+				}
+			}
+		})
+	}
+}
+
+// TestIntegrationNetworkTagConflict keeps legacy inventory on its own VLAN when a name is reused.
+func TestIntegrationNetworkTagConflict(t *testing.T) {
+	items := []integrationNetwork{{ID: "current", Name: "Office", VLANID: "20"}}
+	legacy := []rawNetwork{{ID: "retired", Name: "Office", VLAN: "10", IPv6Subnet: "2001:db8:10::1/64"}}
+	if err := new(Controller).enrichIntegrationNetworks(context.Background(), "", items, legacy, true); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(items[0].collectedIPv6, legacy[0].IPv6Subnet) {
+		t.Fatalf("reused name imported prefixes %v", items[0].collectedIPv6)
+	}
+	ids := networkAliases([]Network{{ID: "current", Name: "Office", VLAN: "20"}}, legacy)
+	if id := ids["retired"]; id != "" {
+		t.Fatalf("legacy ID resolved to conflicting VLAN %q", id)
 	}
 }

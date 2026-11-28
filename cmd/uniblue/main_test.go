@@ -308,18 +308,19 @@ cve:
 func TestSiteSubnetsExtractsRoutedIPv4AndIPv6Prefixes(t *testing.T) {
 	snap := &unifi.Snapshot{
 		Networks: []unifi.Network{
-			{Name: "RoutedLAN", Subnet: "198.51.100.1/29", IPv6Subnet: "2a02:1234:5678:10::1/64"},
+			{Name: "RoutedLAN", Subnet: "198.51.100.1/29", IPv6Subnet: "2a02:1234:5678:10::1/64", IPv6Subnets: []string{"2001:db8::7/64"}},
 			{Name: "Invalid", Subnet: "not-a-cidr", IPv6Subnet: ""},
 		},
 	}
 	prefixes := siteSubnets(snap)
-	if len(prefixes) != 2 {
-		t.Fatalf("expected 2 parsed prefixes, got %v", prefixes)
+	if len(prefixes) != 3 {
+		t.Fatalf("expected 3 parsed prefixes, got %v", prefixes)
 	}
 	wantV4 := netip.MustParsePrefix("198.51.100.0/29")
 	wantV6 := netip.MustParsePrefix("2a02:1234:5678:10::/64")
-	if prefixes[0] != wantV4 || prefixes[1] != wantV6 {
-		t.Fatalf("siteSubnets = %v, want [%v %v]", prefixes, wantV4, wantV6)
+	wantSecondary := netip.MustParsePrefix("2001:db8::/64")
+	if prefixes[0] != wantV4 || prefixes[1] != wantV6 || prefixes[2] != wantSecondary {
+		t.Fatalf("siteSubnets = %v, want [%v %v %v]", prefixes, wantV4, wantV6, wantSecondary)
 	}
 	if got := siteSubnets(nil); got != nil {
 		t.Fatalf("siteSubnets(nil) = %v, want nil", got)

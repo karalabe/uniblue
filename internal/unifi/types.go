@@ -13,6 +13,7 @@ package unifi
 
 import (
 	"encoding/json"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -952,8 +953,11 @@ type Network struct {
 	// ZoneName is the resolved firewall zone name (e.g., "Internal", "Hotspot", "Dmz").
 	ZoneName string `json:"zone_name,omitempty"`
 
-	// IPv6Subnet records the IPv6 prefix assigned to this VLAN, if configured.
+	// IPv6Subnet holds the first known IPv6 prefix for single-prefix consumers.
 	IPv6Subnet string `json:"ipv6_subnet,omitempty"`
+
+	// IPv6Subnets lists the configured and live IPv6 prefixes on this network.
+	IPv6Subnets []string `json:"ipv6_subnets,omitempty"`
 
 	// RouterDeviceMAC identifies the L3 switch MAC when inter-VLAN routing for
 	// this VLAN is owned by an L3 switch rather than the gateway. Empty means
@@ -980,6 +984,52 @@ type Network struct {
 
 	// ActiveLeases is the count of active clients currently holding IPv4 addresses inside [DHCPStart, DHCPEnd].
 	ActiveLeases int `json:"active_leases,omitempty"`
+}
+
+// MatchesIdentity reports whether an inventory reference identifies this network.
+// Display names can identify a VLAN only when at least one side lacks an ID.
+func (n Network) MatchesIdentity(id, name string) bool {
+	if n.ID != "" && id != "" {
+		return n.ID == id
+	}
+	return n.Name != "" && strings.EqualFold(n.Name, name)
+}
+
+var (
+	ipv6LinkLocal = netip.MustParsePrefix("fe80::/10")
+	ipv6Multicast = netip.MustParsePrefix("ff00::/8")
+)
+
+// Prefixes returns the network's distinct IPv4 and unicast IPv6 prefixes.
+// It preserves interface addresses in CIDRs and accepts older single-prefix snapshots.
+func (n Network) Prefixes() []netip.Prefix {
+	var prefixes []netip.Prefix
+	if p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil && p.Addr().Is4() {
+		prefixes = append(prefixes, p)
+	}
+	addIPv6 := func(raw string) {
+		p, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || !p.Addr().Is6() || p.Addr().Is4In6() || !p.Masked().Addr().IsGlobalUnicast() ||
+			p.Overlaps(ipv6LinkLocal) || p.Overlaps(ipv6Multicast) {
+			return
+		}
+		masked := p.Masked()
+		for i, other := range prefixes {
+			if other.Masked() == masked {
+				// A bare delegated prefix can arrive before its interface address.
+				if other == masked {
+					prefixes[i] = p
+				}
+				return
+			}
+		}
+		prefixes = append(prefixes, p)
+	}
+	addIPv6(n.IPv6Subnet)
+	for _, raw := range n.IPv6Subnets {
+		addIPv6(raw)
+	}
+	return prefixes
 }
 
 // FirewallZone represents a UniFi Zone-Based Firewall zone grouping one or more
@@ -1434,6 +1484,24 @@ type rawDevice struct {
 	VAPTable      []struct {
 		BSSID string `json:"bssid"`
 	} `json:"vap_table"`
+	// NetworkTable reports the prefixes currently installed on gateway interfaces.
+	NetworkTable []rawNetworkTableEntry `json:"network_table"`
+}
+
+// rawNetworkTableEntry identifies a network in the gateway's live interface inventory.
+type rawNetworkTableEntry struct {
+	// ID references the legacy network configuration.
+	ID string `json:"_id"`
+	// ExternalID references the same network in the Integration API.
+	ExternalID string `json:"external_id"`
+	// Name identifies the network when firmware omits the IDs.
+	Name string `json:"name"`
+	// IPv6Subnets includes active prefixes obtained through prefix delegation.
+	IPv6Subnets []string `json:"ipv6_subnets"`
+	// IPv6Subnet is the single prefix reported by older firmware.
+	IPv6Subnet string `json:"ipv6_subnet"`
+	// IPv6StaticSubnet records the statically assigned IPv6 prefix.
+	IPv6StaticSubnet string `json:"ipv6_static_subnet"`
 }
 
 // flexSTPCount unmarshals UniFi's stp_state_change_count, which modern switch
@@ -1531,6 +1599,10 @@ type rawPortConf struct {
 type rawNetwork struct {
 	// ExternalID is the integration network identifier.
 	ExternalID string `json:"external_id"`
+	// IPv6Subnets lists additional configured prefixes on this VLAN.
+	IPv6Subnets []string `json:"ipv6_subnets"`
+	// IPv6StaticSubnet records the statically assigned prefix.
+	IPv6StaticSubnet string `json:"ipv6_static_subnet"`
 	// ZoneID references the local Network firewall zone.
 	ZoneID                  string     `json:"firewall_zone_id"`
 	ID                      string     `json:"_id"`
@@ -1619,6 +1691,8 @@ type integrationDevice struct {
 
 // integrationNetwork maps a network/VLAN entry returned by GET /integration/v1/sites/{id}/networks.
 type integrationNetwork struct {
+	// collectedIPv6 holds the prefixes gathered from list, detail, and legacy records.
+	collectedIPv6 []string
 	// DeviceID identifies the routing switch for a switch-managed network.
 	DeviceID string `json:"deviceId"`
 	// MDNSForwardingEnabled reports mDNS reflection on Network 11.

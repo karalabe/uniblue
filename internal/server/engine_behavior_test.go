@@ -17,7 +17,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -756,7 +755,7 @@ func TestPreserveUnavailableTelemetryAndFullScanGhostEviction(t *testing.T) {
 // public/out-of-subnet skip reasons matching the probe IP guard, and IPv6-only
 // client classification lookup by MAC fallback.
 func TestClientSkipReasonAndIPv6ClassLookup(t *testing.T) {
-	siteSubnets := []netip.Prefix{netip.MustParsePrefix("2001:db8:1::/64")}
+	siteSubnets := snapshotSubnets(&unifi.Snapshot{Networks: []unifi.Network{{IPv6Subnet: "fd00::/64", IPv6Subnets: []string{"2001:db8:1::7/64"}}}})
 	excluded := map[string]struct{}{
 		"2001:0db8:0000:0000::0050": {},
 		"::ffff:192.168.1.10":       {},

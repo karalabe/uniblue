@@ -18,6 +18,24 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
+// TestIDLessSubnetOverlap distinguishes nested prefixes on one VLAN from an overlap across VLANs.
+func TestIDLessSubnetOverlap(t *testing.T) {
+	snap := &unifi.Snapshot{Networks: []unifi.Network{
+		{Name: "Sensors", IPv6Subnets: []string{"2001:db8::/48", "2001:db8::/64"}},
+		{Name: "Office", IPv6Subnet: "2001:db8:0:1::/64"},
+	}}
+	findings, _ := AnalyzeExtendedNetworkChecks(snap, config.NetworkConfig{})
+	var overlaps []string
+	for _, f := range findings {
+		if f.CheckID == "UB-UNIFI-OVERLAPPING-SUBNETS" {
+			overlaps = append(overlaps, f.Title)
+		}
+	}
+	if len(overlaps) != 1 || !strings.Contains(overlaps[0], "Office") {
+		t.Fatalf("overlapping networks = %v", overlaps)
+	}
+}
+
 // TestIsolationUnavailableGatewayPoliciesMustYieldUnknown verifies that missing
 // gateway firewall policies produce unknown verdicts rather than false blocked-ok cells.
 func TestIsolationUnavailableGatewayPoliciesMustYieldUnknown(t *testing.T) {

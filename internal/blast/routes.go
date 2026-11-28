@@ -404,7 +404,7 @@ func (b *builder) addPolicySockets(a attachment) {
 }
 
 // isRoutableAddr reports whether raw is a valid address in fam that can carry
-// routed traffic, excluding loopback, link-local, and unspecified addresses.
+// a routed unicast connection.
 func isRoutableAddr(raw, fam string) bool {
 	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
 	if err != nil {
@@ -414,7 +414,7 @@ func isRoutableAddr(raw, fam string) bool {
 	if (fam == "ipv6") != addr.Is6() {
 		return false
 	}
-	return !addr.IsLoopback() && !addr.IsLinkLocalUnicast() && !addr.IsLinkLocalMulticast() && !addr.IsUnspecified()
+	return addr.IsGlobalUnicast()
 }
 
 func hasRoutableInFamily(cl unifi.Client, fam string) bool {
@@ -667,11 +667,15 @@ func (b *builder) routes() {
 				// physical outdoor-port cuts that feed `from`.
 				if hasApproved {
 					for _, ap := range b.Oracle.ApprovedServices(pos, a.client, b.Findings, fam) {
+						dst := a.client
+						if ap.DestIP != "" {
+							dst = pin(dst, ap.DestIP)
+						}
 						var cell risk.IsolationCell
 						if ap.Port == 0 {
-							cell = b.Oracle.AnyPort(pos, a.client, fam)
+							cell = b.Oracle.AnyPort(pos, dst, fam)
 						} else {
-							cell = b.Oracle.Service(pos, a.client, cmp.Or(ap.Transport, "tcp"), ap.Port, fam)
+							cell = b.Oracle.Service(pos, dst, cmp.Or(ap.Transport, "tcp"), ap.Port, fam)
 						}
 						if cell.Effective == "allow" {
 							if a.client.NetworkID != risk.GatewayNetworkID || ((ap.Transport == "" || strings.EqualFold(ap.Transport, "tcp")) && (ap.Port == 0 || slices.Contains(gatewayManagementPorts, ap.Port))) {

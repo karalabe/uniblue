@@ -145,6 +145,12 @@ func TestOutdoorPortMembershipAndRecorder(t *testing.T) {
 	if x := exposure(t, Evaluate(in), Physical, "Protect", "network access"); x.State != "contained" {
 		t.Fatal(x)
 	}
+	s.Devices[0].Ports[0].NativeNetworkID = "retired-camera-vlan"
+	r = Evaluate(in)
+	if x := exposure(t, r, Physical, "Protect", "network access"); x.State != "unknown" {
+		t.Fatalf("unresolved native VLAN: %+v", x)
+	}
+	action(t, r, "act:verify:port-profile:"+s.Devices[0].MAC+":3")
 }
 
 // TestParallelFamiliesAndStableQueue checks that independent publications retain one service exposure.
@@ -2372,5 +2378,61 @@ func TestKeyOnlyHygiene(t *testing.T) {
 		if a := action(t, Evaluate(in), "act:wan-pf:ssh"); a.Lane != LaneReduceExposure {
 			t.Fatal(a)
 		}
+	}
+}
+
+// TestSubnetlessIPv6GatewayManagement keeps the assumed-breach path from an
+// empty VLAN unresolved when the first gateway rule depends on its IPv6 prefix.
+func TestSubnetlessIPv6GatewayManagement(t *testing.T) {
+	iot := network("IoT")
+	gw := unifi.Device{ID: "gateway", Type: "udm", IP: "2001:db8:1::1"}
+	catchAll := allow(iot.ZoneName, "Gateway")
+	catchAll.IPVersion, catchAll.Index = "ipv6", 1
+	block := catchAll
+	block.ID, block.Name, block.Action, block.Index = "block", "Block isolated prefixes", "BLOCK", 0
+	block.Source.AnyTarget = false
+	block.Source.IPs = []string{"2001:db8:20::/64", "fc00::/7"}
+	snap := &unifi.Snapshot{Networks: []unifi.Network{iot}, Devices: []unifi.Device{gw},
+		FirewallPolicies: []unifi.FirewallPolicy{block, catchAll}}
+	in := Input{Snapshot: snap, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{iot.Name}}}}
+	if got := exposure(t, Evaluate(in), AssumeBreach, gw.ID, "network management"); got.State != "unknown" {
+		t.Fatalf("gateway management from a VLAN with no known IPv6 prefix: %+v", got)
+	}
+}
+
+// TestMulticastTransitCache keeps a multicast destination from sharing the
+// forwarding decision of a unicast host on the same VLAN in either visit order.
+func TestMulticastTransitCache(t *testing.T) {
+	iot := network("iot")
+	iot.IPv6Subnet = "2001:db8:1::1/64"
+	p := allow("iot", "lan")
+	p.IPVersion = "ipv6"
+	group := client("group", "ff05::123", "lan")
+	host := client("host", "2001:db8:2::5", "lan")
+	snap := &unifi.Snapshot{Networks: []unifi.Network{iot, network("lan")}, FirewallPolicies: []unifi.FirewallPolicy{p}}
+	in := Input{Snapshot: snap, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot"}}}}
+	for _, clients := range [][]unifi.Client{{group, host}, {host, group}} {
+		snap.Clients = clients
+		r := Evaluate(in)
+		if got := exposure(t, r, AssumeBreach, host.ID, "network access"); got.State != "no-known-path" {
+			t.Fatalf("unicast host after %s: %+v", clients[0].ID, got)
+		}
+		if got := exposure(t, r, AssumeBreach, group.ID, "network access"); got.State != "contained" {
+			t.Fatalf("multicast group after %s: %+v", clients[0].ID, got)
+		}
+	}
+}
+
+// TestGatewaySecondaryIPv6 checks management reachable only on a secondary interface.
+func TestGatewaySecondaryIPv6(t *testing.T) {
+	iot := network("iot")
+	iot.IPv6Subnets = []string{"2001:db8::1/64", "fd00:1234::7/64"}
+	gw := unifi.Device{ID: "gateway", Type: "udm", IP: "192.0.2.1"}
+	p := allow("iot", "Gateway")
+	p.Destination.AnyTarget, p.Destination.IPs = false, []string{"fd00:1234::7"}
+	snap := &unifi.Snapshot{Networks: []unifi.Network{iot}, Devices: []unifi.Device{gw}, FirewallPolicies: []unifi.FirewallPolicy{p}}
+	in := Input{Snapshot: snap, NetCfg: config.NetworkConfig{IsolationPolicy: config.IsolationIntent{IoTVLANs: []string{"iot"}}}}
+	if got := exposure(t, Evaluate(in), AssumeBreach, gw.ID, "network management"); got.State != "no-known-path" {
+		t.Fatalf("secondary gateway interface: %+v", got)
 	}
 }

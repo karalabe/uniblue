@@ -8,6 +8,7 @@ package risk
 
 import (
 	"fmt"
+	"iter"
 	"net/netip"
 	"slices"
 	"sort"
@@ -206,6 +207,15 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 	bmcClients := o.ManagementControllers(rawFindings)
 	printerClients := o.identifyPrinterClients(rawFindings)
 
+	// Keep address-specific evidence in the matrix and report each host finding once.
+	hostFindings := make(map[string]bool)
+	addHostFinding := func(f checks.Finding) {
+		key := f.Key()
+		if !hostFindings[key] {
+			hostFindings[key] = true
+			findings = append(findings, f)
+		}
+	}
 	addCell := func(cell IsolationCell) {
 		matrix.Cells = append(matrix.Cells, cell)
 		switch cell.Verdict {
@@ -229,18 +239,18 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 		bmcZone := strings.TrimSpace(bmcNet.ZoneName)
 		endpoints := bmcServiceEndpoints(bmc, rawFindings)
 		for _, srcNet := range untrustedNets {
-			if strings.EqualFold(srcNet.Name, bmc.NetworkName) {
+			if srcNet.MatchesIdentity(bmc.NetworkID, bmc.NetworkName) {
 				continue
 			}
 			srcZone := strings.TrimSpace(srcNet.ZoneName)
 			for _, ep := range endpoints {
-				for _, fam := range []string{"ipv4", "ipv6"} {
-					if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, bmcNet, bmc) {
+				for fam, targetIP := range hostTargets(bmc, []string{"ipv4", "ipv6"}) {
+					if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, bmcNet, bmc, false) {
 						continue
 					}
-					targetIP := clientAddressForFamily(bmc, fam)
+					target := unifi.Client{NetworkName: bmc.NetworkName, IP: targetIP}
 					expected := "deny"
-					if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, bmc, bmcZone, "bmc", ep.proto, ep.port, fam) {
+					if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, target, bmcZone, "bmc", ep.proto, ep.port, fam) {
 						expected = "allow"
 					}
 					cell := o.evaluateRoutedPath(
@@ -262,7 +272,7 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 					)
 
 					if cell.Verdict == IsolationViolation {
-						addrDisp := firstNonEmptyStr(targetIP, bmc.IP)
+						addrDisp := firstNonEmptyStr(targetIP, "address unknown")
 						cell.RecommendedFix = fmt.Sprintf(
 							"Narrow or remove %s rule %q on %s so %s cannot initiate %s %s/%d connections to BMC %s (%s); restrict BMC access strictly to approved admin workstations while preserving established management sessions.",
 							strings.ToUpper(fam), cell.DecisiveRuleName, cell.Enforcer, srcNet.Name, strings.ToUpper(fam), strings.ToUpper(ep.proto), ep.port, bmc.DisplayName(), addrDisp,
@@ -271,7 +281,7 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 						if fam == "ipv6" {
 							checkID = "UB-UNIFI-ISO-BMC-IPV6"
 						}
-						findings = append(findings, checks.Finding{
+						addHostFinding(checks.Finding{
 							CheckID:           checkID,
 							Title:             fmt.Sprintf("Configured %s Path Permits %s -> BMC %s (%s)", strings.ToUpper(fam), srcNet.Name, bmc.DisplayName(), cell.DecisiveRuleName),
 							Category:          "isolation-policy",
@@ -312,16 +322,17 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 			}
 			srcZone := strings.TrimSpace(srcNet.ZoneName)
 
-			for _, fam := range []string{"ipv4", "ipv6"} {
-				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, prnNet, prn) {
+			noted := make(map[string]bool)
+			for fam, prnAddr := range hostTargets(prn, []string{"ipv4", "ipv6"}) {
+				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, prnNet, prn, false) {
 					continue
 				}
-				prnAddr := clientAddressForFamily(prn, fam)
-				addrDisp := firstNonEmptyStr(prnAddr, prn.IP)
+				target := unifi.Client{NetworkName: prn.NetworkName, IP: prnAddr}
+				addrDisp := firstNonEmptyStr(prnAddr, "address unknown")
 
 				// 2a. IPPS/IPP Printing (default TCP 631).
 				ippsExpected := "deny"
-				if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, prn, prnZone, "printing", "tcp", printPort, fam) {
+				if hasApprovedPath(intent.ApprovedPaths, srcZone, srcNet.Name, target, prnZone, "printing", "tcp", printPort, fam) {
 					ippsExpected = "allow"
 				}
 				ippsCell := o.evaluateRoutedPath(
@@ -346,11 +357,14 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 						"Allow %s -> %s (%s, %s) strictly on TCP %d (IPPS) for approved printing while keeping printer administration (TCP 80/443) denied.",
 						srcNet.Name, prn.DisplayName(), addrDisp, fam, printPort,
 					)
-					notes = append(notes, PostureNote{
-						Severity: checks.SeverityMedium,
-						Title:    fmt.Sprintf("Approved guest printing path blocked (%s -> %s IPPS :%d, %s)", srcNet.Name, prn.DisplayName(), printPort, fam),
-						Detail:   ippsCell.RecommendedFix,
-					})
+					if !noted[fam] {
+						noted[fam] = true
+						notes = append(notes, PostureNote{
+							Severity: checks.SeverityMedium,
+							Title:    fmt.Sprintf("Approved guest printing path blocked (%s -> %s IPPS :%d, %s)", srcNet.Name, prn.DisplayName(), printPort, fam),
+							Detail:   ippsCell.RecommendedFix,
+						})
+					}
 				}
 				addCell(ippsCell)
 
@@ -363,7 +377,7 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 						DestZone:         prnZone,
 						DestNetwork:      prnNet.Name,
 						DestHost:         prn.DisplayName(),
-						DestIP:           addrDisp,
+						DestIP:           prnAddr,
 						DestFunction:     "printer-admin-shared-ipp",
 						Transport:        "tcp",
 						Port:             printPort,
@@ -379,7 +393,7 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 						DecisiveReason:   fmt.Sprintf("CUPS serves /admin on TCP %d (%s) alongside IPP printing, reachable via %q", printPort, fam, ippsCell.DecisiveRuleName),
 						RecommendedFix:   fmt.Sprintf("Restrict CUPS /admin on %s to localhost/admin IPs in cupsd.conf because firewall rules on TCP %d cannot separate printing from CUPS administration.", prn.DisplayName(), printPort),
 					}
-					findings = append(findings, checks.Finding{
+					addHostFinding(checks.Finding{
 						CheckID:           "UB-UNIFI-ISO-PRINTER-ADMIN",
 						Title:             fmt.Sprintf("Guest Network Can Reach CUPS Administration on Shared Print Port (%s -> %s:%d, %s)", srcNet.Name, prn.DisplayName(), printPort, fam),
 						Category:          "isolation-policy",
@@ -424,7 +438,7 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 							"Restrict rule %q so %s can reach %s (%s, %s) only on TCP %d (IPPS printing) and deny printer web administration on TCP %d.",
 							adminCell.DecisiveRuleName, srcNet.Name, prn.DisplayName(), addrDisp, fam, printPort, adminPort,
 						)
-						findings = append(findings, checks.Finding{
+						addHostFinding(checks.Finding{
 							CheckID:           "UB-UNIFI-ISO-PRINTER-ADMIN",
 							Title:             fmt.Sprintf("Guest Network Can Reach Printer Administration (%s -> %s:%d, %s)", srcNet.Name, prn.DisplayName(), adminPort, fam),
 							Category:          "isolation-policy",
@@ -480,11 +494,9 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 		if ap.DestIP != "" {
 			dstClient := unifi.Client{IP: ap.DestIP}
 			for _, cl := range snap.Clients {
-				for _, ip := range cl.AllIPs() {
-					if canonicalIsolationIP(ip) != "" && canonicalIsolationIP(ip) == canonicalIsolationIP(ap.DestIP) {
-						dstClient = cl
-						break
-					}
+				if clientHasIP(cl, ap.DestIP) {
+					dstClient = cl
+					break
 				}
 			}
 			dstNet := o.network(dstClient.NetworkID, dstClient.NetworkName)
@@ -532,6 +544,10 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 		}
 		fams := []string{"ipv4"}
 		switch strings.ToLower(strings.TrimSpace(ap.IPVersion)) {
+		case "":
+			if selectorFamilyTri(ap.DestIP) == "ipv6" {
+				fams = []string{"ipv6"}
+			}
 		case "ipv6":
 			fams = []string{"ipv6"}
 		case "both", "ipv4_and_ipv6":
@@ -542,9 +558,17 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 			dstNet := tgt.net
 			dstZone := firstNonEmptyStr(dstNet.ZoneName, ap.DestZone)
 			dstName := firstNonEmptyStr(dstClient.DisplayName(), ap.DestIP, dstNet.Name)
+			if ap.DestIP != "" {
+				// A host approval covers only the named address, even on a dual-stack client.
+				dstClient.IP, dstClient.IPv6 = ap.DestIP, nil
+			}
 			for _, srcNet := range srcNets {
 				srcZone := strings.TrimSpace(srcNet.ZoneName)
-				for _, fam := range fams {
+				noted := make(map[string]bool)
+				for fam, dstAddr := range hostTargets(dstClient, fams) {
+					if ap.DestIP != "" && dstAddr == "" {
+						continue
+					}
 					if missingRole {
 						addCell(IsolationCell{
 							SourceZone: srcZone, SourceNetwork: srcNet.Name,
@@ -556,10 +580,9 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 						})
 						continue
 					}
-					if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, dstClient) {
+					if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, dstClient, false) {
 						continue
 					}
-					dstAddr := firstNonEmptyStr(clientAddressForFamily(dstClient, fam), ap.DestIP)
 					cell := o.evaluateRoutedPath(
 						srcNet, dstNet,
 						pathQuery{
@@ -582,11 +605,14 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 							"Allow %s -> %s (%s, %s) on %s %d to restore approved workflow %q.",
 							srcNet.Name, dstName, dstAddr, fam, strings.ToUpper(proto), ap.Port, firstNonEmptyStr(ap.Name, funcLabel),
 						)
-						notes = append(notes, PostureNote{
-							Severity: checks.SeverityMedium,
-							Title:    fmt.Sprintf("Approved workflow blocked (%s -> %s %s:%d, %s)", srcNet.Name, dstName, strings.ToUpper(proto), ap.Port, fam),
-							Detail:   cell.RecommendedFix,
-						})
+						if !noted[fam] {
+							noted[fam] = true
+							notes = append(notes, PostureNote{
+								Severity: checks.SeverityMedium,
+								Title:    fmt.Sprintf("Approved workflow blocked (%s -> %s %s:%d, %s)", srcNet.Name, dstName, strings.ToUpper(proto), ap.Port, fam),
+								Detail:   cell.RecommendedFix,
+							})
+						}
 					}
 					addCell(cell)
 				}
@@ -601,7 +627,7 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 		for _, dstNet := range trustedNets {
 			dstZone := strings.TrimSpace(dstNet.ZoneName)
 			for _, fam := range []string{"ipv4", "ipv6"} {
-				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, unifi.Client{}) {
+				if fam == "ipv6" && !siteHasIPv6Context(snap, srcNet, dstNet, unifi.Client{}, false) {
 					continue
 				}
 				cell := o.boundaryWithApproval(
@@ -664,13 +690,19 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 					Transport:         gwAdminCell.Transport,
 					BaseSeverity:      checks.SeverityHigh,
 					EffectiveSeverity: checks.SeverityHigh,
-					Client:            unifi.Client{MAC: "gw:" + srcNet.ID, IP: firstNonEmptyStr(gwAdminCell.DestIP, o.gwIP), Name: o.gwName, NetworkName: srcNet.Name + " -> Gateway"},
+					Client:            unifi.Client{MAC: "gw:" + srcNet.ID, IP: gwAdminCell.DestIP, Name: o.gwName, NetworkName: srcNet.Name + " -> Gateway"},
 					Port:              gwAdminCell.Port,
 					Evidence:          fmt.Sprintf("source=%s (%s) -> gateway=%s (function=gateway-admin, family=%s, proto=%s/%d, decisive_rule=%q)", srcNet.Name, srcZone, o.gwName, fam, gwAdminCell.Transport, gwAdminCell.Port, gwAdminCell.DecisiveRuleName),
 					Remediation: checks.Remediation{
 						Summary:      gwAdminCell.RecommendedFix,
 						UniFiActions: []string{"block_untrusted_gateway_admin"},
 					},
+				})
+			} else if gwAdminCell.Verdict == IsolationUnknown && gwAdminCell.MissingInput != "" {
+				notes = append(notes, PostureNote{
+					Severity: checks.SeverityLow,
+					Title:    fmt.Sprintf("Isolation verdict unknown for %s -> Gateway (%s)", srcNet.Name, strings.ToUpper(fam)),
+					Detail:   gwAdminCell.MissingInput,
 				})
 			}
 			addCell(gwAdminCell)
@@ -682,9 +714,7 @@ func (o *Oracle) evaluateIsolation(rawFindings []checks.Finding, netCfg config.N
 		// DNS/DHCP ALLOW rules scoped to the VLAN's local gateway IP are recognized as approved.
 		if o.gwPoliciesAvailable {
 			var depDstIPs []string
-			if vlanGW := subnetGatewayIP(srcNet.Subnet); vlanGW != "" {
-				depDstIPs = append(depDstIPs, vlanGW)
-			}
+			depDstIPs = slices.AppendSeq(depDstIPs, gatewayInterfaceIPs(srcNet, "ipv4"))
 			if o.gwIP != "" && (len(depDstIPs) == 0 || depDstIPs[0] != o.gwIP) {
 				depDstIPs = append(depDstIPs, o.gwIP)
 			}
@@ -1098,19 +1128,19 @@ func matchesEndpoint(ep unifi.PolicyEndpoint, zone, netID, netName, ip, mac stri
 		}
 		if len(ep.IPs) > 0 {
 			m := matchNo
-			if ip == "" && !allSelectorsOppositeFamily(ep.IPs, ipFamily) {
-				m = matchUnknown
-			} else if ip != "" {
-				for _, v := range ep.IPs {
-					r := ipMatchesSelectorTri(ip, v)
-					if r == matchYes {
-						m = r
-						break
-					}
-					if r == matchUnknown {
-						m = r
-					}
+			for _, v := range ep.IPs {
+				r := ipMatchesSelectorTri(ip, v, ipFamily)
+				if r == matchYes {
+					m = r
+					break
 				}
+				if r == matchUnknown {
+					m = r
+				}
+			}
+			// Even an unidentified gateway interface has a unicast address.
+			if m == matchUnknown && ip == "" && strings.EqualFold(zone, "Gateway") && ipFamily != "" && unicastSelectorFamily(ep.IPs, ipFamily) == matchNo {
+				m = matchNo
 			}
 			combine(m)
 		}
@@ -1135,14 +1165,23 @@ func matchesEndpoint(ep unifi.PolicyEndpoint, zone, netID, netName, ip, mac stri
 	return matchYes, ""
 }
 
-// ipMatchesSelectorTri tests whether targetIP matches selector (an exact IP,
-// CIDR prefix, or inclusive "start-end" range). Identical non-empty strings
-// match immediately (case-insensitively) before IP parsing; otherwise it
-// returns matchUnknown when either input is empty or unparseable.
-func ipMatchesSelectorTri(targetIP, selector string) triMatch {
+// ipMatchesSelectorTri matches an exact IP, prefix, or inclusive address range.
+// For a missing address, the family alone can rule out a selector or prove a /0 match.
+func ipMatchesSelectorTri(targetIP, selector, fam string) triMatch {
 	targetIP = strings.TrimSpace(targetIP)
 	selector = strings.TrimSpace(selector)
-	if targetIP == "" || selector == "" {
+	if targetIP == "" {
+		if sf := selectorFamilyTri(selector); fam != "" && sf != "" {
+			if !strings.EqualFold(sf, fam) {
+				return matchNo
+			}
+			if p, err := netip.ParsePrefix(selector); err == nil && p.Bits() == 0 {
+				return matchYes
+			}
+		}
+		return matchUnknown
+	}
+	if selector == "" {
 		return matchUnknown
 	}
 	if strings.EqualFold(targetIP, selector) {
@@ -1183,22 +1222,31 @@ func ipMatchesSelectorTri(targetIP, selector string) triMatch {
 	return matchUnknown
 }
 
-func clientAddressForFamily(cl unifi.Client, fam string) string {
-	if strings.EqualFold(fam, "ipv6") {
-		for _, ip6 := range cl.IPv6 {
-			if addr, err := netip.ParseAddr(strings.TrimSpace(ip6)); err == nil && addr.Is6() {
-				return addr.String()
+// hostTargets yields routable addresses for cross-VLAN checks. When a host has
+// no routable address in a family it yields "" so zone-level checks still
+// evaluate, except when a host only has non-routable IPv6 addresses (such as
+// link-local fe80::), which cannot be reached across VLANs.
+func hostTargets(cl unifi.Client, families []string) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		for _, fam := range families {
+			raw := peerAddresses(cl, fam)
+			ips := slices.DeleteFunc(slices.Clone(raw), isNonRoutableIP)
+			if len(ips) == 0 {
+				if strings.EqualFold(fam, "ipv6") && len(raw) > 0 {
+					continue
+				}
+				if !yield(fam, "") {
+					return
+				}
+				continue
+			}
+			for _, ip := range ips {
+				if !yield(fam, ip) {
+					return
+				}
 			}
 		}
-		if addr, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && addr.Is6() {
-			return addr.String()
-		}
-		return ""
 	}
-	if addr, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && addr.Is4() {
-		return addr.String()
-	}
-	return cl.IP
 }
 
 // bmcServiceEndpoints collects deduplicated IPMI and Redfish/HTTPS service
@@ -1246,7 +1294,7 @@ func printerServicePort(prn unifi.Client, rawFindings []checks.Finding, intent c
 		}
 	}
 	for _, ap := range intent.ApprovedPaths {
-		if ap.Port > 0 && (ap.DestIP == prn.IP || strings.Contains(strings.ToLower(ap.Function), "print")) {
+		if ap.Port > 0 && (clientHasIP(prn, ap.DestIP) || (ap.DestIP == "" && strings.Contains(strings.ToLower(ap.Function), "print"))) {
 			return ap.Port
 		}
 	}
@@ -1260,6 +1308,12 @@ func hasCUPSAdminFinding(prn unifi.Client, rawFindings []checks.Finding) bool {
 		}
 	}
 	return false
+}
+
+// clientHasIP matches a configured host address against every inventory alias.
+func clientHasIP(cl unifi.Client, ip string) bool {
+	want := canonicalIsolationIP(ip)
+	return want != "" && slices.ContainsFunc(cl.AllIPs(), func(raw string) bool { return canonicalIsolationIP(raw) == want })
 }
 
 func sameClient(a, b unifi.Client) bool {
@@ -1323,28 +1377,29 @@ func matchesProtocol(ruleProto, queryProto string) bool {
 	return rp == qp
 }
 
-// siteHasIPv6Context reports whether IPv6 isolation should be evaluated for
-// networks a and b (and optional client cl) based on configured IPv6 subnets,
-// IPv6-specific firewall policies, or live IPv6 client addresses on either VLAN.
-func siteHasIPv6Context(snap *unifi.Snapshot, a, b unifi.Network, cl unifi.Client) bool {
-	if a.IPv6Subnet != "" || b.IPv6Subnet != "" || len(cl.IPv6) > 0 {
+// siteHasIPv6Context checks both VLANs, the target client, and IPv6 policies.
+// On-link queries also consider clients whose only IPv6 address is link-local.
+func siteHasIPv6Context(snap *unifi.Snapshot, a, b unifi.Network, cl unifi.Client, onLink bool) bool {
+	if len(networkPrefixesForFamily(a, "ipv6")) > 0 || len(networkPrefixesForFamily(b, "ipv6")) > 0 {
 		return true
 	}
-	for _, pol := range snap.FirewallPolicies {
-		if strings.EqualFold(pol.IPVersion, "ipv6") {
+	for _, raw := range cl.AllIPs() {
+		addr, err := netip.ParseAddr(raw)
+		if err == nil && addr.Unmap().Is6() && (addr.IsGlobalUnicast() || onLink && addr.IsLinkLocalUnicast()) {
 			return true
 		}
 	}
-	// Prefix-delegated IPv6 networks often omit static IPv6Subnet in UniFi while
-	// clients on those networks carry live IPv6 addresses.
-	for _, c := range snap.Clients {
-		if len(c.IPv6) == 0 {
+	for _, pol := range snap.FirewallPolicies {
+		if !pol.Enabled {
 			continue
 		}
-		if (a.Name != "" && strings.EqualFold(c.NetworkName, a.Name)) ||
-			(b.Name != "" && strings.EqualFold(c.NetworkName, b.Name)) ||
-			(a.ID != "" && c.NetworkID == a.ID) ||
-			(b.ID != "" && c.NetworkID == b.ID) {
+		if strings.EqualFold(pol.IPVersion, "ipv6") || matchesIPFamily(pol.IPVersion, "ipv6") &&
+			(gatewayIPv6Target(pol.Source) == matchYes || gatewayIPv6Target(pol.Destination) == matchYes) {
+			return true
+		}
+	}
+	for _, n := range []unifi.Network{a, b} {
+		for range networkClientAddresses(n, snap, "ipv6", onLink) {
 			return true
 		}
 	}
@@ -1358,7 +1413,7 @@ func hasApprovedPath(paths []config.ApprovedPath, srcZone, srcNet string, dst un
 		if ap.SourceZone != "" && !strings.EqualFold(ap.SourceZone, srcZone) && !strings.EqualFold(ap.SourceZone, srcNet) {
 			continue
 		}
-		if ap.DestIP != "" && !strings.EqualFold(ap.DestIP, dst.IP) && !containsFold(dst.IPv6, ap.DestIP) {
+		if ap.DestIP != "" && !slices.Contains(peerAddresses(dst, fam), canonicalIsolationIP(ap.DestIP)) {
 			continue
 		}
 		if ap.DestZone != "" && !strings.EqualFold(ap.DestZone, dstZone) && !strings.EqualFold(ap.DestZone, dst.NetworkName) {
@@ -1642,65 +1697,117 @@ func isTransitProbeApproved(
 	return false
 }
 
-// gatewayHasIPv6Context reports whether Untrusted -> Gateway isolation should
-// also be evaluated for IPv6 (true when srcNet has IPv6 addressing/clients or
-// any enabled policy targeting Gateway explicitly references IPv6).
+var gatewayAdminPorts = []int{443, 22, 80, 8443}
+
+// gatewayAdminPolicy reports whether the rule can apply to a management
+// connection from this zone. Discovery and address assignment use other services.
+func gatewayAdminPolicy(pol unifi.FirewallPolicy, srcZone, fam string) bool {
+	return pol.Enabled && matchesIPFamily(pol.IPVersion, fam) && matchesConnState(pol.ConnectionStates, "new") &&
+		(pol.Destination.ZoneName == "" || strings.EqualFold(pol.Destination.ZoneName, "gateway")) &&
+		(srcZone == "" || pol.Source.ZoneName == "" || strings.EqualFold(pol.Source.ZoneName, srcZone)) &&
+		matchesPolicyProtocol(pol.Protocol, pol.ProtocolNegated, "tcp") &&
+		slices.ContainsFunc(gatewayAdminPorts, func(p int) bool { return endpointCanMatchPort(pol.Destination, p) })
+}
+
+// gatewayHasIPv6Context checks for IPv6 addressing on the source VLAN or
+// IPv6 management policy. Multicast groups do not identify a gateway interface.
 func gatewayHasIPv6Context(snap *unifi.Snapshot, srcNet unifi.Network, policies []unifi.FirewallPolicy) bool {
-	if strings.TrimSpace(srcNet.IPv6Subnet) != "" {
+	if len(networkPrefixesForFamily(srcNet, "ipv6")) > 0 {
 		return true
 	}
-	if snap != nil {
-		for _, cl := range snap.Clients {
-			if len(cl.IPv6) == 0 {
-				continue
-			}
-			if (srcNet.ID != "" && cl.NetworkID == srcNet.ID) ||
-				(srcNet.Name != "" && strings.EqualFold(cl.NetworkName, srcNet.Name)) {
-				return true
-			}
-		}
+	for range networkClientAddresses(srcNet, snap, "ipv6", true) {
+		return true
 	}
-	srcZone := strings.TrimSpace(srcNet.ZoneName)
 	for _, pol := range policies {
-		if !pol.Enabled {
+		if !gatewayAdminPolicy(pol, srcNet.ZoneName, "ipv6") {
 			continue
 		}
-		if pol.Destination.ZoneName != "" && !strings.EqualFold(pol.Destination.ZoneName, "gateway") {
+		if srcNet.ID != "" && len(pol.Source.NetworkIDs) > 0 && containsFold(pol.Source.NetworkIDs, srcNet.ID) == pol.Source.NegateTarget {
 			continue
 		}
-		if pol.Source.ZoneName != "" && srcZone != "" && !strings.EqualFold(pol.Source.ZoneName, srcZone) {
-			continue
-		}
-		if strings.EqualFold(pol.IPVersion, "ipv6") {
+		src, dst := gatewayIPv6Target(pol.Source), gatewayIPv6Target(pol.Destination)
+		if src != matchNo && dst != matchNo && (src == matchYes || dst == matchYes || strings.EqualFold(pol.IPVersion, "ipv6")) {
 			return true
-		}
-		for _, sel := range pol.Destination.IPs {
-			if selectorFamilyTri(sel) == "ipv6" {
-				return true
-			}
 		}
 	}
 	return false
 }
 
-// allGatewayIPsForFamily collects gateway interface IPs of family fam ("ipv4"
-// or "ipv6") from gwIP, snap.Networks subnets, and any explicit gateway-targeted
-// ALLOW policies so both zone-wide and host-targeted gateway admin rules match.
+// gatewayIPv6Target distinguishes an IPv6 selector from an endpoint that leaves
+// the family unspecified. A multicast-only selector cannot match an admin socket.
+func gatewayIPv6Target(ep unifi.PolicyEndpoint) triMatch {
+	if ep.AnyTarget || len(ep.IPs) == 0 {
+		return matchUnknown
+	}
+	state := unicastSelectorFamily(ep.IPs, "ipv6")
+	if ep.NegateTarget && state == matchNo {
+		return matchUnknown
+	}
+	return state
+}
+
+// unicastSelectorFamily reports whether any selector contains a unicast address
+// in fam. An unparseable selector leaves the answer unknown.
+func unicastSelectorFamily(selectors []string, fam string) triMatch {
+	state := matchNo
+	for _, sel := range selectors {
+		if iv, ok := parseSelectorInterval(sel, fam); ok {
+			if iv.containsUnicast() {
+				return matchYes
+			}
+		} else if selectorFamilyTri(sel) == "" {
+			state = matchUnknown
+		}
+	}
+	return state
+}
+
+// containsUnicast reports whether a selector interval contains any address that
+// could identify an interface, including one on the local link.
+func (iv ipInterval) containsUnicast() bool {
+	if iv.lo == iv.hi {
+		return gatewayUnicast(iv.lo)
+	}
+	if iv.lo.Is6() {
+		return !iv.lo.IsMulticast() && iv.hi.Compare(netip.IPv6Loopback()) > 0
+	}
+	return !(iv.lo.IsMulticast() && iv.hi.IsMulticast() || iv.lo.IsLoopback() && iv.hi.IsLoopback())
+}
+
+// gatewayUnicast accepts interface addresses, including a gateway on the local link.
+func gatewayUnicast(addr netip.Addr) bool {
+	return addr.IsGlobalUnicast() || addr.IsLinkLocalUnicast()
+}
+
+// allGatewayIPsForFamily collects candidate management addresses from the
+// source VLAN, gateway inventory, other interfaces, and applicable admin allows.
+// An empty witness preserves uncertainty when no interface address is known.
 func allGatewayIPsForFamily(snap *unifi.Snapshot, gwIP, fam string, srcNet unifi.Network, policies []unifi.FirewallPolicy) []string {
 	wantV6 := strings.EqualFold(fam, "ipv6")
+	// A subnet-directed broadcast is never an interface, even if a rule names it.
+	broadcasts := make(map[netip.Addr]bool)
+	if !wantV6 {
+		addBroadcast := func(n unifi.Network) {
+			if p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil && p.Addr().Is4() && p.Bits() <= 30 {
+				broadcasts[lastAddrOfPrefix(p)] = true
+			}
+		}
+		addBroadcast(srcNet)
+		if snap != nil {
+			for _, n := range snap.Networks {
+				addBroadcast(n)
+			}
+		}
+	}
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(ip string) {
-		ip = strings.TrimSpace(ip)
-		if ip == "" {
-			return
-		}
-		addr, err := netip.ParseAddr(ip)
+		addr, err := netip.ParseAddr(strings.TrimSpace(ip))
 		if err != nil {
 			return
 		}
 		addr = addr.Unmap()
-		if addr.Is6() != wantV6 {
+		if addr.Is6() != wantV6 || !gatewayUnicast(addr) || broadcasts[addr] {
 			return
 		}
 		s := addr.String()
@@ -1711,42 +1818,23 @@ func allGatewayIPsForFamily(snap *unifi.Snapshot, gwIP, fam string, srcNet unifi
 		out = append(out, s)
 	}
 
-	// Prefer srcNet's own gateway interface IP first, then primary gwIP and other VLAN gateway IPs.
-	if wantV6 {
-		if s := sampleNetworkIPv6(srcNet, nil); s != "" {
-			add(s)
+	// Prefer the source VLAN's interface when several gateways have the same verdict.
+	addNetwork := func(n unifi.Network) {
+		for ip := range gatewayInterfaceIPs(n, fam) {
+			add(ip)
 		}
-		add(gwIP)
-		if snap != nil {
-			for _, n := range snap.Networks {
-				if s := sampleNetworkIPv6(n, nil); s != "" {
-					add(s)
-				}
-			}
-		}
-	} else {
-		if s := subnetGatewayIP(srcNet.Subnet); s != "" {
-			add(s)
-		}
-		add(gwIP)
-		if snap != nil {
-			for _, n := range snap.Networks {
-				if hostStr, _, ok := strings.Cut(strings.TrimSpace(n.Subnet), "/"); ok {
-					add(hostStr)
-				}
-			}
+	}
+	addNetwork(srcNet)
+	add(gwIP)
+	if snap != nil {
+		for _, n := range snap.Networks {
+			addNetwork(n)
 		}
 	}
 
 	srcZone := strings.TrimSpace(srcNet.ZoneName)
 	for _, pol := range policies {
-		if !pol.Enabled || !strings.EqualFold(pol.Action, "ALLOW") || !matchesIPFamily(pol.IPVersion, fam) {
-			continue
-		}
-		if pol.Destination.ZoneName != "" && !strings.EqualFold(pol.Destination.ZoneName, "gateway") {
-			continue
-		}
-		if pol.Source.ZoneName != "" && srcZone != "" && !strings.EqualFold(pol.Source.ZoneName, srcZone) {
+		if !strings.EqualFold(pol.Action, "ALLOW") || !gatewayAdminPolicy(pol, srcZone, fam) {
 			continue
 		}
 		if !pol.Destination.AnyTarget && !pol.Destination.NegateTarget {
@@ -1764,27 +1852,15 @@ func allGatewayIPsForFamily(snap *unifi.Snapshot, gwIP, fam string, srcNet unifi
 	return out
 }
 
-// networkPrefixForFamily returns the parsed IPv4 or IPv6 CIDR prefix for net.
-func networkPrefixForFamily(n unifi.Network, fam string) (netip.Prefix, bool) {
+// networkPrefixesForFamily keeps every prefix that can contain the query address.
+func networkPrefixesForFamily(n unifi.Network, fam string) []netip.Prefix {
 	wantV6 := strings.EqualFold(fam, "ipv6")
-	raw := n.Subnet
-	if wantV6 {
-		raw = n.IPv6Subnet
-	}
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return netip.Prefix{}, false
-	}
-	pfx, err := netip.ParsePrefix(s)
-	if err != nil || pfx.Addr().Unmap().Is6() != wantV6 {
-		return netip.Prefix{}, false
-	}
-	return pfx.Masked(), true
+	return slices.DeleteFunc(n.Prefixes(), func(p netip.Prefix) bool { return p.Addr().Is6() != wantV6 })
 }
 
 // ipBelongsToNetwork reports whether ip (of family fam) belongs to net. When
-// net defines a subnet for fam, strict CIDR containment decides; otherwise
-// client ownership and exclusion against sibling networks' subnets decide.
+// configured prefixes or client attachments establish ownership, they take
+// precedence over inference from the absence of competing subnets.
 func ipBelongsToNetwork(ip string, net unifi.Network, snap *unifi.Snapshot, fam string) bool {
 	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
 	if err != nil {
@@ -1795,28 +1871,33 @@ func ipBelongsToNetwork(ip string, net unifi.Network, snap *unifi.Snapshot, fam 
 	if addr.Is6() != wantV6 {
 		return false
 	}
-	if pfx, ok := networkPrefixForFamily(net, fam); ok {
-		return pfx.Contains(addr)
+	prefixes := networkPrefixesForFamily(net, fam)
+	if slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return p.Contains(addr) }) {
+		return true
 	}
 	if snap != nil {
+		observed := false
 		for _, cl := range snap.Clients {
-			onNet := (net.ID != "" && cl.NetworkID == net.ID) || (net.Name != "" && strings.EqualFold(cl.NetworkName, net.Name))
-			for _, cip := range cl.AllIPs() {
-				if ca, cerr := netip.ParseAddr(strings.TrimSpace(cip)); cerr == nil && ca.Unmap() == addr {
-					return onNet
+			if clientHasIP(cl, ip) {
+				if net.MatchesIdentity(cl.NetworkID, cl.NetworkName) {
+					return true
 				}
+				observed = true
 			}
 		}
+		if observed || len(prefixes) > 0 {
+			return false
+		}
 		for _, other := range snap.Networks {
-			if (net.ID != "" && other.ID == net.ID) || (net.Name != "" && strings.EqualFold(other.Name, net.Name)) {
+			if net.MatchesIdentity(other.ID, other.Name) {
 				continue
 			}
-			if opfx, ok := networkPrefixForFamily(other, fam); ok && opfx.Contains(addr) {
+			if slices.ContainsFunc(networkPrefixesForFamily(other, fam), func(p netip.Prefix) bool { return p.Contains(addr) }) {
 				return false
 			}
 		}
 	}
-	return true
+	return len(prefixes) == 0
 }
 
 // approvedHostIPsFor returns the concrete destination host IPs on dstNet that
@@ -1876,8 +1957,10 @@ func approvedHostIPsFor(
 					if !clientMatchesApprovedRole(cl, rawFindings, ap.DestRole, ap.Function) {
 						continue
 					}
-					if addr := clientAddressForFamily(cl, fam); addr != "" && ipBelongsToNetwork(addr, dstNet, snap, fam) {
-						addIP(addr)
+					for _, addr := range peerAddresses(cl, fam) {
+						if ipBelongsToNetwork(addr, dstNet, snap, fam) {
+							addIP(addr)
+						}
 					}
 				}
 			}
@@ -2066,13 +2149,9 @@ func parseSelectorInterval(sel, fam string) (ipInterval, bool) {
 	return ipInterval{}, false
 }
 
-// partitionIPIntervals splits net's address space for fam into disjoint atomic
-// intervals where every IP selector in selectors and every address in
-// extraPoints has a constant membership truth value. When net has a CIDR
-// prefix for fam, the entire prefix is partitioned; when net has no prefix,
-// real client IPs on net (plus any positive selector intervals belonging to
-// net) form the domain so negated exclusions never fabricate out-of-network
-// addresses like 0.0.0.0.
+// partitionIPIntervals splits the known address space at policy and approval
+// boundaries. Observations can extend a configured prefix or establish that a
+// subnet-less VLAN uses this family, allowing policy selectors to cover offline hosts.
 func partitionIPIntervals(
 	net unifi.Network,
 	snap *unifi.Snapshot,
@@ -2082,134 +2161,39 @@ func partitionIPIntervals(
 	extraPoints []netip.Addr,
 ) []ipInterval {
 	wantV6 := strings.EqualFold(fam, "ipv6")
-	netPfx, hasNetPfx := networkPrefixForFamily(net, fam)
-
-	if hasNetPfx {
-		domLo := netPfx.Addr().Unmap()
-		domHi := lastAddrOfPrefix(netPfx)
-		starts := []netip.Addr{domLo}
-		addInterval := func(lo, hi netip.Addr) {
-			if !lo.IsValid() || !hi.IsValid() {
-				return
-			}
-			lo, hi = lo.Unmap(), hi.Unmap()
-			if lo.Is6() != wantV6 || hi.Is6() != wantV6 {
-				return
-			}
-			if lo.Compare(hi) > 0 {
-				lo, hi = hi, lo
-			}
-			if hi.Compare(domLo) < 0 || lo.Compare(domHi) > 0 {
-				return
-			}
-			if lo.Compare(domLo) < 0 {
-				lo = domLo
-			}
-			if hi.Compare(domHi) > 0 {
-				hi = domHi
-			}
-			starts = append(starts, lo)
-			if hi.Compare(domHi) < 0 {
-				if nxt := hi.Next(); nxt.IsValid() {
-					starts = append(starts, nxt)
-				}
-			}
-		}
-
-		for _, sel := range positiveSelectors {
-			if iv, ok := parseSelectorInterval(sel, fam); ok {
-				addInterval(iv.lo, iv.hi)
-			}
-		}
-		for _, sel := range negatedSelectors {
-			if iv, ok := parseSelectorInterval(sel, fam); ok {
-				addInterval(iv.lo, iv.hi)
-			}
-		}
-		for _, pt := range extraPoints {
-			addInterval(pt, pt)
-		}
-
-		sort.Slice(starts, func(i, j int) bool {
-			return starts[i].Compare(starts[j]) < 0
-		})
-		uniq := starts[:0]
-		for _, s := range starts {
-			if len(uniq) == 0 || uniq[len(uniq)-1] != s {
-				uniq = append(uniq, s)
-			}
-		}
-
-		preferred, _ := netip.ParseAddr(strings.TrimSpace(sampleNetworkIPForFamily(net, snap, fam)))
-		preferred = preferred.Unmap()
-
-		out := make([]ipInterval, 0, len(uniq))
-		for i, lo := range uniq {
-			hi := domHi
-			if i+1 < len(uniq) {
-				hi = uniq[i+1].Prev()
-			}
-			if !hi.IsValid() || lo.Compare(hi) > 0 {
-				continue
-			}
-			iv := ipInterval{lo: lo, hi: hi}
-			rep := representativeIPInInterval(iv, netPfx, true, preferred)
-			if rep != "" && ipBelongsToNetwork(rep, net, snap, fam) {
-				out = append(out, iv)
-			}
-		}
-		return out
-	}
-
-	// Subnet-less network: build domain from real clients on net, positive
-	// selectors belonging to net, and approved host points (falling back to
-	// sampleIPOutsideSelectors only when no clients exist on net).
 	var domains []ipInterval
-	hasClient := false
-	if snap != nil && (net.ID != "" || net.Name != "") {
-		for _, cl := range snap.Clients {
-			if (net.ID == "" || cl.NetworkID != net.ID) &&
-				(net.Name == "" || !strings.EqualFold(cl.NetworkName, net.Name)) {
-				continue
-			}
-			for _, raw := range cl.AllIPs() {
-				if a, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil {
-					a = a.Unmap()
-					if a.Is6() == wantV6 {
-						hasClient = true
-						domains = append(domains, ipInterval{lo: a, hi: a})
-					}
-				}
-			}
+	prefixes := networkPrefixesForFamily(net, fam)
+	for _, p := range prefixes {
+		domains = append(domains, ipInterval{lo: p.Masked().Addr(), hi: lastAddrOfPrefix(p)})
+	}
+	observed := make(map[netip.Addr]bool)
+	for addr := range networkClientAddresses(net, snap, fam, false) {
+		if !slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return p.Contains(addr) }) {
+			domains = append(domains, ipInterval{lo: addr, hi: addr})
+			observed[addr] = true
 		}
 	}
-	for _, sel := range positiveSelectors {
-		if iv, ok := parseSelectorInterval(sel, fam); ok {
-			if ipBelongsToNetwork(iv.lo.String(), net, snap, fam) || ipBelongsToNetwork(iv.hi.String(), net, snap, fam) {
+	if len(prefixes) == 0 {
+		hasClient := len(domains) > 0
+		external := strings.EqualFold(net.ZoneName, "External")
+		if !hasClient && !external {
+			return nil
+		}
+		for _, sel := range positiveSelectors {
+			if iv, ok := parseSelectorInterval(sel, fam); ok && (external || iv.containsUnicast()) &&
+				(ipBelongsToNetwork(iv.lo.String(), net, snap, fam) || ipBelongsToNetwork(iv.hi.String(), net, snap, fam)) {
 				domains = append(domains, iv)
 			}
 		}
-	}
-	for _, pt := range extraPoints {
-		if pt.IsValid() && pt.Unmap().Is6() == wantV6 && ipBelongsToNetwork(pt.Unmap().String(), net, snap, fam) {
-			u := pt.Unmap()
-			domains = append(domains, ipInterval{lo: u, hi: u})
-		}
-	}
-	if !hasClient {
-		if s := sampleNetworkIPForFamily(net, snap, fam); s != "" {
-			if a, err := netip.ParseAddr(strings.TrimSpace(s)); err == nil && a.Unmap().Is6() == wantV6 {
-				u := a.Unmap()
-				domains = append(domains, ipInterval{lo: u, hi: u})
+		for _, pt := range extraPoints {
+			if ipBelongsToNetwork(pt.String(), net, snap, fam) {
+				domains = append(domains, ipInterval{lo: pt.Unmap(), hi: pt.Unmap()})
 			}
 		}
-		allExcl := make([]string, 0, len(positiveSelectors)+len(negatedSelectors))
-		allExcl = append(allExcl, positiveSelectors...)
-		allExcl = append(allExcl, negatedSelectors...)
-		if outIP := sampleIPOutsideSelectors(net, snap, fam, allExcl); outIP != "" {
-			if a, err := netip.ParseAddr(strings.TrimSpace(outIP)); err == nil && a.Unmap().Is6() == wantV6 {
-				u := a.Unmap()
-				domains = append(domains, ipInterval{lo: u, hi: u})
+		if !hasClient {
+			sample := sampleIPOutsideSelectors(net, snap, fam, slices.Concat(positiveSelectors, negatedSelectors))
+			if addr, err := netip.ParseAddr(sample); err == nil {
+				domains = append(domains, ipInterval{lo: addr, hi: addr})
 			}
 		}
 	}
@@ -2228,7 +2212,7 @@ func partitionIPIntervals(
 	mergedDom := domains[:1]
 	for _, cur := range domains[1:] {
 		last := &mergedDom[len(mergedDom)-1]
-		if cur.lo.Compare(last.hi) <= 0 || (last.hi.Next().IsValid() && cur.lo == last.hi.Next()) {
+		if cur.lo.Compare(last.hi) <= 0 {
 			if cur.hi.Compare(last.hi) > 0 {
 				last.hi = cur.hi
 			}
@@ -2293,12 +2277,9 @@ func partitionIPIntervals(
 			if i+1 < len(uniq) {
 				hi = uniq[i+1].Prev()
 			}
-			if !hi.IsValid() || lo.Compare(hi) > 0 {
-				continue
-			}
 			iv := ipInterval{lo: lo, hi: hi}
-			rep := representativeIPInInterval(iv, netip.Prefix{}, false, preferred)
-			if rep != "" && ipBelongsToNetwork(rep, net, snap, fam) {
+			// An attached client already establishes ownership of its own address.
+			if len(prefixes) > 0 || iv.lo == iv.hi && observed[iv.lo] || ipBelongsToNetwork(representativeIPInInterval(iv, nil, preferred), net, snap, fam) {
 				out = append(out, iv)
 			}
 		}
@@ -2309,14 +2290,14 @@ func partitionIPIntervals(
 // representativeIPInInterval picks a deterministic probe IP inside iv,
 // preferring preferred when contained and skipping the subnet network address
 // when a subsequent host address exists in iv.
-func representativeIPInInterval(iv ipInterval, netPfx netip.Prefix, hasNetPfx bool, preferred netip.Addr) string {
+func representativeIPInInterval(iv ipInterval, prefixes []netip.Prefix, preferred netip.Addr) string {
 	if iv.lo == iv.hi {
 		return iv.lo.String()
 	}
 	if preferred.IsValid() && preferred.Compare(iv.lo) >= 0 && preferred.Compare(iv.hi) <= 0 {
 		return preferred.String()
 	}
-	if hasNetPfx && iv.lo == netPfx.Addr().Unmap() {
+	if slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return iv.lo == p.Masked().Addr() }) {
 		if nxt := iv.lo.Next(); nxt.IsValid() && nxt.Compare(iv.hi) <= 0 {
 			return nxt.String()
 		}
@@ -2633,9 +2614,11 @@ type peerEndpoints struct {
 // "ipv6"), preserving secondary IPv6 aliases alongside the primary IPv4 address.
 func peerAddresses(c unifi.Client, fam string) []string {
 	var out []string
-	for _, raw := range append(append([]string(nil), c.IPv6...), c.IP) {
+	for _, raw := range c.AllIPs() {
 		if ip, err := netip.ParseAddr(raw); err == nil && (fam == "ipv4") == ip.Unmap().Is4() {
-			out = append(out, ip.Unmap().String())
+			if addr := ip.Unmap().String(); !slices.Contains(out, addr) {
+				out = append(out, addr)
+			}
 		}
 	}
 	return out
@@ -2734,7 +2717,9 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 			"fc00::/7", "fe80::/10", "ff00::/8",
 		}
 		for _, local := range o.snap.Networks {
-			externalExclusions = append(externalExclusions, local.Subnet, local.IPv6Subnet)
+			for _, prefix := range networkPrefixesForFamily(local, fam) {
+				externalExclusions = append(externalExclusions, prefix.String())
+			}
 		}
 		for _, raw := range externalExclusions {
 			if prefix, err := netip.ParsePrefix(raw); err == nil {
@@ -2916,8 +2901,8 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 	}
 	protos = append(protos, representative)
 
-	srcNetPfx, hasSrcNetPfx := networkPrefixForFamily(srcNet, fam)
-	dstNetPfx, hasDstNetPfx := networkPrefixForFamily(dstNet, fam)
+	srcPrefixes := networkPrefixesForFamily(srcNet, fam)
+	dstPrefixes := networkPrefixesForFamily(dstNet, fam)
 	prefSrc, _ := netip.ParseAddr(strings.TrimSpace(srcIPSample))
 	prefSrc = prefSrc.Unmap()
 	prefDst, _ := netip.ParseAddr(strings.TrimSpace(dstIPSample))
@@ -3183,7 +3168,7 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 
 		var srcReps []string
 		for _, iv := range srcIntervals {
-			if rep := representativeIPInInterval(iv, srcNetPfx, hasSrcNetPfx, prefSrc); rep != "" {
+			if rep := representativeIPInInterval(iv, srcPrefixes, prefSrc); rep != "" {
 				if strings.EqualFold(srcZone, "External") && isNonRoutableIP(rep) {
 					continue
 				}
@@ -3196,7 +3181,7 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 
 		var dstReps []string
 		for _, iv := range dstIntervals {
-			if rep := representativeIPInInterval(iv, dstNetPfx, hasDstNetPfx, prefDst); rep != "" {
+			if rep := representativeIPInInterval(iv, dstPrefixes, prefDst); rep != "" {
 				dstReps = append(dstReps, rep)
 			}
 		}
@@ -3204,20 +3189,10 @@ func (o *Oracle) boundaryWithApproval(rawFindings []checks.Finding, intent confi
 			dstReps = []string{dstIPSample}
 		}
 
-		// When a subnet-less, client-less network yields no concrete IP
-		// representatives, still probe with an empty IP if the rule's endpoint
-		// can match without an IP (AnyTarget, negated target, no IPs, or an
-		// unparseable IP selector) so the rule is evaluated instead of skipped.
+		// An empty address preserves uncertainty for any selector that could
+		// match this family. Opposite-family literals can be ruled out directly.
 		endpointNeedsEmptyIPProbe := func(ep unifi.PolicyEndpoint) bool {
-			if ep.AnyTarget || ep.NegateTarget || len(ep.IPs) == 0 {
-				return true
-			}
-			for _, sel := range ep.IPs {
-				if selectorFamilyTri(sel) == "" {
-					return true
-				}
-			}
-			return false
+			return ep.AnyTarget || ep.NegateTarget || !allSelectorsOppositeFamily(ep.IPs, fam)
 		}
 
 		var srcMACs []string
@@ -3393,7 +3368,6 @@ func (o *Oracle) evaluateGatewayAdminBoundary(
 	srcNet unifi.Network,
 	srcZone, fam string,
 ) IsolationCell {
-	adminPorts := []int{443, 22, 80, 8443}
 	srcIPSample := sampleNetworkIPForFamily(srcNet, o.snap, fam)
 
 	gateway := unifi.Network{Name: "Gateway", ZoneName: "Gateway"}
@@ -3408,7 +3382,7 @@ func (o *Oracle) evaluateGatewayAdminBoundary(
 	for _, sip := range srcIPs {
 		for _, smac := range srcMACs {
 			for _, gip := range gwIPs {
-				for _, port := range adminPorts {
+				for _, port := range gatewayAdminPorts {
 					evals++
 					if evals > maxExactBoundaryEvals {
 						incomplete = true
@@ -3462,80 +3436,64 @@ doneGW:
 	return firstCell
 }
 
-// subnetGatewayIP parses the gateway interface IP from a UniFi network subnet
-// string such as "192.168.50.1/24".
-func subnetGatewayIP(subnet string) string {
-	hostStr, _, ok := strings.Cut(strings.TrimSpace(subnet), "/")
-	if !ok {
-		return ""
-	}
-	addr, err := netip.ParseAddr(strings.TrimSpace(hostStr))
-	if err != nil {
-		return ""
-	}
-	return addr.Unmap().String()
-}
-
-// sampleNetworkIPv6 returns a representative IPv6 address on net, preferring
-// net.IPv6Subnet and falling back to an active client's IPv6 address on net.
-func sampleNetworkIPv6(net unifi.Network, snap *unifi.Snapshot) string {
-	if s := strings.TrimSpace(net.IPv6Subnet); s != "" {
-		if pfx, err := netip.ParsePrefix(s); err == nil {
-			addr := pfx.Addr().Unmap()
-			if addr.Is6() {
-				if addr == pfx.Masked().Addr() && pfx.Bits() < 128 {
-					addr = addr.Next()
-				}
-				return addr.String()
+// gatewayInterfaceIPs yields addresses reported on gateway-owned interfaces.
+// A bare prefix describes the VLAN without identifying its router's address.
+func gatewayInterfaceIPs(n unifi.Network, fam string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		if n.RouterDeviceMAC != "" || n.RouterUnresolved {
+			return
+		}
+		for _, p := range networkPrefixesForFamily(n, fam) {
+			if (p.Bits() == p.Addr().BitLen() || p.Addr() != p.Masked().Addr()) && !yield(p.Addr().String()) {
+				return
 			}
 		}
 	}
-	if snap != nil {
-		fallback := ""
+}
+
+// networkClientAddresses yields observed unicast addresses on the specified VLAN.
+// Link-local addresses are usable for peers and the gateway on the same link.
+func networkClientAddresses(net unifi.Network, snap *unifi.Snapshot, fam string, onLink bool) iter.Seq[netip.Addr] {
+	wantV6 := strings.EqualFold(fam, "ipv6")
+	return func(yield func(netip.Addr) bool) {
+		if snap == nil {
+			return
+		}
 		for _, cl := range snap.Clients {
-			if (net.ID == "" || cl.NetworkID != net.ID) &&
-				(net.Name == "" || !strings.EqualFold(cl.NetworkName, net.Name)) {
+			if !net.MatchesIdentity(cl.NetworkID, cl.NetworkName) {
 				continue
 			}
-			for _, raw := range cl.IPv6 {
-				if addr, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil && addr.Is6() {
-					if !addr.IsLinkLocalUnicast() {
-						return addr.String()
-					}
-					if fallback == "" {
-						fallback = addr.String()
-					}
+			for _, raw := range cl.AllIPs() {
+				addr, err := netip.ParseAddr(raw)
+				addr = addr.Unmap()
+				if err != nil || addr.Is6() != wantV6 || !(addr.IsGlobalUnicast() || onLink && addr.IsLinkLocalUnicast()) {
+					continue
+				}
+				if !yield(addr) {
+					return
 				}
 			}
 		}
-		if fallback != "" {
-			return fallback
-		}
 	}
-	return ""
 }
 
-// sampleNetworkIPForFamily returns a valid representative IP address on net
-// for the requested address family ("ipv4" or "ipv6").
+// prefixHost preserves the reported interface address and uses the first IPv6
+// host when the controller supplies a delegated network address.
+func prefixHost(p netip.Prefix) netip.Addr {
+	if p.Addr().Is6() && p.Bits() < 128 && p.Addr() == p.Masked().Addr() {
+		return p.Addr().Next()
+	}
+	return p.Addr()
+}
+
+// sampleNetworkIPForFamily returns an address from the network inventory so
+// policies scoped to an unknown local subnet retain an unknown verdict.
 func sampleNetworkIPForFamily(net unifi.Network, snap *unifi.Snapshot, fam string) string {
-	if strings.EqualFold(fam, "ipv6") {
-		return sampleNetworkIPv6(net, snap)
+	if prefixes := networkPrefixesForFamily(net, fam); len(prefixes) > 0 {
+		return prefixHost(prefixes[0]).String()
 	}
-	if gw := subnetGatewayIP(net.Subnet); gw != "" {
-		if addr, err := netip.ParseAddr(gw); err == nil && addr.Is4() {
-			return addr.String()
-		}
-	}
-	if snap != nil {
-		for _, cl := range snap.Clients {
-			if (net.ID == "" || cl.NetworkID != net.ID) &&
-				(net.Name == "" || !strings.EqualFold(cl.NetworkName, net.Name)) {
-				continue
-			}
-			if addr, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && addr.Is4() {
-				return addr.String()
-			}
-		}
+	for addr := range networkClientAddresses(net, snap, fam, false) {
+		return addr.String()
 	}
 	return ""
 }
@@ -3546,31 +3504,15 @@ func zoneHasIPv6Context(snap *unifi.Snapshot, zoneLow string) bool {
 	if snap == nil {
 		return false
 	}
-	zoneNets := make(map[string]struct{})
-	zoneNetIDs := make(map[string]struct{})
 	for _, n := range snap.Networks {
 		nz := strings.ToLower(strings.TrimSpace(n.ZoneName))
 		if nz != zoneLow && nz != "internal" {
 			continue
 		}
-		if strings.TrimSpace(n.IPv6Subnet) != "" {
+		if len(networkPrefixesForFamily(n, "ipv6")) > 0 {
 			return true
 		}
-		if n.Name != "" {
-			zoneNets[strings.ToLower(strings.TrimSpace(n.Name))] = struct{}{}
-		}
-		if n.ID != "" {
-			zoneNetIDs[n.ID] = struct{}{}
-		}
-	}
-	for _, cl := range snap.Clients {
-		if len(cl.IPv6) == 0 {
-			continue
-		}
-		if _, ok := zoneNetIDs[cl.NetworkID]; ok {
-			return true
-		}
-		if _, ok := zoneNets[strings.ToLower(strings.TrimSpace(cl.NetworkName))]; ok {
+		for range networkClientAddresses(n, snap, "ipv6", true) {
 			return true
 		}
 	}
@@ -3701,86 +3643,42 @@ func selectorBoundaryNeighbors(selector, fam string) []netip.Addr {
 // selector in excluded.
 func ipMatchesNoSelector(ip string, excluded []string) bool {
 	for _, sel := range excluded {
-		if ipMatchesSelectorTri(ip, sel) != matchNo {
+		if ipMatchesSelectorTri(ip, sel, "") != matchNo {
 			return false
 		}
 	}
 	return true
 }
 
-// sampleIPOutsideSelectors chooses a valid IP address of family fam belonging
-// to net (when net defines a subnet for fam) that does not match any selector
-// in excluded. Returns "" if net has a subnet for fam and every candidate in
-// that subnet is covered by excluded.
+// sampleIPOutsideSelectors searches observed clients and configured prefixes
+// for an address outside the exclusions. Only External can supply a fallback
+// address when the controller has no address inventory for this family.
 func sampleIPOutsideSelectors(net unifi.Network, snap *unifi.Snapshot, fam string, excluded []string) string {
 	wantV6 := strings.EqualFold(fam, "ipv6")
-	var netPfx netip.Prefix
-	hasPfx := false
-	rawSub := net.Subnet
-	if wantV6 {
-		rawSub = net.IPv6Subnet
-	}
-	if s := strings.TrimSpace(rawSub); s != "" {
-		if pfx, err := netip.ParsePrefix(s); err == nil && pfx.Addr().Unmap().Is6() == wantV6 {
-			netPfx = pfx
-			hasPfx = true
-		}
-	}
-
+	prefixes := networkPrefixesForFamily(net, fam)
 	usable := func(a netip.Addr) bool {
-		if !a.IsValid() {
-			return false
-		}
 		a = a.Unmap()
-		if a.Is6() != wantV6 || a.IsUnspecified() || a.IsMulticast() {
+		if !a.IsGlobalUnicast() || a.Is6() != wantV6 {
 			return false
 		}
-		if hasPfx && !netPfx.Contains(a) {
+		if len(prefixes) > 0 && !slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return p.Contains(a) }) {
 			return false
 		}
 		return ipMatchesNoSelector(a.String(), excluded)
 	}
 
-	// 1. Prefer an actual active client IP on net that is outside excluded.
-	hasNetClient := false
-	if snap != nil && (net.ID != "" || net.Name != "") {
-		for _, cl := range snap.Clients {
-			if (net.ID == "" || cl.NetworkID != net.ID) &&
-				(net.Name == "" || !strings.EqualFold(cl.NetworkName, net.Name)) {
-				continue
-			}
-			if wantV6 {
-				for _, raw := range cl.IPv6 {
-					if a, err := netip.ParseAddr(strings.TrimSpace(raw)); err == nil && a.Unmap().Is6() {
-						hasNetClient = true
-						if usable(a) {
-							return a.Unmap().String()
-						}
-					}
-				}
-				if a, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && a.Unmap().Is6() {
-					hasNetClient = true
-					if usable(a) {
-						return a.Unmap().String()
-					}
-				}
-			} else if a, err := netip.ParseAddr(strings.TrimSpace(cl.IP)); err == nil && a.Unmap().Is4() {
-				hasNetClient = true
-				if usable(a) {
-					return a.Unmap().String()
-				}
-			}
+	hasClient := false
+	for addr := range networkClientAddresses(net, snap, fam, false) {
+		hasClient = true
+		if ipMatchesNoSelector(addr.String(), excluded) {
+			return addr.String()
 		}
 	}
-
-	// When net has no configured subnet for fam but does have active clients of
-	// family fam, every active client was checked above and covered by excluded;
-	// do not invent synthetic out-of-network addresses.
-	if !hasPfx && hasNetClient {
+	if len(prefixes) == 0 && (hasClient || !strings.EqualFold(net.ZoneName, "External")) {
 		return ""
 	}
 
-	// 2. Try boundary neighbors just outside each excluded selector.
+	// Selector boundaries can leave a narrow permitted gap inside a prefix.
 	for _, sel := range excluded {
 		for _, cand := range selectorBoundaryNeighbors(sel, fam) {
 			if usable(cand) {
@@ -3789,8 +3687,8 @@ func sampleIPOutsideSelectors(net unifi.Network, snap *unifi.Snapshot, fam strin
 		}
 	}
 
-	// 3. Try standard host positions within net's configured subnet.
-	if hasPfx {
+	// Check both ends of each prefix when the exclusions lie elsewhere.
+	for _, netPfx := range prefixes {
 		first := netPfx.Masked().Addr().Unmap()
 		last := lastAddrOfPrefix(netPfx)
 		cands := []netip.Addr{
@@ -3806,11 +3704,12 @@ func sampleIPOutsideSelectors(net unifi.Network, snap *unifi.Snapshot, fam strin
 				return c.String()
 			}
 		}
+	}
+	if len(prefixes) > 0 {
 		return ""
 	}
 
-	// 4. When net has no subnet configured for fam, try deterministic fallback
-	// documentation/private addresses of fam outside excluded.
+	// A subnet-less External zone still represents sources outside the selectors.
 	fallbacks := []string{"192.0.2.250", "10.255.255.250", "172.16.255.250"}
 	if wantV6 {
 		fallbacks = []string{"fd00:ffff::1", "2001:db8:ffff::1", "fd00:fffe::1"}
@@ -3823,16 +3722,11 @@ func sampleIPOutsideSelectors(net unifi.Network, snap *unifi.Snapshot, fam strin
 	return ""
 }
 
+// sampleIPFromSelector keeps any explicit interface address in a CIDR and
+// uses the lower endpoint of a valid range for gateway policy matching.
 func sampleIPFromSelector(selector, fam string) string {
 	s := strings.TrimSpace(selector)
 	wantV6 := strings.EqualFold(fam, "ipv6")
-	if addr, err := netip.ParseAddr(s); err == nil {
-		addr = addr.Unmap()
-		if addr.Is6() == wantV6 {
-			return addr.String()
-		}
-		return ""
-	}
 	if pfx, err := netip.ParsePrefix(s); err == nil {
 		addr := pfx.Addr().Unmap()
 		if addr.Is6() == wantV6 {
@@ -3840,13 +3734,8 @@ func sampleIPFromSelector(selector, fam string) string {
 		}
 		return ""
 	}
-	if startStr, _, ok := strings.Cut(s, "-"); ok {
-		if addr, err := netip.ParseAddr(strings.TrimSpace(startStr)); err == nil {
-			addr = addr.Unmap()
-			if addr.Is6() == wantV6 {
-				return addr.String()
-			}
-		}
+	if iv, ok := parseSelectorInterval(s, fam); ok {
+		return iv.lo.String()
 	}
 	return ""
 }
@@ -3920,7 +3809,7 @@ func (o *Oracle) identifyPrinterClients(rawFindings []checks.Finding) []unifi.Cl
 	for _, ap := range o.intent.ApprovedPaths {
 		if strings.Contains(strings.ToLower(ap.Function), "print") || strings.Contains(strings.ToLower(ap.DestRole), "printer") || ap.Port == 631 {
 			for _, cl := range o.snap.Clients {
-				if (ap.DestIP != "" && cl.IP == ap.DestIP) || strings.Contains(strings.ToLower(cl.Name+cl.Hostname), "print") {
+				if clientHasIP(cl, ap.DestIP) || strings.Contains(strings.ToLower(cl.Name+cl.Hostname), "print") {
 					k := firstNonEmptyStr(strings.ToLower(cl.MAC), cl.IP)
 					if k != "" {
 						prnByKey[k] = cl

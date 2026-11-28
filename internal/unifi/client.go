@@ -847,7 +847,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 			Purpose:               purpose,
 			VLAN:                  string(rn.VLANID),
 			Subnet:                subnet,
-			IPv6Subnet:            extractIntegrationIPv6Subnet(rn),
+			IPv6Subnets:           rn.collectedIPv6,
 			IsolationEnabled:      rn.IsolationEnabled,
 			InternetAccessEnabled: rn.InternetAccessEnabled,
 			DomainName:            extractIntegrationDomainName(rn),
@@ -868,6 +868,7 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 		networks = append(networks, n)
 	}
 	netIDs := networkAliases(networks, legacyNets)
+	enrichGatewayIPv6Subnets(networks, netIDs, ldr.items)
 
 	tmlByID := make(map[string]integrationTrafficMatchingList, len(tr.items))
 	for _, list := range tr.items {
@@ -880,6 +881,10 @@ func (c *Controller) fetchIntegrationSnapshot(ctx context.Context) (*Snapshot, e
 	legacyClientByMAC := make(map[string]rawClient, len(lcr.items))
 	for _, lc := range lcr.items {
 		if m := strings.ToLower(strings.TrimSpace(lc.MAC)); m != "" {
+			// Without networkconf, legacy IDs cannot identify Integration networks.
+			if ln.err != nil {
+				lc.NetworkID = ""
+			}
 			legacyClientByMAC[m] = lc
 		}
 	}
@@ -1222,7 +1227,7 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			Purpose:               strings.ToLower(strings.TrimSpace(rn.Purpose)),
 			VLAN:                  string(rn.VLAN),
 			Subnet:                rn.IPSubnet,
-			IPv6Subnet:            strings.TrimSpace(rn.IPv6Subnet),
+			IPv6Subnets:           rn.ipv6Prefixes(),
 			IsolationEnabled:      rn.NetworkIsolationEnabled,
 			InternetAccessEnabled: rn.InternetAccessEnabled,
 			DomainName:            strings.TrimSpace(rn.DomainName),
@@ -1236,11 +1241,14 @@ func (c *Controller) fetchLegacySnapshot(ctx context.Context) (*Snapshot, error)
 			DHCPEnd:               dhcpEnd,
 		}
 		networks = append(networks, n)
+	}
+	netIDs := networkAliases(networks, nr.items)
+	enrichGatewayIPv6Subnets(networks, netIDs, dr.items)
+	for _, n := range networks {
 		if n.ID != "" {
 			netByID[n.ID] = n
 		}
 	}
-	netIDs := networkAliases(networks, nr.items)
 	for alias, id := range netIDs {
 		if n, ok := netByID[id]; ok {
 			netByID[alias] = n
@@ -1874,14 +1882,62 @@ func convertPortForwards(raw []rawPortForward, groups groupIndex) []PortForward 
 	return forwards
 }
 
-// parseNetworkPrefix parses a UniFi gateway CIDR such as "192.168.20.1/24" and
-// returns its masked network prefix ("192.168.20.0/24") for containment checks.
-func parseNetworkPrefix(cidr string) (netip.Prefix, error) {
-	pfx, err := netip.ParsePrefix(strings.TrimSpace(cidr))
-	if err != nil {
-		return netip.Prefix{}, err
+// enrichGatewayIPv6Subnets merges live delegated prefixes with configured ones
+// before client addresses are assigned to VLANs. Gateway tables can use either
+// API's network IDs, and some firmware supplies only the network name.
+func enrichGatewayIPv6Subnets(networks []Network, ids aliases, devices []rawDevice) {
+	byID := make(map[string]*Network)
+	byName := make(map[string]*Network)
+	for i := range networks {
+		n := &networks[i]
+		if n.ID != "" {
+			byID[n.ID] = n
+		}
+		if name := strings.ToLower(strings.TrimSpace(n.Name)); name != "" {
+			if _, exists := byName[name]; exists {
+				byName[name] = nil
+			} else {
+				byName[name] = n
+			}
+		}
 	}
-	return pfx.Masked(), nil
+	for _, d := range devices {
+		if len(d.NetworkTable) == 0 {
+			continue
+		}
+		switch strings.ToLower(firstNonEmpty(d.Type, inferDeviceTypeFromModel(d.Model))) {
+		case "udm", "udr", "udw", "ucg", "uxg", "ugw", "usg", "efg", "gateway", "router":
+		default:
+			continue
+		}
+		for _, row := range d.NetworkTable {
+			local, external := ids[row.ID], ids[row.ExternalID]
+			if local != "" && external != "" && local != external {
+				continue
+			}
+			n := byID[firstNonEmpty(local, external)]
+			if row.ID == "" && row.ExternalID == "" {
+				n = byName[strings.ToLower(strings.TrimSpace(row.Name))]
+			}
+			if n != nil {
+				n.IPv6Subnets = append(n.IPv6Subnets, row.IPv6Subnets...)
+				n.IPv6Subnets = append(n.IPv6Subnets, row.IPv6Subnet, row.IPv6StaticSubnet)
+			}
+		}
+	}
+	for i := range networks {
+		n := &networks[i]
+		prefixes := n.Prefixes()
+		n.IPv6Subnet, n.IPv6Subnets = "", nil
+		for _, p := range prefixes {
+			if p.Addr().Is6() {
+				n.IPv6Subnets = append(n.IPv6Subnets, p.String())
+			}
+		}
+		if len(n.IPv6Subnets) > 0 {
+			n.IPv6Subnet = n.IPv6Subnets[0]
+		}
+	}
 }
 
 // extractIntegrationSubnet returns the CIDR string from an integrationNetwork,
@@ -1896,22 +1952,22 @@ func extractIntegrationSubnet(rn integrationNetwork) string {
 	return ""
 }
 
-func extractIntegrationIPv6Subnet(rn integrationNetwork) string {
-	if s := strings.TrimSpace(rn.IPv6Subnet); s != "" {
-		return s
+// ipv6Prefixes collects every configured subnet before the network selects its
+// primary prefix, since firmware can report different values in each field.
+func (rn rawNetwork) ipv6Prefixes() []string {
+	return append([]string{rn.IPv6Subnet, rn.IPv6StaticSubnet}, rn.IPv6Subnets...)
+}
+
+// ipv6Prefixes includes the interface address alongside bare delegated prefixes.
+func (rn integrationNetwork) ipv6Prefixes() []string {
+	prefixes := []string{rn.IPv6Subnet}
+	if cfg := rn.IPv6Configuration; cfg != nil {
+		prefixes = append(prefixes, cfg.Subnet, cfg.Prefix)
+		if cfg.HostIPAddress != "" && cfg.PrefixLength > 0 {
+			prefixes = append(prefixes, fmt.Sprintf("%s/%d", cfg.HostIPAddress, cfg.PrefixLength))
+		}
 	}
-	if rn.IPv6Configuration != nil {
-		if s := strings.TrimSpace(rn.IPv6Configuration.Subnet); s != "" {
-			return s
-		}
-		if s := strings.TrimSpace(rn.IPv6Configuration.Prefix); s != "" {
-			return s
-		}
-		if rn.IPv6Configuration.HostIPAddress != "" && rn.IPv6Configuration.PrefixLength > 0 {
-			return fmt.Sprintf("%s/%d", rn.IPv6Configuration.HostIPAddress, rn.IPv6Configuration.PrefixLength)
-		}
-	}
-	return ""
+	return prefixes
 }
 
 func integrationDHCPDisabled(rn integrationNetwork) bool {
@@ -2678,9 +2734,7 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 				if detail.IPv4Configuration != nil {
 					n.IPv4Configuration = detail.IPv4Configuration
 				}
-				if detail.IPv6Configuration != nil {
-					n.IPv6Configuration = detail.IPv6Configuration
-				}
+				n.collectedIPv6 = detail.ipv6Prefixes()
 				n.IsolationEnabled = n.IsolationEnabled || detail.IsolationEnabled
 				if detail.InternetAccessEnabled != nil {
 					n.InternetAccessEnabled = detail.InternetAccessEnabled
@@ -2689,7 +2743,6 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 				n.ZoneID = firstNonEmpty(detail.ZoneID, n.ZoneID)
 				n.DomainName = firstNonEmpty(detail.DomainName, n.DomainName)
 				n.Subnet = firstNonEmpty(detail.Subnet, n.Subnet)
-				n.IPv6Subnet = firstNonEmpty(detail.IPv6Subnet, n.IPv6Subnet)
 				n.Purpose = firstNonEmpty(detail.Purpose, n.Purpose)
 				if detail.Management != "" {
 					n.Management = detail.Management
@@ -2711,30 +2764,39 @@ func (c *Controller) enrichIntegrationNetworks(ctx context.Context, siteBase str
 	for _, r := range legacyNets {
 		refs.add(r.ID, r.ID, r.ExternalID)
 	}
+	itemNameCounts := make(map[string]int, len(items))
+	for _, it := range items {
+		if k := strings.ToLower(strings.TrimSpace(it.Name)); k != "" {
+			itemNameCounts[k]++
+		}
+	}
 	for i := range items {
+		items[i].collectedIPv6 = append(items[i].collectedIPv6, items[i].ipv6Prefixes()...)
 		id, ok := refs[items[i].ID]
 		if !ok {
-			name, named := names[strings.ToLower(items[i].Name)]
+			nameKey := strings.ToLower(strings.TrimSpace(items[i].Name))
+			name, named := names[nameKey]
+			if itemNameCounts[nameKey] > 1 {
+				named = false
+			}
 			vlan, tagged := vlans[string(items[i].VLANID)]
 			switch {
 			case named && tagged && name == vlan:
 				id = name
-			case named && !tagged:
+			case named && !tagged && (items[i].VLANID == "" || rows[name].VLAN == "" || rows[name].VLAN == items[i].VLANID):
 				id = name
 			case tagged && !named:
 				id = vlan
 			}
 		}
 		rn, ok := rows[id]
-		if !ok {
+		if !ok || (rn.ExternalID != "" && rn.ExternalID != items[i].ID && rn.ID != items[i].ID) {
 			continue
 		}
 		if extractIntegrationSubnet(items[i]) == "" && rn.IPSubnet != "" {
 			items[i].Subnet = rn.IPSubnet
 		}
-		if extractIntegrationIPv6Subnet(items[i]) == "" && rn.IPv6Subnet != "" {
-			items[i].IPv6Subnet = rn.IPv6Subnet
-		}
+		items[i].collectedIPv6 = append(items[i].collectedIPv6, rn.ipv6Prefixes()...)
 		if items[i].Purpose == "" && rn.Purpose != "" {
 			items[i].Purpose = rn.Purpose
 		}

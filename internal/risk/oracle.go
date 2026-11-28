@@ -234,7 +234,7 @@ func (o *Oracle) InternetEgress(cl unifi.Client, fam string) IsolationCell {
 // Families returns the address families modeled for this client and network.
 func (o *Oracle) Families(cl unifi.Client) []string {
 	n := o.network(cl.NetworkID, cl.NetworkName)
-	if siteHasIPv6Context(o.snap, n, n, cl) || strings.Contains(cl.IP, ":") {
+	if siteHasIPv6Context(o.snap, n, n, cl, true) {
 		return []string{"ipv4", "ipv6"}
 	}
 	return []string{"ipv4"}
@@ -255,8 +255,14 @@ func (o *Oracle) DeviceClient(d unifi.Device) unifi.Client {
 	n := o.NetworkForAddress(d.IP)
 	cl.NetworkID, cl.NetworkName = n.ID, n.Name
 	switch strings.ToLower(d.Type) {
-	case "udm", "udr", "udw", "ucg", "uxg", "ugw", "usg", "gateway", "router":
+	case "udm", "udr", "udw", "ucg", "uxg", "ugw", "usg", "efg", "gateway", "router":
 		cl.NetworkID, cl.NetworkName = GatewayNetworkID, "Gateway"
+		// LAN interfaces can accept administration independently of the management IP.
+		for _, ip := range allGatewayIPsForFamily(o.snap, "", "ipv6", unifi.Network{}, nil) {
+			if ip != "" && ip != canonicalIsolationIP(d.IP) {
+				cl.IPv6 = append(cl.IPv6, ip)
+			}
+		}
 	}
 	return cl
 }
@@ -366,7 +372,7 @@ func (o *Oracle) Internet(dst unifi.Client, proto string, port int, fam string) 
 			}
 		}
 	}
-	if len(ips) > 0 || fam != "ipv6" || siteHasIPv6Context(o.snap, net, net, dst) {
+	if len(ips) > 0 || fam != "ipv6" || siteHasIPv6Context(o.snap, net, net, dst, false) {
 		cells = append(cells, o.firewallIngress(net, dst, proto, port, fam)...)
 	}
 	return cells
@@ -471,17 +477,16 @@ func isNonRoutableIP(raw string) bool {
 	if err != nil {
 		return false
 	}
-	addr = addr.Unmap()
-	return addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsUnspecified()
+	return !addr.Unmap().IsGlobalUnicast()
 }
 
 // nonRoutableExternalCIDRs returns exact CIDR boundaries matching isNonRoutableIP
 // so External source-interval partitioning isolates non-routable ranges cleanly.
 func nonRoutableExternalCIDRs(fam string) []string {
 	if fam == "ipv6" {
-		return []string{"::/128", "::1/128", "fe80::/10", "ff02::/16"}
+		return []string{"::/128", "::1/128", "fe80::/10", "ff00::/8"}
 	}
-	return []string{"0.0.0.0/32", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/24"}
+	return []string{"0.0.0.0/32", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32"}
 }
 
 // isWANNetwork reports whether n represents an External/WAN uplink.
@@ -489,8 +494,8 @@ func isWANNetwork(n unifi.Network) bool {
 	return strings.EqualFold(n.ZoneName, "External") || strings.EqualFold(n.Purpose, "wan") || strings.EqualFold(n.Purpose, "wan2")
 }
 
-// routableClient removes loopback, unspecified, and link-local addresses in fam
-// from cl and reports whether cl had addresses in fam that were all non-routable.
+// routableClient keeps unicast addresses usable across VLANs and reports
+// whether every known address in the requested family was confined to the link.
 func routableClient(cl unifi.Client, fam string) (unifi.Client, bool) {
 	if len(peerAddresses(cl, fam)) == 0 {
 		return cl, false
@@ -664,9 +669,10 @@ func (o *Oracle) reach(src Position, dst unifi.Client, proto string, port int, f
 	}
 	if !same {
 		srcZone := firstNonEmptyStr(src.Zone, srcNet.ZoneName)
-		if isWANNetwork(srcNet) {
+		if strings.EqualFold(srcZone, "External") || isWANNetwork(srcNet) {
 			srcZone = firstNonEmptyStr(srcZone, "External")
-			srcNet.Subnet, srcNet.IPv6Subnet = "0.0.0.0/0", "2000::/3"
+			srcNet.ZoneName = srcZone
+			srcNet.Subnet, srcNet.IPv6Subnet, srcNet.IPv6Subnets = "0.0.0.0/0", "2000::/3", nil
 		}
 		var nonRoutable bool
 		if peers.src, nonRoutable = routableClient(peers.src, fam); nonRoutable {
@@ -697,8 +703,8 @@ func (o *Oracle) reach(src Position, dst unifi.Client, proto string, port int, f
 	return cell
 }
 
-// nonRoutableCell returns a deny cell when a cross-VLAN or External query only
-// carries loopback, unspecified, or link-local addresses in fam.
+// nonRoutableCell records a deny when neither a router nor a WAN gateway
+// can forward the endpoint's addresses as unicast traffic in this family.
 func (o *Oracle) nonRoutableCell(srcNet, dstNet unifi.Network, srcZone, dstZone string, dst unifi.Client, proto string, port int, fam string) IsolationCell {
 	destFn := "service"
 	if proto == "" {
@@ -724,7 +730,7 @@ func (o *Oracle) nonRoutableCell(srcNet, dstNet unifi.Network, srcZone, dstZone 
 	}
 	applyDecisionToCell(&c, policyDecision{
 		action: "deny",
-		reason: "Non-routable loopback or link-local address cannot cross an L3 boundary",
+		reason: "The address cannot be used for a routed unicast connection",
 	})
 	return c
 }
@@ -997,12 +1003,12 @@ func (o *Oracle) network(id, name string) unifi.Network {
 		}
 	}
 	if name != "" {
-		if n, ok := o.netByName[strings.ToLower(name)]; ok {
+		if n, ok := o.netByName[strings.ToLower(name)]; ok && n.MatchesIdentity(id, name) {
 			return n
 		}
 	}
 
-	return unifi.Network{Name: name}
+	return unifi.Network{ID: id, Name: name}
 }
 
 // peerAttachment identifies a switch socket. An AP uplink can represent all
@@ -1227,6 +1233,18 @@ func (o *Oracle) routedCell(srcNet, dstNet unifi.Network, q pathQuery, destHost,
 		PathKind:      "gateway-routed",
 		Expected:      expected,
 	}
+	// An unspecified address represents an entire family in baseline probes.
+	// Concrete non-routable peers can only communicate on the local link.
+	localOnly := func(ip string) bool {
+		addr, _ := netip.ParseAddr(ip)
+		addr = addr.Unmap()
+		return addr.IsValid() && !addr.IsGlobalUnicast() && !addr.IsUnspecified()
+	}
+	if !srcNet.MatchesIdentity(dstNet.ID, dstNet.Name) && !strings.EqualFold(q.dstZone, "Gateway") &&
+		(localOnly(q.srcIP) || localOnly(q.dstIP)) {
+		applyDecisionToCell(&cell, policyDecision{action: "deny", reason: "The address cannot be used for a routed unicast connection"})
+		return cell
+	}
 	path := routingOwners(srcNet, dstNet, q.srcZone, q.dstZone)
 	if len(path) == 0 {
 		applyDecisionToCell(&cell, policyDecision{action: "unknown", missingInput: "Switch routing owner could not be resolved"})
@@ -1351,7 +1369,7 @@ func (o *Oracle) sourceRepresentatives(srcNet, dstNet unifi.Network, q pathQuery
 		}
 	}
 
-	srcNetPfx, hasSrcNetPfx := networkPrefixForFamily(srcNet, q.ipFamily)
+	srcPrefixes := networkPrefixesForFamily(srcNet, q.ipFamily)
 	prefSrc, _ := netip.ParseAddr(strings.TrimSpace(srcIPSample))
 	prefSrc = prefSrc.Unmap()
 
@@ -1360,7 +1378,7 @@ func (o *Oracle) sourceRepresentatives(srcNet, dstNet unifi.Network, q pathQuery
 	}
 	var srcIPs []string
 	for _, iv := range partitionIPIntervals(srcNet, o.snap, q.ipFamily, srcPosSelectors, srcNegSelectors, nil) {
-		if rep := representativeIPInInterval(iv, srcNetPfx, hasSrcNetPfx, prefSrc); rep != "" {
+		if rep := representativeIPInInterval(iv, srcPrefixes, prefSrc); rep != "" {
 			if strings.EqualFold(q.srcZone, "External") && isNonRoutableIP(rep) {
 				continue
 			}

@@ -1978,3 +1978,339 @@ func TestCompromisedEnforcers(t *testing.T) {
 		}
 	}
 }
+
+// TestIPv6AddressGroupIsolation checks both zone boundaries and the service
+// query used by Blast Radius when an IPv6 address group precedes a blanket allow.
+func TestIPv6AddressGroupIsolation(t *testing.T) {
+	const pd = "2001:db8:20::/64"
+	const ula = "fd00:20::/64"
+	for _, tc := range []struct {
+		name, primary     string
+		prefixes, clients []string
+		want              IsolationVerdict
+	}{
+		{name: "missing prefix", want: IsolationUnknown},
+		{name: "only non-routable clients", clients: []string{"ff02::fb", "::1", "::", "fe80::2"}, want: IsolationUnknown},
+		{name: "observed ULA client", clients: []string{"fe80::2", "fd00:20::2"}, want: IsolationBlockedOK},
+		{name: "legacy prefix", primary: pd, want: IsolationBlockedOK},
+		{name: "uncovered client outside configured ULA", primary: ula, clients: []string{"2001:db8:30::42"}, want: IsolationViolation},
+		{name: "delegated and ULA", prefixes: []string{pd, ula}, want: IsolationBlockedOK},
+		{name: "uncovered second prefix", primary: pd, prefixes: []string{pd, "2001:db8:30::/64"}, want: IsolationViolation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := unifi.Network{ID: "iot", Name: "IoT", ZoneName: "IoT", IPv6Subnet: tc.primary, IPv6Subnets: tc.prefixes}
+			snap := &unifi.Snapshot{
+				Networks:   []unifi.Network{src, {ID: "lan", Name: "Default", ZoneName: "Internal"}},
+				Visibility: &unifi.SiteVisibility{GatewayPoliciesAvailable: true},
+			}
+			if len(tc.clients) > 0 {
+				snap.Clients = []unifi.Client{{NetworkID: src.ID, IPv6: tc.clients}}
+			}
+			for _, zone := range []string{"Internal", "Gateway"} {
+				block := unifi.FirewallPolicy{ID: "block-" + zone, Name: "Block IPv6 group", Enabled: true, Action: "BLOCK", IPVersion: "ipv6",
+					Source:      unifi.PolicyEndpoint{ZoneName: src.ZoneName, AnyPort: true, IPs: []string{pd, "fc00::/7"}},
+					Destination: unifi.PolicyEndpoint{ZoneName: zone, AnyPort: true, AnyTarget: true}}
+				allow := block
+				allow.ID, allow.Name, allow.Action, allow.Index = "allow-"+zone, "Allow All Traffic", "ALLOW", 1
+				allow.Source = unifi.PolicyEndpoint{ZoneName: src.ZoneName, AnyPort: true, AnyTarget: true}
+				snap.FirewallPolicies = append(snap.FirewallPolicies, block, allow)
+			}
+			cfg := config.NetworkConfig{TrustedVLANs: []string{"Default"}, IsolatedVLANs: []string{"IoT"}}
+			matrix, findings, notes := EvaluateIsolation(snap, nil, cfg)
+			for _, dst := range []string{"Default", "Gateway"} {
+				i := slices.IndexFunc(matrix.Cells, func(c IsolationCell) bool {
+					return c.SourceNetwork == src.Name && c.DestNetwork == dst && c.IPFamily == "ipv6" &&
+						(c.DestFunction == "gateway-admin" || c.DestFunction == "trusted-lan-transit")
+				})
+				if i < 0 {
+					t.Fatalf("missing IPv6 boundary to %s", dst)
+				}
+				if matrix.Cells[i].Verdict != tc.want {
+					t.Fatalf("expected %s for %s, got %+v", tc.want, dst, matrix.Cells[i])
+				}
+				if tc.want == IsolationUnknown {
+					detail := matrix.Cells[i].MissingInput
+					if detail == "" || !slices.ContainsFunc(notes, func(n PostureNote) bool {
+						return n.Title == "Isolation verdict unknown for IoT -> "+dst+" (IPV6)" && n.Severity == checks.SeverityLow && n.Detail == detail
+					}) {
+						t.Errorf("missing low-severity note for %s: %+v", dst, notes)
+					}
+				}
+			}
+			hasFinding := slices.ContainsFunc(findings, func(f checks.Finding) bool { return f.CheckID == "UB-UNIFI-ISO-GW-ADMIN" })
+			if hasFinding != (tc.want == IsolationViolation) {
+				t.Errorf("gateway admin finding = %v for %s", hasFinding, tc.want)
+			}
+			cell := NewOracle(snap, cfg).Service(Position{NetworkID: src.ID}, unifi.Client{NetworkID: GatewayNetworkID, IP: "2001:db8:1::1"}, "tcp", 443, "ipv6")
+			if cell.Verdict != tc.want {
+				t.Errorf("gateway service verdict = %s, want %s", cell.Verdict, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubnetlessIPv6ScopedAllow checks a non-baseline port so only the exact
+// boundary search can discover the possibly permitted service.
+func TestSubnetlessIPv6ScopedAllow(t *testing.T) {
+	src := unifi.Network{ID: "s", Name: "Sensors", ZoneName: "IoT"}
+	dst := unifi.Network{ID: "d", Name: "Default", ZoneName: "Internal"}
+	for _, tc := range []struct {
+		clientID string
+		selector unifi.PolicyEndpoint
+		want     IsolationVerdict
+	}{
+		{"", unifi.PolicyEndpoint{IPs: []string{"fd00::/8"}}, IsolationUnknown},
+		{"", unifi.PolicyEndpoint{IPs: []string{"::/0"}}, IsolationViolation},
+		{src.ID, unifi.PolicyEndpoint{IPs: []string{"fd00::/8"}}, IsolationViolation},
+		{src.ID, unifi.PolicyEndpoint{IPs: []string{"2001:db8:20::50"}}, IsolationViolation},
+		{"stale", unifi.PolicyEndpoint{IPs: []string{"fd00::/8"}}, IsolationUnknown},
+		{"", unifi.PolicyEndpoint{NetworkIDs: []string{src.ID}}, IsolationViolation},
+		{"", unifi.PolicyEndpoint{AnyTarget: true}, IsolationViolation},
+	} {
+		source := tc.selector
+		source.ZoneName, source.AnyPort = src.ZoneName, true
+		pol := unifi.FirewallPolicy{Enabled: true, Action: "ALLOW", Protocol: "tcp", IPVersion: "ipv6", Source: source,
+			Destination: unifi.PolicyEndpoint{ZoneName: dst.ZoneName, AnyTarget: true, Ports: []int{9443}}}
+		snap := &unifi.Snapshot{Networks: []unifi.Network{src, dst}, FirewallPolicies: []unifi.FirewallPolicy{pol}}
+		if tc.clientID != "" {
+			snap.Clients = []unifi.Client{{NetworkID: tc.clientID, NetworkName: src.Name, IPv6: []string{"2001:db8:30::2"}}}
+		}
+		o := NewOracle(snap, config.NetworkConfig{})
+		cell := o.evaluateBoundary(nil, config.IsolationIntent{}, src, dst, src.ZoneName, dst.ZoneName, "ipv6", "deny", nil)
+		if cell.Verdict != tc.want || cell.Port != 9443 {
+			t.Fatalf("source %+v: expected %s on TCP 9443, got %+v", source, tc.want, cell)
+		}
+	}
+}
+
+// TestGatewayAdminTargets excludes multicast and service-specific destinations
+// even when the policy itself explicitly names IPv6.
+func TestGatewayAdminTargets(t *testing.T) {
+	src := unifi.Network{ZoneName: "IoT"}
+	for _, tc := range []struct {
+		family, proto, target string
+		port                  int
+	}{
+		{"ipv6", "udp", "ff02::fb", 5353}, {"ipv4", "udp", "224.0.0.251", 5353},
+		{"ipv6", "udp", "2001:db8::2", 547}, {"ipv6", "icmpv6", "2001:db8::2", 0},
+		{"ipv6", "tcp", "2001:db8::2", 5353}, {"ipv6", "tcp", "ff02::fb", 443},
+		{"ipv6", "tcp", "::", 443}, {"ipv6", "tcp", "::1", 443},
+		{"ipv4", "tcp", "255.255.255.255", 443},
+	} {
+		policies := []unifi.FirewallPolicy{{Enabled: true, Action: "ALLOW", IPVersion: tc.family, Protocol: tc.proto,
+			Destination: unifi.PolicyEndpoint{ZoneName: "Gateway", IPs: []string{tc.target}, Ports: []int{tc.port}}}}
+		if got := allGatewayIPsForFamily(nil, "", tc.family, src, policies); !slices.Equal(got, []string{""}) {
+			t.Errorf("%+v supplied a gateway admin target %v", tc, got)
+		}
+		if gatewayHasIPv6Context(nil, src, policies) {
+			t.Errorf("%+v supplied IPv6 admin context", tc)
+		}
+	}
+	src.IPv6Subnets = []string{"2001:db8:1::/64", "fd12:3456::7/64"}
+	snap := &unifi.Snapshot{Networks: []unifi.Network{src, {IPv6Subnet: "fd00:2::1/64", RouterDeviceMAC: "02:00:00:00:00:02"}}}
+	want := []string{"fd12:3456::7"}
+	if got := allGatewayIPsForFamily(snap, "", "ipv6", src, nil); !slices.Equal(got, want) {
+		t.Fatalf("gateway interface addresses = %v", got)
+	}
+	if got := NewOracle(snap, config.NetworkConfig{}).DeviceClient(unifi.Device{Type: "udm"}); !slices.Equal(got.IPv6, want) {
+		t.Fatalf("gateway inventory addresses = %v", got.IPv6)
+	}
+	if sample := sampleNetworkIPForFamily(src, snap, "ipv6"); sample != "2001:db8:1::1" {
+		t.Fatalf("delegated prefix sample = %q", sample)
+	}
+}
+
+// TestExternalZoneSource checks the public source domain without a WAN inventory record.
+func TestExternalZoneSource(t *testing.T) {
+	dst := unifi.Network{ID: "lan", Name: "LAN", ZoneName: "Internal"}
+	allow := zoneRule(1, "External", dst.ZoneName, "ALLOW", "tcp")
+	allow.Source.AnyTarget, allow.Source.IPs = false, []string{"2001:db8:44::/64"}
+	allow.Destination.AnyPort, allow.Destination.Ports = false, []int{9443}
+	o := NewOracle(&unifi.Snapshot{Networks: []unifi.Network{dst}, FirewallPolicies: []unifi.FirewallPolicy{allow}}, config.NetworkConfig{})
+	pos, host := Position{Zone: "External"}, unifi.Client{NetworkID: dst.ID, IP: "2001:db8::5"}
+	for _, cell := range []IsolationCell{o.Service(pos, host, "tcp", 9443, "ipv6"), o.AnyPort(pos, host, "ipv6")} {
+		if cell.Verdict != IsolationViolation || cell.DecisiveRuleID != allow.ID {
+			t.Fatalf("External zone source: %+v", cell)
+		}
+	}
+}
+
+// TestGatewayAdminLinkLocalContext checks IPv6 exposure when the gateway's only
+// inventoried address is IPv4 and the source VLAN has only a link-local IPv6 client.
+func TestGatewayAdminLinkLocalContext(t *testing.T) {
+	src := unifi.Network{ID: "guest", Name: "Guest", ZoneName: "Hotspot", Purpose: "guest"}
+	block := zoneRule(0, src.ZoneName, "Gateway", "BLOCK", "tcp")
+	block.IPVersion = "ipv4"
+	allow := zoneRule(1, src.ZoneName, "Gateway", "ALLOW", "tcp")
+	snap := &unifi.Snapshot{Networks: []unifi.Network{src}, Devices: []unifi.Device{{Type: "udm", IP: "192.0.2.1"}},
+		Clients: []unifi.Client{{NetworkID: src.ID, IPv6: []string{"fe80::22"}}}, FirewallPolicies: []unifi.FirewallPolicy{block, allow}}
+	cfg := config.NetworkConfig{IsolationPolicy: config.IsolationIntent{GuestVLANs: []string{src.Name}}}
+	_, findings, _ := EvaluateIsolation(snap, nil, cfg)
+	i := slices.IndexFunc(findings, func(f checks.Finding) bool {
+		return f.CheckID == "UB-UNIFI-ISO-GW-ADMIN" && f.Property == "isolation-gw-admin-guest-ipv6"
+	})
+	if i < 0 || findings[i].Client.IP != "" {
+		t.Fatalf("expected IPv6 finding without an invented gateway address: %+v", findings)
+	}
+	snap.FirewallPolicies[1].Destination.AnyTarget = false
+	snap.FirewallPolicies[1].Destination.IPs = []string{"ff02::/16", "::1"}
+	cell := NewOracle(snap, cfg).evaluateGatewayAdminBoundary([]string{""}, src, src.ZoneName, "ipv6")
+	if cell.Verdict != IsolationBlockedOK {
+		t.Fatalf("multicast and loopback admin targets: %+v", cell)
+	}
+}
+
+// TestGatewayAdminSelectors checks the address evidence supplied by gateway policies.
+func TestGatewayAdminSelectors(t *testing.T) {
+	src := unifi.Network{ID: "guest", ZoneName: "Guest", Subnet: "192.0.2.1/24"}
+	p := zoneRule(1, src.ZoneName, "Gateway", "ALLOW", "tcp")
+	p.Source.AnyTarget = false
+	for _, tc := range []struct {
+		selector string
+		want     bool
+	}{
+		{"fd00::/8", true}, {"2001:db8::50", true}, {"ff02::/16", false}, {"::1", false}, {"192.0.2.3", false},
+	} {
+		p.Source.IPs = []string{tc.selector}
+		if got := gatewayHasIPv6Context(nil, src, []unifi.FirewallPolicy{p}); got != tc.want {
+			t.Errorf("source %s gave IPv6 context %t, want %t", tc.selector, got, tc.want)
+		}
+		snap := &unifi.Snapshot{FirewallPolicies: []unifi.FirewallPolicy{p}}
+		if got := siteHasIPv6Context(snap, src, unifi.Network{}, unifi.Client{}, false); got != tc.want {
+			t.Errorf("dual-stack selector %s gave site IPv6 context %t, want %t", tc.selector, got, tc.want)
+		}
+	}
+	p.Source.NetworkIDs, p.Source.IPs = []string{"other"}, []string{"fd00::/8"}
+	if gatewayHasIPv6Context(nil, src, []unifi.FirewallPolicy{p}) {
+		t.Fatal("another VLAN's rule supplied IPv6 gateway context")
+	}
+	p.Source.NetworkIDs = nil
+	p.Source.IPs = []string{"ff02::fb"}
+	observed := &unifi.Snapshot{Networks: []unifi.Network{src}, FirewallPolicies: []unifi.FirewallPolicy{p},
+		Clients: []unifi.Client{{NetworkID: src.ID, IPv6: []string{"fd00::2"}}}}
+	cell := NewOracle(observed, config.NetworkConfig{}).evaluateGatewayAdminBoundary([]string{"fd00::1"}, src, src.ZoneName, "ipv6")
+	if cell.Verdict != IsolationBlockedOK {
+		t.Fatalf("multicast source on a VLAN with an observed unicast client: %+v", cell)
+	}
+	p.Source.AnyTarget = true
+	p.Destination.AnyTarget, p.Destination.IPs = false, []string{"192.0.2.255", "198.51.100.7", "203.0.113.3"}
+	snap := &unifi.Snapshot{Networks: []unifi.Network{src, {Subnet: "198.51.100.5/30"}, {Subnet: "203.0.113.2/31"}}}
+	want := []string{"192.0.2.1", "198.51.100.5", "203.0.113.3"}
+	if got := allGatewayIPsForFamily(snap, "192.0.2.255", "ipv4", src, []unifi.FirewallPolicy{p}); !slices.Equal(got, want) {
+		t.Fatalf("gateway addresses = %v, want %v", got, want)
+	}
+}
+
+// TestExternalBaselinePolicy preserves the gateway decision for an unspecified WAN source.
+func TestExternalBaselinePolicy(t *testing.T) {
+	lan := unifi.Network{ID: "lan", Name: "LAN", ZoneName: "Internal"}
+	host := unifi.Client{NetworkID: lan.ID, IP: "192.0.2.7"}
+	snap := &unifi.Snapshot{Networks: []unifi.Network{lan}}
+	query := func() IsolationCell {
+		return NewOracle(snap, config.NetworkConfig{}).AnyPort(Position{Zone: "External"}, host, "ipv4")
+	}
+	if got := query(); got.Verdict != IsolationUnknown || got.MissingInput == "" {
+		t.Fatalf("missing WAN policies: %+v", got)
+	}
+	block := zoneRule(0, "External", lan.ZoneName, "BLOCK", "all")
+	snap.FirewallPolicies = []unifi.FirewallPolicy{block}
+	if got := query(); got.Verdict != IsolationBlockedOK || got.DecisiveRuleName != block.Name {
+		t.Fatalf("explicit WAN block: %+v", got)
+	}
+}
+
+// TestIsolatedZonePrefixOrder requires explicit transit blocks for each source and destination prefix.
+func TestIsolatedZonePrefixOrder(t *testing.T) {
+	src := unifi.Network{ID: "s", Name: "Sensors", ZoneName: "IoT", IPv6Subnets: []string{"2001:db8:1::/64", "fd00:1::/64"}}
+	dst := unifi.Network{ID: "d", Name: "LAN", ZoneName: "Internal", IPv6Subnets: []string{"2001:db8:2::/64", "fd00:2::/64"}}
+	v4 := zoneRule(0, src.ZoneName, dst.ZoneName, "BLOCK", "all")
+	v4.IPVersion = "ipv4"
+	tcp := zoneRule(1, src.ZoneName, dst.ZoneName, "BLOCK", "tcp")
+	tcp.IPVersion = "ipv6"
+	dns := zoneRule(2, src.ZoneName, dst.ZoneName, "BLOCK", "udp")
+	dns.IPVersion = "ipv6"
+	for _, tc := range []struct {
+		proto                 string
+		sources, destinations []string
+		want                  bool
+	}{
+		{"udp", src.IPv6Subnets[:1], nil, false},
+		{"udp", nil, dst.IPv6Subnets[:1], false},
+		{"tcp", nil, dst.IPv6Subnets[:1], false},
+		{"udp", src.IPv6Subnets, dst.IPv6Subnets, true},
+	} {
+		snap := &unifi.Snapshot{Networks: []unifi.Network{src, dst}, FirewallPolicies: []unifi.FirewallPolicy{v4, tcp, dns}}
+		for i := range snap.FirewallPolicies {
+			p := &snap.FirewallPolicies[i]
+			if p.Protocol == tc.proto {
+				p.Source.AnyTarget, p.Source.IPs = tc.sources == nil, tc.sources
+				p.Destination.AnyTarget, p.Destination.IPs = tc.destinations == nil, tc.destinations
+			}
+		}
+		for range 2 {
+			if got := IsolatedZones(snap)["iot"]; got != tc.want {
+				t.Errorf("sources %v, destinations %v, first prefixes %s and %s: isolated = %t, want %t",
+					tc.sources, tc.destinations, snap.Networks[0].IPv6Subnets[0], snap.Networks[1].IPv6Subnets[0], got, tc.want)
+			}
+			snap.Networks[0].IPv6Subnets = []string{src.IPv6Subnets[1], src.IPv6Subnets[0]}
+			snap.Networks[1].IPv6Subnets = []string{dst.IPv6Subnets[1], dst.IPv6Subnets[0]}
+		}
+	}
+}
+
+// TestRoutedHostAliases keeps both routable addresses in the matrix and one report per affected service.
+func TestRoutedHostAliases(t *testing.T) {
+	guest := unifi.Network{ID: "guest", Name: "Guest", ZoneName: "Hotspot"}
+	lan := unifi.Network{ID: "lan", Name: "LAN", ZoneName: "Internal"}
+	bmc := unifi.Client{MAC: "02:00:00:00:00:01", Name: "Server-BMC", NetworkID: lan.ID,
+		IPv6: []string{"fe80::2", "2001:db8::2", "fd00::2"}}
+	printer := unifi.Client{MAC: "02:00:00:00:00:02", Name: "Printer", NetworkID: lan.ID,
+		IPv6: []string{"fe80::3", "ff02::fb", "::", "::1", "2001:db8::3", "fd00::3"}}
+	admin := zoneRule(0, guest.ZoneName, lan.ZoneName, "ALLOW", "tcp")
+	admin.IPVersion = "ipv6"
+	admin.Destination.AnyPort, admin.Destination.Ports = false, []int{80, 443}
+	snap := &unifi.Snapshot{Networks: []unifi.Network{guest, lan}, Clients: []unifi.Client{bmc, printer},
+		FirewallPolicies: []unifi.FirewallPolicy{admin}}
+	cfg := config.NetworkConfig{IsolationPolicy: config.IsolationIntent{ApprovedPaths: []config.ApprovedPath{
+		{SourceZone: guest.ZoneName, DestRole: "printer", Function: "printing", IPVersion: "ipv6", Port: 631},
+		{SourceZone: guest.ZoneName, DestRole: "printer", Function: "monitoring", IPVersion: "ipv6", Port: 9100},
+	}}}
+	matrix, findings, notes := EvaluateIsolation(snap, nil, cfg)
+	var bmcCells int
+	for _, c := range matrix.Cells {
+		if c.DestHost == bmc.Name || c.DestHost == printer.Name {
+			if isNonRoutableIP(c.DestIP) {
+				t.Fatalf("non-routable host target: %+v", c)
+			}
+			if c.DestHost == bmc.Name && c.IPFamily == "ipv6" && c.Port == 443 {
+				bmcCells++
+			}
+		}
+	}
+	seen := make(map[string]bool)
+	for _, f := range findings {
+		if f.CheckID == "UB-UNIFI-ISO-BMC-IPV6" || f.CheckID == "UB-UNIFI-ISO-PRINTER-ADMIN" {
+			if seen[f.Key()] {
+				t.Errorf("duplicate finding %s", f.Key())
+			}
+			seen[f.Key()] = true
+		}
+	}
+	if bmcCells != 2 || len(seen) != 3 {
+		t.Errorf("got %d IPv6 BMC cells and %d distinct host findings, want 2 and 3", bmcCells, len(seen))
+	}
+	for _, prefix := range []string{"Approved guest printing path blocked", "Approved workflow blocked"} {
+		count := 0
+		for _, n := range notes {
+			if strings.HasPrefix(n.Title, prefix) {
+				count++
+				if strings.Contains(n.Detail, "fe80:") {
+					t.Errorf("link-local recommendation: %s", n.Detail)
+				}
+			}
+		}
+		if count != 1 {
+			t.Errorf("got %d %q notes, want 1", count, prefix)
+		}
+	}
+}

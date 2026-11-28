@@ -154,42 +154,37 @@ func AnalyzeExtendedNetworkChecks(
 
 	// 5. Duplicate or Overlapping LAN Subnets (IPv4 and IPv6).
 	type netPfx struct {
-		net unifi.Network
-		pfx netip.Prefix
+		netIdx int
+		pfx    netip.Prefix
 	}
 	var lanPfxs []netPfx
-	for _, n := range snap.Networks {
+	for netIdx, n := range snap.Networks {
 		p := strings.ToLower(strings.TrimSpace(n.Purpose))
 		if p == "wan" || p == "wan2" {
 			continue
 		}
-		if n.Subnet != "" {
-			if pfx, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet)); err == nil {
-				lanPfxs = append(lanPfxs, netPfx{net: n, pfx: pfx.Masked()})
-			}
-		}
-		if n.IPv6Subnet != "" {
-			if pfx, err := netip.ParsePrefix(strings.TrimSpace(n.IPv6Subnet)); err == nil {
-				lanPfxs = append(lanPfxs, netPfx{net: n, pfx: pfx.Masked()})
-			}
+		for _, pfx := range n.Prefixes() {
+			lanPfxs = append(lanPfxs, netPfx{netIdx: netIdx, pfx: pfx.Masked()})
 		}
 	}
 	for i := 0; i < len(lanPfxs); i++ {
 		for j := i + 1; j < len(lanPfxs); j++ {
-			if lanPfxs[i].net.ID != "" && lanPfxs[i].net.ID == lanPfxs[j].net.ID {
+			a, b := lanPfxs[i], lanPfxs[j]
+			if a.netIdx == b.netIdx {
 				continue
 			}
-			if lanPfxs[i].pfx.Overlaps(lanPfxs[j].pfx) {
+			if a.pfx.Overlaps(b.pfx) {
+				left, right := snap.Networks[a.netIdx], snap.Networks[b.netIdx]
 				findings = append(findings, checks.Finding{
 					CheckID:           "UB-UNIFI-OVERLAPPING-SUBNETS",
-					Title:             fmt.Sprintf("Overlapping LAN Subnets (%s %s and %s %s)", lanPfxs[i].net.Name, lanPfxs[i].pfx, lanPfxs[j].net.Name, lanPfxs[j].pfx),
+					Title:             fmt.Sprintf("Overlapping LAN Subnets (%s %s and %s %s)", left.Name, a.pfx, right.Name, b.pfx),
 					Category:          "network-health",
 					ClaimKind:         checks.ClaimConfiguredAccess,
-					Property:          fmt.Sprintf("overlap-%s-%s", lanPfxs[i].net.ID, lanPfxs[j].net.ID),
+					Property:          fmt.Sprintf("overlap-%s-%s", left.ID, right.ID),
 					BaseSeverity:      checks.SeverityMedium,
 					EffectiveSeverity: checks.SeverityMedium,
 					Client:            gwClient,
-					Evidence:          fmt.Sprintf("network %q (%s) overlaps network %q (%s)", lanPfxs[i].net.Name, lanPfxs[i].pfx, lanPfxs[j].net.Name, lanPfxs[j].pfx),
+					Evidence:          fmt.Sprintf("network %q (%s) overlaps network %q (%s)", left.Name, a.pfx, right.Name, b.pfx),
 					Remediation: checks.Remediation{
 						Summary:      "Renumber one of the overlapping LAN/VPN subnets so longest-prefix routing and firewall selectors remain unambiguous.",
 						UniFiActions: []string{"renumber_overlapping_subnet"},
