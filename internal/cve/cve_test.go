@@ -28,6 +28,7 @@ import (
 
 	"github.com/karalabe/uniblue/fingerprints"
 	"github.com/karalabe/uniblue/internal/checks"
+	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
 	"golang.org/x/net/dns/dnsmessage"
@@ -177,9 +178,10 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 
 	profiles := []probe.HostProfile{
 		{
-			Client:    unifi.Client{IP: "192.168.10.2", MAC: "aa:01", Name: "truenas-01", NetworkName: "LAN"},
+			Client:    unifi.Client{IP: "192.0.2.1", Name: "build-host", NetworkName: "LAN"},
 			SSHBanner: "SSH-2.0-OpenSSH_9.2p1",
 		},
+		{Client: unifi.Client{IP: "192.0.2.2", Name: "truenas-01"}},
 	}
 	products := fp.Identify(nil, profiles)
 
@@ -217,7 +219,7 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 	if summaries[0].MinFixedVersion != "9.8p1" || summaries[0].KEVCount != 1 {
 		t.Fatalf("unexpected OpenSSH rollup summary: %+v", summaries[0])
 	}
-	profiles[0].SSHBanner += " Debian-2+deb12u3"
+	profiles[0].SSHBanner = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
 	matches, err = cache.MatchProducts(fp.Identify(nil, profiles), MatchOptions{})
 	if err != nil || len(matches) != 3 {
 		t.Fatalf("packaged OpenSSH matches: %v, %v", matches, err)
@@ -236,7 +238,230 @@ func TestSyncMatchLookupAndSearch(t *testing.T) {
 	if err != nil || len(matches) != 2 || matches[0].Product.Label == "OpenSSH" {
 		t.Fatalf("out-of-range packaged OpenSSH: %v, %v", matches, err)
 	}
+}
 
+// TestSSHBannerBackports covers distribution suffixes and appliances that omit
+// them. Only the bundled service inherits uncertainty from the host identity.
+func TestSSHBannerBackports(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"Debian-7+deb13u4", "Raspbian-1", "OpenWrt", "NetBSD", "OpenBSD", "DragonFly BSD"} {
+		hp := probe.HostProfile{SSHBanner: "SSH-2.0-OpenSSH_10.0p2 " + suffix}
+		p := fp.Identify(nil, []probe.HostProfile{hp})
+		if len(p) != 1 || p[0].Version != "10.0p2" || !p[0].VersionAmbiguous {
+			t.Errorf("packaged SSH banner %q: %+v", suffix, p)
+		}
+	}
+	// Use an isolated registry so the fallback is exercised on machines
+	// that have never synced the IEEE cache.
+	dir := t.TempDir()
+	file, err := os.Create(filepath.Join(dir, "ieee-oui.tsv.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(file)
+	_, err = gz.Write([]byte("001122\tSynology Incorporated\n"))
+	if err := errors.Join(err, gz.Close(), file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	fp.ouiDB = oui.New(dir)
+	if err := fp.ouiDB.Load(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		hp        probe.HostProfile
+		ambiguous bool
+	}{
+		{probe.HostProfile{Client: unifi.Client{OUI: "Synology Incorporated"}}, true},
+		{probe.HostProfile{Client: unifi.Client{MAC: "00:11:22:00:00:01"}}, true},
+		{probe.HostProfile{Client: unifi.Client{MAC: "00:11:22:00:00:01", OUI: "Intel"}}, false},
+		{probe.HostProfile{Client: unifi.Client{Hostname: "backup-readynas01"}}, true},
+		{probe.HostProfile{Client: unifi.Client{Hostname: "truenas-01"}}, true},
+		{probe.HostProfile{HTTP: map[int]probe.HTTPBanner{443: {Title: "QNAP QTS"}}}, true},
+		{probe.HostProfile{Services: []probe.Service{{Port: 443, Protocol: "https", Title: "ADM - ASUSTOR"}}}, true},
+		{probe.HostProfile{Services: []probe.Service{{Port: 5001, CPEs: []string{"cpe:2.3:o:synology:diskstation_manager:*"}}}}, true},
+		{probe.HostProfile{Services: []probe.Service{{Port: 443, CPEs: []string{"cpe:2.3:h:netgear:readynas:*"}}}}, true},
+		{probe.HostProfile{Services: []probe.Service{{Port: 443, CPEs: []string{"cpe:2.3:a:qnap:qts:*"}}}}, true},
+		{probe.HostProfile{Services: []probe.Service{{Port: 443, CPEs: []string{"cpe:2.3:o:synology:ds116_firmware:*"}}}}, true},
+		{probe.HostProfile{Services: []probe.Service{{Port: 443, CPEs: []string{"cpe:2.3:a:synology:note_station_client:2.2"}}}}, false},
+		{probe.HostProfile{Client: unifi.Client{OUI: "QNAP Systems, Inc."}}, false},
+		{probe.HostProfile{Client: unifi.Client{Name: "nas", OUI: "NETGEAR"}}, false},
+		{probe.HostProfile{Client: unifi.Client{Hostname: "buffalo"}}, false},
+		{probe.HostProfile{HTTP: map[int]probe.HTTPBanner{80: {Title: "Buffalo weather"}}}, false},
+		{probe.HostProfile{HTTP: map[int]probe.HTTPBanner{80: {Title: "Synology user group"}}}, false},
+		{probe.HostProfile{Services: []probe.Service{{Port: 25, Protocol: "smtp", Banner: "220 mx.qnap-users.example ESMTP"}}}, false},
+	} {
+		tc.hp.Client.IP = "192.0.2.1"
+		tc.hp.SSHBanner = "SSH-2.0-OpenSSH_8.2"
+		p := fp.Identify(nil, []probe.HostProfile{tc.hp})
+		if !slices.ContainsFunc(p, func(p Product) bool {
+			return p.Label == "OpenSSH" && p.Version == "8.2" && p.VersionAmbiguous == tc.ambiguous
+		}) {
+			t.Errorf("appliance identity %+v: %+v", tc.hp, p)
+		}
+	}
+	// UniFi aliases identify the NAS for its own advisories but are too loose
+	// to mark the bundled daemons as patched.
+	for name, label := range map[string]string{"Synology NAS": "Synology DSM", "TrueNAS Scale": "TrueNAS", "Unraid Server": "Unraid"} {
+		p := fp.Identify(nil, []probe.HostProfile{{Client: unifi.Client{IP: "192.0.2.1", Name: name}, SSHBanner: "SSH-2.0-OpenSSH_8.2"}})
+		if !slices.ContainsFunc(p, func(p Product) bool { return p.Label == label }) ||
+			!slices.ContainsFunc(p, func(p Product) bool { return p.Label == "OpenSSH" && !p.VersionAmbiguous }) {
+			t.Errorf("alias %q: %+v", name, p)
+		}
+	}
+	// The firmware CPE can be the only evidence of the appliance's identity.
+	hp := probe.HostProfile{Client: unifi.Client{IP: "192.0.2.1"}, SSHBanner: "SSH-2.0-OpenSSH_8.2",
+		Services: []probe.Service{
+			{Port: 5001, Banner: "nginx (Debian)", CPEs: []string{"cpe:2.3:a:synology:diskstation_manager:7.2.1-69057"}},
+			{Port: 445, CPEs: []string{"cpe:2.3:a:samba:samba:4.18-1"}},
+			{Port: 3000, CPEs: []string{"cpe:2.3:a:grafana:grafana:11.0"}},
+			{Port: 8443, CPEs: []string{"cpe:2.3:a:lighttpd:lighttpd:1.4.76", "cpe:2.3:a:openssl:openssl:3.3.0"}},
+		}}
+	want := map[string]bool{
+		"diskstation_manager:7.2.1-69057": false, "openssh:8.2": true, "samba:4.18": true,
+		"grafana:11.0": false, "lighttpd:1.4.76": false, "openssl:3.3.0": false,
+	}
+	for _, p := range fp.Identify(nil, []probe.HostProfile{hp}) {
+		key := p.Products[0] + ":" + p.Version
+		if ambiguous, ok := want[key]; !ok || p.VersionAmbiguous != ambiguous {
+			t.Errorf("unexpected appliance fingerprint: %+v", p)
+		}
+		delete(want, key)
+	}
+	if len(want) != 0 {
+		t.Fatal("missing appliance fingerprints", want)
+	}
+}
+
+// TestNASContainerMatches keeps upstream web servers on a NAS address eligible
+// for exact matches while the bundled SSH daemon requires patch verification.
+func TestNASContainerMatches(t *testing.T) {
+	fp, err := LoadFingerprinter(fingerprints.BuiltinFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hp := probe.HostProfile{
+		Client: unifi.Client{IP: "192.0.2.2"}, SSHBanner: "SSH-2.0-OpenSSH_8.2",
+		HTTP: map[int]probe.HTTPBanner{
+			5001: {Title: "Synology DiskStation"},
+			8080: {Server: "nginx/1.25.3"},
+			8081: {Server: "Apache/2.4.58 (Unix)"},
+		},
+	}
+	cache := NewCache(t.TempDir())
+	dir := filepath.Join(cache.dir, "vendors")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]Confidence{"openssh": ConfidenceVersionAmbiguous, "nginx": ConfidenceExact, "http_server": ConfidenceExact}
+	for _, cpe := range []CPEMatch{
+		{Vendor: "openbsd", Product: "openssh", EndIncl: "8.2"},
+		{Vendor: "nginx", Product: "nginx", EndIncl: "1.25.3"},
+		{Vendor: "apache", Product: "http_server", EndIncl: "2.4.58"},
+	} {
+		records := []Record{{ID: "CVE-2026-1000", Matches: []CPEMatch{cpe}}}
+		if _, err := writeGzipJSONAtomic(filepath.Join(dir, cpe.Vendor+".json.gz"), records); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matches, err := cache.MatchProducts(fp.Identify(nil, []probe.HostProfile{hp}), MatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range matches {
+		if m.Confidence != want[m.MatchedCPE.Product] {
+			t.Errorf("%s: got %s, want %s", m.MatchedCPE.Product, m.Confidence, want[m.MatchedCPE.Product])
+		}
+		delete(want, m.MatchedCPE.Product)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing service matches: %v", want)
+	}
+}
+
+// TestOpenSSHListenerAdvisories keeps client tools, platform prerequisites and
+// server vulnerabilities distinct even when all three share a CPE and version.
+func TestOpenSSHListenerAdvisories(t *testing.T) {
+	cache := NewCache(t.TempDir())
+	dir := filepath.Join(cache.dir, "vendors")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	clientDescriptions := map[string]string{
+		"CVE-2023-51385": "In ssh in OpenSSH before 9.6, OS command injection might occur if a user name or host name has shell metacharacters.",
+		"CVE-2025-26465": "A vulnerability was found in OpenSSH when the VerifyHostKeyDNS option is enabled. A malicious machine can impersonate a legit server.",
+		"CVE-2019-6110":  "In OpenSSH 7.9, due to accepting and displaying arbitrary stderr output from the server, a malicious server can manipulate the client output.",
+		"CVE-2015-5352":  "The x11_open_helper function in channels.c in ssh in OpenSSH before 6.9, when ForwardX11Trusted mode is not used, lacks a check of the refusal deadline for X connections.",
+		"CVE-2007-4752":  "ssh in OpenSSH before 4.7 does not properly handle when an untrusted cookie cannot be created and uses a trusted X11 cookie instead.",
+		"CVE-2023-38408": "The PKCS#11 feature in ssh-agent in OpenSSH has an insufficiently trustworthy search path.",
+		"CVE-2023-28531": "ssh-add in OpenSSH adds smartcard keys to ssh-agent without the intended constraints.",
+		"CVE-2026-60002": "ssh in OpenSSH can have a use-after-free when a server changes its host key. This occurs only on the client side.",
+		"CVE-2026-35385": "A file downloaded by scp may be installed setuid or setgid.",
+		"CVE-2020-12062": "The scp client in OpenSSH incorrectly sends duplicate responses to the server.",
+		"CVE-2020-15778": "scp in OpenSSH allows command injection in the scp.c toremote function.",
+		"CVE-2021-28041": "ssh-agent in OpenSSH has a double free.",
+		"CVE-2016-1908":  "The client in OpenSSH relies on the local X11 server for access-control decisions.",
+		"CVE-2016-0778":  "The roaming functions in the client in OpenSSH allow remote servers to cause a denial of service.",
+		"CVE-2016-10009": "Untrusted search path vulnerability in ssh-agent.c in ssh-agent in OpenSSH.",
+	}
+	records := []Record{
+		{ID: "CVE-2024-6387", Description: "OpenSSH's server (sshd) has a signal handler race."},
+		{ID: "CVE-2025-26466", Description: "For each ping packet the SSH server receives, a pong packet is allocated in a memory buffer."},
+		{ID: "CVE-2023-48795", Description: "The SSH transport protocol allows integrity checks to be bypassed, and a client and server may end up with downgraded security features."},
+		{ID: "CVE-2019-16905", Description: "OpenSSH has an integer overflow if a client or server is configured to use a crafted XMSS key."},
+		{ID: "CVE-2026-106585", Description: "In sshd and ssh in OpenSSH before 10.6, there is no check for whether the maximum packet length is exceeded."},
+		{ID: "CVE-2026-123158", Description: "sshd on Linux using musl libc without PAM.", NeedsContext: true},
+	}
+	for id, description := range clientDescriptions {
+		records = append(records, Record{ID: id, Description: description})
+	}
+	for i, r := range records {
+		records[i].Matches = []CPEMatch{{Vendor: "openbsd", Product: "openssh", EndExcl: "10", NeedsContext: r.NeedsContext}}
+	}
+	if _, err := writeGzipJSONAtomic(filepath.Join(dir, "openbsd.json.gz"), records); err != nil {
+		t.Fatal(err)
+	}
+	p := Product{Label: "OpenSSH", Version: "8.9p1", Vendors: []string{"openbsd"}, Products: []string{"openssh"},
+		Source: "nerva-cpe", Ports: []EndpointPort{{"tcp", 2222}}}
+	for _, packaged := range []bool{false, true} {
+		p.VersionAmbiguous = packaged
+		matches, err := cache.MatchProducts([]Product{p}, MatchOptions{})
+		if err != nil || len(matches) != len(records) {
+			t.Fatalf("MatchProducts: %d matches, %v", len(matches), err)
+		}
+		for _, m := range matches {
+			_, clientOnly := clientDescriptions[m.Record.ID]
+			context := clientOnly || m.Record.NeedsContext
+			want := ConfidenceExact
+			if context {
+				want = ConfidencePotential
+			} else if packaged {
+				want = ConfidenceVersionAmbiguous
+			}
+			if m.ClientOnly != clientOnly || m.MatchedCPE.NeedsContext != context || m.Confidence != want {
+				t.Errorf("packaged=%t: %+v", packaged, m)
+			}
+		}
+		sums := RollupMatches(matches)
+		if len(sums) != 3 || !slices.ContainsFunc(sums, func(s ProductSummary) bool {
+			return s.ClientOnly && s.TotalCVEs == len(clientDescriptions) && s.NeedsContext && s.MinFixedVersion == "" && strings.Contains(s.Headline(), "client")
+		}) {
+			t.Errorf("expected a separate client-tools advisory: %+v", sums)
+		}
+	}
+	for _, description := range []string{
+		"User enumeration due to early bailout for an invalid authenticating user.",
+		"An ssh client can trigger a vulnerability in sshd.",
+		"A remote SSH client can bypass authentication with a malformed request.",
+		"A malicious scp client can overwrite files on the server.",
+		"The process_open function in sftp-server.c fails to prevent write operations.",
+	} {
+		if clientOnlyOpenSSH(Record{Description: description}) {
+			t.Errorf("classified as client-only: %q", description)
+		}
+	}
 }
 
 // TestSyncCancelPreventsPartialStats verifies that cancelling a Sync context
@@ -702,7 +927,7 @@ func TestVersionSingleLetterPatchOrdering(t *testing.T) {
 	}
 }
 
-// TestParseCPE23UpdateField verifies that ParseCPE23 and parseVersionedCPE23
+// TestParseCPE23UpdateField verifies that ParseCPE23 and parseServiceCPE23
 // fold non-wildcard CPE update fields (parts[6]) into Version so OpenSSH patch
 // levels and pre-releases match accurately without false exact hits.
 func TestParseCPE23UpdateField(t *testing.T) {
@@ -735,9 +960,9 @@ func TestParseCPE23UpdateField(t *testing.T) {
 		t.Fatalf("ParseCPE23(2.0:beta1) = (%+v, %v), want Version=2.0-beta1", m4, ok)
 	}
 
-	v, p, ver, ok := parseVersionedCPE23("cpe:2.3:a:openbsd:openssh:8.5:p1:*:*:*:*:*:*")
-	if !ok || v != "openbsd" || p != "openssh" || ver != "8.5p1" {
-		t.Fatalf("parseVersionedCPE23(8.5:p1) = (%q, %q, %q, %v)", v, p, ver, ok)
+	observed, ok := parseServiceCPE23("cpe:2.3:a:openbsd:openssh:8.5:p1:*:*:*:*:*:*")
+	if !ok || observed.Vendor != "openbsd" || observed.Product != "openssh" || observed.Version != "8.5p1" {
+		t.Fatalf("parseServiceCPE23(8.5:p1) = (%+v, %v)", observed, ok)
 	}
 }
 
@@ -1339,9 +1564,9 @@ func TestJoinCPEVersionUpdatePreservesNumericUpdates(t *testing.T) {
 		if !ok || m.Version != tc.wantVer {
 			t.Fatalf("ParseCPE23(%q) = (%q, %v), want %q", tc.cpe, m.Version, ok, tc.wantVer)
 		}
-		_, _, ver, ok := parseVersionedCPE23(tc.cpe)
-		if !ok || ver != tc.wantVer {
-			t.Fatalf("parseVersionedCPE23(%q) = (%q, %v), want %q", tc.cpe, ver, ok, tc.wantVer)
+		observed, ok := parseServiceCPE23(tc.cpe)
+		if !ok || observed.Version != tc.wantVer {
+			t.Fatalf("parseServiceCPE23(%q) = (%+v, %v), want version %q", tc.cpe, observed, ok, tc.wantVer)
 		}
 	}
 

@@ -955,8 +955,8 @@ func buildDemoDataset(now time.Time) (
 			Record:     cve.Record{ID: "CVE-2024-6387", Severity: checks.SeverityCritical, CVSS: 9.8, AttackVector: "N", KEV: true, Description: "OpenSSH regreSSHion signal handler race condition"},
 		},
 		{
-			Confidence: cve.ConfidenceExact, Product: prodBMCSSH,
-			MatchedCPE: cve.CPEMatch{Vendor: "openbsd", Product: "openssh", EndExcl: "9.3p2"},
+			Confidence: cve.ConfidencePotential, ClientOnly: true, Product: prodBMCSSH,
+			MatchedCPE: cve.CPEMatch{Vendor: "openbsd", Product: "openssh", EndExcl: "9.3p2", NeedsContext: true},
 			Record:     cve.Record{ID: "CVE-2023-38408", Severity: checks.SeverityHigh, CVSS: 8.8, AttackVector: "N", Description: "OpenSSH forwarded ssh-agent PKCS#11 remote code execution"},
 		},
 		{

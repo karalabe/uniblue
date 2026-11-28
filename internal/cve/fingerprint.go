@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/karalabe/uniblue/internal/oui"
 	"github.com/karalabe/uniblue/internal/probe"
 	"github.com/karalabe/uniblue/internal/unifi"
 	"gopkg.in/yaml.v3"
@@ -75,9 +76,11 @@ type FingerprintRule struct {
 // Products ready for deterministic CVE cache lookup.
 type Fingerprinter struct {
 	rules []*FingerprintRule
+	ouiDB *oui.DB
 }
 
-// LoadFingerprinter loads and compiles all YAML fingerprint rules from fsys.
+// LoadFingerprinter compiles the YAML rules in fsys and loads the local IEEE
+// registry when available to identify appliances missing a controller vendor.
 func LoadFingerprinter(fsys fs.FS) (*Fingerprinter, error) {
 	var paths []string
 	err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
@@ -112,7 +115,9 @@ func LoadFingerprinter(fsys fs.FS) (*Fingerprinter, error) {
 			all = append(all, r)
 		}
 	}
-	return &Fingerprinter{rules: all}, nil
+	db := oui.New("")
+	_ = db.Load()
+	return &Fingerprinter{rules: all, ouiDB: db}, nil
 }
 
 // compile pre-compiles optional regular expressions on a FingerprintRule.
@@ -255,8 +260,16 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 		hostIP := hp.Client.PrimaryIP()
 		hostIPs[hostIP] = hp.Client.AllIPs()
 		probeIP := cmp.Or(hp.ProbeIP, hostIP)
+		var observed []Product
+		appliance := f.storageAppliance(hp)
 		for _, rule := range f.rules {
 			for _, hit := range rule.matchAll(hp) {
+				products := expandProductPatterns(rule.Products, hit.model)
+				// Rules also match free-text inventory names, so a firmware rule
+				// identifies the product without marking the host's daemons.
+				firmware := slices.ContainsFunc(rule.Vendors, func(v string) bool {
+					return slices.ContainsFunc(products, func(p string) bool { return storageFirmware(v, p) })
+				})
 				label := rule.Name
 				if hit.model != "" {
 					label = fmt.Sprintf("%s %s", rule.Name, strings.ToUpper(hit.model))
@@ -267,41 +280,46 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 					ip = cmp.Or(hit.ip, probeIP)
 					ports = []EndpointPort{{Transport: "tcp", Port: hit.port}}
 				}
-				add(Product{
+				observed = append(observed, Product{
 					Label:            label,
 					Vendors:          rule.Vendors,
-					Products:         expandProductPatterns(rule.Products, hit.model),
+					Products:         products,
 					Version:          hit.version,
 					Source:           hit.source,
 					HostName:         hp.Client.DisplayName(),
 					HostIP:           ip,
 					VLAN:             hp.Client.NetworkName,
 					Ports:            ports,
-					VersionAmbiguous: hit.ambiguous,
+					VersionAmbiguous: hit.ambiguous && !firmware,
 				})
 			}
 		}
 
-		// Extract exact-version products directly from any versioned CPE 2.3
-		// identifiers reported by Nerva's protocol fingerprinters.
 		for _, svc := range hp.Services {
+			ip := hp.ServiceIP(svc)
 			transport := strings.ToLower(strings.TrimSpace(svc.Transport))
 			if transport == "" {
 				transport = "tcp"
 			}
 			for _, rawCPE := range svc.CPEs {
-				vendor, product, ver, ok := parseVersionedCPE23(rawCPE)
-				ip := hp.ServiceIP(svc)
-				if !ok || ip == "" {
+				cpe, ok := parseServiceCPE23(rawCPE)
+				if !ok {
 					continue
 				}
-				packaged := distroPackage.MatchString(svc.Banner) || distroPackage.MatchString(svc.Version) || distroPackage.MatchString(ver)
-				add(Product{
-					Label:            formatProductLabel(product),
+				// A firmware CPE identifies the host even when Nerva cannot
+				// attribute a specific release to this endpoint.
+				firmware := storageFirmware(cpe.Vendor, cpe.Product)
+				appliance = appliance || firmware
+				if cpe.Version == "" || ip == "" {
+					continue
+				}
+				packaged := !firmware && (distroPackage.MatchString(svc.Banner) || distroPackage.MatchString(svc.Version) || distroPackage.MatchString(cpe.Version))
+				observed = append(observed, Product{
+					Label:            formatProductLabel(cpe.Product),
 					HighConfidence:   protocolIdentity(svc),
-					Vendors:          []string{vendor},
-					Products:         []string{product},
-					Version:          upstreamVersion(ver, packaged),
+					Vendors:          []string{cpe.Vendor},
+					Products:         []string{cpe.Product},
+					Version:          cpe.Version,
 					Source:           "nerva-cpe",
 					HostName:         hp.Client.DisplayName(),
 					HostIP:           ip,
@@ -310,6 +328,14 @@ func (f *Fingerprinter) Identify(snap *unifi.Snapshot, profiles []probe.HostProf
 					VersionAmbiguous: packaged,
 				})
 			}
+		}
+		// Firmware and service evidence can arrive on different interfaces or in either order.
+		for _, p := range observed {
+			if appliance && p.Version != "" && bundledService(p) {
+				p.VersionAmbiguous = true
+			}
+			p.Version = upstreamVersion(p.Version, p.VersionAmbiguous)
+			add(p)
 		}
 	}
 
@@ -683,10 +709,77 @@ func hardwarePrinterService(md probe.MDNSService, banner probe.HTTPBanner) bool 
 	return true
 }
 
-// distroPackage recognizes Linux/BSD distribution names and package revision
-// markers in the original banner or version string (such as Debian, Ubuntu,
-// RHEL/CentOS/Rocky/AlmaLinux/Fedora/Amazon Linux, Alpine, SUSE, and FreeBSD).
-var distroPackage = regexp.MustCompile(`(?i)(?:^|[^a-z])(deb[0-9]+|el[0-9]+|fc[0-9]+|amzn[0-9]+|(?:debian|ubuntu|rhel|red[ -]?hat|centos|rocky|alma(?:linux)?|oracle[ -]?linux|amazon|fedora|alpine|(?:open)?suse|freebsd)(?:[^a-z]|$))`)
+// storageFirmware recognizes NAS product families across CPE parts. Some
+// vendors publish their operating system as an application alongside add-on packages.
+func storageFirmware(vendor, product string) bool {
+	id := strings.TrimSuffix(strings.ToLower(vendor+":"+product), "_firmware")
+	switch id {
+	case "synology:diskstation_manager", "synology:diskstation_manager_unified_controller", "synology:virtual_diskstation_manager", "synology:dsm",
+		"qnap:qts", "qnap:quts_hero", "qnap:qutscloud", "qnap:nas",
+		"ixsystems:truenas", "ixsystems:freenas", "freenas:freenas", "unraid:unraid", "lime-technology:unraid",
+		"asustor:adm", "asustor:asustor_data_master", "asustor:data_master",
+		"terra-master:tos", "terramaster:tos", "terra-master:terramaster_operating_system", "terramaster:terramaster_operating_system",
+		"netgear:readynas", "netgear:readynas_os", "netgear:readynas_raidiator", "drobo:5n2":
+		return true
+	}
+	return storageModel.MatchString(id)
+}
+
+// storageModel recognizes model-specific hardware and firmware CPEs from NAS
+// families. The same vendors also register CPEs for switches, routers and cameras.
+var storageModel = regexp.MustCompile(`^(?:synology:(?:ds|rs)[0-9]|qnap:(?:ts|tvs|ss)-[a-z]*[0-9]|asustor:as[0-9]|terra-?master:f[0-9]+-|netgear:readynas_[0-9]|buffalo(?:tech)?:(?:linkstation|terastation|(?:ls|ts)-?[0-9]))`)
+
+// storageOUI omits multi-purpose NIC vendors such as QNAP, Buffalo and NETGEAR.
+// Their adapters can identify the interface manufacturer on an ordinary PC.
+var storageOUI = regexp.MustCompile(`(?i)^(?:synology|ixsystems|asustor|terra[ -]?master|drobo)\b`)
+
+// storageAdminTitle matches product names in an appliance dashboard title.
+var storageAdminTitle = regexp.MustCompile(`(?i)(?:^|\s[-|:]\s)(?:(?:synology\s+)?(?:diskstation(?: manager)?|rackstation)|synology DSM|QNAP QTS|TrueNAS(?: (?:core|scale))?|FreeNAS|Unraid(?: (?:os|webgui))?|ADM\s*-\s*ASUSTOR|TOS\s*-\s*TerraMaster|ReadyNAS|LinkStation|TeraStation)(?:$|\s[-|:]\s)`)
+
+// storageHostname recognizes NAS model families in inventory names such as backup-readynas01.
+var storageHostname = regexp.MustCompile(`(?i)^(?:[a-z0-9]+[-_])?(?:readynas|linkstation|terastation|freenas|truenas|unraid|diskstation|rackstation|synology[-_]nas)(?:[-_]?[0-9]+)?(?:\..*)?$`)
+
+// storageAppliance looks for hardware inventory or a NAS administration page
+// because an appliance's bundled daemons can advertise unmodified upstream versions.
+func (f *Fingerprinter) storageAppliance(hp probe.HostProfile) bool {
+	vendor := strings.TrimSpace(hp.Client.OUI)
+	if vendor == "" && f.ouiDB != nil {
+		vendor = f.ouiDB.Lookup(hp.Client.MAC).Vendor
+	}
+	if storageOUI.MatchString(vendor) || storageHostname.MatchString(hp.Client.Hostname) || storageHostname.MatchString(hp.Client.Name) {
+		return true
+	}
+	for _, banner := range hp.HTTP {
+		if storageAdminTitle.MatchString(strings.TrimSpace(banner.Title)) {
+			return true
+		}
+	}
+	for _, svc := range hp.Services {
+		// Nerva records web page titles separately from raw protocol greetings.
+		if storageAdminTitle.MatchString(strings.TrimSpace(svc.Title)) {
+			return true
+		}
+	}
+	return false
+}
+
+// bundledService limits the backport inference to OS-supplied daemons. An appliance
+// firmware version still identifies the vendor's own release directly.
+func bundledService(p Product) bool {
+	for _, vendor := range p.Vendors {
+		for _, product := range p.Products {
+			switch strings.ToLower(vendor + ":" + product) {
+			case "openbsd:openssh", "dropbear_ssh_project:dropbear_ssh", "samba:samba", "apple:cups", "openprinting:cups":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// distroPackage recognizes distribution names and package revisions in a banner
+// before normalization strips the evidence of downstream packaging.
+var distroPackage = regexp.MustCompile(`(?i)(?:^|[^a-z])(deb[0-9]+|el[0-9]+|fc[0-9]+|amzn[0-9]+|(?:debian|raspbian|ubuntu|rhel|red[ -]?hat|centos|rocky|alma(?:linux)?|oracle[ -]?linux|amazon|fedora|alpine|(?:open)?suse|openwrt|(?:free|net|open)bsd|dragonfly(?:bsd)?)(?:[^a-z]|$))`)
 
 // packageRevision separates numeric distribution revisions while preserving upstream prereleases.
 var packageRevision = regexp.MustCompile(`[-+~]r?[0-9]`)
@@ -707,14 +800,11 @@ func upstreamVersion(version string, packaged bool) string {
 	return version
 }
 
-// serviceHit builds a port-bound ruleHit from a regex match, stripping any
-// distribution package revision from the captured version and marking ambiguous
-// when raw contains Linux/BSD distro packaging markers.
+// serviceHit keeps the raw version and its packaging evidence together so the
+// caller can distinguish a daemon's package revision from a firmware build number.
 func (r *FingerprintRule) serviceHit(m []string, raw, source string, port int) ruleHit {
-	version := captureGroup(m, r.VersionGroup)
-	packaged := distroPackage.MatchString(raw)
-	return ruleHit{version: upstreamVersion(version, packaged), model: captureGroup(m, r.ModelGroup),
-		source: source, port: port, ambiguous: packaged}
+	return ruleHit{version: captureGroup(m, r.VersionGroup), model: captureGroup(m, r.ModelGroup),
+		source: source, port: port, ambiguous: distroPackage.MatchString(raw)}
 }
 
 // expandProductPatterns substitutes "{model}" placeholders with the captured
@@ -735,27 +825,11 @@ func expandProductPatterns(patterns []string, model string) []string {
 	return out
 }
 
-// parseVersionedCPE23 parses a CPE 2.3 URI ("cpe:2.3:a:vendor:product:version:update:...")
-// and returns (vendor, product, version, true) only when a concrete version
-// token (not "*", "-", or empty) is present, folding any non-wildcard update
-// component (parts[6]) into version.
-func parseVersionedCPE23(raw string) (vendor, product, version string, ok bool) {
-	parts := strings.Split(strings.ToLower(strings.TrimSpace(raw)), ":")
-	if len(parts) < 6 || parts[0] != "cpe" || parts[1] != "2.3" {
-		return "", "", "", false
-	}
-	vendor = strings.TrimSpace(parts[3])
-	product = strings.TrimSpace(parts[4])
-	version = strings.TrimSpace(parts[5])
-	if vendor == "" || vendor == "*" || vendor == "-" ||
-		product == "" || product == "*" || product == "-" ||
-		version == "" || version == "*" || version == "-" {
-		return "", "", "", false
-	}
-	if len(parts) > 6 {
-		version = joinCPEVersionUpdate(version, parts[6])
-	}
-	return vendor, product, version, true
+// parseServiceCPE23 requires a concrete product identity in a protocol fingerprint.
+// A wildcard version can still identify the appliance that supplies a service.
+func parseServiceCPE23(raw string) (CPEMatch, bool) {
+	cpe, ok := ParseCPE23(strings.ToLower(strings.TrimSpace(raw)))
+	return cpe, ok && (cpe.Part == "a" || cpe.Part == "o" || cpe.Part == "h") && cpe.Vendor != "-" && cpe.Product != "-"
 }
 
 // formatProductLabel converts a CPE product token such as "grafana" or

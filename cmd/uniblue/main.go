@@ -2165,7 +2165,7 @@ func runCVEExplore(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 
 	if len(ambiguous) > 0 {
-		fmt.Fprintf(stdout, "\nDistro-Packaged Software (Verify Backported Patches, %d):\n", len(ambiguous))
+		fmt.Fprintf(stdout, "\nDistro / Appliance-Packaged Software (Verify Backported Patches, %d):\n", len(ambiguous))
 		printCVEMatchTable(stdout, ambiguous, len(ambiguous))
 	}
 	fmt.Fprintf(stdout, "\nPotential Product Matches (%d total, showing up to %d):\n", len(potential), *limit)

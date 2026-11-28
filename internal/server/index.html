@@ -4383,8 +4383,16 @@ function renderDrawer() {
   if (ent.potential_cves && ent.potential_cves.length) {
     b += `<div class="dsec-t" style="margin-top:8px">Unverified Patch Advisories (${ent.potential_cves.length})</div>`;
     for (const s of ent.potential_cves) {
+      const product = [s.product.label, s.product.version].filter(Boolean).join(" ");
+      let qualifier = "version hidden";
+      if (s.confidence === "version-ambiguous") {
+        qualifier = "distro/vendor backports - verify package updates";
+      } else if (s.product.version || s.client_only || s.needs_context) {
+        const guidance = s.client_only ? "verify SSH client tools" : "verify applicability";
+        qualifier = s.product.version ? guidance : "version hidden - " + guidance;
+      }
       b += `<div style="padding:9px 11px;border-radius:9px;background:var(--surface);border:1px solid var(--border);margin-bottom:8px;font-size:12px">
-        <strong>${esc(s.product.label)}</strong> · ${s.total_cves} possible CVE(s) (version hidden)
+        <strong>${esc(product)}</strong> · ${s.total_cves} possible CVE(s) (${qualifier})
         <div class="small mono" style="margin-top:2px">${esc((s.top_cves || []).join(", "))}</div>
       </div>`;
     }

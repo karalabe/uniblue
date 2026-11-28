@@ -7,6 +7,7 @@
 package server
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -18,6 +19,26 @@ import (
 	"github.com/karalabe/uniblue/internal/topology"
 	"github.com/karalabe/uniblue/internal/unifi"
 )
+
+// TestHostPatchAdvisories keeps each verification step visible for a single
+// packaged OpenSSH release, including client advisories on an sshd listener.
+func TestHostPatchAdvisories(t *testing.T) {
+	host := unifi.Client{IP: "192.0.2.10", Name: "debian"}
+	p := cve.Product{HostIP: host.IP, Label: "OpenSSH", Version: "10.0p2", VersionAmbiguous: true}
+	groups := []cve.ProductSummary{
+		{Product: p, Confidence: cve.ConfidenceVersionAmbiguous, TotalCVEs: 1},
+		{Product: p, Confidence: cve.ConfidencePotential, NeedsContext: true, ClientOnly: true, TotalCVEs: 2,
+			TopCVEs: []string{"CVE-2026-60002", "CVE-2026-35385"}},
+		{Product: p, Confidence: cve.ConfidencePotential, NeedsContext: true, TotalCVEs: 1},
+		{Product: p, Confidence: cve.ConfidencePotential, TotalCVEs: 1},
+	}
+	pm := BuildPresentationModel(&unifi.Snapshot{Clients: []unifi.Client{host}}, risk.Report{}, nil,
+		[]ClientView{{Client: host}}, nil, append(groups, groups[1]), nil)
+	ent := pm.Entities[hostEntityID(host)]
+	if ent == nil || ent.PotCVECount != 5 || !reflect.DeepEqual(ent.PotentialCVEs, groups) {
+		t.Fatalf("unexpected host advisories: %+v", ent)
+	}
+}
 
 // TestBuildPresentationModelInvariants verifies PresentationModel verdict and
 // layout invariants: exact-CVE hosts are Exposed, unscanned hosts are Unknown,

@@ -543,6 +543,9 @@ func family(ip string) string {
 // cve binds network-reachable CVEs to observed endpoints. Distribution-backport
 // ambiguity stays in Verify even for KEV entries; local-only CVEs are ignored.
 func (b *builder) cve(m cve.Match, bundles serviceBundles) {
+	if m.ClientOnly {
+		return
+	}
 	ip := address(m.Product.HostIP)
 	hosts := b.byIP[ip]
 	r := m.Record

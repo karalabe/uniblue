@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os/exec"
 	"reflect"
 	"slices"
 	"strconv"
@@ -1294,6 +1295,47 @@ func TestDashboardSimulationControls(t *testing.T) {
 	legend, canvas := strings.Index(html, `<div class="br-legend"`), strings.Index(html, `<div class="br-map"`)
 	if legend < 0 || canvas < legend {
 		t.Fatal("map legend must precede the canvas")
+	}
+}
+
+// TestDashboardPatchAdvisories renders the drawer fragment with each kind of
+// advisory so known versions and client-specific guidance stay visible.
+func TestDashboardPatchAdvisories(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is required to render the dashboard JavaScript")
+	}
+	_, block, ok := strings.Cut(string(dashboardHTML), "if (ent.potential_cves && ent.potential_cves.length) {")
+	if !ok {
+		t.Fatal("missing patch advisory rows")
+	}
+	rows, _, ok := strings.Cut(block, "\n  }\n")
+	if !ok {
+		t.Fatal("missing end of advisory row")
+	}
+	script := `const esc = String, ent = {potential_cves: [
+  {product: {label: "OpenSSH", version: "10.0p2"}, confidence: "version-ambiguous"},
+  {product: {label: "OpenSSH", version: "10.0p2"}, needs_context: true},
+  {product: {label: "OpenSSH", version: "8.2"}, client_only: true},
+  {product: {label: "OpenSSH"}, client_only: true, needs_context: true},
+  {product: {label: "OpenSSH"}, needs_context: true},
+  {product: {label: "OpenSSH"}}
+].map(s => ({...s, total_cves: 1}))}; let b = "";` + rows + `console.log(b);`
+	output, err := exec.Command(node, "-e", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("render advisory rows: %v\n%s", err, output)
+	}
+	for _, want := range []string{
+		"OpenSSH 10.0p2</strong> · 1 possible CVE(s) (distro/vendor backports - verify package updates)",
+		"OpenSSH 10.0p2</strong> · 1 possible CVE(s) (verify applicability)",
+		"OpenSSH 8.2</strong> · 1 possible CVE(s) (verify SSH client tools)",
+		"OpenSSH</strong> · 1 possible CVE(s) (version hidden - verify SSH client tools)",
+		"OpenSSH</strong> · 1 possible CVE(s) (version hidden - verify applicability)",
+		"OpenSSH</strong> · 1 possible CVE(s) (version hidden)",
+	} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("missing %q in rendered rows:\n%s", want, output)
+		}
 	}
 }
 

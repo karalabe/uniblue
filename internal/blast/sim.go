@@ -445,6 +445,9 @@ func (b *builder) simCVEs(listeners simListenerIndex, observed map[socket]bool) 
 	critical := map[witness]bool{}
 	disruptionOnly := map[string]bool{}
 	for _, m := range b.CVEMatches {
+		if m.ClientOnly {
+			continue
+		}
 		r := m.Record
 		// Filter out availability/DoS-only CVEs using CVSS v3 (C:N and I:N) and
 		// CVSS v4 (VC:N, VI:N, SC:N, SI:N) vector metrics.

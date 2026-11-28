@@ -13,10 +13,8 @@ import (
 	"github.com/karalabe/uniblue/internal/checks"
 )
 
-// ProductSummary rolls up all CVE matches for a single (Host, Product, Confidence)
-// tuple into one compact, operator-friendly summary row, turning dozens of
-// repetitive CVE lines into a single prioritized item with a computed minimum
-// fixed version.
+// ProductSummary groups CVEs for one host, product, version and confidence.
+// Client-only advisories have a separate summary because they require different evidence.
 type ProductSummary struct {
 	// Product identifies the host, VLAN, software name, and observed version.
 	Product Product `json:"product"`
@@ -24,8 +22,11 @@ type ProductSummary struct {
 	// Confidence describes the evidence for the grouped CVE matches.
 	Confidence Confidence `json:"confidence"`
 
-	// NeedsContext reports whether a matched range requires platform verification.
+	// NeedsContext reports whether a match requires platform or component verification.
 	NeedsContext bool `json:"needs_context,omitempty"`
+
+	// ClientOnly reports whether the advisories concern SSH client tools on a host running sshd.
+	ClientOnly bool `json:"client_only,omitempty"`
 
 	// TotalCVEs is the total number of matching CVEs in this rollup.
 	TotalCVEs int `json:"total_cves"`
@@ -60,7 +61,7 @@ type ProductSummary struct {
 }
 
 // RollupMatches deterministically collapses a slice of granular CVE Matches
-// into per-(Host, Product, Confidence) ProductSummaries, sorted by urgency.
+// into ProductSummaries sorted by urgency.
 // Callers should pre-sort matches by priority (as MatchProducts does) because
 // TopCVEs retains the first three CVE IDs encountered in each group.
 func RollupMatches(matches []Match) []ProductSummary {
@@ -69,10 +70,11 @@ func RollupMatches(matches []Match) []ProductSummary {
 	}
 
 	type groupKey struct {
-		hostIP string
-		label  string
-		ver    string
-		conf   Confidence
+		hostIP     string
+		label      string
+		ver        string
+		conf       Confidence
+		clientOnly bool
 	}
 	type groupState struct {
 		summary *ProductSummary
@@ -85,10 +87,11 @@ func RollupMatches(matches []Match) []ProductSummary {
 
 	for _, m := range matches {
 		k := groupKey{
-			hostIP: m.Product.HostIP,
-			label:  m.Product.Label,
-			ver:    m.Product.Version,
-			conf:   m.Confidence,
+			hostIP:     m.Product.HostIP,
+			label:      m.Product.Label,
+			ver:        m.Product.Version,
+			conf:       m.Confidence,
+			clientOnly: m.ClientOnly,
 		}
 		st, exists := groups[k]
 		if !exists {
@@ -96,6 +99,7 @@ func RollupMatches(matches []Match) []ProductSummary {
 				summary: &ProductSummary{
 					Product:    m.Product,
 					Confidence: m.Confidence,
+					ClientOnly: m.ClientOnly,
 				},
 			}
 			groups[k] = st
@@ -104,7 +108,7 @@ func RollupMatches(matches []Match) []ProductSummary {
 		sum := st.summary
 
 		sum.TotalCVEs++
-		sum.NeedsContext = sum.NeedsContext || m.MatchedCPE.NeedsContext
+		sum.NeedsContext = sum.NeedsContext || m.MatchedCPE.NeedsContext || m.ClientOnly
 		if m.Record.KEV {
 			sum.KEVCount++
 		}
@@ -124,8 +128,8 @@ func RollupMatches(matches []Match) []ProductSummary {
 			sum.TopCVEs = append(sum.TopCVEs, m.Record.ID)
 		}
 
-		// Upstream fixed versions cannot establish the patch level of a distro package.
-		if sum.Confidence == ConfidenceVersionAmbiguous {
+		// A listener cannot establish the installed client version or account for backported fixes.
+		if sum.ClientOnly || sum.Confidence == ConfidenceVersionAmbiguous || sum.Product.VersionAmbiguous {
 			continue
 		}
 		// Track both exclusive (EndExcl) and inclusive (EndIncl / exact Version)
@@ -189,11 +193,13 @@ func (s ProductSummary) Headline() string {
 	if s.KEVCount > 0 {
 		extra += fmt.Sprintf(", %d KEV", s.KEVCount)
 	}
-	if s.NeedsContext {
+	if s.ClientOnly {
+		extra += ", verify SSH client tools"
+	} else if s.NeedsContext {
 		extra += ", verify platform applicability"
 	}
 	if s.Confidence == ConfidenceVersionAmbiguous {
-		extra += ", verify distribution package fixes"
+		extra += ", verify distribution or appliance package fixes"
 	} else if s.MinFixedVersion != "" {
 		extra += fmt.Sprintf(", verify >= %s", s.MinFixedVersion)
 	} else if s.MaxAffectedVersion != "" {

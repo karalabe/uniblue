@@ -1427,6 +1427,37 @@ func TestSimulationCVEImpact(t *testing.T) {
 	}
 }
 
+// TestSSHClientAdvisories keeps client tools out of inbound paths, including
+// the likely paths normally shown for critical CVEs on unversioned listeners.
+func TestSSHClientAdvisories(t *testing.T) {
+	in, src, dst := routedSimulation()
+	ssh := cve.Product{Label: "OpenSSH", Source: "ssh-banner", HostIP: dst.IP, Ports: []cve.EndpointPort{{Transport: "tcp", Port: 22}}}
+	for _, version := range []string{"8.9p1", ""} {
+		ssh.Version = version
+		in.CVEMatches = []cve.Match{{Product: ssh, ClientOnly: true, Confidence: cve.ConfidencePotential,
+			Record: cve.Record{ID: "CVE-2023-38408", Severity: checks.SeverityCritical, AttackVector: "N"}}}
+		r := Evaluate(in)
+		for _, e := range r.Simulation.Edges {
+			if e.From == src.ID && e.To == dst.ID && (e.Tier == "takeover" || e.Tier == "likely") {
+				t.Errorf("SSH client advisory produced an inbound edge: %+v", e)
+			}
+		}
+		for _, a := range r.Actions {
+			if strings.Contains(a.ID, "CVE-2023-38408") || strings.HasPrefix(a.Title, "Verify OpenSSH patches") {
+				t.Errorf("SSH client advisory produced a listener action: %+v", a)
+			}
+		}
+	}
+	ssh.Version = "8.9p1"
+	in.CVEMatches = append(in.CVEMatches, cve.Match{Product: ssh, Confidence: cve.ConfidenceExact,
+		Record: cve.Record{ID: "CVE-2024-6387", Severity: checks.SeverityCritical, AttackVector: "N"}})
+	if !slices.ContainsFunc(Evaluate(in).Simulation.Edges, func(e SimEdge) bool {
+		return e.From == src.ID && e.To == dst.ID && e.Tier == "takeover" && e.Label == "CVE-2024-6387 - tcp/22"
+	}) {
+		t.Fatal("missing inbound edge for the sshd advisory")
+	}
+}
+
 // TestSimulationConditionalGrants retains the boundary fix even when a read-only
 // check cannot establish whether the listener will authorize a control request.
 func TestSimulationConditionalGrants(t *testing.T) {

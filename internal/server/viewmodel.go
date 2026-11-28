@@ -1022,12 +1022,19 @@ func BuildPresentationModel(
 		}
 	}
 	lookupCVEsForIPs := func(idx map[string][]cve.ProductSummary, ips []string) []cve.ProductSummary {
+		// One version can have separate advisories for package backports,
+		// client tools and platform prerequisites.
+		type advisoryKey struct {
+			label, version, ip       string
+			confidence               cve.Confidence
+			clientOnly, needsContext bool
+		}
 		var out []cve.ProductSummary
-		seen := make(map[string]struct{})
+		seen := make(map[advisoryKey]struct{})
 		for _, ip := range ips {
 			k := strings.ToLower(strings.TrimSpace(ip))
 			for _, s := range idx[k] {
-				dedup := s.Product.Label + "|" + s.Product.Version + "|" + s.Product.HostIP
+				dedup := advisoryKey{s.Product.Label, s.Product.Version, s.Product.HostIP, s.Confidence, s.ClientOnly, s.NeedsContext}
 				if _, dup := seen[dedup]; dup {
 					continue
 				}

@@ -24,7 +24,7 @@ const (
 	ConfidenceExact Confidence = "exact"
 
 	// ConfidenceVersionAmbiguous means the upstream version matches, but a
-	// distribution may already have backported the fix to its package.
+	// distribution or appliance vendor may already have backported the fix.
 	ConfidenceVersionAmbiguous Confidence = "version-ambiguous"
 
 	// ConfidencePotential indicates the vendor and product matched, but the
@@ -93,7 +93,7 @@ type Record struct {
 
 // CPEMatch represents one vulnerable CPE 2.3 criteria node extracted from NVD.
 type CPEMatch struct {
-	// NeedsContext indicates that this range requires additional platform evidence.
+	// NeedsContext indicates that the range requires additional platform or component evidence.
 	NeedsContext bool `json:"needs_context,omitempty"`
 
 	// Part is the CPE component type: "a" (application), "o" (OS), or "h" (hardware).
@@ -217,7 +217,7 @@ type Product struct {
 
 	// Ports lists observed service endpoints. Host inventory has no port binding.
 	Ports []EndpointPort `json:"ports,omitempty"`
-	// VersionAmbiguous indicates that distribution packaging obscures patch status.
+	// VersionAmbiguous indicates that distribution or appliance packaging obscures patch status.
 	VersionAmbiguous bool `json:"version_ambiguous,omitempty"`
 	// HighConfidence reports whether the product identity came from controller
 	// inventory or a protocol-level fingerprint rather than a generic banner.
@@ -256,6 +256,19 @@ type Match struct {
 	// Confidence records the strength of the version and platform evidence.
 	Confidence Confidence `json:"confidence"`
 
+	// ClientOnly indicates that the advisory affects SSH client tools and the
+	// observed listener supplies no evidence of inbound exposure.
+	ClientOnly bool `json:"client_only,omitempty"`
+
 	// MatchedCPE records the specific CPE vendor/product/range that triggered.
 	MatchedCPE CPEMatch `json:"matched_cpe"`
+}
+
+// preferredTo selects the strongest evidence across overlapping ranges and vendor
+// aliases. At equal confidence a client-only range must not hide a possible server match.
+func (m Match) preferredTo(other Match) bool {
+	if m.Confidence != other.Confidence {
+		return m.Confidence.rank() > other.Confidence.rank()
+	}
+	return other.ClientOnly && !m.ClientOnly
 }

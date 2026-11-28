@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -1116,6 +1117,32 @@ func (c *Cache) LookupVendor(vendor string) ([]Record, error) {
 	return recs, nil
 }
 
+// openSSHClientScope looks for the affected component rather than a reference to
+// an arbitrary SSH client connecting to a vulnerable service.
+var openSSHClientScope = regexp.MustCompile(
+	`(?:^(?:openssh )?|\b(?:in|affects) (?:the )?)(?:ssh-agent|ssh-add|ssh-keygen|scp|(?:ssh|sftp) client)\b|` +
+		`\b(?:ssh|ssh-agent|ssh-add|ssh-keygen|scp|sftp|(?:ssh |scp |sftp |the )client) (?:in|for) openssh\b|` +
+		`\b(?:on the client[- ]side|the client[- ]side in|in the client|downloaded by scp)\b`)
+
+// clientOnlyOpenSSH reports whether an advisory identifies a client component.
+// Truncated descriptions and those mentioning a server need individual review
+// to distinguish a hostile peer from a vulnerable listener.
+func clientOnlyOpenSSH(rec Record) bool {
+	d := strings.ToLower(rec.Description)
+	if strings.Contains(d, "sshd") || strings.Contains(d, "server-side") || strings.Contains(d, "server side") {
+		return false
+	}
+	// These descriptions identify the server as the client's peer or, for X11,
+	// the local display server. The affected component runs on the client.
+	switch rec.ID {
+	case "CVE-2000-1169", "CVE-2004-0175", "CVE-2014-2653", "CVE-2016-0777", "CVE-2016-0778",
+		"CVE-2016-1908", "CVE-2018-20685", "CVE-2019-6109", "CVE-2019-6110", "CVE-2019-6111", "CVE-2020-12062", "CVE-2020-14145",
+		"CVE-2025-26465", "CVE-2026-35386", "CVE-2026-59995", "CVE-2026-60002", "CVE-2026-106552":
+		return true
+	}
+	return !strings.Contains(d, "server") && !strings.HasSuffix(d, "...") && openSSHClientScope.MatchString(d)
+}
+
 // MatchProducts evaluates a slice of detected LAN/UniFi Products against the
 // local vendor shards and retains the evidence for each match.
 func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, error) {
@@ -1143,14 +1170,14 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 		hostKey := productHostKey(prod)
 		labelKey := strings.ToLower(strings.TrimSpace(prod.Label))
 		verKey := strings.ToLower(strings.TrimSpace(prod.Version))
+		listener := len(prod.Ports) > 0 || prod.Source == "ssh-banner" || prod.Source == "nerva-cpe"
 		for _, vendor := range prod.Vendors {
 			recs := loaded[sanitizeVendor(vendor)]
 			for _, rec := range recs {
 				if !rec.KEV && rec.Severity < opts.MinSeverity {
 					continue
 				}
-				bestConf := Confidence("")
-				var bestCPE CPEMatch
+				var best Match
 
 				for _, cpe := range rec.Matches {
 					if !strings.EqualFold(vendor, cpe.Vendor) || !matchesAnyPattern(prod.Products, cpe.Product) {
@@ -1160,20 +1187,22 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 					if !ok {
 						continue
 					}
-					// Downgrade exact upstream range hits when the CVE requires
-					// unobserved OS/application context or when distro backports
-					// obscure patch status, never promoting potential matches.
+					// NVD shares one product between sshd and the client tools. A
+					// listener identifies the server even on a nonstandard port.
+					clientOnly := listener && strings.EqualFold(cpe.Vendor, "openbsd") &&
+						strings.EqualFold(cpe.Product, "openssh") && clientOnlyOpenSSH(rec)
+					cpe.NeedsContext = cpe.NeedsContext || clientOnly
 					if cpe.NeedsContext && conf == ConfidenceExact {
 						conf = ConfidencePotential
 					} else if prod.VersionAmbiguous && conf == ConfidenceExact {
 						conf = ConfidenceVersionAmbiguous
 					}
-					if conf.rank() > bestConf.rank() {
-						bestConf = conf
-						bestCPE = cpe
+					m := Match{Record: rec, Product: prod, Confidence: conf, MatchedCPE: cpe, ClientOnly: clientOnly}
+					if m.preferredTo(best) {
+						best = m
 					}
 				}
-				if bestConf == "" {
+				if best.Confidence == "" {
 					continue
 				}
 
@@ -1183,23 +1212,17 @@ func (c *Cache) MatchProducts(products []Product, opts MatchOptions) ([]Match, e
 				// vendor-alias hits for the same product and version collapse.
 				cveID := strings.ToUpper(strings.TrimSpace(rec.ID))
 				dedupKey := fmt.Sprintf("%s|%s|%s|%s", hostKey, labelKey, verKey, cveID)
-				if bestConf == ConfidenceExact && verKey != "" {
+				if best.Confidence == ConfidenceExact && verKey != "" {
 					exactByHostLabelCVE[fmt.Sprintf("%s|%s|%s", hostKey, labelKey, cveID)] = struct{}{}
 				}
-				candidate := Match{
-					Record:     rec,
-					Product:    prod,
-					Confidence: bestConf,
-					MatchedCPE: bestCPE,
-				}
 				if idx, exists := seenIdx[dedupKey]; exists {
-					if bestConf.rank() > matches[idx].Confidence.rank() {
-						matches[idx] = candidate
+					if best.preferredTo(matches[idx]) {
+						matches[idx] = best
 					}
 					continue
 				}
 				seenIdx[dedupKey] = len(matches)
-				matches = append(matches, candidate)
+				matches = append(matches, best)
 			}
 		}
 	}
